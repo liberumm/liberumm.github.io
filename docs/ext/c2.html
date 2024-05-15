@@ -1,0 +1,197 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>店舗配分システム</title>
+    <link href="https://stackpath.bootstrapcdn.com/bootstrap/4.5.2/css/bootstrap.min.css" rel="stylesheet">
+</head>
+<body>
+    <div class="container">
+        <h1 class="mt-5">店舗配分システム</h1>
+        <form id="upload-form" class="mt-4">
+            <div class="form-group">
+                <label for="shop_master">店舗マスタ (CSV)</label>
+                <input type="file" class="form-control" id="shop_master">
+            </div>
+            <div class="form-group">
+                <label for="shop_coefficients">店舗係数マスタ (CSV)</label>
+                <input type="file" class="form-control" id="shop_coefficients">
+            </div>
+            <button type="button" class="btn btn-primary" id="load-defaults">デフォルトCSVを読み込む</button>
+        </form>
+
+        <h2 class="mt-5">商品マスタ</h2>
+        <button id="add-product" class="btn btn-success mb-3">商品を追加</button>
+        <table class="table table-striped" id="product-table">
+            <thead>
+                <tr>
+                    <th>納品日</th>
+                    <th>商品コード</th>
+                    <th>商品名</th>
+                    <th>原価</th>
+                    <th>売価</th>
+                    <th>係数パターン</th>
+                    <th>配分総数</th>
+                </tr>
+            </thead>
+            <tbody>
+            </tbody>
+        </table>
+
+        <button id="calculate" class="btn btn-primary mt-3">配分を計算</button>
+
+        <div id="result" class="mt-5"></div>
+        <button id="download" class="btn btn-success mt-3" style="display:none;">Excelとしてダウンロード</button>
+    </div>
+
+    <script src="https://code.jquery.com/jquery-3.6.0.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.17.0/xlsx.full.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/PapaParse/5.3.0/papaparse.min.js"></script>
+    <script>
+        $(document).ready(function () {
+            let defaultShopMasterUrl = 'default_shop_master.csv';
+            let defaultShopCoefficientsUrl = 'default_shop_coefficients.csv';
+
+            function getQueryParam(param) {
+                const urlParams = new URLSearchParams(window.location.search);
+                return urlParams.get(param);
+            }
+
+            function loadCSVFromUrl(url) {
+                return new Promise((resolve, reject) => {
+                    Papa.parse(url, {
+                        download: true,
+                        header: true,
+                        complete: function (results) {
+                            resolve(results.data);
+                        },
+                        error: reject
+                    });
+                });
+            }
+
+            async function loadDefaultCSVs() {
+                const shopMasterUrl = getQueryParam('shop_master') || defaultShopMasterUrl;
+                const shopCoefficientsUrl = getQueryParam('shop_coefficients') || defaultShopCoefficientsUrl;
+
+                try {
+                    const shopMasterData = await loadCSVFromUrl(shopMasterUrl);
+                    const shopCoefficientsData = await loadCSVFromUrl(shopCoefficientsUrl);
+
+                    return { shopMasterData, shopCoefficientsData };
+                } catch (error) {
+                    console.error("CSVファイルの読み込み中にエラーが発生しました:", error);
+                    alert("CSVファイルの読み込み中にエラーが発生しました。コンソールを確認してください。");
+                }
+            }
+
+            $('#load-defaults').on('click', async function () {
+                const { shopMasterData, shopCoefficientsData } = await loadDefaultCSVs();
+                $('#shop_master').data('data', shopMasterData);
+                $('#shop_coefficients').data('data', shopCoefficientsData);
+                alert("デフォルトCSVが読み込まれました。");
+            });
+
+            $('#add-product').on('click', function () {
+                $('#product-table tbody').append(`
+                    <tr>
+                        <td><input type="date" class="form-control" name="納品日"></td>
+                        <td><input type="text" class="form-control" name="商品コード"></td>
+                        <td><input type="text" class="form-control" name="商品名"></td>
+                        <td><input type="number" class="form-control" name="原価"></td>
+                        <td><input type="number" class="form-control" name="売価"></td>
+                        <td>
+                            <select class="form-control" name="係数パターン">
+                                <option value="1">係数パターン1</option>
+                                <option value="2">係数パターン2</option>
+                                <!-- 必要に応じて他の係数パターンを追加 -->
+                            </select>
+                        </td>
+                        <td><input type="number" class="form-control" name="配分総数"></td>
+                    </tr>
+                `);
+            });
+
+            $('#calculate').on('click', function () {
+                let shopMasterData = $('#shop_master').data('data');
+                let shopCoefficientsData = $('#shop_coefficients').data('data');
+
+                if (!shopMasterData || !shopCoefficientsData) {
+                    alert("店舗マスタおよび店舗係数マスタのデータが読み込まれていません。");
+                    return;
+                }
+
+                let productMasterData = [];
+                $('#product-table tbody tr').each(function () {
+                    let row = {};
+                    $(this).find('input, select').each(function () {
+                        let name = $(this).attr('name');
+                        let value = $(this).val();
+                        row[name] = value;
+                    });
+                    productMasterData.push(row);
+                });
+
+                const allocationResult = calculateAllocation(productMasterData, shopMasterData, shopCoefficientsData);
+                displayResult(allocationResult);
+                enableDownload(allocationResult);
+            });
+
+            function calculateAllocation(productMaster, shopMaster, shopCoefficients) {
+                let result = [];
+
+                productMaster.forEach((product) => {
+                    const totalQuantity = product['配分総数'];
+                    const coefficientPattern = product['係数パターン'];
+
+                    shopCoefficients.forEach((coeff) => {
+                                        const shopName = coeff['店舗'];
+                    const coefficient = coeff[`係数パターン${coefficientPattern}`];
+                    const allocationQuantity = (totalQuantity * coefficient) / 100;
+
+                    result.push({
+                        '納品日': product['納品日'],
+                        '商品コード': product['商品コード'],
+                        '商品名': product['商品名'],
+                        '原価': product['原価'],
+                        '売価': product['売価'],
+                        '店舗名': shopName,
+                        '係数パターン': `係数パターン${coefficientPattern}`,
+                        '配分数': allocationQuantity
+                    });
+                });
+            });
+
+            return result;
+        }
+
+        function displayResult(data) {
+            let table = '<table class="table table-striped"><thead><tr>';
+            Object.keys(data[0]).forEach(key => {
+                table += `<th>${key}</th>`;
+            });
+            table += '</tr></thead><tbody>';
+            data.forEach(row => {
+                table += '<tr>';
+                Object.values(row).forEach(value => {
+                    table += `<td>${value}</td>`;
+                });
+                table += '</tr>';
+            });
+            table += '</tbody></table>';
+            $('#result').html(table);
+        }
+
+        function enableDownload(data) {
+            $('#download').show().off('click').on('click', function () {
+                const worksheet = XLSX.utils.json_to_sheet(data);
+                const workbook = XLSX.utils.book_new();
+                XLSX.utils.book_append_sheet(workbook, worksheet, '配分結果');
+                XLSX.writeFile(workbook, 'allocation_result.xlsx');
+            });
+        }
+    });
+</script>
+</body>
+</html>
