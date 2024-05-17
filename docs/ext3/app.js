@@ -103,29 +103,47 @@ function createTable(sheetName, data, type) {
     container.appendChild(tableWrapper);
 }
 
-function downloadTemplate(templateType) {
+function downloadTemplate(templateType, fileType) {
     const templates = {
         "storeMaster": {name: "店舗マスタ", columns: ["店舗コード", "店舗名", "グループ"]},
         "storeCoefficient": {name: "店舗係数マスタ", columns: ["店舗コード", "店舗名", "係数パターン1", "係数パターン2", "係数パターン3"]},
-        "productList": {name: "商品リスト", columns: ["商品コード", "商品名", "総数"]}
+        "productList": {name: "商品リスト", columns: ["納品日", "商品コード", "係数パターン", "配分数"]}
     };
 
     const template = templates[templateType];
     const worksheet = XLSX.utils.aoa_to_sheet([template.columns]);
     const workbook = XLSX.utils.book_new();
     XLSX.utils.book_append_sheet(workbook, worksheet, template.name);
-    XLSX.writeFile(workbook, `${template.name}.xlsx`);
+    
+    if (fileType === 'xlsx') {
+        XLSX.writeFile(workbook, `${template.name}.xlsx`);
+    } else if (fileType === 'csv') {
+        const csv = XLSX.utils.sheet_to_csv(workbook.Sheets[template.name]);
+        const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
+        const link = document.createElement("a");
+
+        if (link.download !== undefined) {
+            const url = URL.createObjectURL(blob);
+            link.setAttribute("href", url);
+            link.setAttribute("download", `${template.name}.csv`);
+            link.style.visibility = 'hidden';
+            document.body.appendChild(link);
+            link.click();
+            document.body.removeChild(link);
+        }
+    }
 }
 
 function addRow() {
     const table = document.getElementById('allocationTable').getElementsByTagName('tbody')[0];
     const templateRow = document.getElementById('templateRow').cloneNode(true);
     templateRow.id = '';
-    templateRow.cells[0].textContent = table.rows.length + 1;
+    templateRow.cells[1].textContent = table.rows.length + 1;
     Array.from(templateRow.querySelectorAll('input')).forEach(input => {
         input.value = '';
         input.addEventListener('input', validateAndCalculateTotal);
     });
+    templateRow.querySelector('td:nth-child(9) input').addEventListener('input', setRowQuantities); // 一括数量の入力フィールドにイベントリスナーを追加
     table.appendChild(templateRow);
 }
 
@@ -158,7 +176,7 @@ function adjustStoreColumns(count) {
     const tbody = document.getElementById('allocationTable').getElementsByTagName('tbody')[0];
 
     // Clear existing store columns
-    while (headerRow1.cells.length > 7) {
+    while (headerRow1.cells.length > 12) { // 11 columns + clear button column
         headerRow1.deleteCell(-1);
     }
     while (headerRow2.cells.length > 0) {
@@ -168,22 +186,27 @@ function adjustStoreColumns(count) {
     // Add new store columns
     for (let i = 1; i <= count; i++) {
         const newHeader1 = document.createElement('th');
-        newHeader1.textContent = '店舗';
+        newHeader1.innerHTML = `<input type="text" class="form-control" placeholder="店舗${i} 名">`;
         headerRow1.appendChild(newHeader1);
 
         const newHeader2 = document.createElement('th');
-        newHeader2.innerHTML = `<input type="text" class="form-control" placeholder="店舗${i} 名">`;
+        newHeader2.innerHTML = `<input type="text" class="form-control" placeholder="店舗${i} コード">`;
         headerRow2.appendChild(newHeader2);
     }
+
+    // Add "再合計" header
+    const extraTotalHeader = document.createElement('th');
+    extraTotalHeader.textContent = '再合計';
+    headerRow2.appendChild(extraTotalHeader);
 
     // Adjust rows
     for (let i = 0; i < tbody.rows.length; i++) {
         const row = tbody.rows[i];
-        while (row.cells.length > 7) {
+        while (row.cells.length > 12) { // 11 columns + clear button column
             row.deleteCell(-1);
         }
         for (let j = 0; j < count; j++) {
-            const newCell = row.insertCell();
+            const newCell = row.insertCell(row.cells.length); // Insert before the last cell (which is the total cell)
             const input = document.createElement('input');
             input.type = 'number';
             input.classList.add('form-control', 'table-input');
@@ -191,7 +214,28 @@ function adjustStoreColumns(count) {
             input.setAttribute('oninput', 'validateAndCalculateTotal(this)');
             newCell.appendChild(input);
         }
+        // Add extra total cell at the end
+        const extraTotalCell = row.insertCell(row.cells.length);
+        const extraTotalInput = document.createElement('input');
+        extraTotalInput.type = 'number';
+        extraTotalInput.classList.add('form-control', 'table-input');
+        extraTotalInput.disabled = true;
+        extraTotalCell.appendChild(extraTotalInput);
     }
+}
+
+function setRowQuantities(element) {
+    const quantity = parseInt(element.value);
+    if (isNaN(quantity) || quantity < 0) return;
+
+    const row = element.closest('tr');
+    const cells = row.querySelectorAll('td input[type="number"]');
+    cells.forEach((cell, index) => {
+        if (index >= 5 && index < cells.length - 1) { // 配分数以降のセルに数量を設定（導入店舗数、合計セルを除く）
+            cell.value = quantity;
+        }
+    });
+    updateTotal(row);
 }
 
 function validateAndCalculateTotal(element) {
@@ -210,18 +254,31 @@ function validateAndCalculateTotal(element) {
 function updateTotal(row) {
     const cells = row.querySelectorAll('td input[type="number"]');
     let total = 0;
+    let storeCount = 0;
 
     cells.forEach((cell, index) => {
-        // 4番目のセル以降を合計に含める
-        if (index >= 3 && !isNaN(cell.value) && cell.value !== '') {
+        // 配分数の次のセル以降を合計に含める（クリアボタン、No、納品日、商品コード、係数パターン、配分数、単位、最低導入数、一括数量の後）
+        if (index >= 5 && index < cells.length - 1 && !isNaN(cell.value) && cell.value !== '') {
             total += parseInt(cell.value);
+            if (parseInt(cell.value) > 0) {
+                storeCount++;
+            }
         }
     });
 
-    // 合計値を初期化して設定する
-    const totalCell = row.cells[6].querySelector('input');
+    // 合計値と導入店舗数を初期化して設定する
+    const totalCell = row.cells[10].querySelector('input'); // 合計セル
+    const storeCountCell = row.cells[9].querySelector('input'); // 導入店舗数セル
+    const extraTotalCell = row.cells[row.cells.length - 1].querySelector('input'); // 最終セル
+
     if (totalCell) {
         totalCell.value = total;
+    }
+    if (storeCountCell) {
+        storeCountCell.value = storeCount;
+    }
+    if (extraTotalCell) {
+        extraTotalCell.value = total;
     }
 }
 
@@ -242,12 +299,22 @@ function clearStoreQuantities() {
 
     for (let row of rows) {
         Array.from(row.querySelectorAll('td input[type="number"]')).forEach((input, index) => {
-            if (index >= 3) {
+            if (index >= 5) {
                 input.value = '';
             }
         });
         updateTotal(row);
     }
+}
+
+function clearRowQuantities(button) {
+    const row = button.closest('tr');
+    Array.from(row.querySelectorAll('td input[type="number"]')).forEach((input, index) => {
+        if (index >= 5) {
+            input.value = '';
+        }
+    });
+    updateTotal(row);
 }
 
 function setDeliveryDate() {
@@ -256,7 +323,7 @@ function setDeliveryDate() {
     const rows = table.getElementsByTagName('tr');
 
     for (let row of rows) {
-        const dateInput = row.querySelector('td:nth-child(2) input[type="date"]');
+        const dateInput = row.querySelector('td:nth-child(3) input[type="date"]');
         if (dateInput) {
             dateInput.value = date;
         }
