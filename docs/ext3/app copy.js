@@ -1,9 +1,6 @@
-// app.js
-
 let storeCoefficients = {}; // 店舗係数を保存するオブジェクト
+let coefficientPatterns = []; // 係数パターンを保存する配列
 let storeMaster = []; // 店舗マスタを保存する配列
-let coefficientPatterns = []; // 係数パターン名を保存する配列
-
 
 document.getElementById('storeMasterDropArea').addEventListener('dragover', handleDragOver);
 document.getElementById('storeMasterDropArea').addEventListener('dragleave', handleDragLeave);
@@ -112,17 +109,22 @@ function importData(file, type) {
 }
 
 function processWorkbook(workbook, type) {
-    if (type === 'storeMaster') {
-        parseStoreMaster(workbook);
-        adjustStoreColumns(storeMaster.length);
-    } else if (type === 'storeCoefficient') {
-        storeCoefficients = parseStoreCoefficients(workbook);
-    }
     const sheetNames = workbook.SheetNames;
     sheetNames.forEach(sheetName => {
         const sheetData = XLSX.utils.sheet_to_json(workbook.Sheets[sheetName], { header: 1 });
         createTable(sheetName, sheetData, type);
     });
+
+    if (type === 'storeMaster') {
+        storeMaster = parseStoreMaster(workbook);
+        updateStoreColumns(storeMaster);
+    }
+
+    if (type === 'storeCoefficient') {
+        storeCoefficients = parseStoreCoefficients(workbook);
+        coefficientPatterns = Object.keys(storeCoefficients[Object.keys(storeCoefficients)[0]]);
+        updateCoefficientPatterns(coefficientPatterns);
+    }
 }
 
 function fetchFileAndImport(fileName, type) {
@@ -185,25 +187,6 @@ function createTable(sheetName, data, type) {
     table.appendChild(tbody);
     tableWrapper.appendChild(table);
     container.appendChild(tableWrapper);
-
-    // マスタデータの場合、storeCoefficientsを更新
-    if (type === 'storeCoefficient') {
-        updateStoreCoefficients(data);
-    }
-}
-
-function updateStoreCoefficients(data) {
-    // Assume first row is header
-    const headers = data[0];
-    data.slice(1).forEach(row => {
-        const storeCode = row[headers.indexOf('店舗コード')];
-        storeCoefficients[storeCode] = {};
-        headers.forEach((header, index) => {
-            if (header !== '店舗コード' && header !== '店舗名') {
-                storeCoefficients[storeCode][header] = parseFloat(row[index]);
-            }
-        });
-    });
 }
 
 function downloadTemplate(templateType, fileType) {
@@ -247,6 +230,20 @@ function addRow() {
         input.addEventListener('input', validateAndCalculateTotal);
     });
     templateRow.querySelector('td:nth-child(9) input').addEventListener('input', setRowQuantities); // 一括数量の入力フィールドにイベントリスナーを追加
+
+    // 係数パターンのセルをセレクトボックスに変更
+    const coefficientPatternCell = templateRow.cells[4];
+    const select = document.createElement('select');
+    select.classList.add('form-control', 'table-input');
+    coefficientPatterns.forEach(pattern => {
+        const option = document.createElement('option');
+        option.value = pattern;
+        option.textContent = pattern;
+        select.appendChild(option);
+    });
+    coefficientPatternCell.innerHTML = '';
+    coefficientPatternCell.appendChild(select);
+
     table.appendChild(templateRow);
 }
 
@@ -333,7 +330,6 @@ function adjustStoreColumns(count) {
     }
 }
 
-
 function setRowQuantities(element) {
     const quantity = parseInt(element.value);
     if (isNaN(quantity) || quantity < 0) return;
@@ -357,8 +353,8 @@ function validateAndCalculateTotal(element) {
     }
 
     // 合計を再計算
-    //const row = element.closest('tr');
-    //updateTotal(row);
+    const row = element.closest('tr');
+    updateTotal(row);
 }
 
 function updateTotal(row) {
@@ -439,83 +435,17 @@ function setDeliveryDate() {
         }
     }
 }
+
 function exportTableToExcel() {
     const table = document.getElementById('allocationTable');
-    const workbook = XLSX.utils.book_new();
-    const ws_data = [];
-
-    // ヘッダー行を取得
-    const headerRow1 = Array.from(document.getElementById('headerRow1').cells).map(cell => cell.innerText || cell.querySelector('input')?.value || "");
-    const headerRow2 = Array.from(document.getElementById('headerRow2').cells).map(cell => cell.querySelector('input')?.value || "");
-
-    // オフセットを調整
-    const offset = headerRow1.length - headerRow2.length;
-    for (let i = 0; i < offset; i++) {
-        headerRow2.unshift("");
-    }
-
-    // カスタムヘッダーを作成
-    const customHeaders = ["", "No", "納品日", "商品コード", "係数パターン", "配分数", "単位", "最低導入数", "一括数量", "導入店舗数", "合計"];
-    const storeHeaders = headerRow2.slice(10).map((storeCode, index) => {
-        const storeName = headerRow1[10 + index];
-        return `${storeCode}_${storeName}`;
-    });
-
-    const combinedHeaderRow = customHeaders.concat(storeHeaders);
-    ws_data.push(combinedHeaderRow);
-
-    // 各行のデータを取得
-    const rows = table.getElementsByTagName('tbody')[0].getElementsByTagName('tr');
-    for (let row of rows) {
-        const rowData = Array.from(row.getElementsByTagName('td')).map(cell => {
-            const input = cell.querySelector('input');
-            return input ? input.value : cell.innerText;
-        });
-        ws_data.push(rowData);
-    }
-
-    const ws = XLSX.utils.aoa_to_sheet(ws_data);
-    XLSX.utils.book_append_sheet(workbook, ws, "Sheet1");
+    const workbook = XLSX.utils.table_to_book(table, { sheet: "Sheet1" });
     XLSX.writeFile(workbook, 'table.xlsx');
 }
 
 function exportTableToCSV() {
     const table = document.getElementById('allocationTable');
-    const workbook = XLSX.utils.book_new();
-    const ws_data = [];
-
-    // ヘッダー行を取得
-    const headerRow1 = Array.from(document.getElementById('headerRow1').cells).map(cell => cell.innerText || cell.querySelector('input')?.value || "");
-    const headerRow2 = Array.from(document.getElementById('headerRow2').cells).map(cell => cell.querySelector('input')?.value || "");
-
-    // オフセットを調整
-    const offset = headerRow1.length - headerRow2.length;
-    for (let i = 0; i < offset; i++) {
-        headerRow2.unshift("");
-    }
-
-    // カスタムヘッダーを作成
-    const customHeaders = ["", "No", "納品日", "商品コード", "係数パターン", "配分数", "単位", "最低導入数", "一括数量", "導入店舗数", "合計"];
-    const storeHeaders = headerRow2.slice(10).map((storeCode, index) => {
-        const storeName = headerRow1[10 + index];
-        return `${storeCode}_${storeName}`;
-    });
-
-    const combinedHeaderRow = customHeaders.concat(storeHeaders);
-    ws_data.push(combinedHeaderRow);
-
-    // 各行のデータを取得
-    const rows = table.getElementsByTagName('tbody')[0].getElementsByTagName('tr');
-    for (let row of rows) {
-        const rowData = Array.from(row.getElementsByTagName('td')).map(cell => {
-            const input = cell.querySelector('input');
-            return input ? input.value : cell.innerText;
-        });
-        ws_data.push(rowData);
-    }
-
-    const ws = XLSX.utils.aoa_to_sheet(ws_data);
-    const csv = XLSX.utils.sheet_to_csv(ws);
+    const workbook = XLSX.utils.table_to_book(table, { sheet: "Sheet1" });
+    const csv = XLSX.utils.sheet_to_csv(workbook.Sheets["Sheet1"]);
     const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
     const link = document.createElement("a");
 
@@ -529,7 +459,6 @@ function exportTableToCSV() {
         document.body.removeChild(link);
     }
 }
-
 
 function distributeAllocations() {
     const table = document.getElementById('allocationTable').getElementsByTagName('tbody')[0];
@@ -610,15 +539,14 @@ function getStoreCoefficients(pattern, totalStores, row) {
     return coefficients;
 }
 
+
 function parseStoreMaster(workbook) {
     const sheet = workbook.Sheets[workbook.SheetNames[0]];
-    const data = XLSX.utils.sheet_to_json(sheet, { header: 1 });
-    storeMaster = data.slice(1).map(row => ({
+    return XLSX.utils.sheet_to_json(sheet, { header: 1 }).slice(1).map(row => ({
         code: row[0],
         name: row[1]
     }));
 }
-
 
 function parseStoreCoefficients(workbook) {
     const sheet = workbook.Sheets[workbook.SheetNames[0]];
@@ -634,37 +562,8 @@ function parseStoreCoefficients(workbook) {
         });
     });
 
-    coefficientPatterns = headers; // 係数パターン名を保存
-    storeMaster = data.slice(1).map(row => ({
-        code: row[0],
-        name: row[1]
-    }));
-
-    updateCoefficientPatternOptions();
-    adjustStoreColumns(storeMaster.length);
-
     return coefficients;
 }
-
-function updateCoefficientPatternOptions() {
-    const rows = document.querySelectorAll('#allocationTable tbody tr');
-    rows.forEach(row => {
-        const select = row.querySelector('td:nth-child(5) select');
-        if (select) {
-            // 既存の選択肢をクリア
-            select.innerHTML = '';
-
-            // 新しい選択肢を追加
-            coefficientPatterns.forEach(pattern => {
-                const option = document.createElement('option');
-                option.value = pattern;
-                option.text = pattern;
-                select.appendChild(option);
-            });
-        }
-    });
-}
-
 
 document.getElementById('allocateButton').addEventListener('click', () => {
     const table = document.getElementById('allocationTable').getElementsByTagName('tbody')[0];
