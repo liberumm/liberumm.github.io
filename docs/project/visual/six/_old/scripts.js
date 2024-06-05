@@ -267,17 +267,13 @@ function displayTable(showAllColumns = false) {
         th.textContent = header;
         th.style.cursor = 'pointer';
         th.addEventListener('click', () => {
-            showLoading(); // ソート開始時にローディング表示
-            setTimeout(() => {
-                if (sortColumn === header) {
-                    sortOrder = sortOrder === 'asc' ? 'desc' : 'asc';
-                } else {
-                    sortColumn = header;
-                    sortOrder = 'asc';
-                }
-                sortDisplayData(header);
-                hideLoading(); // ソート完了後にローディング表示を隠す
-            }, 0);
+            if (sortColumn === header) {
+                sortOrder = sortOrder === 'asc' ? 'desc' : 'asc';
+            } else {
+                sortColumn = header;
+                sortOrder = 'asc';
+            }
+            sortDisplayData(header);
         });
         tableHeaders.appendChild(th);
     });
@@ -362,26 +358,18 @@ function resetTable() {
 
 function prevPage() {
     if (currentPage > 1) {
-        showLoading(); // ページ切り替え開始時にローディング表示
-        setTimeout(() => {
-            currentPage--;
-            updateDisplayData();
-            displayTable();
-            hideLoading(); // ページ切り替え完了後にローディング表示を隠す
-        }, 0);
+        currentPage--;
+        updateDisplayData();
+        displayTable();
     }
 }
 
 function nextPage() {
     const totalPages = Math.ceil(displayData.length / rowsPerPage);
     if (currentPage < totalPages) {
-        showLoading(); // ページ切り替え開始時にローディング表示
-        setTimeout(() => {
-            currentPage++;
-            updateDisplayData();
-            displayTable();
-            hideLoading(); // ページ切り替え完了後にローディング表示を隠す
-        }, 0);
+        currentPage++;
+        updateDisplayData();
+        displayTable();
     }
 }
 
@@ -392,15 +380,11 @@ function goToPage(event) {
     const newPage = parseInt(event.target.value);
 
     if (newPage >= 1 && newPage <= totalPages) {
-        showLoading(); // ページ切り替え開始時にローディング表示
-        setTimeout(() => {
-            currentPage = newPage;
-            pageInputTop.value = newPage;
-            pageInputBottom.value = newPage;
-            updateDisplayData();
-            displayTable();
-            hideLoading(); // ページ切り替え完了後にローディング表示を隠す
-        }, 0);
+        currentPage = newPage;
+        pageInputTop.value = newPage;
+        pageInputBottom.value = newPage;
+        updateDisplayData();
+        displayTable();
     }
 }
 
@@ -421,30 +405,26 @@ function toggleFilterMode() {
 }
 
 function applyFilters() {
-    showLoading();
-    setTimeout(() => {
-        const filterSelects = document.querySelectorAll('#filterRow select');
-        filterSelects.forEach(select => {
-            const column = select.dataset.column;
-            const value = select.value;
-            if (value) {
-                filters[column] = value;
-            } else {
-                delete filters[column];
-            }
-        });
+    const filterSelects = document.querySelectorAll('#filterRow select');
+    filterSelects.forEach(select => {
+        const column = select.dataset.column;
+        const value = select.value;
+        if (value) {
+            filters[column] = value;
+        } else {
+            delete filters[column];
+        }
+    });
 
-        displayData = workingData.filter(row => {
-            return Object.keys(filters).every(column => {
-                return row[column] === filters[column];
-            });
+    displayData = workingData.filter(row => {
+        return Object.keys(filters).every(column => {
+            return row[column] === filters[column];
         });
+    });
 
-        currentPage = 1;
-        updateDisplayData();
-        displayTable();
-        hideLoading();
-    }, 0);
+    currentPage = 1;
+    updateDisplayData();
+    displayTable();
 }
 
 function resetFilters() {
