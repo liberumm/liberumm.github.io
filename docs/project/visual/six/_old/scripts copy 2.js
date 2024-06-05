@@ -1,12 +1,17 @@
 let originalData = [];
-let filteredData = [];
-let groupedData = [];
+let workingData = [];
+let displayData = [];
+let currentDisplayData = [];
+let displayedHeaders = [];
+let allHeaders = [];
+let filterMode = false; // フィルターモードの状態を追跡
+let filters = {};
 let sortColumn = '';
 let sortOrder = 'asc'; // or 'desc'
 const rowsPerPage = 100;
 let currentPage = 1;
 let currentFile = null;
-let currentHeaders = [];
+let isGrouped = false; // グループ化の状態を追跡
 
 document.getElementById('fileInput').addEventListener('change', handleFile);
 document.getElementById('encodingSelect').addEventListener('change', handleEncodingChange);
@@ -16,6 +21,8 @@ document.getElementById('prevPageBottom').addEventListener('click', prevPage);
 document.getElementById('nextPageBottom').addEventListener('click', nextPage);
 document.getElementById('pageInputTop').addEventListener('change', goToPage);
 document.getElementById('pageInputBottom').addEventListener('change', goToPage);
+document.getElementById('filterToggle').addEventListener('click', toggleFilterMode); // フィルターモードの切り替えボタン
+document.getElementById('applyFilters').addEventListener('click', applyFilters); // フィルター適用ボタン
 window.addEventListener('load', handleQueryParams);
 
 document.getElementById('uploadArea').addEventListener('click', () => {
@@ -57,14 +64,16 @@ function readFile(file, encoding) {
         Papa.parse(csvData, {
             header: true,
             complete: function (results) {
+                console.log('CSV読み込み完了:', results.data);
                 originalData = results.data;
-                filteredData = originalData;
-                groupedData = originalData;
-                currentHeaders = Object.keys(originalData[0]);
+                workingData = [...originalData];
+                displayData = [...workingData];
+                allHeaders = Object.keys(originalData[0]);
                 currentPage = 1;
+                isGrouped = false;
+                filters = {};
                 populateSelectOptions();
-                createFilterOptions();
-                displayTable();
+                initialDisplayTable(); // 初回は全ての列とデータを表示
                 hideLoading();
             },
             error: function() {
@@ -73,7 +82,6 @@ function readFile(file, encoding) {
             }
         });
     };
-
     textReader.readAsText(file, encoding);
 }
 
@@ -91,14 +99,16 @@ function handleQueryParams() {
                     header: true,
                     encoding: encoding,
                     complete: function (results) {
+                        console.log('CSV読み込み完了:', results.data);
                         originalData = results.data;
-                        filteredData = originalData;
-                        groupedData = originalData;
-                        currentHeaders = Object.keys(originalData[0]);
+                        workingData = [...originalData];
+                        displayData = [...workingData];
+                        allHeaders = Object.keys(originalData[0]);
                         currentPage = 1;
+                        isGrouped = false;
+                        filters = {};
                         populateSelectOptions();
-                        createFilterOptions();
-                        displayTable();
+                        initialDisplayTable(); // 初回は全ての列とデータを表示
                         hideLoading();
                     },
                     error: function() {
@@ -121,6 +131,7 @@ function populateSelectOptions() {
     }
 
     const headers = Object.keys(originalData[0]);
+    console.log('ヘッダー:', headers);
     headers.forEach(header => {
         const groupOption = document.createElement('div');
         groupOption.className = 'list-group-item';
@@ -146,42 +157,23 @@ function populateSelectOptions() {
     dragula([groupByContainer, aggregateColumnsContainer]);
 }
 
-function createFilterOptions() {
-    const filterRow = document.getElementById('filterRow');
-    filterRow.innerHTML = '';
-
-    if (originalData.length === 0) {
-        return;
+function applyGrouping() {
+    if (isGrouped) {
+        resetGrouping(); // 既にグループ化されている場合はリセットする
     }
 
-    currentHeaders.forEach(header => {
-        const filterCell = document.createElement('th');
-        let uniqueValues = [...new Set(originalData.map(row => row[header]))];
-        uniqueValues = uniqueValues.sort((a, b) => a.localeCompare(b));
-        filterCell.innerHTML = `
-            <select class="form-select" data-column="${header}">
-                <option value="">全て</option>
-                ${uniqueValues.map(value => `<option value="${value}">${value}</option>`).join('')}
-            </select>
-        `;
-        filterRow.appendChild(filterCell);
-    });
-
-    document.querySelectorAll('#filterRow select').forEach(select => {
-        select.addEventListener('change', () => {
-            applyFilters();
-            displayTable(); // Ensure table is displayed after filtering
-        });
-    });
-}
-
-function applyGrouping() {
     showLoading();
     const groupByColumns = Array.from(document.querySelectorAll('#groupByContainer .form-check-input:checked')).map(input => input.value);
     const aggregateColumns = Array.from(document.querySelectorAll('#aggregateColumnsContainer .form-check-input:checked')).map(input => input.value);
 
+    if (groupByColumns.length === 0 || aggregateColumns.length === 0) {
+        alert('グループ化および集計する列を選択してください。');
+        hideLoading();
+        return;
+    }
+
     const grouped = {};
-    filteredData.forEach(row => {
+    workingData.forEach(row => {
         const groupKey = groupByColumns.map(col => row[col]).join(' | ');
         if (!grouped[groupKey]) {
             grouped[groupKey] = { count: 0 };
@@ -195,7 +187,7 @@ function applyGrouping() {
         });
     });
 
-    groupedData = Object.keys(grouped).map(key => {
+    workingData = Object.keys(grouped).map(key => {
         const row = {};
         const keyParts = key.split(' | ');
         groupByColumns.forEach((col, index) => {
@@ -207,12 +199,28 @@ function applyGrouping() {
         return row;
     });
 
+    console.log('グループ化後のデータ:', workingData);
+    displayData = [...workingData];
+    displayedHeaders = [...groupByColumns, ...aggregateColumns];
     currentPage = 1;
+    isGrouped = true;
+    updateDisplayData();
     displayTable();
     hideLoading();
 }
 
-function displayTable() {
+function updateDisplayData() {
+    const startRow = (currentPage - 1) * rowsPerPage;
+    const endRow = Math.min(startRow + rowsPerPage, displayData.length);
+    currentDisplayData = displayData.slice(startRow, endRow);
+}
+
+function initialDisplayTable() {
+    displayedHeaders = allHeaders.slice(); // 全てのヘッダーを初期表示
+    displayTable(true); // 初回は全ての列を表示
+}
+
+function displayTable(showAllColumns = false) {
     const tableHeaders = document.getElementById('tableHeaders');
     const filterRow = document.getElementById('filterRow');
     const tableBody = document.getElementById('tableBody');
@@ -222,69 +230,62 @@ function displayTable() {
     const pageInputBottom = document.getElementById('pageInputBottom');
 
     tableHeaders.innerHTML = '';
+    filterRow.innerHTML = '';
     tableBody.innerHTML = '';
     pageInfoTop.innerHTML = '';
     pageInfoBottom.innerHTML = '';
 
-    if (groupedData.length === 0) {
+    if (workingData.length === 0) {
         pageInfoTop.textContent = '0/0';
         pageInfoBottom.textContent = '0/0';
         return;
     }
 
-    console.log(`Redrawing table with ${currentHeaders.length} columns`);
+    if (showAllColumns) {
+        displayedHeaders = allHeaders.slice();
+    }
+    
+    console.log('テーブルヘッダー:', displayedHeaders);
+    if (filterMode) {
+        displayedHeaders.forEach(header => {
+            const filterCell = document.createElement('th');
+            const uniqueValues = [...new Set(displayData.map(row => row[header]))].sort();
+            const filterSelect = document.createElement('select');
+            filterSelect.className = 'form-select filter-select';
+            filterSelect.dataset.column = header;
+            filterSelect.innerHTML = `
+                <option value="">全て</option>
+                ${uniqueValues.map(value => `<option value="${value}">${value}</option>`).join('')}
+            `;
+            filterCell.appendChild(filterSelect);
+            filterRow.appendChild(filterCell);
+        });
+    }
 
-    currentHeaders.forEach(header => {
+    displayedHeaders.forEach(header => {
         const th = document.createElement('th');
         th.textContent = header;
         th.style.cursor = 'pointer';
         th.addEventListener('click', () => {
-            // 並び替える前に現在の列数を取得
-            console.log(`Current number of columns before sorting: ${currentHeaders.length}`);
             if (sortColumn === header) {
                 sortOrder = sortOrder === 'asc' ? 'desc' : 'asc';
             } else {
                 sortColumn = header;
                 sortOrder = 'asc';
             }
-            console.log(`Sorting by: ${header}, order: ${sortOrder}`);
-            sortGroupedData();
-            displayTable();
+            sortDisplayData(header);
         });
         tableHeaders.appendChild(th);
     });
 
-    filterRow.innerHTML = '';
-    currentHeaders.forEach(header => {
-        const filterCell = document.createElement('th');
-        let uniqueValues = [...new Set(filteredData.map(row => row[header]))];
-        uniqueValues = uniqueValues.sort((a, b) => a.localeCompare(b));
-        filterCell.innerHTML = `
-            <select class="form-select" data-column="${header}">
-                <option value="">全て</option>
-                ${uniqueValues.map(value => `<option value="${value}">${value}</option>`).join('')}
-            </select>
-        `;
-        filterRow.appendChild(filterCell);
-    });
+    updateDisplayData();
 
-    document.querySelectorAll('#filterRow select').forEach(select => {
-        select.addEventListener('change', () => {
-            applyFilters();
-            displayTable();
-        });
-    });
-
-    sortGroupedData();
-
-    const startRow = (currentPage - 1) * rowsPerPage;
-    const endRow = Math.min(startRow + rowsPerPage, groupedData.length);
-    const pageData = groupedData.slice(startRow, endRow);
+    console.log('表示データ:', currentDisplayData);
 
     const fragment = document.createDocumentFragment();
-    pageData.forEach(row => {
+    currentDisplayData.forEach(row => {
         const tr = document.createElement('tr');
-        currentHeaders.forEach(header => {
+        displayedHeaders.forEach(header => {
             const td = document.createElement('td');
             td.textContent = row[header];
             tr.appendChild(td);
@@ -293,90 +294,81 @@ function displayTable() {
     });
     tableBody.appendChild(fragment);
 
-    const totalPages = Math.ceil(groupedData.length / rowsPerPage);
-    pageInfoTop.textContent = `${currentPage}/${totalPages}`; // ここで現在のページ番号と総ページ数を表示
-    pageInfoBottom.textContent = `${currentPage}/${totalPages}`; // ここで現在のページ番号と総ページ数を表示
+    const totalPages = Math.ceil(displayData.length / rowsPerPage);
+    pageInfoTop.textContent = `/ ${totalPages}`;
+    pageInfoBottom.textContent = `/ ${totalPages}`;
     pageInputTop.max = totalPages;
     pageInputBottom.max = totalPages;
     pageInputTop.value = currentPage;
     pageInputBottom.value = currentPage;
 }
 
-function sortGroupedData() {
-    console.log(`Sorting data by: ${sortColumn}, order: ${sortOrder}`);
-    groupedData.sort((a, b) => {
-        if (a[sortColumn] < b[sortColumn]) {
-            return sortOrder === 'asc' ? -1 : 1;
-        }
-        if (a[sortColumn] > b[sortColumn]) {
-            return sortOrder === 'asc' ? 1 : -1;
-        }
-        return 0;
-    });
-    console.log(`Data sorted by: ${sortColumn}, order: ${sortOrder}`);
-}
-
-function applyFilters() {
-    showLoading();
-    const filters = Array.from(document.querySelectorAll('#filterRow select')).reduce((acc, select) => {
-        acc[select.dataset.column] = select.value.toLowerCase();
-        return acc;
-    }, {});
-
-    filteredData = originalData.filter(row => {
-        return Object.keys(filters).every(column => {
-            if (filters[column] === '') return true;
-            return row[column] != null && row[column].toString().toLowerCase().includes(filters[column]);
+function sortDisplayData(columnKey) {
+    showLoading(); // ソート開始時にローディング表示
+    console.log(`ソート対象のカラム: ${columnKey}`);
+    setTimeout(() => {
+        displayData.sort((a, b) => {
+            const aValue = a[columnKey] || '';
+            const bValue = b[columnKey] || '';
+            if (aValue === '' && bValue !== '') return 1; // 空の値を最後に移動
+            if (aValue !== '' && bValue === '') return -1; // 空の値を最後に移動
+            if (aValue < bValue) {
+                return sortOrder === 'asc' ? -1 : 1;
+            }
+            if (aValue > bValue) {
+                return sortOrder === 'asc' ? 1 : -1;
+            }
+            return 0;
         });
-    });
-
-    groupedData = filteredData; // Ensure groupedData is updated with filtered data
-    currentPage = 1; // Reset to first page after filtering
-    hideLoading();
-    displayTable(); // Ensure table is displayed after filtering
+        console.log('ソート後のデータ:', displayData);
+        updateDisplayData();
+        displayTable(); // ソート後にテーブルを再描画
+        hideLoading(); // ソート完了後にローディング表示を隠す
+    }, 0);
 }
 
 function resetGrouping() {
-    filteredData = originalData;
-    groupedData = originalData;
+    workingData = [...originalData];
+    displayData = [...workingData];
+    displayedHeaders = allHeaders.slice();
     currentPage = 1;
+    isGrouped = false;
+    updateDisplayData();
     displayTable();
 }
 
 function resetTable() {
     originalData = [];
-    filteredData = [];
-    groupedData = [];
+    workingData = [];
+    displayData = [];
+    currentDisplayData = [];
+    displayedHeaders = [];
+    allHeaders = [];
     currentPage = 1;
     sortColumn = '';
     sortOrder = 'asc';
+    isGrouped = false;
+    filters = {};
     document.getElementById('fileInput').value = '';
     document.getElementById('encodingSelect').value = 'UTF-8';
     document.getElementById('groupByContainer').innerHTML = '';
     document.getElementById('aggregateColumnsContainer').innerHTML = '';
-    document.getElementById('filterRow').innerHTML = '';
-    displayTable();
-}
-
-function resetFilters() {
-    document.querySelectorAll('#filterRow select').forEach(select => {
-        select.value = '';
-    });
-    applyFilters();
     displayTable();
 }
 
 function prevPage() {
     if (currentPage > 1) {
         currentPage--;
+        updateDisplayData();
         displayTable();
     }
 }
 
 function nextPage() {
-    const totalPages = Math.ceil(groupedData.length / rowsPerPage);
+    const totalPages = Math.ceil(displayData.length / rowsPerPage);
     if (currentPage < totalPages) {
         currentPage++;
+        updateDisplayData();
         displayTable();
     }
 }
@@ -384,13 +376,14 @@ function nextPage() {
 function goToPage(event) {
     const pageInputTop = document.getElementById('pageInputTop');
     const pageInputBottom = document.getElementById('pageInputBottom');
-    const totalPages = Math.ceil(groupedData.length / rowsPerPage);
+    const totalPages = Math.ceil(displayData.length / rowsPerPage);
     const newPage = parseInt(event.target.value);
 
     if (newPage >= 1 && newPage <= totalPages) {
         currentPage = newPage;
         pageInputTop.value = newPage;
         pageInputBottom.value = newPage;
+        updateDisplayData();
         displayTable();
     }
 }
@@ -403,4 +396,41 @@ function showLoading() {
 function hideLoading() {
     document.getElementById('loadingOverlay').style.display = 'none';
     document.getElementById('loadingSpinner').style.display = 'none';
+}
+
+function toggleFilterMode() {
+    filterMode = !filterMode;
+    filters = {};
+    displayTable(); // フィルターモードを切り替えるときにテーブルを再描画
+}
+
+function applyFilters() {
+    const filterSelects = document.querySelectorAll('#filterRow select');
+    filterSelects.forEach(select => {
+        const column = select.dataset.column;
+        const value = select.value;
+        if (value) {
+            filters[column] = value;
+        } else {
+            delete filters[column];
+        }
+    });
+
+    displayData = workingData.filter(row => {
+        return Object.keys(filters).every(column => {
+            return row[column] === filters[column];
+        });
+    });
+
+    currentPage = 1;
+    updateDisplayData();
+    displayTable();
+}
+
+function resetFilters() {
+    filters = {};
+    displayData = [...workingData];
+    currentPage = 1;
+    updateDisplayData();
+    displayTable();
 }

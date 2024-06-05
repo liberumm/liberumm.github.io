@@ -12,6 +12,8 @@ const rowsPerPage = 100;
 let currentPage = 1;
 let currentFile = null;
 let isGrouped = false; // グループ化の状態を追跡
+let loadingCount = 0;
+let loadingInterval = null;
 
 document.getElementById('fileInput').addEventListener('change', handleFile);
 document.getElementById('encodingSelect').addEventListener('change', handleEncodingChange);
@@ -250,14 +252,17 @@ function displayTable(showAllColumns = false) {
         displayedHeaders.forEach(header => {
             const filterCell = document.createElement('th');
             const uniqueValues = [...new Set(displayData.map(row => row[header]))].sort();
-            const filterSelect = document.createElement('select');
-            filterSelect.className = 'form-select filter-select';
+            const filterSelect = document.createElement('input');
+            filterSelect.className = 'form-control filter-select';
+            filterSelect.setAttribute('list', `datalist-${header}`);
             filterSelect.dataset.column = header;
-            filterSelect.innerHTML = `
-                <option value="">全て</option>
-                ${uniqueValues.map(value => `<option value="${value}">${value}</option>`).join('')}
+            const dataList = document.createElement('datalist');
+            dataList.id = `datalist-${header}`;
+            dataList.innerHTML = `
+                ${uniqueValues.map(value => `<option value="${value}"></option>`).join('')}
             `;
             filterCell.appendChild(filterSelect);
+            filterCell.appendChild(dataList);
             filterRow.appendChild(filterCell);
         });
     }
@@ -267,13 +272,17 @@ function displayTable(showAllColumns = false) {
         th.textContent = header;
         th.style.cursor = 'pointer';
         th.addEventListener('click', () => {
-            if (sortColumn === header) {
-                sortOrder = sortOrder === 'asc' ? 'desc' : 'asc';
-            } else {
-                sortColumn = header;
-                sortOrder = 'asc';
-            }
-            sortDisplayData(header);
+            showLoading(); // ソート開始時にローディング表示
+            setTimeout(() => {
+                if (sortColumn === header) {
+                    sortOrder = sortOrder === 'asc' ? 'desc' : 'asc';
+                } else {
+                    sortColumn = header;
+                    sortOrder = 'asc';
+                }
+                sortDisplayData(header);
+                hideLoading(); // ソート完了後にローディング表示を隠す
+            }, 0);
         });
         tableHeaders.appendChild(th);
     });
@@ -288,6 +297,10 @@ function displayTable(showAllColumns = false) {
         displayedHeaders.forEach(header => {
             const td = document.createElement('td');
             td.textContent = row[header];
+            td.addEventListener('dblclick', () => {
+                filters[header] = row[header];
+                applyFilters();
+            });
             tr.appendChild(td);
         });
         fragment.appendChild(tr);
@@ -358,18 +371,26 @@ function resetTable() {
 
 function prevPage() {
     if (currentPage > 1) {
-        currentPage--;
-        updateDisplayData();
-        displayTable();
+        showLoading(); // ページ切り替え開始時にローディング表示
+        setTimeout(() => {
+            currentPage--;
+            updateDisplayData();
+            displayTable();
+            hideLoading(); // ページ切り替え完了後にローディング表示を隠す
+        }, 0);
     }
 }
 
 function nextPage() {
     const totalPages = Math.ceil(displayData.length / rowsPerPage);
     if (currentPage < totalPages) {
-        currentPage++;
-        updateDisplayData();
-        displayTable();
+        showLoading(); // ページ切り替え開始時にローディング表示
+        setTimeout(() => {
+            currentPage++;
+            updateDisplayData();
+            displayTable();
+            hideLoading(); // ページ切り替え完了後にローディング表示を隠す
+        }, 0);
     }
 }
 
@@ -380,22 +401,32 @@ function goToPage(event) {
     const newPage = parseInt(event.target.value);
 
     if (newPage >= 1 && newPage <= totalPages) {
-        currentPage = newPage;
-        pageInputTop.value = newPage;
-        pageInputBottom.value = newPage;
-        updateDisplayData();
-        displayTable();
+        showLoading(); // ページ切り替え開始時にローディング表示
+        setTimeout(() => {
+            currentPage = newPage;
+            pageInputTop.value = newPage;
+            pageInputBottom.value = newPage;
+            updateDisplayData();
+            displayTable();
+            hideLoading(); // ページ切り替え完了後にローディング表示を隠す
+        }, 0);
     }
 }
 
 function showLoading() {
     document.getElementById('loadingOverlay').style.display = 'block';
-    document.getElementById('loadingSpinner').style.display = 'block';
+    const loadingCountElement = document.getElementById('loadingCount');
+    loadingCount = 0;
+    loadingCountElement.textContent = loadingCount;
+    loadingInterval = setInterval(() => {
+        loadingCount++;
+        loadingCountElement.textContent = loadingCount;
+    }, 100); // 0.1秒ごとにカウントアップ
 }
 
 function hideLoading() {
     document.getElementById('loadingOverlay').style.display = 'none';
-    document.getElementById('loadingSpinner').style.display = 'none';
+    clearInterval(loadingInterval);
 }
 
 function toggleFilterMode() {
@@ -405,26 +436,30 @@ function toggleFilterMode() {
 }
 
 function applyFilters() {
-    const filterSelects = document.querySelectorAll('#filterRow select');
-    filterSelects.forEach(select => {
-        const column = select.dataset.column;
-        const value = select.value;
-        if (value) {
-            filters[column] = value;
-        } else {
-            delete filters[column];
-        }
-    });
-
-    displayData = workingData.filter(row => {
-        return Object.keys(filters).every(column => {
-            return row[column] === filters[column];
+    showLoading();
+    setTimeout(() => {
+        const filterSelects = document.querySelectorAll('#filterRow input');
+        filterSelects.forEach(select => {
+            const column = select.dataset.column;
+            const value = select.value;
+            if (value) {
+                filters[column] = value;
+            } else {
+                delete filters[column];
+            }
         });
-    });
 
-    currentPage = 1;
-    updateDisplayData();
-    displayTable();
+        displayData = workingData.filter(row => {
+            return Object.keys(filters).every(column => {
+                return row[column] === filters[column];
+            });
+        });
+
+        currentPage = 1;
+        updateDisplayData();
+        displayTable();
+        hideLoading();
+    }, 0);
 }
 
 function resetFilters() {
