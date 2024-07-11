@@ -10,6 +10,18 @@
             padding: 0;
             height: 100%;
             display: flex;
+            flex-direction: row;
+        }
+        .sidebar {
+            width: 20%;
+            background-color: #f1f1f1;
+            padding: 1em;
+            box-sizing: border-box;
+            overflow-y: auto;
+        }
+        .main-content {
+            width: 80%;
+            display: flex;
             flex-direction: column;
         }
         .navbar {
@@ -44,6 +56,13 @@
             text-align: center;
             margin-top: 10px;
         }
+        .thumbnail {
+            margin-bottom: 10px;
+            cursor: pointer;
+        }
+        .highlight {
+            background-color: yellow;
+        }
     </style>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/2.10.377/pdf.min.js"></script>
     <script>
@@ -53,16 +72,17 @@
         let pageNumPending = null;
         const scale = 1.5;
         let canvas, ctx;
+        let searchResults = [];
 
         function logError(message) {
             const errorLog = document.getElementById('error-log');
             errorLog.textContent += message + '\n';
         }
 
-        function renderPage(num) {
+        function renderPage(num, highlightText = "") {
             pageRendering = true;
             pdfDoc.getPage(num).then(function(page) {
-                const viewport = page.getViewport({scale: scale});
+                const viewport = page.getViewport({ scale: scale });
                 canvas.height = viewport.height;
                 canvas.width = viewport.width;
 
@@ -78,7 +98,11 @@
                         renderPage(pageNumPending);
                         pageNumPending = null;
                     }
+                    if (highlightText) {
+                        highlightSearchResults(page, highlightText);
+                    }
                 });
+
                 document.getElementById('page_num').textContent = num;
                 document.getElementById('page_count').textContent = pdfDoc.numPages;
             }).catch(logError);
@@ -97,15 +121,15 @@
                 return;
             }
             pageNum--;
-            queueRenderPage(pageNum);
+            queueRenderPage(pageNum, document.getElementById('search-box').value);
         }
 
         function onNextPage() {
-            if (pageNum >= pdfDoc.numPages) {
+            if (pageNum >= searchResults.length) {
                 return;
             }
             pageNum++;
-            queueRenderPage(pageNum);
+            queueRenderPage(searchResults[pageNum - 1], document.getElementById('search-box').value);
         }
 
         function getPDFUrl() {
@@ -113,18 +137,54 @@
             return urlParams.get('pdf') || 'default.pdf';
         }
 
-        function searchPDF(text) {
-            pdfDoc.getPage(pageNum).then(function(page) {
-                page.getTextContent().then(function(textContent) {
-                    const textItems = textContent.items;
-                    for (let i = 0; i < textItems.length; i++) {
-                        if (textItems[i].str.includes(text)) {
-                            alert(`Found on page ${pageNum}: ${textItems[i].str}`);
-                            return;
-                        }
+        function highlightSearchResults(page, text) {
+            page.getTextContent().then(function(textContent) {
+                const textItems = textContent.items;
+                const matches = [];
+                for (let i = 0; i < textItems.length; i++) {
+                    if (textItems[i].str.includes(text)) {
+                        matches.push(textItems[i]);
                     }
-                    alert('Not found');
+                }
+
+                const canvasContext = ctx;
+                matches.forEach(function(match) {
+                    canvasContext.fillStyle = 'yellow';
+                    canvasContext.fillRect(match.transform[4], match.transform[5] - match.height, match.width, match.height);
                 });
+            }).catch(logError);
+        }
+
+        function searchPDF(text) {
+            searchResults = [];
+            const numPages = pdfDoc.numPages;
+
+            const searchInPage = function(pageNum) {
+                return pdfDoc.getPage(pageNum).then(function(page) {
+                    return page.getTextContent().then(function(textContent) {
+                        const textItems = textContent.items;
+                        for (let i = 0; i < textItems.length; i++) {
+                            if (textItems[i].str.includes(text)) {
+                                searchResults.push(pageNum);
+                                break;
+                            }
+                        }
+                    });
+                });
+            };
+
+            const promises = [];
+            for (let i = 1; i <= numPages; i++) {
+                promises.push(searchInPage(i));
+            }
+
+            Promise.all(promises).then(function() {
+                if (searchResults.length > 0) {
+                    pageNum = searchResults[0];
+                    queueRenderPage(pageNum, text);
+                } else {
+                    alert('No matches found');
+                }
             }).catch(logError);
         }
 
@@ -136,6 +196,7 @@
                     const typedarray = new Uint8Array(this.result);
                     pdfjsLib.getDocument(typedarray).promise.then(function(pdfDoc_) {
                         pdfDoc = pdfDoc_;
+                        renderThumbnails();
                         pageNum = 1;
                         renderPage(pageNum);
                     }).catch(logError);
@@ -143,6 +204,32 @@
                 fileReader.readAsArrayBuffer(file);
             } else {
                 alert('Please select a PDF file.');
+            }
+        }
+
+        function renderThumbnails() {
+            const thumbnailContainer = document.getElementById('thumbnail-container');
+            thumbnailContainer.innerHTML = '';
+
+            for (let i = 1; i <= pdfDoc.numPages; i++) {
+                pdfDoc.getPage(i).then(function(page) {
+                    const viewport = page.getViewport({ scale: 0.2 });
+                    const thumbnailCanvas = document.createElement('canvas');
+                    const context = thumbnailCanvas.getContext('2d');
+                    thumbnailCanvas.height = viewport.height;
+                    thumbnailCanvas.width = viewport.width;
+                    const renderContext = {
+                        canvasContext: context,
+                        viewport: viewport
+                    };
+                    page.render(renderContext).promise.then(function() {
+                        thumbnailCanvas.classList.add('thumbnail');
+                        thumbnailCanvas.addEventListener('click', function() {
+                            queueRenderPage(i);
+                        });
+                        thumbnailContainer.appendChild(thumbnailCanvas);
+                    });
+                });
             }
         }
 
@@ -154,6 +241,7 @@
             if (pdfUrl !== 'default.pdf') {
                 pdfjsLib.getDocument(pdfUrl).promise.then(function(pdfDoc_) {
                     pdfDoc = pdfDoc_;
+                    renderThumbnails();
                     renderPage(pageNum);
                 }).catch(logError);
             }
@@ -172,21 +260,26 @@
     </script>
 </head>
 <body>
-    <div class="navbar">
-        <form id="search-form" class="search-bar">
-            <input type="text" id="search-box" placeholder="検索...">
-            <button type="submit">検索</button>
-        </form>
-        <input type="file" id="file-input" accept="application/pdf">
+    <div class="sidebar">
+        <div id="thumbnail-container"></div>
     </div>
-    <div class="pdf-container">
-        <canvas id="pdf-canvas"></canvas>
+    <div class="main-content">
+        <div class="navbar">
+            <form id="search-form" class="search-bar">
+                <input type="text" id="search-box" placeholder="検索...">
+                <button type="submit">検索</button>
+            </form>
+            <input type="file" id="file-input" accept="application/pdf">
+        </div>
+        <div class="pdf-container">
+            <canvas id="pdf-canvas"></canvas>
+        </div>
+        <div class="controls">
+            <button id="prev">前のページ</button>
+            <span>ページ: <span id="page_num"></span> / <span id="page_count"></span></span>
+            <button id="next">次のページ</button>
+        </div>
+        <textarea id="error-log" class="error-log" readonly></textarea>
     </div>
-    <div class="controls">
-        <button id="prev">前のページ</button>
-        <span>ページ: <span id="page_num"></span> / <span id="page_count"></span></span>
-        <button id="next">次のページ</button>
-    </div>
-    <textarea id="error-log" class="error-log" readonly></textarea>
 </body>
 </html>
