@@ -1,337 +1,190 @@
 <!DOCTYPE html>
-<html lang="ja">
+<html lang="ja" dir="ltr" mozdisallowselectionprint>
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>PDF表示ページ</title>
-    <style>
-        body, html {
-            margin: 0;
-            padding: 0;
-            height: 100%;
-            width: 100%;
-            display: flex;
-            flex-direction: column;
-        }
-        .navbar {
-            background-color: #333;
-            color: white;
-            padding: 1em;
-            text-align: center;
-            width: 100%;
-        }
-        .content {
-            display: flex;
-            flex: 1;
-            width: 100%;
-        }
-        .sidebar {
-            width: 20%;
-            background-color: #f1f1f1;
-            padding: 1em;
-            box-sizing: border-box;
-            overflow-y: auto;
-            display: none;
-        }
-        .sidebar.visible {
-            display: block;
-        }
-        .main-content {
-            flex: 1;
-            display: flex;
-            flex-direction: column;
-        }
-        .pdf-container {
-            flex: 1;
-            overflow: auto;
-            position: relative;
-            background-color: #ccc;
-        }
-        #pdf-canvas {
-            display: block;
-            margin: auto;
-            background-color: white;
-        }
-        .search-bar {
-            margin: 0;
-            padding: 0;
-        }
-        .controls {
-            text-align: center;
-            margin-top: 10px;
-        }
-        .thumbnail {
-            margin-bottom: 10px;
-            cursor: pointer;
-        }
-        .highlight {
-            background-color: yellow;
-        }
-    </style>
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/2.10.377/pdf.min.js"></script>
-    <script>
-        let pdfDoc = null;
-        let pageNum = 1;
-        let pageRendering = false;
-        let pageNumPending = null;
-        let scale = 1.0;
-        let canvas, ctx;
-        let searchResults = [];
-        let minScale;
-        const maxScale = 2.0;
+  <meta charset="utf-8">
+  <title>PDF.js viewer</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
 
-        function logError(message) {
-            console.error(message);
-        }
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/2.10.377/web/viewer.css">
+  <link rel="resource" type="application/l10n" href="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/2.10.377/web/locale/locale.properties">
 
-        function renderPage(num, highlightText = "") {
-            pageRendering = true;
-            pdfDoc.getPage(num).then(function(page) {
-                const viewport = page.getViewport({ scale: scale });
-                canvas.height = viewport.height;
-                canvas.width = viewport.width;
-                const renderContext = {
-                    canvasContext: ctx,
-                    viewport: viewport
-                };
-                const renderTask = page.render(renderContext);
-
-                renderTask.promise.then(function() {
-                    pageRendering = false;
-                    if (pageNumPending !== null) {
-                        renderPage(pageNumPending);
-                        pageNumPending = null;
-                    }
-                    if (highlightText) {
-                        highlightSearchResults(page, highlightText);
-                    }
-                });
-
-                document.getElementById('page_num').textContent = num;
-                document.getElementById('page_count').textContent = pdfDoc.numPages;
-            }).catch(logError);
-        }
-
-        function queueRenderPage(num) {
-            if (pageRendering) {
-                pageNumPending = num;
-            } else {
-                renderPage(num, document.getElementById('search-box').value);
-            }
-        }
-
-        function onPrevPage() {
-            if (pageNum <= 1) {
-                return;
-            }
-            pageNum--;
-            queueRenderPage(pageNum, document.getElementById('search-box').value);
-        }
-
-        function onNextPage() {
-            if (pageNum >= pdfDoc.numPages) {
-                return;
-            }
-            pageNum++;
-            queueRenderPage(pageNum, document.getElementById('search-box').value);
-        }
-
-        function getPDFUrl() {
-            const urlParams = new URLSearchParams(window.location.search);
-            return urlParams.get('pdf') || 'default.pdf';
-        }
-
-        function highlightSearchResults(page, text) {
-            page.getTextContent().then(function(textContent) {
-                const textItems = textContent.items;
-                const matches = [];
-                for (let i = 0; i < textItems.length; i++) {
-                    if (textItems[i].str.includes(text)) {
-                        matches.push(textItems[i]);
-                    }
-                }
-
-                matches.forEach(function(match) {
-                    const transform = match.transform;
-                    const fontSize = match.height;
-                    const x = transform[4];
-                    const y = transform[5] - fontSize;
-                    const width = match.width * transform[0];
-                    const height = fontSize;
-
-                    ctx.fillStyle = 'yellow';
-                    ctx.fillRect(x, y, width, height);
-                });
-            }).catch(logError);
-        }
-
-        function searchPDF(text) {
-            searchResults = [];
-            const numPages = pdfDoc.numPages;
-
-            const searchInPage = function(pageNum) {
-                return pdfDoc.getPage(pageNum).then(function(page) {
-                    return page.getTextContent().then(function(textContent) {
-                        const textItems = textContent.items;
-                        for (let i = 0; i < textItems.length; i++) {
-                            if (textItems[i].str.includes(text)) {
-                                searchResults.push(pageNum);
-                                break;
-                            }
-                        }
-                    });
-                });
-            };
-
-            const promises = [];
-            for (let i = 1; i <= numPages; i++) {
-                promises.push(searchInPage(i));
-            }
-
-            Promise.all(promises).then(function() {
-                if (searchResults.length > 0) {
-                    pageNum = searchResults[0];
-                    queueRenderPage(pageNum, text);
-                } else {
-                    alert('No matches found');
-                }
-            }).catch(logError);
-        }
-
-        function handleFileSelect(evt) {
-            const file = evt.target.files[0];
-            if (file.type === 'application/pdf') {
-                const fileReader = new FileReader();
-                fileReader.onload = function() {
-                    const typedarray = new Uint8Array(this.result);
-                    pdfjsLib.getDocument(typedarray).promise.then(function(pdfDoc_) {
-                        pdfDoc = pdfDoc_;
-                        renderThumbnails();
-                        pageNum = 1;
-                        initScale();
-                        renderPage(pageNum);
-                    }).catch(logError);
-                };
-                fileReader.readAsArrayBuffer(file);
-            } else {
-                alert('Please select a PDF file.');
-            }
-        }
-
-        function renderThumbnails() {
-            const thumbnailContainer = document.getElementById('thumbnail-container');
-            thumbnailContainer.innerHTML = '';
-
-            for (let i = 1; i <= pdfDoc.numPages; i++) {
-                pdfDoc.getPage(i).then(function(page) {
-                    const viewport = page.getViewport({ scale: 0.2 });
-                    const thumbnailCanvas = document.createElement('canvas');
-                    const context = thumbnailCanvas.getContext('2d');
-                    thumbnailCanvas.height = viewport.height;
-                    thumbnailCanvas.width = viewport.width;
-                    const renderContext = {
-                        canvasContext: context,
-                        viewport: viewport
-                    };
-                    page.render(renderContext).promise.then(function() {
-                        thumbnailCanvas.classList.add('thumbnail');
-                        thumbnailCanvas.addEventListener('click', function() {
-                            queueRenderPage(i);
-                        });
-                        thumbnailContainer.appendChild(thumbnailCanvas);
-                    });
-                });
-            }
-        }
-
-        function toggleSidebar() {
-            const sidebar = document.querySelector('.sidebar');
-            sidebar.classList.toggle('visible');
-        }
-
-        function initScale() {
-            pdfDoc.getPage(1).then(page => {
-                const viewport = page.getViewport({ scale: 1 });
-                const containerWidth = document.querySelector('.pdf-container').clientWidth;
-                const containerHeight = document.querySelector('.pdf-container').clientHeight;
-                const scaleWidth = containerWidth / viewport.width;
-                const scaleHeight = containerHeight / viewport.height;
-                scale = Math.min(scaleWidth, scaleHeight);
-                minScale = scale;
-                renderPage(pageNum);
-            });
-        }
-
-        function zoomIn() {
-            if (scale < maxScale) {
-                scale += 0.1;
-                renderPage(pageNum);
-            }
-        }
-
-        function zoomOut() {
-            if (scale > minScale) {
-                scale -= 0.1;
-                renderPage(pageNum);
-            }
-        }
-
-        window.onload = function() {
-            canvas = document.getElementById('pdf-canvas');
-            ctx = canvas.getContext('2d');
-
-            const pdfUrl = getPDFUrl();
-            if (pdfUrl !== 'default.pdf') {
-                pdfjsLib.getDocument(pdfUrl).promise.then(function(pdfDoc_) {
-                    pdfDoc = pdfDoc_;
-                    renderThumbnails();
-                    initScale();
-                    renderPage(pageNum);
-                }).catch(logError);
-            }
-
-            document.getElementById('search-form').addEventListener('submit', function(event) {
-                event.preventDefault();
-                const searchText = document.getElementById('search-box').value;
-                searchPDF(searchText);
-            });
-
-            document.getElementById('file-input').addEventListener('change', handleFileSelect);
-
-            document.getElementById('prev').addEventListener('click', onPrevPage);
-            document.getElementById('next').addEventListener('click', onNextPage);
-            document.getElementById('zoom-in').addEventListener('click', zoomIn);
-            document.getElementById('zoom-out').addEventListener('click', zoomOut);
-            document.getElementById('toggle-sidebar').addEventListener('click', toggleSidebar);
-        };
-    </script>
+  <style>
+    #outerContainer {
+      position: absolute;
+      top: 0;
+      left: 0;
+      bottom: 0;
+      right: 0;
+      overflow: hidden;
+      display: flex;
+      flex-direction: column;
+    }
+    #file-input {
+      position: absolute;
+      top: 10px;
+      left: 10px;
+      z-index: 1000;
+    }
+  </style>
 </head>
-<body>
-    <div class="navbar">
-        <form id="search-form" class="search-bar">
-            <input type="text" id="search-box" placeholder="検索...">
-            <button type="submit">検索</button>
-        </form>
-        <input type="file" id="file-input" accept="application/pdf">
-        <button id="toggle-sidebar">サムネイル表示/非表示</button>
-        <button id="zoom-in">ズームイン</button>
-        <button id="zoom-out">ズームアウト</button>
-    </div>
-    <div class="content">
-        <div class="sidebar">
-            <div id="thumbnail-container"></div>
+<body tabindex="1" class="loadingInProgress">
+  <div id="outerContainer">
+    <div id="sidebarContainer">
+      <div id="toolbarSidebar">
+        <!-- Sidebar Toolbar Content -->
+      </div>
+      <div id="sidebarContent">
+        <div id="thumbnailView"></div>
+        <div id="outlineView" class="hidden"></div>
+        <div id="attachmentsView" class="hidden"></div>
+        <div id="layersView" class="hidden"></div>
+      </div>
+      <div id="sidebarResizer"></div>
+    </div> <!-- sidebarContainer -->
+
+    <div id="mainContainer">
+      <div class="findbar hidden doorHanger" id="findbar">
+        <!-- Findbar Content -->
+      </div>
+
+      <div id="secondaryToolbar" class="secondaryToolbar hidden doorHangerRight">
+        <div id="secondaryToolbarButtonContainer">
+          <!-- Secondary Toolbar Buttons -->
         </div>
-        <div class="main-content">
-            <div class="pdf-container">
-                <canvas id="pdf-canvas"></canvas>
+      </div> <!-- secondaryToolbar -->
+
+      <div class="toolbar">
+        <div id="toolbarContainer">
+          <div id="toolbarViewer">
+            <div id="toolbarViewerLeft">
+              <button id="sidebarToggle" class="toolbarButton" title="Toggle Sidebar" tabindex="11">
+                <span>Toggle Sidebar</span>
+              </button>
+              <div class="toolbarButtonSpacer"></div>
+              <button id="viewFind" class="toolbarButton" title="Find in Document" tabindex="12">
+                <span>Find</span>
+              </button>
+              <div class="splitToolbarButton hiddenSmallView">
+                <button class="toolbarButton pageUp" title="Previous Page" id="previous" tabindex="13">
+                  <span>Previous</span>
+                </button>
+                <div class="splitToolbarButtonSeparator"></div>
+                <button class="toolbarButton pageDown" title="Next Page" id="next" tabindex="14">
+                  <span>Next</span>
+                </button>
+              </div>
+              <input type="number" id="pageNumber" class="toolbarField pageNumber" title="Page" value="1" size="4" min="1" tabindex="15">
+              <span id="numPages" class="toolbarLabel"></span>
             </div>
-            <div class="controls">
-                <button id="prev">前のページ</button>
-                <span>ページ: <span id="page_num"></span> / <span id="page_count"></span></span>
-                <button id="next">次のページ</button>
+            <div id="toolbarViewerRight">
+              <button id="presentationMode" class="toolbarButton" title="Switch to Presentation Mode" tabindex="31">
+                <span>Presentation Mode</span>
+              </button>
+
+              <button id="openFile" class="toolbarButton" title="Open File" tabindex="32">
+                <span>Open</span>
+              </button>
+
+              <button id="print" class="toolbarButton" title="Print" tabindex="33">
+                <span>Print</span>
+              </button>
+
+              <button id="download" class="toolbarButton" title="Download" tabindex="34">
+                <span>Download</span>
+              </button>
+              <div class="verticalToolbarSeparator"></div>
+              <button id="secondaryToolbarToggle" class="toolbarButton" title="Tools" tabindex="35">
+                <span>Tools</span>
+              </button>
             </div>
+            <div id="toolbarViewerMiddle">
+              <div class="splitToolbarButton">
+                <button id="zoomOut" class="toolbarButton zoomOut" title="Zoom Out" tabindex="21">
+                  <span>Zoom Out</span>
+                </button>
+                <div class="splitToolbarButtonSeparator"></div>
+                <button id="zoomIn" class="toolbarButton zoomIn" title="Zoom In" tabindex="22">
+                  <span>Zoom In</span>
+                </button>
+              </div>
+              <span id="scaleSelectContainer" class="dropdownToolbarButton">
+                <select id="scaleSelect" title="Zoom" tabindex="23">
+                  <option id="pageAutoOption" value="auto" selected="selected">Automatic Zoom</option>
+                  <option id="pageActualOption" value="page-actual">Actual Size</option>
+                  <option id="pageFitOption" value="page-fit">Fit Page</option>
+                  <option id="pageWidthOption" value="page-width">Full Width</option>
+                  <option id="customScaleOption" value="custom" disabled="disabled" hidden="true"></option>
+                  <option value="0.5">50%</option>
+                  <option value="0.75">75%</option>
+                  <option value="1">100%</option>
+                  <option value="1.25">125%</option>
+                  <option value="1.5">150%</option>
+                  <option value="2">200%</option>
+                  <option value="3">300%</option>
+                  <option value="4">400%</option>
+                </select>
+              </span>
+            </div>
+          </div>
+          <div id="loadingBar">
+            <div class="progress">
+              <div class="glimmer">
+              </div>
+            </div>
+          </div>
         </div>
-    </div>
+      </div> <!-- toolbar -->
+
+      <div id="viewerContainer" tabindex="0">
+        <div id="viewer" class="pdfViewer"></div>
+      </div>
+
+      <div id="errorWrapper" hidden='true'>
+        <div id="errorMessageLeft">
+          <span id="errorMessage"></span>
+          <button id="errorShowMore">More Information</button>
+          <button id="errorShowLess" hidden='true'>Less Information</button>
+        </div>
+        <div id="errorMessageRight">
+          <button id="errorClose">Close</button>
+        </div>
+        <div class="clearBoth"></div>
+        <textarea id="errorMoreInfo" hidden='true' readonly='readonly'></textarea>
+      </div>
+    </div> <!-- mainContainer -->
+  </div> <!-- outerContainer -->
+
+  <input type="file" id="file-input" accept="application/pdf">
+
+  <script type="module">
+    import * as pdfjsLib from 'https://cdn.jsdelivr.net/npm/pdfjs-dist@4.4.168/+esm';
+    import { PDFViewer } from 'https://cdn.jsdelivr.net/npm/pdfjs-dist@4.4.168/+esm/web/pdf_viewer.js';
+
+    pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdn.jsdelivr.net/npm/pdfjs-dist@4.4.168/+esm/pdf.worker.min.js';
+
+    const eventBus = new pdfjsLib.EventBus();
+    const pdfViewer = new PDFViewer({
+      container: document.getElementById('viewerContainer'),
+      eventBus: eventBus
+    });
+
+    document.addEventListener('webviewerloaded', function() {
+      document.getElementById('file-input').addEventListener('change', function(event) {
+        const file = event.target.files[0];
+        if (file.type === 'application/pdf') {
+          const fileReader = new FileReader();
+          fileReader.onload = function() {
+            const typedarray = new Uint8Array(this.result);
+            pdfjsLib.getDocument({ data: typedarray }).promise.then(function(pdfDocument) {
+              pdfViewer.setDocument(pdfDocument);
+            });
+          };
+          fileReader.readAsArrayBuffer(file);
+        } else {
+          alert('Please select a PDF file.');
+        }
+      });
+    });
+  </script>
 </body>
 </html>
-
