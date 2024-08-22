@@ -1,0 +1,632 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>納品数配分システム</title>
+    <!-- React & ReactDOM CDN -->
+    <script src="https://unpkg.com/react@17/umd/react.production.min.js"></script>
+    <script src="https://unpkg.com/react-dom@17/umd/react-dom.production.min.js"></script>
+    <!-- MUI JavaScript CDN -->
+    <script src="https://cdn.jsdelivr.net/npm/@mui/material@5.13.5/umd/material-ui.development.min.js"></script>
+    <!-- Emotion CDN -->
+    <script src="https://cdn.jsdelivr.net/npm/@emotion/react@11.10.6/umd/emotion-react.umd.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@emotion/styled@11.10.6/umd/emotion-styled.umd.min.js"></script>
+    <!-- XLSX (for Excel/CSV export) -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.16.9/xlsx.full.min.js"></script>
+</head>
+<body>
+    <div id="root"></div>
+    <script>
+        const { useState } = React;
+        const { Button, Container, Grid, TextField, Typography, Box, Slider, Table, TableHead, TableBody, TableRow, TableCell, TableContainer, Paper, Checkbox, Tabs, Tab } = MaterialUI;
+
+        const columnWidths = {
+            checkbox: "50px", // チェックボックス列の幅
+            deliveryDate: "125px",
+            productCode: "125px",
+            productName: "200px",
+            cost: "75px",
+            price: "75px",
+            coefficientPattern: "100px",
+            distribution: "100px",
+            unit: "75px",
+            minimumQuantity: "100px",
+            store: "100px",  // 各店舗列の幅
+            total: "100px",
+        };
+
+        const rowHeight = 45; // 行の高さを定義
+
+        let storeCoefficients = {}; // 店舗係数を保存するオブジェクト
+        let storeMaster = []; // 店舗マスタを保存する配列
+        let coefficientPatterns = []; // 係数パターン名を保存する配列
+        let productList = []; // 商品リストを保存する配列
+
+        function createEmptyRow(id, storeCount) {
+            const stores = Array(storeCount).fill(0).reduce((acc, _, i) => {
+                acc[`store${i + 1}`] = 0;
+                return acc;
+            }, {});
+            return {
+                id: id,
+                selected: false, // 選択状態を保持するプロパティ
+                deliveryDate: "",
+                productCode: "",
+                productName: "",
+                cost: 0,
+                price: 0,
+                coefficientPattern: "",
+                distribution: 0,
+                unit: "",
+                minimumQuantity: 0,
+                totalCost: 0,
+                totalPrice: 0,
+                marginRate: "",
+                storeCount: storeCount,
+                total: 0,
+                ...stores
+            };
+        }
+
+        const App = () => {
+            const [activeTab, setActiveTab] = useState(0);
+            const [rowCount, setRowCount] = useState(10);
+            const [storeCount, setStoreCount] = useState(5); 
+            const [deliveryDate, setDeliveryDate] = useState("");
+            const [tableData, setTableData] = useState([createEmptyRow(1, storeCount)]);
+            const [storeSelection, setStoreSelection] = useState(Array(storeCount).fill(true)); // 各店舗列のチェックボックス状態を基本的に選択状態に
+            const [storeNames, setStoreNames] = useState(Array.from({ length: storeCount }, (_, i) => `店舗${i + 1}`)); // 仮の店舗名
+
+            const handleTabChange = (event, newValue) => {
+                setActiveTab(newValue);
+            };
+
+            const handleRowCountChange = (value) => {
+                const count = parseInt(value, 10);
+                setRowCount(count);
+
+                const newTableData = [...tableData];
+                if (count > tableData.length) {
+                    while (newTableData.length < count) {
+                        newTableData.push(createEmptyRow(newTableData.length + 1, storeCount));
+                    }
+                } else if (count < tableData.length) {
+                    newTableData.length = count;
+                }
+                setTableData(newTableData);
+            };
+
+            const handleStoreCountChange = (value) => {
+                const count = parseInt(value, 10);
+                setStoreCount(count);
+
+                const newTableData = tableData.map(row => ({
+                    ...row,
+                    ...Array(count).fill(0).reduce((acc, _, i) => {
+                        acc[`store${i + 1}`] = row[`store${i + 1}`] || 0;
+                        return acc;
+                    }, {})
+                }));
+                setTableData(newTableData);
+                setStoreSelection(Array(count).fill(true)); // チェックボックスを基本的に選択状態にする
+                setStoreNames(Array.from({ length: count }, (_, i) => storeMaster[i]?.name || `店舗${i + 1}`));
+            };
+
+            const handleInputChange = (index, field, value) => {
+                const newData = [...tableData];
+                newData[index][field] = value;
+                setTableData(newData);
+            };
+
+            const setAllDeliveryDates = () => {
+                const newData = tableData.map(row => ({ ...row, deliveryDate }));
+                setTableData(newData);
+            };
+
+            const clearTable = () => {
+                setTableData(tableData.map((_, index) => createEmptyRow(index + 1, storeCount)));
+            };
+
+            const distributeAllocations = () => {
+                const newTableData = tableData.map(row => {
+                    const totalQuantity = row.distribution;
+                    let remainingQuantity = totalQuantity;
+
+                    const coefficients = Array.from({ length: storeCount }).map((_, i) => {
+                        const coeff = storeCoefficients[`store${i + 1}`] || 1;
+                        return coeff;
+                    });
+
+                    const totalCoefficient = coefficients.reduce((sum, coeff) => sum + coeff, 0);
+
+                    const newStores = coefficients.map(coeff => {
+                        const allocation = Math.floor((coeff / totalCoefficient) * totalQuantity);
+                        remainingQuantity -= allocation;
+                        return allocation;
+                    });
+
+                    // If there's remaining quantity, distribute it
+                    for (let i = 0; remainingQuantity > 0 && i < newStores.length; i++) {
+                        newStores[i]++;
+                        remainingQuantity--;
+                    }
+
+                    return {
+                        ...row,
+                        ...newStores.reduce((acc, qty, i) => {
+                            acc[`store${i + 1}`] = qty;
+                            return acc;
+                        }, {}),
+                    };
+                });
+
+                setTableData(newTableData);
+            };
+
+            const handleDrop = (event, type) => {
+                event.preventDefault();
+                const files = event.dataTransfer.files;
+                if (files.length === 0) return;
+
+                const file = files[0];
+                const reader = new FileReader();
+
+                reader.onload = function (e) {
+                    const data = new Uint8Array(e.target.result);
+                    const workbook = XLSX.read(data, { type: 'array' });
+
+                    if (type === 'storeMaster') {
+                        parseStoreMaster(workbook);
+                        handleStoreCountChange(storeMaster.length);
+                    } else if (type === 'storeCoefficient') {
+                        storeCoefficients = parseStoreCoefficients(workbook);
+                    } else if (type === 'productList') {
+                        parseProductList(workbook);
+                    }
+                };
+
+                reader.readAsArrayBuffer(file);
+            };
+
+            const parseStoreMaster = (workbook) => {
+                const sheet = workbook.Sheets[workbook.SheetNames[0]];
+                const data = XLSX.utils.sheet_to_json(sheet, { header: 1 });
+                storeMaster = data.slice(1).map(row => ({
+                    code: row[0],
+                    name: row[1]
+                }));
+                setStoreNames(storeMaster.map(store => store.name));
+            };
+
+            const parseStoreCoefficients = (workbook) => {
+                const sheet = workbook.Sheets[workbook.SheetNames[0]];
+                const data = XLSX.utils.sheet_to_json(sheet, { header: 1 });
+                const headers = data[0].slice(2); // 最初の2列（店舗コードと店舗名）を除く
+                const coefficients = {};
+
+                data.slice(1).forEach(row => {
+                    const storeCode = row[0];
+                    coefficients[storeCode] = {};
+                    headers.forEach((header, index) => {
+                        coefficients[storeCode][header] = row[index + 2];
+                    });
+                });
+
+                coefficientPatterns = headers;
+                updateCoefficientPatternOptions();
+                return coefficients;
+            };
+
+            const parseProductList = (workbook) => {
+                const sheet = workbook.Sheets[workbook.SheetNames[0]];
+                const data = XLSX.utils.sheet_to_json(sheet, { header: 1 });
+                productList = data.slice(1);
+                adjustRowCount(productList.length);
+                fillProductList();
+            };
+
+            const fillProductList = () => {
+                const newTableData = productList.map((product, index) => {
+                    return {
+                        id: index + 1,
+                        deliveryDate: formatDate(product[1]),
+                        productCode: product[2] || '',
+                        productName: product[3] || '',
+                        cost: product[4] || 0,
+                        price: product[5] || 0,
+                        coefficientPattern: product[6] || '',
+                        distribution: product[7] || 0,
+                        unit: product[8] || '',
+                        minimumQuantity: product[9] || 0,
+                        total: 0,
+                    };
+                });
+                setTableData(newTableData);
+            };
+
+            const formatDate = (excelDate) => {
+                const date = new Date((excelDate - (25567 + 2)) * 86400 * 1000);
+                return date.toISOString().split('T')[0];
+            };
+
+            const exportToExcel = () => {
+                const ws = XLSX.utils.json_to_sheet(tableData);
+                const wb = XLSX.utils.book_new();
+                XLSX.utils.book_append_sheet(wb, ws, "Sheet1");
+                XLSX.writeFile(wb, "table_data.xlsx");
+            };
+
+            const exportToCSV = () => {
+                const ws = XLSX.utils.json_to_sheet(tableData);
+                const csv = XLSX.utils.sheet_to_csv(ws);
+                const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
+                const link = document.createElement("a");
+
+                if (link.download !== undefined) {
+                    const url = URL.createObjectURL(blob);
+                    link.setAttribute("href", url);
+                    link.setAttribute("download", "table_data.csv");
+                    link.style.visibility = 'hidden';
+                    document.body.appendChild(link);
+                    link.click();
+                    document.body.removeChild(link);
+                }
+            };
+
+            const downloadTemplate = (type) => {
+                const templateData = [];
+                if (type === 'storeMaster') {
+                    templateData.push(["店舗コード", "店舗名"]);
+                    templateData.push(["001", "店舗A"]);
+                    templateData.push(["002", "店舗B"]);
+                } else if (type === 'storeCoefficient') {
+                    templateData.push(["店舗コード", "店舗名", "パターン1", "パターン2"]);
+                    templateData.push(["001", "店舗A", 1, 2]);
+                    templateData.push(["002", "店舗B", 3, 4]);
+                } else if (type === 'productList') {
+                    templateData.push(["ID", "納品日", "商品コード", "商品名", "原価", "売価", "係数パターン", "配分数", "単位", "最低導入数"]);
+                    templateData.push([1, "2024-08-01", "P001", "商品A", 100, 150, "パターン1", 100, "個", 10]);
+                }
+
+                const ws = XLSX.utils.aoa_to_sheet(templateData);
+                const wb = XLSX.utils.book_new();
+                XLSX.utils.book_append_sheet(wb, ws, "Template");
+                XLSX.writeFile(wb, `${type}_template.xlsx`);
+            };
+
+            const handleSelectRow = (index) => {
+                const newData = [...tableData];
+                newData[index].selected = !newData[index].selected;
+                setTableData(newData);
+            };
+
+            const handleStoreSelect = (index) => {
+                const newSelection = [...storeSelection];
+                newSelection[index] = !newSelection[index];
+                setStoreSelection(newSelection);
+            };
+
+            return (
+                React.createElement(Container, { style: { paddingLeft: '8px', paddingRight: '8px', maxWidth: '100%' } },
+                    React.createElement(Typography, { variant: "h4", gutterBottom: true, style: { marginBottom: '16px' } }, "納品数配分システム"),
+                    React.createElement(Tabs, { value: activeTab, onChange: handleTabChange, indicatorColor: "primary", textColor: "primary", centered: true },
+                        React.createElement(Tab, { label: "商品リスト" }),
+                        React.createElement(Tab, { label: "納品数配分" }),
+                        React.createElement(Tab, { label: "店舗係数確認" })
+                    ),
+                    activeTab === 0 && (
+                        React.createElement(Box, { mt: 2 },
+                            React.createElement(Typography, { variant: "h6", gutterBottom: true }, "商品リスト"),
+                            // ここに商品リストページのコンテンツを追加
+                            React.createElement(Grid, { container: true, spacing: 2 },
+                                React.createElement(Grid, { item: true, xs: 12 },
+                                    React.createElement(Button, { onClick: () => downloadTemplate("productList"), variant: "contained", color: "secondary", fullWidth: true, style: { marginTop: '8px' } }, "商品リストテンプレートをダウンロード")
+                                )
+                            )
+                        )
+                    ),
+                    activeTab === 1 && (
+                        React.createElement(Box, { mt: 2 },
+                            React.createElement(Typography, { variant: "h6", gutterBottom: true }, "納品数配分"),
+                            // ここに納品数配分ページのコンテンツを追加
+                            React.createElement(Grid, { container: true, spacing: 2 },
+
+                                // Row and Store Count Section
+                                React.createElement(Grid, { item: true, xs: 12 },
+                                    React.createElement(Typography, { variant: "h6", gutterBottom: true }, "設定"),
+                                    React.createElement(Grid, { container: true, spacing: 2 },
+                                        React.createElement(Grid, { item: true, xs: 6 },
+                                            React.createElement(TextField, {
+                                                label: "商品行数",
+                                                type: "number",
+                                                value: rowCount,
+                                                onChange: (e) => handleRowCountChange(e.target.value),
+                                                fullWidth: true
+                                            }),
+                                            React.createElement(Slider, {
+                                                value: rowCount,
+                                                min: 1,
+                                                max: 100,
+                                                onChange: (e, value) => handleRowCountChange(value),
+                                                valueLabelDisplay: "auto"
+                                            })
+                                        ),
+                                        React.createElement(Grid, { item: true, xs: 6 },
+                                            React.createElement(TextField, {
+                                                label: "店舗列数",
+                                                type: "number",
+                                                value: storeCount,
+                                                onChange: (e) => handleStoreCountChange(e.target.value),
+                                                fullWidth: true
+                                            }),
+                                            React.createElement(Slider, {
+                                                value: storeCount,
+                                                min: 1,
+                                                max: 100,
+                                                onChange: (e, value) => handleStoreCountChange(value),
+                                                valueLabelDisplay: "auto"
+                                            })
+                                        )
+                                    )
+                                ),
+
+                                // Delivery Date Section
+                                React.createElement(Grid, { item: true, xs: 12 },
+                                    React.createElement(Typography, { variant: "h6", gutterBottom: true }, "納品日"),
+                                    React.createElement(Grid, { container: true, spacing: 2 },
+                                        React.createElement(Grid, { item: true, xs: 8 },
+                                            React.createElement(TextField, {
+                                                label: "納品日",
+                                                type: "date",
+                                                value: deliveryDate,
+                                                onChange: (e) => setDeliveryDate(e.target.value),
+                                                fullWidth: true
+                                            })
+                                        ),
+                                        React.createElement(Grid, { item: true, xs: 4 },
+                                            React.createElement(Button, { onClick: setAllDeliveryDates, variant: "contained", color: "info", fullWidth: true, style: { marginTop: '8px' } }, "納品日を一括設定")
+                                        )
+                                    )
+                                ),
+
+                                // File Upload and Template Download Section
+                                React.createElement(Grid, { item: true, xs: 12 },
+                                    React.createElement(Typography, { variant: "h6", gutterBottom: true }, "ファイルのインポート"),
+                                    React.createElement(Grid, { container: true, spacing: 2 },
+                                        React.createElement(Grid, { item: true, xs: 4 },
+                                            React.createElement(Box, {
+                                                id: "storeMasterDropArea",
+                                                style: {
+                                                    border: "2px dashed #aaa",
+                                                    padding: "10px",
+                                                    textAlign: "center",
+                                                    marginBottom: "16px",
+                                                },
+                                                onDragOver: (e) => e.preventDefault(),
+                                                onDrop: (e) => handleDrop(e, "storeMaster"),
+                                            }, "店舗マスタをここにドラッグ＆ドロップ"),
+                                            React.createElement(Button, { onClick: () => downloadTemplate("storeMaster"), variant: "contained", color: "secondary", fullWidth: true, style: { marginTop: '8px' } }, "店舗マスタテンプレートをダウンロード")
+                                        ),
+                                        React.createElement(Grid, { item: true, xs: 4 },
+                                            React.createElement(Box, {
+                                                id: "storeCoefficientDropArea",
+                                                style: {
+                                                    border: "2px dashed #aaa",
+                                                    padding: "10px",
+                                                    textAlign: "center",
+                                                    marginBottom: "16px",
+                                                },
+                                                onDragOver: (e) => e.preventDefault(),
+                                                onDrop: (e) => handleDrop(e, "storeCoefficient"),
+                                            }, "店舗係数をここにドラッグ＆ドロップ"),
+                                            React.createElement(Button, { onClick: () => downloadTemplate("storeCoefficient"), variant: "contained", color: "secondary", fullWidth: true, style: { marginTop: '8px' } }, "店舗係数テンプレートをダウンロード")
+                                        ),
+                                        React.createElement(Grid, { item: true, xs: 4 },
+                                            React.createElement(Box, {
+                                                id: "productListDropArea",
+                                                style: {
+                                                    border: "2px dashed #aaa",
+                                                    padding: "10px",
+                                                    textAlign: "center",
+                                                    marginBottom: "16px",
+                                                },
+                                                onDragOver: (e) => e.preventDefault(),
+                                                onDrop: (e) => handleDrop(e, "productList"),
+                                            }, "商品リストをここにドラッグ＆ドロップ"),
+                                            React.createElement(Button, { onClick: () => downloadTemplate("productList"), variant: "contained", color: "secondary", fullWidth: true, style: { marginTop: '8px' } }, "商品リストテンプレートをダウンロード")
+                                        )
+                                    )
+                                ),
+
+                                // Actions Section
+                                React.createElement(Grid, { item: true, xs: 12 },
+                                    React.createElement(Typography, { variant: "h6", gutterBottom: true }, "アクション"),
+                                    React.createElement(Grid, { container: true, spacing: 2 },
+                                        React.createElement(Grid, { item: true, xs: 4 },
+                                            React.createElement(Button, { onClick: clearTable, variant: "contained", color: "warning", fullWidth: true, style: { marginTop: '8px' } }, "テーブルをクリア")
+                                        ),
+                                        React.createElement(Grid, { item: true, xs: 4 },
+                                            React.createElement(Button, { onClick: distributeAllocations, variant: "contained", color: "primary", fullWidth: true, style: { marginTop: '8px' } }, "配分を実行")
+                                        ),
+                                        React.createElement(Grid, { item: true, xs: 4 },
+                                            React.createElement(Button, { onClick: exportToExcel, variant: "contained", color: "primary", fullWidth: true, style: { marginTop: '8px' } }, "Excelにエクスポート")
+                                        ),
+                                        React.createElement(Grid, { item: true, xs: 4 },
+                                            React.createElement(Button, { onClick: exportToCSV, variant: "contained", color: "primary", fullWidth: true, style: { marginTop: '8px' } }, "CSVにエクスポート")
+                                        )
+                                    )
+                                )
+                            ),
+                            // Data Table Section
+                            React.createElement(Box, { mt: 2, style: { overflowX: 'auto', width: '100%' } },
+                                React.createElement(TableContainer, { component: Paper, style: { width: '100%' } },
+                                    React.createElement(Table, { size: "small", style: { minWidth: '1200px', tableLayout: 'fixed' } },
+                                        React.createElement(TableHead, null,
+                                            React.createElement(TableRow, { style: { height: `${rowHeight}px` } },
+                                                React.createElement(TableCell, { padding: "none", style: { width: columnWidths.checkbox }, align: "center" },
+                                                    React.createElement(Checkbox, {
+                                                        inputProps: { 'aria-label': 'select all rows' },
+                                                        onChange: (e) => {
+                                                            const checked = e.target.checked;
+                                                            setTableData(tableData.map(row => ({ ...row, selected: checked })));
+                                                        }
+                                                    })
+                                                ),
+                                                React.createElement(TableCell, { padding: "none", style: { width: columnWidths.deliveryDate }, align: "center" }, "納品日"),
+                                                React.createElement(TableCell, { padding: "none", style: { width: columnWidths.productCode }, align: "center" }, "商品コード"),
+                                                React.createElement(TableCell, { padding: "none", style: { width: columnWidths.productName }, align: "center" }, "商品名"),
+                                                React.createElement(TableCell, { padding: "none", style: { width: columnWidths.cost }, align: "center" }, "原価"),
+                                                React.createElement(TableCell, { padding: "none", style: { width: columnWidths.price }, align: "center" }, "売価"),
+                                                React.createElement(TableCell, { padding: "none", style: { width: columnWidths.coefficientPattern }, align: "center" }, "係数パターン"),
+                                                React.createElement(TableCell, { padding: "none", style: { width: columnWidths.distribution }, align: "center" }, "配分数"),
+                                                React.createElement(TableCell, { padding: "none", style: { width: columnWidths.unit }, align: "center" }, "単位"),
+                                                React.createElement(TableCell, { padding: "none", style: { width: columnWidths.minimumQuantity }, align: "center" }, "最低導入数"),
+                                                Array.from({ length: storeCount }).map((_, i) =>
+                                                    React.createElement(TableCell, { key: i, padding: "none", style: { width: columnWidths.store }, align: "center" },
+                                                        React.createElement(Box, { display: "flex", flexDirection: "column", alignItems: "center" },
+                                                            React.createElement(Checkbox, {
+                                                                inputProps: { 'aria-label': `select store ${i + 1}` },
+                                                                checked: storeSelection[i],
+                                                                onChange: () => handleStoreSelect(i)
+                                                            }),
+                                                            React.createElement(Typography, { variant: "caption" }, storeNames[i])
+                                                        )
+                                                    )
+                                                ),
+                                                React.createElement(TableCell, { padding: "none", style: { width: columnWidths.total }, align: "center" }, "合計")
+                                            )
+                                        ),
+                                        React.createElement(TableBody, null,
+                                            tableData.map((row, index) =>
+                                                React.createElement(TableRow, { key: row.id, style: { height: `${rowHeight}px` } },
+                                                    React.createElement(TableCell, { padding: "none", style: { width: columnWidths.checkbox }, align: "center" },
+                                                        React.createElement(Checkbox, {
+                                                            checked: row.selected,
+                                                            onChange: () => handleSelectRow(index)
+                                                        })
+                                                    ),
+                                                    React.createElement(TableCell, { padding: "none", style: { width: columnWidths.deliveryDate } },
+                                                        React.createElement(TextField, {
+                                                            type: "date",
+                                                            value: row.deliveryDate,
+                                                            onChange: (e) => handleInputChange(index, "deliveryDate", e.target.value),
+                                                            fullWidth: true,
+                                                            inputProps: { style: { padding: '0 8px' }   }
+                                                        })
+                                                    ),
+                                                    React.createElement(TableCell, { padding: "none", style: { width: columnWidths.productCode } },
+                                                        React.createElement(TextField, {
+                                                            value: row.productCode,
+                                                            onChange: (e) => handleInputChange(index, "productCode", e.target.value),
+                                                            inputProps: { maxLength: 10, style: { padding: '0 8px' }  },
+                                                            fullWidth: true
+                                                        })
+                                                    ),
+                                                    React.createElement(TableCell, { padding: "none", style: { width: columnWidths.productName } },
+                                                        React.createElement(TextField, {
+                                                            value: row.productName,
+                                                            onChange: (e) => handleInputChange(index, "productName", e.target.value),
+                                                            inputProps: { maxLength: 20, style: { padding: '0 8px' }  },
+                                                            fullWidth: true
+                                                        })
+                                                    ),
+                                                    React.createElement(TableCell, { padding: "none", style: { width: columnWidths.cost } },
+                                                        React.createElement(TextField, {
+                                                            type: "number",
+                                                            value: row.cost,
+                                                            onChange: (e) => handleInputChange(index, "cost", e.target.value),
+                                                            inputProps: { maxLength: 5, style: { padding: '0 8px' }  },
+                                                            fullWidth: true
+                                                        })
+                                                    ),
+                                                    React.createElement(TableCell, { padding: "none", style: { width: columnWidths.price } },
+                                                        React.createElement(TextField, {
+                                                            type: "number",
+                                                            value: row.price,
+                                                            onChange: (e) => handleInputChange(index, "price", e.target.value),
+                                                            inputProps: { maxLength: 5, style: { padding: '0 8px' } },
+                                                            fullWidth: true
+                                                        })
+                                                    ),
+                                                    React.createElement(TableCell, { padding: "none", style: { width: columnWidths.coefficientPattern } },
+                                                        React.createElement(TextField, {
+                                                            value: row.coefficientPattern,
+                                                            onChange: (e) => handleInputChange(index, "coefficientPattern", e.target.value),
+                                                            inputProps: { maxLength: 5, style: { padding: '0 8px' } },
+                                                            fullWidth: true
+                                                        })
+                                                    ),
+                                                    React.createElement(TableCell, { padding: "none", style: { width: columnWidths.distribution } },
+                                                        React.createElement(TextField, {
+                                                            type: "number",
+                                                            value: row.distribution,
+                                                            onChange: (e) => handleInputChange(index, "distribution", e.target.value),
+                                                            inputProps: { maxLength: 5, style: { padding: '0 8px' } },
+                                                            fullWidth: true
+                                                        })
+                                                    ),
+                                                    React.createElement(TableCell, { padding: "none", style: { width: columnWidths.unit } },
+                                                        React.createElement(TextField, {
+                                                            value: row.unit,
+                                                            onChange: (e) => handleInputChange(index, "unit", e.target.value),
+                                                            inputProps: { maxLength: 5, style: { padding: '0 8px' } },
+                                                            fullWidth: true
+                                                        })
+                                                    ),
+                                                    React.createElement(TableCell, { padding: "none", style: { width: columnWidths.minimumQuantity } },
+                                                        React.createElement(TextField, {
+                                                            type: "number",
+                                                            value: row.minimumQuantity,
+                                                            onChange: (e) => handleInputChange(index, "minimumQuantity", e.target.value),
+                                                            inputProps: { maxLength: 5, style: { padding: '0 8px' } },
+                                                            fullWidth: true
+                                                        })
+                                                    ),
+                                                    Array.from({ length: storeCount }).map((_, i) =>
+                                                        React.createElement(TableCell, { key: i, padding: "none", style: { width: columnWidths.store } },
+                                                            React.createElement(TextField, {
+                                                                type: "number",
+                                                                value: row[`store${i + 1}`],
+                                                                onChange: (e) => handleInputChange(index, `store${i + 1}`, e.target.value),
+                                                                fullWidth: true,
+                                                                inputProps: { style: { padding: '0 8px' } }
+                                                            })
+                                                        )
+                                                    ),
+                                                    React.createElement(TableCell, { padding: "none", style: { width: columnWidths.total } },
+                                                        React.createElement(TextField, {
+                                                            type: "number",
+                                                            value: row.total,
+                                                            disabled: true,
+                                                            fullWidth: true,
+                                                            inputProps: { style: { padding: '0 8px' } }
+                                                        })
+                                                    )
+                                                )
+                                            )
+                                        )
+                                    )
+                                )
+                            )
+                        )
+                    ),
+                    activeTab === 2 && (
+                        React.createElement(Box, { mt: 2 },
+                            React.createElement(Typography, { variant: "h6", gutterBottom: true }, "店舗係数確認"),
+                            // ここに店舗係数確認ページのコンテンツを追加
+                            React.createElement(Grid, { container: true, spacing: 2 },
+                                React.createElement(Grid, { item: true, xs: 12 },
+                                    React.createElement(Button, { onClick: () => downloadTemplate("storeCoefficient"), variant: "contained", color: "secondary", fullWidth: true, style: { marginTop: '8px' } }, "店舗係数テンプレートをダウンロード")
+                                )
+                            )
+                        )
+                    )
+                )
+            );
+        };
+
+        ReactDOM.render(React.createElement(App), document.getElementById('root'));
+    </script>
+</body>
+</html>
