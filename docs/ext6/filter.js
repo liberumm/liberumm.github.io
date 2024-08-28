@@ -85,7 +85,7 @@ const Filter = () => {
         <Box px={3} py={2}>
             <Grid container spacing={2}>
                 {/* 年度選択 */}
-                <Grid item xs={4} sm={4} md={2}>
+                <Grid item xs={4} sm={4} md={1.5}>
                     <TextField
                         select
                         label="年度"
@@ -100,7 +100,7 @@ const Filter = () => {
                 </Grid>
 
                 {/* 月度選択 */}
-                <Grid item xs={4} sm={4} md={2}>
+                <Grid item xs={4} sm={4} md={1.5}>
                     <TextField
                         select
                         label="月度"
@@ -115,7 +115,7 @@ const Filter = () => {
                 </Grid>
 
                 {/* 週の選択 */}
-                <Grid item xs={4} sm={4} md={2}>
+                <Grid item xs={4} sm={4} md={1.5}>
                     <TextField
                         select
                         label="週"
@@ -130,7 +130,7 @@ const Filter = () => {
                 </Grid>
 
                 {/* 開始日 */}
-                <Grid item xs={6} sm={6} md={3}>
+                <Grid item xs={6} sm={6} md={2}>
                     <TextField
                         label="開始日"
                         type="date"
@@ -142,7 +142,7 @@ const Filter = () => {
                 </Grid>
 
                 {/* 終了日 */}
-                <Grid item xs={6} sm={6} md={3}>
+                <Grid item xs={6} sm={6} md={2}>
                     <TextField
                         label="終了日"
                         type="date"
@@ -154,7 +154,7 @@ const Filter = () => {
                 </Grid>
 
                 {/* 店舗/部署の選択 */}
-                <Grid item xs={12} sm={6} md={6}>
+                <Grid item xs={6} sm={6} md={2}>
                     <TextField
                         select
                         label="店舗/部署"
@@ -169,7 +169,7 @@ const Filter = () => {
                 </Grid>
 
                 {/* 部門の選択 */}
-                <Grid item xs={12} sm={6} md={6}>
+                <Grid item xs={6} sm={6} md={1.5}>
                     <TextField
                         select
                         label="部門"
