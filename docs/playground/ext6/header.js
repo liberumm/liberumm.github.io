@@ -21,7 +21,7 @@ function Header() {
 
                     <Box sx={{ display: { xs: 'block', md: 'none' } }}>
                         <IconButton edge="start" color="inherit" aria-label="menu" onClick={handleMenuOpen}>
-                            <span class="material-icons">menu</span>
+                            <span className="material-icons">menu</span>
                         </IconButton>
                         <Menu
                             anchorEl={anchorEl}
