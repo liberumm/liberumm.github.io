@@ -5,15 +5,15 @@ function Footer() {
         <Box component="footer" sx={{ bgcolor: 'primary.dark', color: 'white', py: 4 }}>
             <Container maxWidth="md">
                 <Grid container spacing={2}>
-                    <Grid item xs={12} sm={4}>
+                    <Grid item xs={12} sm={6}>
                         <Typography variant="h6" gutterBottom>
-                            Your Company Name
+                        サミット株式会社 SUMMIT,INC.
                         </Typography>
                         <Typography variant="body2">
                             ここに会社の紹介文を入れることができます。
                         </Typography>
                     </Grid>
-                    <Grid item xs={12} sm={4}>
+                    <Grid item xs={12} sm={6}>
                         <Typography variant="h6" gutterBottom>
                             クイックリンク
                         </Typography>
