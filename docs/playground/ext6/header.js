@@ -13,7 +13,7 @@ function Header() {
 
     return (
         <AppBar position="static" sx={{ bgcolor: '#1976d2', boxShadow: 3 }}>
-            <Container maxWidth="md">
+            <Container maxWidth={false} sx={{ padding: 0 }}>
                 <Toolbar disableGutters>
                     <Typography variant="h6" noWrap sx={{ flexGrow: 1, textAlign: { xs: 'center', sm: 'left' } }}>
                         Appbar
