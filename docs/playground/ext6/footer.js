@@ -30,7 +30,7 @@ function Footer() {
                 </Grid>
                 <Box mt={4} textAlign="center">
                     <Typography variant="body2">
-                        © {new Date().getFullYear()} Your Company Name. All rights reserved.
+                        © {new Date().getFullYear()} SUMMIT,INC. All rights reserved.
                     </Typography>
                 </Box>
             </Container>

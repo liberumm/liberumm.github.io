@@ -9,12 +9,12 @@ function Graph() {
 
         const svg = d3.select(svgRef.current);
         const margin = { top: 20, right: 30, bottom: 30, left: 40 };
-        const width = parseInt(svg.style('width')) - margin.left - margin.right;
-        const height = 400 - margin.top - margin.bottom;
 
         const updateChart = () => {
             const width = svg.node().parentNode.clientWidth - margin.left - margin.right;
-            svg.attr('width', width + margin.left + margin.right);
+            const height = window.innerHeight * 0.3 - margin.top - margin.bottom;
+            svg.attr('width', width + margin.left + margin.right)
+               .attr('height', height + margin.top + margin.bottom);
 
             svg.selectAll('*').remove(); // 既存のSVG内容をクリア
 
@@ -55,9 +55,9 @@ function Graph() {
 
     return (
         <Grid container spacing={2} justifyContent="center">
-            <Grid item xs={12} sm={8}>
-                <Box component="div" sx={{ py: 4, display: 'flex', justifyContent: 'center' }}>
-                    <svg ref={svgRef} width="100%" height="400px"></svg>
+            <Grid item xs={12}>
+                <Box component="div" sx={{ py: 4, display: 'flex', justifyContent: 'center', width: '100%' }}>
+                    <svg ref={svgRef} width="100%" height="30%"></svg>
                 </Box>
             </Grid>
         </Grid>
