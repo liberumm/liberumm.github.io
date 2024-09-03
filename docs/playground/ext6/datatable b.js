@@ -1,7 +1,8 @@
-const { Box, Grid, Table, TableBody, TableCell, TableContainer, TableHead, TableRow, Paper, Checkbox, Tabs, Tab, TablePagination, Dialog, DialogTitle, DialogContent, DialogContentText, DialogActions, Button, ButtonGroup, TextField, FormControlLabel, Switch, Snackbar, Alert, Slider } = MaterialUI;
-const { useState, useEffect } = React;
+const { Box, Grid, Table, TableBody, TableCell, TableContainer, TableHead, TableRow, Paper, Checkbox, Tabs, Tab, TablePagination, Dialog, DialogTitle, DialogContent, DialogContentText, DialogActions, Button, ButtonGroup, TextField, FormControlLabel, Switch, Snackbar, Alert } = MaterialUI;
+const { useState } = React;
 
 function DataTable() {
+    // テーブルデータ
     const [initialData, setInitialData] = useState([
         { id: 1, displayName: 'Alice Johnson', firstName: 'Alice', lastName: 'Johnson', organization: 'Tech Co', department: 'Development', role: 'Engineer', status: '有効' },
         { id: 2, displayName: 'Bob Smith', firstName: 'Bob', lastName: 'Smith', organization: 'Design LLC', department: 'Creative', role: 'Designer', status: '無効' },
@@ -13,7 +14,10 @@ function DataTable() {
         { id: 8, displayName: 'Henry Adams', firstName: 'Henry', lastName: 'Adams', organization: 'Tech Co', department: 'Executive', role: 'CEO', status: '無効' }
     ]);
 
+    // ソート状態
     const [sortConfig, setSortConfig] = useState({ key: 'id', direction: 'asc' });
+
+    // フィルタ用の状態
     const [filters, setFilters] = useState({
         status: '',
         id: '',
@@ -24,27 +28,48 @@ function DataTable() {
         department: '',
         role: ''
     });
+
+    // ページネーションの状態
     const [page, setPage] = useState(0);
-    const [rowsPerPage, setRowsPerPage] = useState(10); 
+    const [rowsPerPage, setRowsPerPage] = useState(10); // デフォルト行数を10に設定
+
+    // タブの選択状態
     const [selectedTab, setSelectedTab] = useState(0);
+
+    // チェックボックスの選択状態
     const [selectedRows, setSelectedRows] = useState([]);
+
+    // ヘッダーのチェックボックス状態
     const isAllSelected = selectedRows.length === initialData.length;
+
+    // モーダルの状態
     const [open, setOpen] = useState(false);
     const [selectedRow, setSelectedRow] = useState(null);
+
+    // 空行を表示するかどうかの状態
     const [showEmptyRows, setShowEmptyRows] = useState(true);
+
+    // 編集モードの状態
     const [editMode, setEditMode] = useState(false);
+
+    // 編集されたセルの追跡
     const [editedRows, setEditedRows] = useState({});
+
+    // 確定された編集の追跡
     const [confirmedEdits, setConfirmedEdits] = useState({});
-    const [history, setHistory] = useState([initialData]);
-    const [generation, setGeneration] = useState(0);
-    const [maxGenerations, setMaxGenerations] = useState(5);
+
+    // 確認ダイアログの表示状態
     const [confirmDialogOpen, setConfirmDialogOpen] = useState(false);
+
+    // 編集確定時のスナックバーの状態
     const [snackbarOpen, setSnackbarOpen] = useState(false);
 
+    // フィルター用のハンドラー
     const handleFilterChange = (field, value) => {
         setFilters({ ...filters, [field]: value });
     };
 
+    // ソート処理
     const sortedData = [...initialData].sort((a, b) => {
         if (a[sortConfig.key] < b[sortConfig.key]) {
             return sortConfig.direction === 'asc' ? -1 : 1;
@@ -55,6 +80,7 @@ function DataTable() {
         return 0;
     });
 
+    // フィルタリング処理
     const filteredData = sortedData.filter(row => {
         return (
             (selectedTab === 0 || row.status === (selectedTab === 1 ? '有効' : '無効')) &&
@@ -69,25 +95,31 @@ function DataTable() {
         );
     });
 
+    // 表示するデータのスライス
     const displayedData = filteredData.slice(page * rowsPerPage, page * rowsPerPage + rowsPerPage);
 
+    // 空行の追加
     const emptyRows = rowsPerPage - displayedData.length;
 
+    // タブの変更ハンドラー
     const handleChangeTab = (event, newValue) => {
-        setSelectedRows([]); 
+        setSelectedRows([]); // タブ変更時に選択をクリア
         setSelectedTab(newValue);
-        setPage(0); 
+        setPage(0); // タブを変更したらページをリセット
     };
 
+    // ページの変更ハンドラー
     const handleChangePage = (event, newPage) => {
         setPage(newPage);
     };
 
+    // 1ページあたりの行数を変更するハンドラー
     const handleChangeRowsPerPage = (event) => {
         setRowsPerPage(parseInt(event.target.value, 10));
-        setPage(0); 
+        setPage(0); // ページネーションをリセット
     };
 
+    // 行のチェックボックスをクリックしたときのハンドラー
     const handleCheckboxClick = (id) => {
         if (selectedRows.includes(id)) {
             setSelectedRows(selectedRows.filter(rowId => rowId !== id));
@@ -96,6 +128,7 @@ function DataTable() {
         }
     };
 
+    // ヘッダーのチェックボックスをクリックしたときのハンドラー
     const handleSelectAllClick = () => {
         if (isAllSelected) {
             setSelectedRows([]);
@@ -104,6 +137,7 @@ function DataTable() {
         }
     };
 
+    // 行をクリックしたときにモーダルを開くハンドラー（チェックボックス列以外）
     const handleRowClick = (row) => {
         if (!editMode) {
             setSelectedRow(row);
@@ -111,10 +145,12 @@ function DataTable() {
         }
     };
 
+    // モーダルを閉じるハンドラー
     const handleClose = () => {
         setOpen(false);
     };
 
+    // ヘッダークリック時のソート変更ハンドラー
     const handleSort = (key) => {
         let direction = 'asc';
         if (sortConfig.key === key && sortConfig.direction === 'asc') {
@@ -123,6 +159,7 @@ function DataTable() {
         setSortConfig({ key, direction });
     };
 
+    // CSV出力のハンドラー
     const handleExportCSV = () => {
         const headers = ["ID", "表示名", "姓", "名", "組織", "部署", "役割", "ステータス"];
         const rows = filteredData.map(row => [row.id, row.displayName, row.lastName, row.firstName, row.organization, row.department, row.role, row.status]);
@@ -140,6 +177,7 @@ function DataTable() {
         document.body.removeChild(link);
     };
 
+    // Excel出力のハンドラー
     const handleExportExcel = () => {
         const headers = ["ID", "表示名", "姓", "名", "組織", "部署", "役割", "ステータス"];
         const rows = filteredData.map(row => [row.id, row.displayName, row.lastName, row.firstName, row.organization, row.department, row.role, row.status]);
@@ -151,82 +189,71 @@ function DataTable() {
         XLSX.writeFile(wb, "table_data.xlsx");
     };
 
+    // 空行表示の切り替え
     const handleToggleEmptyRows = (event) => {
         setShowEmptyRows(event.target.checked);
     };
 
+    // 編集モードのトグル
     const toggleEditMode = () => {
         if (editMode) {
-            setConfirmDialogOpen(true); 
+            setConfirmDialogOpen(true); // 編集モード終了時に確認ダイアログを表示
         } else {
             setEditMode(true);
         }
     };
 
+    // セル編集のハンドラー
     const handleCellEdit = (id, field, value) => {
         setEditedRows({
             ...editedRows,
             [id]: {
                 ...editedRows[id],
-                [field]: value !== undefined ? value : '', 
+                [field]: value
             }
         });
     };
 
+    // 確認ダイアログを閉じるハンドラー
     const handleConfirmClose = (confirmed) => {
         setConfirmDialogOpen(false);
         if (confirmed) {
+            // 確定した場合、編集内容を反映する
             const newData = initialData.map(row => {
                 if (editedRows[row.id]) {
                     return { ...row, ...editedRows[row.id] };
                 }
                 return row;
             });
-    
-            const confirmed = {};
-            Object.keys(editedRows).forEach(id => {
-                confirmed[id] = { ...editedRows[id] };
-                Object.keys(editedRows[id]).forEach(field => {
-                    confirmed[id][field] = editedRows[id][field] || ''; 
-                });
-            });
-    
             setInitialData(newData);
-            setConfirmedEdits(confirmed);
-            setSnackbarOpen(true);
-    
-            const newHistory = [...history.slice(0, generation + 1), newData];
-            if (newHistory.length > maxGenerations) {
-                newHistory.shift(); 
-            }
-            setHistory(newHistory);
-            setGeneration(newHistory.length - 1);
+            setConfirmedEdits(editedRows); // 編集内容を確定
+            setSnackbarOpen(true); // スナックバーを表示
         }
-        setEditedRows({});
+        setEditedRows({}); // 編集内容をリセット
         setEditMode(false);
     };
-    
 
+    // スナックバーを閉じるハンドラー
     const handleSnackbarClose = () => {
         setSnackbarOpen(false);
     };
 
-    const handleSliderChange = (event, newValue) => {
-        setGeneration(newValue);
-        setInitialData(history[newValue]);
-    };
-
-    const handleMaxGenerationsChange = (event) => {
-        setMaxGenerations(parseInt(event.target.value, 10));
+    // 元に戻す機能のハンドラー
+    const handleUndo = () => {
+        setEditedRows({});  // 編集したセルをリセット
     };
 
     return (
-        <Grid container spacing={1} justifyContent="center">
+        <Grid container spacing={1} justifyContent="center"> {/* spacingを1にして余白を減らす */}
             <Grid item xs={12}>
-                <Box sx={{ width: '100%', display: 'flex', justifyContent: 'center', alignItems: 'center', mb: 1 }}>
+                <Box sx={{ width: '100%', display: 'flex', justifyContent: 'center', alignItems: 'center', mb: 1 }}> {/* mbを1にして下マージンを減らす */}
                     <ButtonGroup variant="contained" color="primary">
-                        <Button onClick={handleExportCSV}>CSVに出力</Button>
-                        <Button onClick={handleExportExcel}>Excelに出力</Button>
+                        <Button onClick={handleExportCSV}>
+                            CSVに出力
+                        </Button>
+                        <Button onClick={handleExportExcel}>
+                            Excelに出力
+                        </Button>
                     </ButtonGroup>
                 </Box>
                 <Box sx={{ width: '100%', display: 'flex', justifyContent: 'center', mb: 1 }}>
@@ -238,36 +265,17 @@ function DataTable() {
                         control={<Switch checked={editMode} onChange={toggleEditMode} />}
                         label="編集モード"
                     />
-                    <Box>
-                    <TextField sx={{ width: 80, mx: 2, mt:1 }}
-                        label="保持世代数"
-                        type="number"
-                        value={maxGenerations}
-                        onChange={handleMaxGenerationsChange}
-                        variant="outlined"
-                        size="small"
-                    />
-                    </Box>
-                    <Box sx={{ width: 100, mx: 2 ,mt:1 }}>
-                            <Slider
-                            value={generation}
-                            onChange={handleSliderChange}
-                            step={1}
-                            marks
-                            min={0}
-                            max={history.length - 1}
-                            valueLabelDisplay="auto"
-                        />
-                    </Box>
+                    {editMode && <Button onClick={handleUndo} variant="outlined" color="secondary" sx={{ ml: 2 }}>元に戻す</Button>}
                 </Box>
                 <Box sx={{ width: '100%' }}>
+                    {/* タブの設定 */}
                     <Tabs value={selectedTab} onChange={handleChangeTab} centered>
                         <Tab label="全て" />
                         <Tab label="有効" />
                         <Tab label="無効" />
                     </Tabs>
                 </Box>
-                <Box sx={{ py: 2, display: 'block', width: '100%' }}>
+                <Box sx={{ py: 2, display: 'block', width: '100%' }}> {/* pyを2にして上下のパディングを減らす */}
                     <TableContainer component={Paper} sx={{ maxWidth: '100%', margin: 'auto' }}>
                         <Table aria-label="simple table" sx={{ borderCollapse: 'collapse' }}>
                             <TableHead>
@@ -285,7 +293,11 @@ function DataTable() {
                                         <TableCell 
                                             key={key} 
                                             sx={{ textAlign: 'center', padding: '4px', cursor: 'pointer' }}
-                                            onClick={(event) => !event.target.classList.contains('MuiInputBase-input') && handleSort(key)}
+                                            onClick={(event) => {
+                                                if (event.target.tagName !== 'INPUT') {
+                                                    handleSort(key);
+                                                }
+                                            }}
                                         >
                                             <TextField
                                                 placeholder={key}
@@ -299,7 +311,7 @@ function DataTable() {
                                                         textAlign: 'center'
                                                     }
                                                 }}
-                                                onClick={(e) => e.stopPropagation()} 
+                                                onClick={(event) => event.stopPropagation()} // フィルター行のクリック時にソートを防止
                                             />
                                         </TableCell>
                                     ))}
@@ -345,14 +357,14 @@ function DataTable() {
                                                 color="primary"
                                                 checked={selectedRows.includes(row.id)}
                                                 onChange={() => handleCheckboxClick(row.id)}
-                                                disabled={editMode}
+                                                disabled={editMode} // 編集モード時はチェックボックスを無効化
                                             />
                                         </TableCell>
                                         <TableCell sx={{ textAlign: 'center', padding: '4px' }}>{page * rowsPerPage + index + 1}</TableCell>
-                                        <TableCell sx={{ textAlign: 'center', padding: '4px', backgroundColor: editedRows[row.id]?.status !== undefined ? 'lightyellow' : (confirmedEdits[row.id]?.status !== undefined ? 'lightgray' : 'inherit') }}>
+                                        <TableCell sx={{ textAlign: 'center', padding: '4px', backgroundColor: confirmedEdits[row.id]?.status ? 'lightgray' : (editedRows[row.id]?.status ? 'yellow' : 'inherit') }}>
                                             {editMode ? (
                                                 <TextField
-                                                    value={editedRows[row.id]?.status !== undefined ? editedRows[row.id]?.status : row.status}
+                                                    value={editedRows[row.id]?.status || row.status}
                                                     onChange={(e) => handleCellEdit(row.id, 'status', e.target.value)}
                                                     variant="outlined"
                                                     size="small"
@@ -362,10 +374,10 @@ function DataTable() {
                                                 row.status
                                             )}
                                         </TableCell>
-                                        <TableCell sx={{ textAlign: 'center', padding: '4px', backgroundColor: editedRows[row.id]?.id !== undefined ? 'lightyellow' : (confirmedEdits[row.id]?.id !== undefined ? 'lightgray' : 'inherit') }}>
+                                        <TableCell sx={{ textAlign: 'center', padding: '4px', backgroundColor: confirmedEdits[row.id]?.id ? 'lightgray' : (editedRows[row.id]?.id ? 'yellow' : 'inherit') }}>
                                             {editMode ? (
                                                 <TextField
-                                                    value={editedRows[row.id]?.id !== undefined ? editedRows[row.id]?.id : row.id}
+                                                    value={editedRows[row.id]?.id || row.id}
                                                     onChange={(e) => handleCellEdit(row.id, 'id', e.target.value)}
                                                     variant="outlined"
                                                     size="small"
@@ -375,10 +387,10 @@ function DataTable() {
                                                 row.id
                                             )}
                                         </TableCell>
-                                        <TableCell sx={{ textAlign: 'center', padding: '4px', backgroundColor: editedRows[row.id]?.displayName !== undefined ? 'lightyellow' : (confirmedEdits[row.id]?.displayName !== undefined ? 'lightgray' : 'inherit') }}>
+                                        <TableCell sx={{ textAlign: 'center', padding: '4px', backgroundColor: confirmedEdits[row.id]?.displayName ? 'lightgray' : (editedRows[row.id]?.displayName ? 'yellow' : 'inherit') }}>
                                             {editMode ? (
                                                 <TextField
-                                                    value={editedRows[row.id]?.displayName !== undefined ? editedRows[row.id]?.displayName : row.displayName}
+                                                    value={editedRows[row.id]?.displayName || row.displayName}
                                                     onChange={(e) => handleCellEdit(row.id, 'displayName', e.target.value)}
                                                     variant="outlined"
                                                     size="small"
@@ -388,10 +400,10 @@ function DataTable() {
                                                 row.displayName
                                             )}
                                         </TableCell>
-                                        <TableCell sx={{ textAlign: 'center', padding: '4px', backgroundColor: editedRows[row.id]?.lastName !== undefined ? 'lightyellow' : (confirmedEdits[row.id]?.lastName !== undefined ? 'lightgray' : 'inherit') }}>
+                                        <TableCell sx={{ textAlign: 'center', padding: '4px', backgroundColor: confirmedEdits[row.id]?.lastName ? 'lightgray' : (editedRows[row.id]?.lastName ? 'yellow' : 'inherit') }}>
                                             {editMode ? (
                                                 <TextField
-                                                    value={editedRows[row.id]?.lastName !== undefined ? editedRows[row.id]?.lastName : row.lastName}
+                                                    value={editedRows[row.id]?.lastName || row.lastName}
                                                     onChange={(e) => handleCellEdit(row.id, 'lastName', e.target.value)}
                                                     variant="outlined"
                                                     size="small"
@@ -401,10 +413,10 @@ function DataTable() {
                                                 row.lastName
                                             )}
                                         </TableCell>
-                                        <TableCell sx={{ textAlign: 'center', padding: '4px', backgroundColor: editedRows[row.id]?.firstName !== undefined ? 'lightyellow' : (confirmedEdits[row.id]?.firstName !== undefined ? 'lightgray' : 'inherit') }}>
+                                        <TableCell sx={{ textAlign: 'center', padding: '4px', backgroundColor: confirmedEdits[row.id]?.firstName ? 'lightgray' : (editedRows[row.id]?.firstName ? 'yellow' : 'inherit') }}>
                                             {editMode ? (
                                                 <TextField
-                                                    value={editedRows[row.id]?.firstName !== undefined ? editedRows[row.id]?.firstName : row.firstName}
+                                                    value={editedRows[row.id]?.firstName || row.firstName}
                                                     onChange={(e) => handleCellEdit(row.id, 'firstName', e.target.value)}
                                                     variant="outlined"
                                                     size="small"
@@ -414,10 +426,10 @@ function DataTable() {
                                                 row.firstName
                                             )}
                                         </TableCell>
-                                        <TableCell sx={{ textAlign: 'center', padding: '4px', backgroundColor: editedRows[row.id]?.organization !== undefined ? 'lightyellow' : (confirmedEdits[row.id]?.organization !== undefined ? 'lightgray' : 'inherit') }}>
+                                        <TableCell sx={{ textAlign: 'center', padding: '4px', backgroundColor: confirmedEdits[row.id]?.organization ? 'lightgray' : (editedRows[row.id]?.organization ? 'yellow' : 'inherit') }}>
                                             {editMode ? (
                                                 <TextField
-                                                    value={editedRows[row.id]?.organization !== undefined ? editedRows[row.id]?.organization : row.organization}
+                                                    value={editedRows[row.id]?.organization || row.organization}
                                                     onChange={(e) => handleCellEdit(row.id, 'organization', e.target.value)}
                                                     variant="outlined"
                                                     size="small"
@@ -427,10 +439,10 @@ function DataTable() {
                                                 row.organization
                                             )}
                                         </TableCell>
-                                        <TableCell sx={{ textAlign: 'center', padding: '4px', backgroundColor: editedRows[row.id]?.department !== undefined ? 'lightyellow' : (confirmedEdits[row.id]?.department !== undefined ? 'lightgray' : 'inherit') }}>
+                                        <TableCell sx={{ textAlign: 'center', padding: '4px', backgroundColor: confirmedEdits[row.id]?.department ? 'lightgray' : (editedRows[row.id]?.department ? 'yellow' : 'inherit') }}>
                                             {editMode ? (
                                                 <TextField
-                                                    value={editedRows[row.id]?.department !== undefined ? editedRows[row.id]?.department : row.department}
+                                                    value={editedRows[row.id]?.department || row.department}
                                                     onChange={(e) => handleCellEdit(row.id, 'department', e.target.value)}
                                                     variant="outlined"
                                                     size="small"
@@ -440,10 +452,10 @@ function DataTable() {
                                                 row.department
                                             )}
                                         </TableCell>
-                                        <TableCell sx={{ textAlign: 'center', padding: '4px', backgroundColor: editedRows[row.id]?.role !== undefined ? 'lightyellow' : (confirmedEdits[row.id]?.role !== undefined ? 'lightgray' : 'inherit') }}>
+                                        <TableCell sx={{ textAlign: 'center', padding: '4px', backgroundColor: confirmedEdits[row.id]?.role ? 'lightgray' : (editedRows[row.id]?.role ? 'yellow' : 'inherit') }}>
                                             {editMode ? (
                                                 <TextField
-                                                    value={editedRows[row.id]?.role !== undefined ? editedRows[row.id]?.role : row.role}
+                                                    value={editedRows[row.id]?.role || row.role}
                                                     onChange={(e) => handleCellEdit(row.id, 'role', e.target.value)}
                                                     variant="outlined"
                                                     size="small"
@@ -455,6 +467,7 @@ function DataTable() {
                                         </TableCell>
                                     </TableRow>
                                 ))}
+                                {/* 空行を追加してページネーションの行数を維持 */}
                                 {showEmptyRows && emptyRows > 0 && (
                                     Array.from({ length: emptyRows }).map((_, index) => (
                                         <TableRow key={`empty-${index}`}>
@@ -468,9 +481,14 @@ function DataTable() {
                                 )}
                             </TableBody>
                         </Table>
+                        {/* テーブルフッター */}
+                        <Box sx={{ backgroundColor: 'secondary.light' }}>
+                            {/* テーブルフッターの内容があればここに追加 */}
+                        </Box>
                     </TableContainer>
                 </Box>
-                <Box sx={{ mt: 1, display: 'flex', justifyContent: 'center' }}>
+                {/* ページネーションの追加 */}
+                <Box sx={{ mt: 1, display: 'flex', justifyContent: 'center' }}> {/* mtで上マージンを追加 */}
                     <TablePagination
                         rowsPerPageOptions={[10, 15, 20]}
                         component="div"
@@ -483,6 +501,7 @@ function DataTable() {
                 </Box>
             </Grid>
 
+            {/* 編集モード終了確認のダイアログ */}
             <Dialog open={confirmDialogOpen} onClose={() => handleConfirmClose(false)}>
                 <DialogTitle>編集の確定</DialogTitle>
                 <DialogContent>
@@ -500,6 +519,7 @@ function DataTable() {
                 </DialogActions>
             </Dialog>
 
+            {/* 確定後のスナックバー */}
             <Snackbar open={snackbarOpen} autoHideDuration={3000} onClose={handleSnackbarClose}>
                 <Alert onClose={handleSnackbarClose} severity="success" sx={{ width: '100%' }}>
                     変更が確定されました！
