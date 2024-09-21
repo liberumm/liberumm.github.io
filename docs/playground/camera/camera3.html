@@ -87,7 +87,7 @@
         /* Modal content layout */
         .modal-content {
             background-color: white;
-            padding: 1px;
+            padding: 20px;
             border-radius: 10px;
             max-width: 90%;
             margin: 100px auto;
@@ -124,7 +124,22 @@
     <script type="text/babel" data-type="module">
         import * as React from 'react';
         import { createRoot } from 'react-dom';
-        import { Button, Switch, Typography, Modal, TextField, Container, Box } from '@mui/material';
+        import { 
+            Button, 
+            Switch, 
+            Typography, 
+            Modal, 
+            TextField, 
+            Container, 
+            Box, 
+            Select, 
+            MenuItem, 
+            InputLabel, 
+            FormControl, 
+            Checkbox, 
+            ListItemText, 
+            OutlinedInput 
+        } from '@mui/material';
 
         const { useEffect, useRef, useState } = React;
 
@@ -132,24 +147,66 @@
             const quaggaRef = useRef(null);
             const captureCanvasRef = useRef(null);
 
+            // バーコード読み取り結果
             const [result, setResult] = useState("***");
             const [totalScans, setTotalScans] = useState(0);
             const [errorMessage, setErrorMessage] = useState("");
             const [history, setHistory] = useState([]);
+
+            // モード管理
             const [singleMode, setSingleMode] = useState(false);
             const [isScanning, setIsScanning] = useState(false);
+
+            // モーダル管理
             const [modalOpen, setModalOpen] = useState(false);
             const [singleScanModalOpen, setSingleScanModalOpen] = useState(false);
             const [modalHistory, setModalHistory] = useState([]);
+
+            // 履歴検索
             const [searchTerm, setSearchTerm] = useState("");
             const [searchResults, setSearchResults] = useState([]);
+
+            // 詳細設定
             const [showAdvancedSettings, setShowAdvancedSettings] = useState(false);
-            const [cameraFacingMode, setCameraFacingMode] = useState("environment"); // Default is the back camera
+
+            // カメラ設定
+            const [cameraFacingMode, setCameraFacingMode] = useState("environment"); // 'environment' or 'user'
             const [isTorchOn, setIsTorchOn] = useState(false);
             const [currentStream, setCurrentStream] = useState(null);
 
+            // QuaggaJSの設定オプション
+            const [inputStreamOptions, setInputStreamOptions] = useState({
+                name: 'Live',
+                type: 'LiveStream',
+                constraints: {
+                    width: 640,
+                    height: 480,
+                    facingMode: 'environment'
+                },
+                area: { 
+                    top: "20%", 
+                    right: "20%",
+                    bottom: "20%", 
+                    left: "20%"
+                }
+            });
+
+            const [decoderOptions, setDecoderOptions] = useState({
+                readers: ['code_128_reader', 'ean_reader'],
+                multiple: false,
+                locate: true,
+                halfSample: true,
+                patchSize: 'medium'
+            });
+
+            const [otherOptions, setOtherOptions] = useState({
+                numOfWorkers: 4,
+                frequency: 10
+            });
+
+            // イベントリスナーの設定
             useEffect(() => {
-                // Event listener for barcode detection
+                // バーコード検出時の処理
                 const handleDetected = (result) => {
                     const barcodeValue = result.codeResult.code;
                     const timestamp = new Date().toLocaleString();
@@ -159,22 +216,12 @@
 
                     if (singleMode) {
                         setModalHistory([{ code: barcodeValue, timestamp }]);
-                        stopScanner(); // Stop the scanner in single mode
-                        setSingleScanModalOpen(true); // Show modal in single mode
+                        stopScanner(); // スキャナーを停止
+                        setSingleScanModalOpen(true); // モーダルを開く
                     }
                 };
 
-                Quagga.onDetected(handleDetected);
-
-                // Cleanup on unmount
-                return () => {
-                    Quagga.offDetected(handleDetected);
-                    Quagga.stop();
-                };
-            }, [singleMode]);
-
-            useEffect(() => {
-                // Event listener for processing frames (optional)
+                // フレーム処理時の描画
                 const handleProcessed = (result) => {
                     if (!result || typeof result !== "object" || !result.boxes) return;
                     const ctx = Quagga.canvas.ctx.overlay;
@@ -183,13 +230,70 @@
                     Quagga.ImageDebug.drawPath(result.box, { x: 0, y: 1 }, ctx, { color: "blue", lineWidth: 5 });
                 };
 
+                Quagga.onDetected(handleDetected);
                 Quagga.onProcessed(handleProcessed);
 
+                // クリーンアップ
                 return () => {
+                    Quagga.offDetected(handleDetected);
                     Quagga.offProcessed(handleProcessed);
+                    Quagga.stop();
                 };
-            }, []);
+            }, [singleMode]);
 
+            // スキャナーの初期化・開始
+            const startScanner = () => {
+                setErrorMessage("");
+                setIsScanning(true);
+
+                Quagga.init({
+                    inputStream: {
+                        name: inputStreamOptions.name,
+                        type: inputStreamOptions.type,
+                        target: quaggaRef.current,
+                        constraints: inputStreamOptions.constraints,
+                        area: inputStreamOptions.area
+                    },
+                    decoder: {
+                        readers: decoderOptions.readers,
+                        multiple: decoderOptions.multiple,
+                        locate: decoderOptions.locate,
+                        halfSample: decoderOptions.halfSample,
+                        patchSize: decoderOptions.patchSize
+                    },
+                    locate: decoderOptions.locate,
+                    numOfWorkers: otherOptions.numOfWorkers,
+                    frequency: otherOptions.frequency
+                }, (err) => {
+                    if (err) {
+                        setErrorMessage("初期化エラー: " + err.message);
+                        setIsScanning(false);
+                        return;
+                    }
+                    Quagga.start();
+
+                    // カメラストリームの取得
+                    const getStream = async () => {
+                        try {
+                            const stream = await Quagga.CameraAccess.getActiveStream();
+                            setCurrentStream(stream);
+                        } catch (error) {
+                            console.error("カメラストリーム取得エラー:", error);
+                            setErrorMessage("カメラストリームの取得に失敗しました。");
+                        }
+                    };
+                    getStream();
+                });
+            };
+
+            // スキャナーの停止
+            const stopScanner = () => {
+                Quagga.stop();
+                setIsScanning(false);
+                setIsTorchOn(false); // トーチをオフにする
+            };
+
+            // スキャナーの切り替え
             const toggleScanner = () => {
                 if (isScanning) {
                     stopScanner();
@@ -198,53 +302,12 @@
                 }
             };
 
-            const startScanner = () => {
-                setErrorMessage("");
-                setIsScanning(true);
-
-                Quagga.init({
-                    inputStream: {
-                        name: "Live",
-                        type: "LiveStream",
-                        target: quaggaRef.current,
-                        constraints: {
-                            facingMode: cameraFacingMode,
-                            // torch: isTorchOn // トーチはMediaStreamTrackで制御するため削除
-                        }
-                    },
-                    decoder: {
-                        readers: ["ean_reader"]
-                    }
-                }, (err) => {
-                    if (err) {
-                        setErrorMessage("初期化エラー: " + err.message);
-                        setIsScanning(false);
-                        return;
-                    }
-                    Quagga.start();
-                });
-
-                // Obtain the current stream for torch control
-                Quagga.onProcessed(() => {
-                    if (!currentStream) {
-                        const stream = Quagga.CameraAccess.getActiveStream();
-                        if (stream) {
-                            setCurrentStream(stream);
-                        }
-                    }
-                });
-            };
-
-            const stopScanner = () => {
-                Quagga.stop();
-                setIsScanning(false);
-                setIsTorchOn(false); // トーチをオフにする
-            };
-
+            // 履歴のリセット
             const resetHistory = () => {
                 setHistory([]);
             };
 
+            // モードの切り替え
             const handleToggle = () => {
                 setSingleMode(prev => {
                     const newMode = !prev;
@@ -259,6 +322,7 @@
                 });
             };
 
+            // モーダルの閉鎖
             const handleCloseModal = () => {
                 setModalOpen(false);
             };
@@ -270,11 +334,13 @@
                 }
             };
 
+            // 履歴モーダルの表示
             const handleHistoryClick = () => {
                 setModalHistory(history);
                 setModalOpen(true);
             };
 
+            // 履歴検索
             const handleSearch = () => {
                 const results = history.filter(item =>
                     item.code.includes(searchTerm) || item.timestamp.includes(searchTerm)
@@ -282,14 +348,23 @@
                 setSearchResults(results);
             };
 
+            // カメラの切り替え
             const switchCamera = () => {
                 setCameraFacingMode(prev => prev === "environment" ? "user" : "environment");
+                setInputStreamOptions(prev => ({
+                    ...prev,
+                    constraints: {
+                        ...prev.constraints,
+                        facingMode: prev.constraints.facingMode === "environment" ? "user" : "environment"
+                    }
+                }));
                 stopScanner();
                 if (!singleMode) {
                     startScanner();
                 }
             };
 
+            // トーチの切り替え
             const toggleTorch = () => {
                 if (navigator.userAgent.includes('iPhone') && navigator.userAgent.includes('Safari')) {
                     alert("iPhone Safariではライト機能はサポートされていません。");
@@ -318,8 +393,18 @@
                 }
             };
 
+            // 詳細設定の切り替え
             const toggleAdvancedSettings = () => {
                 setShowAdvancedSettings(prev => !prev);
+            };
+
+            // 詳細設定の適用
+            const applyAdvancedSettings = () => {
+                if (isScanning) {
+                    stopScanner();
+                    startScanner();
+                }
+                setShowAdvancedSettings(false);
             };
 
             return (
@@ -335,7 +420,7 @@
                     {/* 1行目のボタン (センター寄せ) */}
                     <Box className="button-row-center">
                         <Button variant="contained" color="default" onClick={switchCamera} style={{ marginRight: '10px' }} id="camera_switch_button">
-                            カメラ切替 ({cameraFacingMode === "environment" ? "アウト" : "イン"})
+                            カメラ切替 ({cameraFacingMode === "environment" ? "背面" : "前面"})
                         </Button>
                         <Button variant="contained" color={isScanning ? "secondary" : "primary"} onClick={toggleScanner} style={{ marginRight: '10px' }} id="scan_button">
                             {isScanning ? '停止' : '開始'}
@@ -355,10 +440,10 @@
                         </Box>
 
                         <Box className="button-row-right">
-                            <Button variant="contained" color="default" onClick={resetHistory} id="reset_button">
+                            <Button variant="contained" color="default" onClick={resetHistory} id="reset_button" style={{ marginRight: '10px' }}>
                                 履歴リセット
                             </Button>
-                            <Button variant="contained" color="default" onClick={toggleAdvancedSettings} style={{ marginRight: '10px' }} id="advanced_settings_button">
+                            <Button variant="contained" color="default" onClick={toggleAdvancedSettings} id="advanced_settings_button">
                                 {showAdvancedSettings ? '詳細設定を非表示' : '詳細設定'}
                             </Button>
                         </Box>
@@ -367,32 +452,241 @@
                     {showAdvancedSettings && (
                         <div className="advanced-settings" style={{ marginTop: '10px' }}>
                             <Typography variant="h6">詳細設定</Typography>
-                            <TextField
-                                label="入力タイプ"
-                                value="LiveStream"
-                                fullWidth
-                                disabled
-                            />
-                            <TextField
-                                label="パッチサイズ"
-                                value="medium"
-                                fullWidth
-                                disabled
-                            />
-                            <TextField
-                                label="キャプチャ頻度 (ms)"
-                                type="number"
-                                value="10"
-                                fullWidth
-                                disabled
-                            />
-                            <TextField
-                                label="ワーカーの数"
-                                type="number"
-                                value="4"
-                                fullWidth
-                                disabled
-                            />
+
+                            {/* InputStream Options */}
+                            <Box>
+                                <Typography variant="subtitle1">Input Stream Options</Typography>
+                                <FormControl fullWidth margin="normal">
+                                    <InputLabel id="facing-mode-label">カメラ方向</InputLabel>
+                                    <Select
+                                        labelId="facing-mode-label"
+                                        id="facing-mode-select"
+                                        value={inputStreamOptions.constraints.facingMode}
+                                        label="カメラ方向"
+                                        onChange={(e) => setInputStreamOptions(prev => ({
+                                            ...prev,
+                                            constraints: {
+                                                ...prev.constraints,
+                                                facingMode: e.target.value
+                                            }
+                                        }))}
+                                    >
+                                        <MenuItem value="environment">背面カメラ</MenuItem>
+                                        <MenuItem value="user">前面カメラ</MenuItem>
+                                    </Select>
+                                </FormControl>
+
+                                <TextField
+                                    label="幅 (px)"
+                                    type="number"
+                                    fullWidth
+                                    margin="normal"
+                                    value={inputStreamOptions.constraints.width}
+                                    onChange={(e) => setInputStreamOptions(prev => ({
+                                        ...prev,
+                                        constraints: {
+                                            ...prev.constraints,
+                                            width: parseInt(e.target.value)
+                                        }
+                                    }))}
+                                />
+                                <TextField
+                                    label="高さ (px)"
+                                    type="number"
+                                    fullWidth
+                                    margin="normal"
+                                    value={inputStreamOptions.constraints.height}
+                                    onChange={(e) => setInputStreamOptions(prev => ({
+                                        ...prev,
+                                        constraints: {
+                                            ...prev.constraints,
+                                            height: parseInt(e.target.value)
+                                        }
+                                    }))}
+                                />
+
+                                <Typography variant="body2" style={{ marginTop: '10px' }}>読み取りエリア (%):</Typography>
+                                <Box display="flex" justifyContent="space-between">
+                                    <TextField
+                                        label="Top"
+                                        type="number"
+                                        inputProps={{ min: 0, max: 100 }}
+                                        value={parseInt(inputStreamOptions.area.top)}
+                                        onChange={(e) => setInputStreamOptions(prev => ({
+                                            ...prev,
+                                            area: {
+                                                ...prev.area,
+                                                top: `${e.target.value}%`
+                                            }
+                                        }))}
+                                        style={{ width: '48%' }}
+                                    />
+                                    <TextField
+                                        label="Bottom"
+                                        type="number"
+                                        inputProps={{ min: 0, max: 100 }}
+                                        value={parseInt(inputStreamOptions.area.bottom)}
+                                        onChange={(e) => setInputStreamOptions(prev => ({
+                                            ...prev,
+                                            area: {
+                                                ...prev.area,
+                                                bottom: `${e.target.value}%`
+                                            }
+                                        }))}
+                                        style={{ width: '48%' }}
+                                    />
+                                </Box>
+                                <Box display="flex" justifyContent="space-between">
+                                    <TextField
+                                        label="Left"
+                                        type="number"
+                                        inputProps={{ min: 0, max: 100 }}
+                                        value={parseInt(inputStreamOptions.area.left)}
+                                        onChange={(e) => setInputStreamOptions(prev => ({
+                                            ...prev,
+                                            area: {
+                                                ...prev.area,
+                                                left: `${e.target.value}%`
+                                            }
+                                        }))}
+                                        style={{ width: '48%' }}
+                                    />
+                                    <TextField
+                                        label="Right"
+                                        type="number"
+                                        inputProps={{ min: 0, max: 100 }}
+                                        value={parseInt(inputStreamOptions.area.right)}
+                                        onChange={(e) => setInputStreamOptions(prev => ({
+                                            ...prev,
+                                            area: {
+                                                ...prev.area,
+                                                right: `${e.target.value}%`
+                                            }
+                                        }))}
+                                        style={{ width: '48%' }}
+                                    />
+                                </Box>
+                            </Box>
+
+                            {/* Decoder Options */}
+                            <Box>
+                                <Typography variant="subtitle1">Decoder Options</Typography>
+                                <FormControl fullWidth margin="normal">
+                                    <InputLabel id="readers-label">読み取りフォーマット</InputLabel>
+                                    <Select
+                                        labelId="readers-label"
+                                        id="readers-select"
+                                        multiple
+                                        value={decoderOptions.readers}
+                                        onChange={(e) => setDecoderOptions(prev => ({
+                                            ...prev,
+                                            readers: e.target.value
+                                        }))}
+                                        input={<OutlinedInput label="読み取りフォーマット" />}
+                                        renderValue={(selected) => selected.join(', ')}
+                                    >
+                                        {[
+                                            { label: 'Code 128', value: 'code_128_reader' },
+                                            { label: 'EAN-13', value: 'ean_reader' },
+                                            { label: 'EAN-8', value: 'ean_8_reader' },
+                                            { label: 'UPC-A', value: 'upc_reader' },
+                                            { label: 'Code 39', value: 'code_39_reader' },
+                                            { label: 'Codabar', value: 'codabar_reader' },
+                                            { label: 'Interleaved 2 of 5', value: 'interleaved_2of5_reader' },
+                                        ].map((option) => (
+                                            <MenuItem key={option.value} value={option.value}>
+                                                <Checkbox checked={decoderOptions.readers.indexOf(option.value) > -1} />
+                                                <ListItemText primary={option.label} />
+                                            </MenuItem>
+                                        ))}
+                                    </Select>
+                                </FormControl>
+
+                                <FormControl fullWidth margin="normal">
+                                    <InputLabel id="patch-size-label">パッチサイズ</InputLabel>
+                                    <Select
+                                        labelId="patch-size-label"
+                                        id="patch-size-select"
+                                        value={decoderOptions.patchSize}
+                                        label="パッチサイズ"
+                                        onChange={(e) => setDecoderOptions(prev => ({
+                                            ...prev,
+                                            patchSize: e.target.value
+                                        }))}
+                                    >
+                                        <MenuItem value="small">小</MenuItem>
+                                        <MenuItem value="medium">中</MenuItem>
+                                        <MenuItem value="large">大</MenuItem>
+                                    </Select>
+                                </FormControl>
+
+                                <FormControl fullWidth margin="normal">
+                                    <InputLabel id="half-sample-label">Half Sample</InputLabel>
+                                    <Switch
+                                        checked={decoderOptions.halfSample}
+                                        onChange={(e) => setDecoderOptions(prev => ({
+                                            ...prev,
+                                            halfSample: e.target.checked
+                                        }))}
+                                        id="half-sample-switch"
+                                    />
+                                </FormControl>
+
+                                <FormControl fullWidth margin="normal">
+                                    <InputLabel id="multiple-label">複数読み取り</InputLabel>
+                                    <Switch
+                                        checked={decoderOptions.multiple}
+                                        onChange={(e) => setDecoderOptions(prev => ({
+                                            ...prev,
+                                            multiple: e.target.checked
+                                        }))}
+                                        id="multiple-switch"
+                                    />
+                                </FormControl>
+
+                                <FormControl fullWidth margin="normal">
+                                    <InputLabel id="locate-label">自動位置検出</InputLabel>
+                                    <Switch
+                                        checked={decoderOptions.locate}
+                                        onChange={(e) => setDecoderOptions(prev => ({
+                                            ...prev,
+                                            locate: e.target.checked
+                                        }))}
+                                        id="locate-switch"
+                                    />
+                                </FormControl>
+                            </Box>
+
+                            {/* その他のオプション */}
+                            <Box>
+                                <Typography variant="subtitle1">その他のオプション</Typography>
+                                <TextField
+                                    label="ワーカーの数"
+                                    type="number"
+                                    fullWidth
+                                    margin="normal"
+                                    value={otherOptions.numOfWorkers}
+                                    onChange={(e) => setOtherOptions(prev => ({
+                                        ...prev,
+                                        numOfWorkers: parseInt(e.target.value)
+                                    }))}
+                                />
+                                <TextField
+                                    label="キャプチャ頻度 (フレーム/秒)"
+                                    type="number"
+                                    fullWidth
+                                    margin="normal"
+                                    value={otherOptions.frequency}
+                                    onChange={(e) => setOtherOptions(prev => ({
+                                        ...prev,
+                                        frequency: parseInt(e.target.value)
+                                    }))}
+                                />
+                            </Box>
+
+                            <Button variant="contained" color="primary" onClick={applyAdvancedSettings} id="apply_settings_button" style={{ marginTop: '10px' }}>
+                                設定を適用
+                            </Button>
                         </div>
                     )}
                     
@@ -424,6 +718,7 @@
                                 value={searchTerm} 
                                 onChange={e => setSearchTerm(e.target.value)} 
                                 id="search_box"
+                                margin="normal"
                             />
                             <Button onClick={handleSearch} variant="contained" color="primary" style={{ marginTop: '10px' }} id="search_button">検索</Button>
                             <div id="modal-history">
@@ -450,8 +745,12 @@
                         <Container className="modal-content">
                             <Typography id="single-scan-modal-title" variant="h6">バーコード認識結果</Typography>
                             <Typography>{result}</Typography>
-                            <Button onClick={handleSingleScanClose} variant="contained" color="primary" style={{ marginTop: '10px' }}>再スキャン</Button>
-                            <Button onClick={handleSingleScanClose} variant="contained" color="default" style={{ marginTop: '10px' }}>閉じる</Button>
+                            <Button onClick={handleSingleScanClose} variant="contained" color="primary" style={{ marginTop: '10px', marginRight: '10px' }}>
+                                再スキャン
+                            </Button>
+                            <Button onClick={handleSingleScanClose} variant="contained" color="default" style={{ marginTop: '10px' }}>
+                                閉じる
+                            </Button>
                         </Container>
                     </Modal>
                 </Container>
