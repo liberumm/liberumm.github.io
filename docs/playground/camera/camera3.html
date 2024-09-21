@@ -146,10 +146,47 @@
             const [showAdvancedSettings, setShowAdvancedSettings] = useState(false);
             const [cameraFacingMode, setCameraFacingMode] = useState("environment"); // Default is the back camera
             const [isTorchOn, setIsTorchOn] = useState(false);
+            const [currentStream, setCurrentStream] = useState(null);
 
             useEffect(() => {
+                // Event listener for barcode detection
+                const handleDetected = (result) => {
+                    const barcodeValue = result.codeResult.code;
+                    const timestamp = new Date().toLocaleString();
+                    setResult(barcodeValue);
+                    setTotalScans(prev => prev + 1);
+                    setHistory(prev => [...prev, { code: barcodeValue, timestamp }]);
+
+                    if (singleMode) {
+                        setModalHistory([{ code: barcodeValue, timestamp }]);
+                        stopScanner(); // Stop the scanner in single mode
+                        setSingleScanModalOpen(true); // Show modal in single mode
+                    }
+                };
+
+                Quagga.onDetected(handleDetected);
+
+                // Cleanup on unmount
                 return () => {
+                    Quagga.offDetected(handleDetected);
                     Quagga.stop();
+                };
+            }, [singleMode]);
+
+            useEffect(() => {
+                // Event listener for processing frames (optional)
+                const handleProcessed = (result) => {
+                    if (!result || typeof result !== "object" || !result.boxes) return;
+                    const ctx = Quagga.canvas.ctx.overlay;
+                    const canvas = Quagga.canvas.dom.overlay;
+                    ctx.clearRect(0, 0, parseInt(canvas.width), parseInt(canvas.height));
+                    Quagga.ImageDebug.drawPath(result.box, { x: 0, y: 1 }, ctx, { color: "blue", lineWidth: 5 });
+                };
+
+                Quagga.onProcessed(handleProcessed);
+
+                return () => {
+                    Quagga.offProcessed(handleProcessed);
                 };
             }, []);
 
@@ -172,7 +209,7 @@
                         target: quaggaRef.current,
                         constraints: {
                             facingMode: cameraFacingMode,
-                            torch: isTorchOn
+                            // torch: isTorchOn // トーチはMediaStreamTrackで制御するため削除
                         }
                     },
                     decoder: {
@@ -187,25 +224,13 @@
                     Quagga.start();
                 });
 
-                Quagga.onProcessed((result) => {
-                    if (!result || typeof result !== "object" || !result.boxes) return;
-                    const ctx = Quagga.canvas.ctx.overlay;
-                    const canvas = Quagga.canvas.dom.overlay;
-                    ctx.clearRect(0, 0, parseInt(canvas.width), parseInt(canvas.height));
-                    Quagga.ImageDebug.drawPath(result.box, { x: 0, y: 1 }, ctx, { color: "blue", lineWidth: 5 });
-                });
-
-                Quagga.onDetected((result) => {
-                    const barcodeValue = result.codeResult.code;
-                    const timestamp = new Date().toLocaleString();
-                    setResult(barcodeValue);
-                    setTotalScans(prev => prev + 1);
-                    setHistory(prev => [...prev, { code: barcodeValue, timestamp }]);
-
-                    if (singleMode) {
-                        setModalHistory([{ code: barcodeValue, timestamp }]);
-                        stopScanner(); // Stop the scanner in single mode
-                        setSingleScanModalOpen(true); // Show modal in single mode
+                // Obtain the current stream for torch control
+                Quagga.onProcessed(() => {
+                    if (!currentStream) {
+                        const stream = Quagga.CameraAccess.getActiveStream();
+                        if (stream) {
+                            setCurrentStream(stream);
+                        }
                     }
                 });
             };
@@ -213,6 +238,7 @@
             const stopScanner = () => {
                 Quagga.stop();
                 setIsScanning(false);
+                setIsTorchOn(false); // トーチをオフにする
             };
 
             const resetHistory = () => {
@@ -223,12 +249,10 @@
                 setSingleMode(prev => {
                     const newMode = !prev;
                     if (newMode) {
-                        // 単発モードの場合はスキャナーを停止してモーダルを開く
+                        // 単発モードに切り替える場合はスキャナーを停止
                         stopScanner();
-                        setSingleScanModalOpen(true);
                     } else {
-                        // 連続モードに切り替える際はスキャナーを再開
-                        setSingleScanModalOpen(false);
+                        // 連続モードに切り替える場合はスキャナーを開始
                         startScanner();
                     }
                     return newMode;
@@ -241,7 +265,9 @@
 
             const handleSingleScanClose = () => {
                 setSingleScanModalOpen(false);
-                startScanner(); // Restart the scanner when closing the single scan modal
+                if (!singleMode) {
+                    startScanner(); // 再スキャンモードの場合はスキャナーを開始
+                }
             };
 
             const handleHistoryClick = () => {
@@ -259,20 +285,35 @@
             const switchCamera = () => {
                 setCameraFacingMode(prev => prev === "environment" ? "user" : "environment");
                 stopScanner();
-                startScanner();
+                if (!singleMode) {
+                    startScanner();
+                }
             };
 
             const toggleTorch = () => {
                 if (navigator.userAgent.includes('iPhone') && navigator.userAgent.includes('Safari')) {
                     alert("iPhone Safariではライト機能はサポートされていません。");
                 } else {
-                    setIsTorchOn(prev => !prev);
                     if (currentStream) {
-                        currentStream.applyConstraints({
-                            advanced: [{ torch: !isTorchOn }]
-                        }).catch(err => {
-                            console.error("Error toggling torch: ", err);
+                        currentStream.getTracks().forEach(track => {
+                            if (track.kind === 'video') {
+                                const capabilities = track.getCapabilities();
+                                if (capabilities.torch) {
+                                    track.applyConstraints({
+                                        advanced: [{ torch: !isTorchOn }]
+                                    }).then(() => {
+                                        setIsTorchOn(prev => !prev);
+                                    }).catch(err => {
+                                        console.error("トーチの切り替えエラー: ", err);
+                                        setErrorMessage("トーチの切り替えに失敗しました。");
+                                    });
+                                } else {
+                                    alert("このデバイスではトーチ機能がサポートされていません。");
+                                }
+                            }
                         });
+                    } else {
+                        alert("カメラストリームが取得できませんでした。");
                     }
                 }
             };
@@ -297,7 +338,7 @@
                             カメラ切替 ({cameraFacingMode === "environment" ? "アウト" : "イン"})
                         </Button>
                         <Button variant="contained" color={isScanning ? "secondary" : "primary"} onClick={toggleScanner} style={{ marginRight: '10px' }} id="scan_button">
-                            {isScanning ? 'Stop' : 'Start'}
+                            {isScanning ? '停止' : '開始'}
                         </Button>
                         <Button variant="contained" color={isTorchOn ? "secondary" : "primary"} onClick={toggleTorch} id="torch_button">
                             ライト {isTorchOn ? "オフ" : "オン"}
