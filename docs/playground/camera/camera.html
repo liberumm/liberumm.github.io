@@ -1,168 +1,121 @@
 <!DOCTYPE html>
 <html lang="ja">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta charset="UTF-8"/>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
     <title>バーコードリーダー</title>
-    <style>
-        body {
-            display: flex;
-            flex-direction: column;
-            align-items: center;
-            justify-content: center;
-            height: 100vh;
-            margin: 0;
-            background-color: #f0f0f0;
-            overflow: hidden;
-        }
-        #scanArea {
-            position: relative;
-            width: calc(100% - 4px);
-            max-width: 600px;
-            height: 50vh;
-            border: 2px solid #333;
-        }
-        canvas {
-            width: 100%;
-            height: 100%;
-            position: absolute;
-            top: 0;
-            left: 0;
-        }
-        #controls {
-            display: flex;
-            justify-content: space-between;
-            width: calc(100% - 4px);
-            max-width: 600px;
-            margin-top: 10px;
-        }
-        #barcodeHistory {
-            width: 100%;
-            max-width: 600px;
-            height: 150px;
-            margin-top: 10px;
-            overflow-y: auto;
-            font-family: monospace;
-        }
-        .modal {
-            display: none;
-            position: fixed;
-            top: 0;
-            left: 0;
-            width: 100%;
-            height: 100%;
-            background-color: rgba(0, 0, 0, 0.8);
-            color: white;
-            padding: 20px;
-            overflow-y: auto;
-        }
-    </style>
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/quagga/0.12.1/quagga.min.js"></script>
+    <link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Roboto:300,400,500,700&display=swap"/>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/@mui/material/5.0.0-alpha.38/material-ui.min.css"/>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/react/17.0.2/umd/react.production.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/17.0.2/umd/react-dom.production.min.js"></script>
+    <script src="https://unpkg.com/@mui/material@5.0.0-alpha.38/umd/material-ui.production.min.js"></script>
+    <script src="https://unpkg.com/@ericblade/quagga2@1.7.4/dist/quagga.min.js"></script>
 </head>
 <body>
-    <h1>バーコードリーダー</h1>
-    <div id="scanArea">
-        <canvas id="canvas"></canvas>
-    </div>
-    <div id="controls">
-        <button id="startStopButton">スキャン開始</button>
-        <button id="toggleMode">連続読み取り</button>
-    </div>
-    <textarea id="barcodeHistory" readonly></textarea>
+    <div id="root"></div>
 
-    <div id="modal" class="modal">
-        <div>
-            <h2>履歴</h2>
-            <pre id="historyContent"></pre>
-            <button id="closeModal">閉じる</button>
-        </div>
-    </div>
+    <script type="text/babel">
+        const { useState, useEffect } = React;
+        const { Button, Container, Typography, TextField, Paper } = MaterialUI;
 
-    <script>
-        const canvas = document.getElementById('canvas');
-        const context = canvas.getContext('2d');
-        const startStopButton = document.getElementById('startStopButton');
-        const toggleModeButton = document.getElementById('toggleMode');
-        const barcodeHistory = document.getElementById('barcodeHistory');
-        const modal = document.getElementById('modal');
-        const historyContent = document.getElementById('historyContent');
-        const closeModal = document.getElementById('closeModal');
+        const BarcodeReader = () => {
+            const [scanning, setScanning] = useState(false);
+            const [continuousMode, setContinuousMode] = useState(true);
+            const [history, setHistory] = useState([]);
 
-        let scanning = false;
-        let continuousMode = true;
-        let videoStream;
-        let scanCount = 0;
-        let history = [];
+            useEffect(() => {
+                if (scanning) {
+                    Quagga.init({
+                        inputStream: {
+                            name: "Live",
+                            type: "LiveStream",
+                            target: document.getElementById("my_quagga"),
+                        },
+                        decoder: {
+                            readers: ["ean_reader"],
+                        },
+                    }, (err) => {
+                        if (err) {
+                            console.error(err);
+                            return;
+                        }
+                        console.log("Initialization finished!!");
+                        Quagga.start();
+                    });
 
-        function startScanner() {
-            Quagga.init({
-                inputStream: {
-                    name: "Live",
-                    type: "LiveStream",
-                    target: document.createElement('video'),
-                    constraints: {
-                        facingMode: "environment"
-                    },
-                },
-                decoder: {
-                    readers: ["ean_reader"], // 認識するバーコードのタイプ
-                },
-            }, (err) => {
-                if (err) {
-                    console.error(err);
-                    return;
+                    Quagga.onDetected(result => {
+                        const code = result.codeResult.code;
+                        const timestamp = new Date().toLocaleString();
+                        setHistory(prevHistory => [...prevHistory, `No.${prevHistory.length + 1}: ${code} (読み取り時刻: ${timestamp})`]);
+                        if (!continuousMode) {
+                            alert(`読み取ったバーコード: ${code}`);
+                            stopScanning();
+                        }
+                    });
+
+                    Quagga.onProcessed(result => {
+                        if (result && result.boxes) {
+                            const ctx = Quagga.canvas.ctx.overlay;
+                            ctx.clearRect(0, 0, ctx.canvas.width, ctx.canvas.height);
+                            result.boxes.forEach(box => {
+                                Quagga.ImageDebug.drawPath(box, { x: 0, y: 0 }, ctx, { color: "blue", lineWidth: 2 });
+                            });
+                        }
+                    });
+                } else {
+                    Quagga.stop();
                 }
-                Quagga.start();
-                scanning = true;
-                startStopButton.textContent = "スキャン停止";
-                Quagga.onProcessed(result => {
-                    if (result && result.boxes) {
-                        const ctx = Quagga.canvas.ctx.overlay;
-                        ctx.clearRect(0, 0, canvas.width, canvas.height);
-                        result.boxes.forEach(box => {
-                            Quagga.ImageDebug.drawPath(box, { x: 0, y: 0 }, ctx, { color: "blue", lineWidth: 2 });
-                        });
+
+                return () => {
+                    if (scanning) {
+                        Quagga.stop();
                     }
-                });
-                Quagga.onDetected(result => {
-                    const code = result.codeResult.code;
-                    scanCount++;
-                    history.push(`No.${scanCount}: ${code}`);
-                    barcodeHistory.value += `No.${scanCount}: ${code}\n`;
-                    if (!continuousMode) {
-                        alert(`読み取ったバーコード: ${code}`);
-                        stopScanning();
-                    }
-                });
-            });
-        }
+                };
+            }, [scanning]);
 
-        function stopScanning() {
-            scanning = false;
-            Quagga.stop();
-            startStopButton.textContent = "スキャン開始";
-        }
+            const startScanning = () => {
+                setScanning(true);
+            };
 
-        toggleModeButton.onclick = () => {
-            continuousMode = !continuousMode;
-            toggleModeButton.textContent = continuousMode ? "単発読み取り" : "連続読み取り";
-            barcodeHistory.value = '';
-            scanCount = 0;
+            const stopScanning = () => {
+                setScanning(false);
+            };
+
+            const toggleMode = () => {
+                setContinuousMode(!continuousMode);
+            };
+
+            return (
+                <Container>
+                    <Typography variant="h4" align="center" gutterBottom>
+                        QuaggaJS バーコードリーダー
+                    </Typography>
+                    <div id="my_quagga" style={{ width: '320px', height: '240px', position: 'relative', backgroundColor: 'silver' }}></div>
+                    <Paper style={{ padding: '10px', margin: '10px 0' }}>
+                        <Typography variant="h6">履歴</Typography>
+                        <TextField
+                            multiline
+                            rows={4}
+                            variant="outlined"
+                            fullWidth
+                            value={history.join('\n')}
+                            inputProps={{ readOnly: true }}
+                        />
+                    </Paper>
+                    <Button variant="contained" color="primary" onClick={startScanning} disabled={scanning}>
+                        スキャン開始
+                    </Button>
+                    <Button variant="contained" color="secondary" onClick={stopScanning} disabled={!scanning}>
+                        スキャン停止
+                    </Button>
+                    <Button variant="contained" onClick={toggleMode}>
+                        {continuousMode ? "単発読み取り" : "連続読み取り"}
+                    </Button>
+                </Container>
+            );
         };
 
-        startStopButton.onclick = () => {
-            scanning ? stopScanning() : startScanner();
-        };
-
-        barcodeHistory.addEventListener('click', () => {
-            historyContent.textContent = history.join('\n');
-            modal.style.display = 'block';
-        });
-
-        closeModal.onclick = () => modal.style.display = 'none';
-        window.onclick = (event) => {
-            if (event.target === modal) modal.style.display = 'none';
-        };
+        ReactDOM.render(<BarcodeReader />, document.getElementById("root"));
     </script>
 </body>
 </html>
