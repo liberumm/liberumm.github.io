@@ -70,11 +70,11 @@
             overflow-y: auto; 
             cursor: pointer;
             display: flex;
-            justify-content: space-between;
+            flex-direction: column;
+            padding-left: 0;
         }
-        /* Disable default list style and padding for the history list */
         #history ul {
-            list-style-type: none; /* Remove the bullet points */
+            list-style-type: none; /* Remove bullet points */
             padding-left: 0;
         }
         /* Modal history area with scrolling */
@@ -82,6 +82,7 @@
             max-height: 50vh;
             overflow-y: auto;
             padding: 10px;
+            text-align: left;
         }
         /* Modal content layout */
         .modal-content {
@@ -90,13 +91,23 @@
             border-radius: 10px;
             max-width: 90%;
             margin: 100px auto;
-            text-align: center;
         }
         /* Ensure that advanced settings fields are not overlapping */
         .advanced-settings {
             display: flex;
             flex-direction: column;
             gap: 10px;
+        }
+        /* Button alignment styles */
+        .button-row-center {
+            display: flex;
+            justify-content: center;
+            margin-top: 10px;
+        }
+        .button-row-right {
+            display: flex;
+            justify-content: flex-end;
+            margin-top: 10px;
         }
     </style>
 
@@ -118,22 +129,19 @@
             const captureCanvasRef = useRef(null);
 
             const [result, setResult] = useState("***");
+            const [totalScans, setTotalScans] = useState(0);
             const [errorMessage, setErrorMessage] = useState("");
             const [history, setHistory] = useState([]);
             const [singleMode, setSingleMode] = useState(false);
             const [isScanning, setIsScanning] = useState(false);
             const [modalOpen, setModalOpen] = useState(false);
+            const [singleScanModalOpen, setSingleScanModalOpen] = useState(false);
             const [modalHistory, setModalHistory] = useState([]);
             const [searchTerm, setSearchTerm] = useState("");
             const [searchResults, setSearchResults] = useState([]);
             const [showAdvancedSettings, setShowAdvancedSettings] = useState(false);
-            const [settings, setSettings] = useState({
-                inputStreamType: "LiveStream",
-                patchSize: "medium",
-                halfSample: true,
-                frequency: 10,
-                numOfWorkers: 4
-            });
+            const [cameraFacingMode, setCameraFacingMode] = useState("environment"); // Default is the back camera
+            const [isTorchOn, setIsTorchOn] = useState(false);
 
             useEffect(() => {
                 return () => {
@@ -156,21 +164,16 @@
                 Quagga.init({
                     inputStream: {
                         name: "Live",
-                        type: settings.inputStreamType,
+                        type: "LiveStream",
                         target: quaggaRef.current,
                         constraints: {
-                            facingMode: "environment"
+                            facingMode: cameraFacingMode, // Set the camera mode (environment or user)
+                            advanced: isTorchOn ? [{ torch: true }] : [] // Use torch if enabled
                         }
                     },
                     decoder: {
                         readers: ["ean_reader"]
-                    },
-                    locator: {
-                        patchSize: settings.patchSize,
-                        halfSample: settings.halfSample
-                    },
-                    frequency: settings.frequency,
-                    numOfWorkers: settings.numOfWorkers
+                    }
                 }, (err) => {
                     if (err) {
                         setErrorMessage("初期化エラー: " + err.message);
@@ -190,25 +193,16 @@
 
                 Quagga.onDetected((result) => {
                     const barcodeValue = result.codeResult.code;
-                    setResult(barcodeValue);
                     const timestamp = new Date().toLocaleString();
+                    setResult(barcodeValue);
+                    setTotalScans(prev => prev + 1);
                     setHistory(prev => [...prev, { code: barcodeValue, timestamp }]);
 
                     if (singleMode) {
-                        captureFrame();
                         setModalHistory([{ code: barcodeValue, timestamp }]);
-                        setModalOpen(true);
+                        setSingleScanModalOpen(true);
                         stopScanner();
                     }
-                });
-            };
-
-            const captureFrame = () => {
-                const video = quaggaRef.current.querySelector("video");
-                const canvas = captureCanvasRef.current;
-                const ctx = canvas.getContext("2d");
-                requestAnimationFrame(() => {
-                    ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
                 });
             };
 
@@ -218,16 +212,21 @@
             };
 
             const resetHistory = () => {
-                setHistory([]);
+                setHistory([]); // Reset history data
             };
 
             const handleToggle = () => {
                 setSingleMode(prev => !prev);
-                setModalOpen(false);
+                setSingleScanModalOpen(false);
             };
 
             const handleCloseModal = () => {
                 setModalOpen(false);
+            };
+
+            const handleSingleScanClose = () => {
+                setSingleScanModalOpen(false);
+                startScanner();  // Restart scanner after closing single scan modal
             };
 
             const handleHistoryClick = () => {
@@ -242,6 +241,18 @@
                 setSearchResults(results);
             };
 
+            const switchCamera = () => {
+                setCameraFacingMode(prev => prev === "environment" ? "user" : "environment");
+                stopScanner();
+                startScanner();
+            };
+
+            const toggleTorch = () => {
+                setIsTorchOn(prev => !prev);
+                stopScanner();
+                startScanner();
+            };
+
             const toggleAdvancedSettings = () => {
                 setShowAdvancedSettings(prev => !prev);
             };
@@ -251,56 +262,66 @@
                     <Typography variant="h6" id="title" style={{ marginBottom: '10px' }}>Img Barcode Reader</Typography>
                     <div id="my_quagga" ref={quaggaRef} onClick={toggleScanner}></div>
                     <canvas ref={captureCanvasRef} width="640" height="480" style={{ display: 'none' }}></canvas>
-                    <Typography variant="h6" id="result_display" style={{ marginTop: '10px' }}>{result}</Typography>
+                    <Typography variant="h6" id="result_display" style={{ marginTop: '10px' }}>
+                        認識数: {totalScans} 最後の認識結果: {result}
+                    </Typography>
                     {errorMessage && <Typography variant="body1" className="error" id="error_message">{errorMessage}</Typography>}
-                    <Box display="flex" alignItems="center" justifyContent="space-between" marginTop="10px">
-                        <Box display="flex" alignItems="center">
-                            <Button variant="contained" color={isScanning ? "secondary" : "primary"} onClick={toggleScanner} style={{ marginRight: '10px' }} id="scan_button">
-                                {isScanning ? 'Stop' : 'Start'}
-                            </Button>
-                            <Typography variant="body2" id="mode_label" style={{ display: 'inline', marginRight: '2px' }}>
-                                {singleMode ? '単発モード' : '連続モード'}
-                            </Typography>
-                            <Switch checked={singleMode} onChange={handleToggle} id="mode_switch" />
-                            <Button variant="contained" color="default" onClick={resetHistory} style={{ marginRight: '10px' }} id="reset_button">履歴リセット</Button>
-                        </Box>
-                        <Box>
-                        <Button variant="contained" color="default" onClick={toggleAdvancedSettings} id="advanced_settings_button">
+                    
+                    {/* 1行目のボタン (センター寄せ) */}
+                    <Box className="button-row-center">
+                        <Button variant="contained" color="default" onClick={switchCamera} style={{ marginRight: '10px' }} id="camera_switch_button">
+                            カメラ切替 ({cameraFacingMode === "environment" ? "アウト" : "イン"})
+                        </Button>
+                        <Button variant="contained" color={isScanning ? "secondary" : "primary"} onClick={toggleScanner} style={{ marginRight: '10px' }} id="scan_button">
+                            {isScanning ? 'Stop' : 'Start'}
+                        </Button>
+                        <Button variant="contained" color={isTorchOn ? "secondary" : "primary"} onClick={toggleTorch} id="torch_button">
+                            ライト {isTorchOn ? "オフ" : "オン"}
+                        </Button>
+                    </Box>
+
+                    {/* 2行目のボタン (右寄せ) */}
+                    <Box className="button-row-right">
+                        <Button variant="contained" color="default" onClick={resetHistory} id="reset_button">
+                            履歴リセット
+                        </Button>
+                        <Button variant="contained" color="default" onClick={toggleAdvancedSettings} style={{ marginRight: '10px' }} id="advanced_settings_button">
                             {showAdvancedSettings ? '詳細設定を非表示' : '詳細設定'}
                         </Button>
-                        </Box>
                     </Box>
+
                     {showAdvancedSettings && (
                         <div className="advanced-settings" style={{ marginTop: '10px' }}>
                             <Typography variant="h6">詳細設定</Typography>
                             <TextField
                                 label="入力タイプ"
-                                value={settings.inputStreamType}
-                                onChange={(e) => setSettings({ ...settings, inputStreamType: e.target.value })}
+                                value="LiveStream"
                                 fullWidth
+                                disabled
                             />
                             <TextField
                                 label="パッチサイズ"
-                                value={settings.patchSize}
-                                onChange={(e) => setSettings({ ...settings, patchSize: e.target.value })}
+                                value="medium"
                                 fullWidth
+                                disabled
                             />
                             <TextField
                                 label="キャプチャ頻度 (ms)"
                                 type="number"
-                                value={settings.frequency}
-                                onChange={(e) => setSettings({ ...settings, frequency: parseInt(e.target.value) })}
+                                value="10"
                                 fullWidth
+                                disabled
                             />
                             <TextField
                                 label="ワーカーの数"
                                 type="number"
-                                value={settings.numOfWorkers}
-                                onChange={(e) => setSettings({ ...settings, numOfWorkers: parseInt(e.target.value) })}
+                                value="4"
                                 fullWidth
+                                disabled
                             />
                         </div>
                     )}
+                    
                     <div id="history" onClick={handleHistoryClick}>
                         <Typography variant="h6" id="history_label">履歴</Typography>
                         <ul>
@@ -311,6 +332,8 @@
                             ))}
                         </ul>
                     </div>
+
+                    {/* 履歴検索モーダル */}
                     <Modal
                         open={modalOpen}
                         onClose={handleCloseModal}
@@ -330,7 +353,7 @@
                             />
                             <Button onClick={handleSearch} variant="contained" color="primary" style={{ marginTop: '10px' }} id="search_button">検索</Button>
                             <div id="modal-history">
-                                <ul>
+                                <ul style={{ paddingLeft: '0', textAlign: 'left' }}>
                                     {(searchResults.length > 0 ? searchResults : modalHistory).map((item, index) => (
                                         <li key={index} id={`modal_history_item_${index}`}>
                                             {index + 1}: {item.code} (時刻: {item.timestamp})
@@ -339,6 +362,21 @@
                                 </ul>
                             </div>
                             <Button onClick={handleCloseModal} variant="contained" color="primary" style={{ marginTop: '20px' }} id="close_button">閉じる</Button>
+                        </Container>
+                    </Modal>
+
+                    {/* 単発モードでのバーコード認識結果モーダル */}
+                    <Modal
+                        open={singleScanModalOpen}
+                        onClose={handleSingleScanClose}
+                        aria-labelledby="single-scan-modal-title"
+                        aria-describedby="single-scan-modal-description"
+                        id="single_scan_modal"
+                    >
+                        <Container className="modal-content">
+                            <Typography id="single-scan-modal-title" variant="h6">バーコード認識結果</Typography>
+                            <Typography>{result}</Typography>
+                            <Button onClick={handleSingleScanClose} variant="contained" color="primary" style={{ marginTop: '10px' }}>再スキャン</Button>
                         </Container>
                     </Modal>
                 </Container>
