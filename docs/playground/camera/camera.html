@@ -14,19 +14,28 @@
             margin: 0;
             background-color: #f0f0f0;
         }
-        video {
+        #scanArea {
+            position: relative;
             width: 100%;
             max-width: 600px;
-            border: 2px solid #333;
             height: 50vh; /* ビューポートの高さの50% */
+            overflow: hidden;
+            border: 2px solid #333;
         }
         canvas {
-            display: none;
+            width: 100%;
+            height: 100%;
+            position: absolute;
+            top: 0;
+            left: 0;
         }
         .overlay {
             position: absolute;
             border: 2px dashed #ff0000;
             display: none;
+            width: 100%;
+            height: 100%;
+            pointer-events: none; /* オーバーレイがマウスイベントを受け取らないように */
         }
         #controls {
             display: flex;
@@ -41,18 +50,25 @@
             height: 50px;
             margin-top: 10px;
         }
-        #result {
-            margin-top: 10px;
+        #scanningMessage {
+            position: absolute;
+            color: #fff;
+            background-color: rgba(0, 0, 0, 0.5);
+            padding: 10px;
+            top: 10px;
+            left: 10px;
+            border-radius: 5px;
+            display: none; /* 初期状態では非表示 */
         }
     </style>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/quagga/0.12.1/quagga.min.js"></script>
 </head>
 <body>
     <h1>バーコードリーダー</h1>
-    <div style="position: relative;">
-        <video id="video" autoplay></video>
+    <div id="scanArea">
         <canvas id="canvas"></canvas>
         <div id="overlay" class="overlay"></div>
+        <div id="scanningMessage">スキャン中...</div>
     </div>
     <div id="controls">
         <button id="toggleMode">連続読み取り</button>
@@ -63,8 +79,10 @@
     <p id="result"></p>
 
     <script>
-        const video = document.getElementById('video');
+        const canvas = document.getElementById('canvas');
+        const context = canvas.getContext('2d');
         const overlay = document.getElementById('overlay');
+        const scanningMessage = document.getElementById('scanningMessage');
         const startButton = document.getElementById('startButton');
         const stopButton = document.getElementById('stopButton');
         const toggleModeButton = document.getElementById('toggleMode');
@@ -72,46 +90,68 @@
 
         let scanning = false;
         let continuousMode = true;
+        let videoStream;
 
         function startScanner() {
-            Quagga.init({
-                inputStream: {
-                    name: "Live",
-                    type: "LiveStream",
-                    target: video,
-                },
-                decoder: {
-                    readers: ["ean_reader"] // JANコード用のリーダーを指定
-                }
-            }, (err) => {
-                if (err) {
+            navigator.mediaDevices.getUserMedia({ video: { facingMode: "environment" } })
+                .then((stream) => {
+                    videoStream = stream;
+                    const video = document.createElement('video');
+                    video.srcObject = stream;
+                    video.setAttribute('playsinline', true);
+                    video.play();
+                    requestAnimationFrame(() => draw(video));
+                })
+                .catch((err) => {
                     console.error(err);
-                    return;
-                }
-                Quagga.start();
-                requestAnimationFrame(tick);
-            });
+                });
         }
 
-        function tick() {
+        function draw(video) {
             if (scanning) {
-                Quagga.onDetected((data) => {
-                    const code = data.codeResult.code;
-                    overlay.style.display = 'block';
-                    // 認識領域の設定 (ここは仮の設定、適宜修正)
-                    overlay.style.left = '0px';
-                    overlay.style.top = '0px';
-                    overlay.style.width = '100%';
-                    overlay.style.height = '100%';
+                canvas.width = video.videoWidth;
+                canvas.height = video.videoHeight;
+                context.drawImage(video, 0, 0, canvas.width, canvas.height);
+                Quagga.decodeSingle({
+                    src: canvas.toDataURL(),
+                    decoder: {
+                        readers: ["ean_reader"] // JANコード用のリーダーを指定
+                    }
+                }, (data) => {
+                    if (data && data.codeResult) {
+                        const code = data.codeResult.code;
+                        overlay.style.display = 'block';
+                        
+                        // 認識領域の設定 (ここは仮の設定、適宜修正)
+                        overlay.style.left = '0px';
+                        overlay.style.top = '0px';
+                        overlay.style.width = '100%';
+                        overlay.style.height = '100%';
 
-                    if (continuousMode) {
-                        barcodeHistory.value = code; // 連続読み取りの場合、最新の値を表示
+                        if (continuousMode) {
+                            barcodeHistory.value = code; // 連続読み取りの場合、最新の値を表示
+                        } else {
+                            alert(`読み取ったバーコード: ${code}`); // 単発読み取りの場合、アラートで表示
+                            scanning = false; // スキャンを停止
+                            stopScanning(); // スキャンを停止
+                        }
                     } else {
-                        alert(`読み取ったバーコード: ${code}`); // 単発読み取りの場合、アラートで表示
+                        overlay.style.display = 'none';
                     }
                 });
             }
-            requestAnimationFrame(tick);
+            requestAnimationFrame(() => draw(video));
+        }
+
+        function stopScanning() {
+            scanning = false;
+            if (videoStream) {
+                videoStream.getTracks().forEach(track => track.stop());
+            }
+            scanningMessage.style.display = 'none'; // スキャン中メッセージを非表示
+            overlay.style.display = 'none'; // オーバーレイを非表示
+            startButton.disabled = false; // スキャン開始ボタンを有効にする
+            stopButton.disabled = true; // スキャン停止ボタンを無効にする
         }
 
         toggleModeButton.onclick = () => {
@@ -127,14 +167,11 @@
             stopButton.disabled = false;
             overlay.style.display = 'none';
             barcodeHistory.value = ''; // スキャン開始時に履歴をクリア
+            scanningMessage.style.display = 'block'; // スキャン中メッセージを表示
         };
 
         stopButton.onclick = () => {
-            scanning = false;
-            startButton.disabled = false;
-            stopButton.disabled = true;
-            overlay.style.display = 'none';
-            Quagga.stop(); // スキャンを停止
+            stopScanning();
         };
     </script>
 </body>
