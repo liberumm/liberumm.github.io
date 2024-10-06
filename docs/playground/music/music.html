@@ -1,0 +1,447 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>作曲アプリケーション</title>
+    <link rel="stylesheet" href="https://fonts.googleapis.com/icon?family=Material+Icons" />
+    <!-- React and ReactDOM from CDN -->
+    <script src="https://unpkg.com/react@16/umd/react.development.js" crossorigin></script>
+    <script src="https://unpkg.com/react-dom@16/umd/react-dom.development.js" crossorigin></script>
+    <!-- Babel -->
+    <script src="https://unpkg.com/@babel/standalone@7/babel.min.js"></script>
+    <!-- Material-UI v4 CSS and JS -->
+    <link rel="stylesheet" href="https://unpkg.com/@material-ui/core@4.12.4/umd/material-ui.min.css">
+    <script src="https://unpkg.com/@material-ui/core@4.12.4/umd/material-ui.development.js" crossorigin></script>
+    <!-- Tone.js -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/tone/14.8.35/Tone.min.js" crossorigin></script>
+    <!-- React Beautiful DnD -->
+    <script src="https://unpkg.com/react-beautiful-dnd@13.1.0/dist/react-beautiful-dnd.min.js"></script>
+</head>
+<body>
+    <div id="root"></div>
+    <script type="text/babel">
+        const { Button, Box, Slider, Typography, TextField, IconButton, Paper, Grid, Checkbox, FormControlLabel, MenuItem, Select, InputLabel, FormControl, List, ListItem, ListItemText, ListItemIcon } = MaterialUI;
+        const { useState, useEffect, useRef } = React;
+        const { DragDropContext, Droppable, Draggable } = window.ReactBeautifulDnd;
+
+        const styles = {
+            container: {
+                padding: 4,
+                textAlign: 'center',
+            },
+            volumeSlider: {
+                margin: 2,
+                width: '100%',
+            },
+            textField: {
+                margin: 2,
+                width: '100%',
+            },
+            bpmDisplay: {
+                margin: 2,
+                textAlign: 'center',
+            },
+            trackBox: {
+                marginBottom: 4,
+                padding: 2,
+                border: '1px solid #ccc',
+                borderRadius: 4,
+                width: '100%',
+            },
+            oscilloscope: {
+                margin: '20px auto',
+                width: '100%',
+                maxWidth: 600,
+                height: 200,
+                backgroundColor: '#000',
+            },
+            chordTile: {
+                padding: 8,
+                margin: 4,
+                border: '1px solid #ccc',
+                borderRadius: 4,
+                textAlign: 'center',
+                cursor: 'pointer',
+                userSelect: 'none',
+            },
+            measureContainer: {
+                display: 'flex',
+                flexDirection: 'row',
+                flexWrap: 'nowrap',
+                overflowX: 'auto',
+            },
+            trackOrderContainer: {
+                margin: 4,
+                padding: 2,
+                border: '1px solid #ccc',
+                borderRadius: 4,
+                textAlign: 'left',
+            },
+        };
+
+        // Initialize instruments outside the component
+        const synth = new Tone.Synth().toDestination();
+        const bass = new Tone.Synth({ oscillator: { type: "sine" } }).toDestination();
+
+        function App() {
+            const [volume, setVolume] = useState(0);
+            const [bpm, setBpm] = useState(120);
+            const [isPlaying, setIsPlaying] = useState(false);
+            const [tracks, setTracks] = useState([{
+                name: 'Intro', instrument: synth, measures: [{ chords: '' }], isSelected: true, trackType: 'Intro'
+            }, {
+                name: 'Verse (Aメロ)', instrument: synth, measures: [{ chords: '' }], isSelected: true, trackType: 'Verse'
+            }, {
+                name: 'Pre Chorus (Bメロ)', instrument: synth, measures: [{ chords: '' }], isSelected: true, trackType: 'Pre Chorus'
+            }, {
+                name: 'Chorus (サビ)', instrument: synth, measures: [{ chords: '' }], isSelected: true, trackType: 'Chorus'
+            }, {
+                name: 'Bridge (Cメロ)', instrument: synth, measures: [{ chords: '' }], isSelected: true, trackType: 'Bridge'
+            }, {
+                name: 'Outro', instrument: synth, measures: [{ chords: '' }], isSelected: true, trackType: 'Outro'
+            }]);
+            const [inputChords, setInputChords] = useState('');
+            const [trackOrder, setTrackOrder] = useState(['Intro', 'Verse', 'Pre Chorus', 'Chorus', 'Bridge', 'Outro']);
+            const canvasRef = useRef(null);
+            const analyser = useRef(null);
+
+            useEffect(() => {
+                if (!analyser.current) {
+                    analyser.current = new Tone.Analyser("waveform", 1024);
+                    Tone.Destination.connect(analyser.current);
+                }
+                Tone.Destination.volume.value = volume;
+                Tone.Transport.bpm.value = bpm;
+            }, [volume, bpm]);
+
+            useEffect(() => {
+                const canvas = canvasRef.current;
+                const ctx = canvas.getContext('2d');
+                let animationFrameId;
+
+                const drawOscilloscope = () => {
+                    animationFrameId = requestAnimationFrame(drawOscilloscope);
+                    const values = analyser.current.getValue();
+                    ctx.clearRect(0, 0, canvas.width, canvas.height);
+                    ctx.beginPath();
+                    ctx.lineWidth = 2;
+                    ctx.strokeStyle = '#00FF00';
+                    const sliceWidth = canvas.width / values.length;
+                    let x = 0;
+
+                    for (let i = 0; i < values.length; i++) {
+                        const v = (values[i] + 1) / 2;
+                        const y = v * canvas.height;
+
+                        if (i === 0) {
+                            ctx.moveTo(x, y);
+                        } else {
+                            ctx.lineTo(x, y);
+                        }
+
+                        x += sliceWidth;
+                    }
+
+                    ctx.lineTo(canvas.width, canvas.height / 2);
+                    ctx.stroke();
+                };
+
+                drawOscilloscope();
+
+                return () => cancelAnimationFrame(animationFrameId);
+            }, []);
+
+            // Play a note
+            const playNote = (note, instrument, time) => {
+                if (note) {
+                    instrument.triggerAttackRelease(note, '8n', time);
+                }
+            };
+
+            // Handle volume change
+            const handleVolumeChange = (event, newValue) => {
+                setVolume(newValue);
+            };
+
+            // Handle BPM change
+            const handleBpmChange = (event, newValue) => {
+                setBpm(newValue);
+            };
+
+            // Update track notes
+            const updateTrackNotes = (trackIndex, measureIndex, newChords) => {
+                setTracks(prevTracks => {
+                    const updatedTracks = [...prevTracks];
+                    updatedTracks[trackIndex].measures[measureIndex].chords = newChords;
+                    return updatedTracks;
+                });
+            };
+
+            // Add a measure
+            const addMeasure = (trackIndex) => {
+                setTracks(prevTracks => {
+                    const updatedTracks = [...prevTracks];
+                    updatedTracks[trackIndex].measures.push({ chords: '' });
+                    return updatedTracks;
+                });
+            };
+
+            // Remove a measure
+            const removeMeasure = (trackIndex, measureIndex) => {
+                setTracks(prevTracks => {
+                    const updatedTracks = [...prevTracks];
+                    updatedTracks[trackIndex].measures.splice(measureIndex, 1);
+                    return updatedTracks;
+                });
+            };
+
+            // Toggle track selection
+            const toggleTrackSelection = (trackIndex) => {
+                setTracks(prevTracks => {
+                    const updatedTracks = [...prevTracks];
+                    updatedTracks[trackIndex].isSelected = !updatedTracks[trackIndex].isSelected;
+                    return updatedTracks;
+                });
+            };
+
+            // Set track type
+            const setTrackType = (trackIndex, trackType) => {
+                setTracks(prevTracks => {
+                    const updatedTracks = [...prevTracks];
+                    updatedTracks[trackIndex].trackType = trackType;
+                    return updatedTracks;
+                });
+            };
+
+            // Update track name
+            const updateTrackName = (trackIndex, newName) => {
+                setTracks(prevTracks => {
+                    const updatedTracks = [...prevTracks];
+                    updatedTracks[trackIndex].name = newName;
+                    return updatedTracks;
+                });
+            };
+
+            // Add a track
+            const addTrack = () => {
+                setTracks(prevTracks => [...prevTracks, {
+                    name: `新しいトラック ${prevTracks.length + 1}`,
+                    instrument: synth,
+                    measures: [{ chords: '' }],
+                    isSelected: true,
+                    trackType: 'Custom'
+                }]);
+            };
+
+            // Play tracks in the order specified by trackOrder
+            const playTracks = () => {
+                Tone.Transport.cancel(); // Clear the schedule on play
+                let timeOffset = 0;
+                trackOrder.forEach((trackType) => {
+                    const track = tracks.find(t => t.trackType === trackType);
+                    if (track && track.isSelected) {
+                        track.measures.forEach((measure, measureIndex) => {
+                            const noteArray = measure.chords.split(' ');
+                            noteArray.forEach((note, noteIndex) => {
+                                if (note) {
+                                    Tone.Transport.scheduleOnce((time) => {
+                                        playNote(note, track.instrument, time);
+                                    }, timeOffset + (noteIndex * (60 / bpm)));
+                                }
+                            });
+                            timeOffset += 4 * (60 / bpm); // Increment time offset by one measure (4 beats)
+                        });
+                    }
+                });
+                Tone.Transport.start();
+            };
+
+            // Toggle play/stop
+            const togglePlay = () => {
+                if (isPlaying) {
+                    Tone.Transport.stop();
+                } else {
+                    playTracks();
+                }
+                setIsPlaying(!isPlaying);
+            };
+
+            // Handle chord input
+            const handleChordInput = (event) => {
+                setInputChords(event.target.value);
+            };
+
+            // Select a chord
+            const selectChord = (chord) => {
+                setInputChords((prevChords) => prevChords + ' ' + chord);
+                playNote(chord, synth, Tone.now());
+            };
+
+            // Handle track order change
+            const handleTrackOrderChange = (result) => {
+                if (!result.destination) return;
+                const items = Array.from(trackOrder);
+                const [reorderedItem] = items.splice(result.source.index, 1);
+                items.splice(result.destination.index, 0, reorderedItem);
+                setTrackOrder(items);
+            };
+
+            return (
+                <Box sx={{ ...styles.container, maxWidth: '100%', margin: '0 auto' }}>
+                    <Typography variant='h4' gutterBottom>作曲アプリケーション - 小節対応</Typography>
+                    <Box id='volume-control' sx={styles.volumeSlider}>
+                        <Typography gutterBottom>ボリューム調整</Typography>
+                        <Slider
+                            value={volume}
+                            min={-30}
+                            max={10}
+                            step={1}
+                            onChange={handleVolumeChange}
+                            aria-labelledby='volume-slider'
+                        />
+                    </Box>
+                    <Box id='bpm-control' sx={styles.volumeSlider}><Typography gutterBottom>BPM 調整</Typography>
+                        <Slider
+                            value={bpm}
+                            min={60}
+                            max={200}
+                            step={1}
+                            onChange={handleBpmChange}
+                            aria-labelledby='bpm-slider'
+                        />
+                        <Typography sx={styles.bpmDisplay}>現在のBPM: {bpm}</Typography>
+                    </Box>
+                    <Box id='play-control' sx={{ margin: 2 }}><Button
+                            variant='contained'
+                            color='primary'
+                            onClick={togglePlay}
+                        >
+                            {isPlaying ? '停止' : '再生'}
+                        </Button>
+                    </Box>
+                    <Paper id='oscilloscope-area' elevation={3} sx={styles.oscilloscope}>
+                        <canvas ref={canvasRef} width={600} height={200} />
+                    </Paper>
+                    <Box id='track-control' sx={{ margin: 4 }}><Button variant='contained' color='primary' onClick={addTrack} sx={{ marginRight: 2 }}>トラックを追加</Button>
+                        <Button variant='contained' color='secondary' onClick={() => removeTrack(tracks.length - 1)}>
+                            トラックを削除
+                        </Button>
+                    </Box>
+                    <Box id='chord-input'><TextField fullWidth
+                            value={inputChords}
+                            onChange={handleChordInput}
+                            label='コードを入力してください'
+                            variant='outlined'
+                            InputProps={{ readOnly: false }}
+                            sx={styles.textField}
+                            size='small'
+                        />
+                    </Box>
+                    <Grid id='chord-selection' container spacing={2} justifyContent='center'>
+                        {[6, 5, 4, 3, 2, 1].map((octave) => (
+                            <Grid container item key={octave} spacing={2} justifyContent='center'>
+                                {['C', 'D', 'E', 'F', 'G', 'A', 'B'].map((note) => (
+                                    <Grid item key={`${note}${octave}`}>
+                                        <Box
+                                            sx={styles.chordTile}
+                                            onClick={() => selectChord(`${note}${octave}`)}
+                                        >
+                                            {note}{octave}
+                                        </Box>
+                                    </Grid>
+                                ))}
+                            </Grid>
+                        ))}
+                    </Grid>
+                    {tracks.map((track, trackIndex) => (
+                        <Box id={`track-${trackIndex}`} key={trackIndex} sx={styles.trackBox}>
+                            <FormControlLabel
+                                control={
+                                    <Checkbox
+                                        checked={track.isSelected}
+                                        onChange={() => toggleTrackSelection(trackIndex)}
+                                    />
+                                }
+                                label={
+                                    <TextField
+                                        value={track.name}
+                                        onChange={(event) => updateTrackName(trackIndex, event.target.value)}
+                                        variant='outlined'
+                                        sx={{ marginRight: 2 }}
+                                        size='small'
+                                    />
+                                }
+                            />
+                            <FormControl sx={{ margin: 2, minWidth: 120 }}>
+                                <InputLabel id={`track-type-label-${trackIndex}`}>トラックタイプ</InputLabel>
+                                <Select
+                                    labelId={`track-type-label-${trackIndex}`}
+                                    value={track.trackType}
+                                    onChange={(event) => setTrackType(trackIndex, event.target.value)}
+                                    size='small'
+                                >
+                                    <MenuItem value={'Intro'}>Intro (イントロ)</MenuItem>
+                                    <MenuItem value={'Verse'}>Verse (Aメロ)</MenuItem>
+                                    <MenuItem value={'Pre Chorus'}>Pre Chorus (Bメロ)</MenuItem>
+                                    <MenuItem value={'Chorus'}>Chorus (サビ)</MenuItem>
+                                    <MenuItem value={'Bridge'}>Bridge (Cメロ)</MenuItem>
+                                    <MenuItem value={'Outro'}>Outro (アウトロ)</MenuItem>
+                                </Select>
+                            </FormControl>
+                            <Box sx={styles.measureContainer}>
+                                {track.measures.map((measure, measureIndex) => (
+                                    <Box key={measureIndex} sx={{ marginRight: 2 }}>
+                                        <TextField
+                                            label={`小節${measureIndex + 1}のコード進行`}
+                                            variant='outlined'
+                                            value={measure.chords}
+                                            onChange={(event) => updateTrackNotes(trackIndex, measureIndex, event.target.value)}
+                                            sx={styles.textField}
+                                            size='small'
+                                        />
+                                    </Box>
+                                ))}
+                            </Box>
+                            <Box sx={{ display: 'flex', justifyContent: 'center', marginTop: 2 }}>
+                                <IconButton onClick={() => addMeasure(trackIndex)}>
+                                    <span className='material-icons'>add_circle</span>
+                                </IconButton>
+                                <IconButton onClick={() => removeMeasure(trackIndex, track.measures.length - 1)}>
+                                    <span className='material-icons'>remove_circle</span>
+                                </IconButton>
+                            </Box>
+                        </Box>
+                    ))}
+                    <Box id='track-order-control' sx={styles.trackOrderContainer}>
+                        <Typography gutterBottom>再生順を変更してください</Typography>
+                        <DragDropContext onDragEnd={handleTrackOrderChange}>
+                            <Droppable droppableId="trackOrder">
+                                {(provided) => (
+                                    <List {...provided.droppableProps} ref={provided.innerRef}>
+                                        {trackOrder.map((trackType, index) => (
+                                            <Draggable key={trackType} draggableId={trackType} index={index}>
+                                                {(provided) => (
+                                                    <ListItem ref={provided.innerRef} {...provided.draggableProps} {...provided.dragHandleProps}>
+                                                        <ListItemIcon>
+                                                            <span className="material-icons">drag_handle</span>
+                                                        </ListItemIcon>
+                                                        <ListItemText primary={trackType} />
+                                                    </ListItem>
+                                                )}
+                                            </Draggable>
+                                        ))}
+                                        {provided.placeholder}
+                                    </List>
+                                )}
+                            </Droppable>
+                        </DragDropContext>
+                    </Box>
+                </Box>
+            );
+        }
+
+        ReactDOM.render(<App />, document.getElementById('root'));
+    </script>
+</body>
+</html>
