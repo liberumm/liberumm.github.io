@@ -92,6 +92,7 @@ const Filter = () => {
                         value={year}
                         onChange={(e) => setYear(e.target.value)}
                         fullWidth
+                        size="small"
                     >
                         {years.map(year => (
                             <MenuItem key={year} value={year}>{year}</MenuItem>
@@ -107,6 +108,7 @@ const Filter = () => {
                         value={month}
                         onChange={handleMonthChange}
                         fullWidth
+                        size="small"
                     >
                         {months.map(month => (
                             <MenuItem key={month} value={month}>{month}</MenuItem>
@@ -122,6 +124,7 @@ const Filter = () => {
                         value={weekNumber}
                         onChange={(e) => setWeekNumber(e.target.value)}
                         fullWidth
+                        size="small"
                     >
                         {weeks.map(week => (
                             <MenuItem key={week} value={week}>{week}</MenuItem>
@@ -138,6 +141,7 @@ const Filter = () => {
                         onChange={(e) => setStartDate(e.target.value)}
                         InputLabelProps={{ shrink: true }}
                         fullWidth
+                        size="small"
                     />
                 </Grid>
 
@@ -150,6 +154,7 @@ const Filter = () => {
                         onChange={(e) => setEndDate(e.target.value)}
                         InputLabelProps={{ shrink: true }}
                         fullWidth
+                        size="small"
                     />
                 </Grid>
 
@@ -161,6 +166,7 @@ const Filter = () => {
                         value={location}
                         onChange={(e) => setLocation(e.target.value)}
                         fullWidth
+                        size="small"
                     >
                         {locations.map(loc => (
                             <MenuItem key={loc} value={loc}>{loc}</MenuItem>
@@ -176,6 +182,7 @@ const Filter = () => {
                         value={department}
                         onChange={(e) => setDepartment(e.target.value)}
                         fullWidth
+                        size="small"
                     >
                         {departments.map(dep => (
                             <MenuItem key={dep} value={dep}>{dep}</MenuItem>
@@ -185,7 +192,7 @@ const Filter = () => {
 
                 {/* 適用ボタン */}
                 <Grid item xs={12}>
-                    <Button variant="contained" color="primary" fullWidth>
+                    <Button variant="contained" color="primary" fullWidth size="small" >
                         適用
                     </Button>
                 </Grid>

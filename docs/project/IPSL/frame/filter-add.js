@@ -46,7 +46,7 @@ function FilterAdd() {
             </Box>
 
             <Collapse in={showFilters}>
-                <Grid container spacing={2} mt={2}>
+                <Grid container spacing={2} mt={1}>
                     {/* 時間軸 */}
                     <Grid item xs={6} sm={4} md={2}>
                         <TextField
@@ -55,6 +55,7 @@ function FilterAdd() {
                             value={year}
                             onChange={(e) => setYear(e.target.value)}
                             fullWidth
+                            size="small"
                         >
                             {years.map(y => (
                                 <MenuItem key={y} value={y}>{y}</MenuItem>
@@ -68,6 +69,7 @@ function FilterAdd() {
                             value={month}
                             onChange={(e) => setMonth(e.target.value)}
                             fullWidth
+                            size="small"
                         >
                             {months.map(m => (
                                 <MenuItem key={m} value={m}>{m}</MenuItem>
@@ -83,6 +85,7 @@ function FilterAdd() {
                             value={city}
                             onChange={(e) => setCity(e.target.value)}
                             fullWidth
+                            size="small"
                         >
                             {cities.map(c => (
                                 <MenuItem key={c} value={c}>{c}</MenuItem>
@@ -96,6 +99,7 @@ function FilterAdd() {
                             value={store}
                             onChange={(e) => setStore(e.target.value)}
                             fullWidth
+                            size="small"
                         >
                             {stores.map(s => (
                                 <MenuItem key={s} value={s}>{s}</MenuItem>
@@ -111,6 +115,7 @@ function FilterAdd() {
                             value={productCategory}
                             onChange={(e) => setProductCategory(e.target.value)}
                             fullWidth
+                            size="small"
                         >
                             {productCategories.map(pc => (
                                 <MenuItem key={pc} value={pc}>{pc}</MenuItem>
@@ -124,6 +129,7 @@ function FilterAdd() {
                             value={customerAge}
                             onChange={(e) => setCustomerAge(e.target.value)}
                             fullWidth
+                            size="small"
                         >
                             {customerAges.map(age => (
                                 <MenuItem key={age} value={age}>{age}</MenuItem>
@@ -139,6 +145,7 @@ function FilterAdd() {
                             value={sales}
                             onChange={(e) => setSales(e.target.value)}
                             fullWidth
+                            size="small"
                         />
                     </Grid>
                     <Grid item xs={6} sm={4} md={2}>
@@ -148,6 +155,7 @@ function FilterAdd() {
                             value={profitMargin}
                             onChange={(e) => setProfitMargin(e.target.value)}
                             fullWidth
+                            size="small"
                         />
                     </Grid>
 
@@ -159,6 +167,7 @@ function FilterAdd() {
                             value={weatherCondition}
                             onChange={(e) => setWeatherCondition(e.target.value)}
                             fullWidth
+                            size="small"
                         >
                             {weatherConditions.map(wc => (
                                 <MenuItem key={wc} value={wc}>{wc}</MenuItem>
@@ -174,6 +183,7 @@ function FilterAdd() {
                             value={customerBehavior}
                             onChange={(e) => setCustomerBehavior(e.target.value)}
                             fullWidth
+                            size="small"
                         >
                             {customerBehaviors.map(cb => (
                                 <MenuItem key={cb} value={cb}>{cb}</MenuItem>
@@ -188,6 +198,7 @@ function FilterAdd() {
                             color="primary"
                             onClick={applyFilters}
                             fullWidth
+                            size="small"
                         >
                             フィルタを適用
                         </Button>
