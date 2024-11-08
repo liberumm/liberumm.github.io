@@ -1,0 +1,507 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>クロス集計表をリストに戻す</title>
+    <!-- ReactとReactDOMをCDNから読み込む -->
+    <script src="https://cdn.jsdelivr.net/npm/react@18/umd/react.production.min.js" crossorigin></script>
+    <script src="https://cdn.jsdelivr.net/npm/react-dom@18/umd/react-dom.production.min.js" crossorigin></script>
+    <!-- Babel -->
+    <script src="https://cdn.jsdelivr.net/npm/@babel/standalone@7/babel.min.js"></script>
+    <!-- MUI CoreのCSS -->
+    <link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Roboto:300,400,500,700&display=swap" />
+    <link rel="stylesheet" href="https://fonts.googleapis.com/icon?family=Material+Icons" />
+    <!-- MUI CoreのJS -->
+    <script src="https://cdn.jsdelivr.net/npm/@mui/material@5.0.0/umd/material-ui.production.min.js" crossorigin></script>
+    <!-- Papaparse CDN for CSV parsing -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/PapaParse/5.3.0/papaparse.min.js"></script>
+    <!-- encoding-japanese CDN for Shift-JIS encoding -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/encoding-japanese/1.0.30/encoding.min.js"></script>
+    <style>
+        /* ドラッグアンドドロップ領域のスタイル */
+        .dropzone {
+            border: 2px dashed #cccccc;
+            border-radius: 10px;
+            padding: 20px;
+            text-align: center;
+            color: #cccccc;
+            transition: background-color 0.3s, border-color 0.3s;
+            cursor: pointer;
+        }
+
+        .dropzone.dragover {
+            background-color: #f0f0f0;
+            border-color: #000000;
+            color: #000000;
+        }
+
+        /* テーブルヘッダーの背景色 */
+        .custom-table-header {
+            background-color: #f5f5f5;
+        }
+
+        /* テーブルフッターの背景色 */
+        .custom-table-footer {
+            background-color: #e0e0e0;
+        }
+    </style>
+</head>
+<body>
+    <div id="root"></div>
+
+    <script type="text/babel">
+        const { useState, useEffect, useCallback } = React;
+        const { 
+            Button, Typography, Table, TableBody, TableCell, TableContainer, 
+            TableHead, TableRow, Paper, TextareaAutosize, FormControl, 
+            InputLabel, Select, MenuItem, Checkbox, FormControlLabel, TablePagination,
+            Tooltip, TextField
+        } = MaterialUI;
+
+        function CsvToTable() {
+            const [tableData, setTableData] = useState([]);
+            const [listData, setListData] = useState([]);
+            const [textData, setTextData] = useState("");
+            const [encoding, setEncoding] = useState("utf-8");
+            const [groupingKeys, setGroupingKeys] = useState([]);
+            const [file, setFile] = useState(null);
+            const [rowsPerPage, setRowsPerPage] = useState(20);
+            const [listRowsPerPage, setListRowsPerPage] = useState(20);
+            const [page, setPage] = useState(0);
+            const [listPage, setListPage] = useState(0);
+            const [errors, setErrors] = useState([]); // エラーハンドリング用
+            const [isDragOver, setIsDragOver] = useState(false); // ドラッグオーバーの状態
+            const [tableName, setTableName] = useState(""); // テーブル名
+
+            // ページネーションの範囲チェック
+            useEffect(() => {
+                if (page > Math.max(0, Math.ceil((tableData.length - 1) / rowsPerPage) - 1)) {
+                    setPage(Math.max(0, Math.ceil((tableData.length - 1) / rowsPerPage) - 1));
+                }
+                if (listPage > Math.max(0, Math.ceil(listData.length / listRowsPerPage) - 1)) {
+                    setListPage(Math.max(0, Math.ceil(listData.length / listRowsPerPage) - 1));
+                }
+            }, [tableData.length, listData.length, rowsPerPage, listRowsPerPage, page, listPage]);
+
+            const handleCsvUpload = (uploadedFile) => {
+                if (uploadedFile) {
+                    setFile(uploadedFile);
+                    // テーブル名をファイル名から設定
+                    const name = uploadedFile.name.replace(/\.[^/.]+$/, ""); // 拡張子を除去
+                    setTableName(name);
+                    parseCsvFile(uploadedFile, encoding);
+                }
+            };
+
+            const parseCsvFile = (file, encoding) => {
+                Papa.parse(file, {
+                    complete: (result) => {
+                        if (result.errors.length > 0) {
+                            const errorMessages = result.errors.map((error, index) => `${index + 1}. ${error.message}`);
+                            setErrors(errorMessages);
+                        } else {
+                            setTableData(result.data);
+                            setGroupingKeys(new Array(result.data[0].length).fill(false));
+                            setListData([]);
+                            setErrors([]);
+                            setPage(0);
+                            setListPage(0);
+                        }
+                    },
+                    header: false,
+                    encoding: encoding,
+                });
+            };
+
+            const handleTextChange = (event) => {
+                setTextData(event.target.value);
+            };
+
+            const handleTextSubmit = () => {
+                try {
+                    const rows = textData.split("\n").map(row => row.split(","));
+                    if (rows.length === 0 || rows[0].length === 0) {
+                        throw new Error("入力されたテキストが無効です。");
+                    }
+                    setTableData(rows);
+                    setGroupingKeys(new Array(rows[0].length).fill(false));
+                    setListData([]);
+                    setErrors([]);
+                    setPage(0);
+                    setListPage(0);
+                    setTableName("テキスト入力データ"); // テーブル名をデフォルト設定
+                } catch (e) {
+                    setErrors([e.message]);
+                }
+            };
+
+            const handleEncodingChange = (event) => {
+                const newEncoding = event.target.value;
+                setEncoding(newEncoding);
+                if (file) {
+                    parseCsvFile(file, newEncoding);
+                }
+            };
+
+            const handleGroupingKeyChange = (index) => {
+                const updatedGroupingKeys = [...groupingKeys];
+                updatedGroupingKeys[index] = !updatedGroupingKeys[index];
+                setGroupingKeys(updatedGroupingKeys);
+            };
+
+            const convertToList = () => {
+                if (tableData.length === 0) return;
+                const header = tableData[0];
+                const list = [];
+
+                for (let i = 1; i < tableData.length; i++) {
+                    const row = tableData[i];
+                    const keyValues = {};
+                    groupingKeys.forEach((isGrouping, index) => {
+                        if (isGrouping && index < row.length) {
+                            keyValues[header[index]] = row[index];
+                        }
+                    });
+                    // 各非グルーピング列について、labelとvalueを別々のフィールドとして追加
+                    for (let j = 0; j < row.length; j++) { // j を 0 から開始
+                        if (!groupingKeys[j]) {
+                            list.push({ 
+                                ...keyValues, 
+                                label: header[j], 
+                                value: row[j] 
+                            });
+                        }
+                    }
+                }
+                setListData(list);
+                setListPage(0); // リストページをリセット
+            };
+
+            const handleReset = () => {
+                setTableData([]);
+                setListData([]);
+                setTextData("");
+                setGroupingKeys([]);
+                setFile(null);
+                setErrors([]);
+                setPage(0);
+                setListPage(0);
+                setTableName("");
+                // ファイル入力フィールドもリセット
+                document.getElementById('fileInput').value = null;
+            };
+
+            const reConvertToList = () => {
+                convertToList();
+            };
+
+            const handleChangePage = (event, newPage) => {
+                setPage(newPage);
+            };
+
+            const handleChangeRowsPerPage = (event) => {
+                setRowsPerPage(parseInt(event.target.value, 10));
+                setPage(0);
+            };
+
+            const handleChangeListPage = (event, newPage) => {
+                setListPage(newPage);
+            };
+
+            const handleChangeListRowsPerPage = (event) => {
+                setListRowsPerPage(parseInt(event.target.value, 10));
+                setListPage(0);
+            };
+
+            // ドラッグアンドドロップのイベントハンドラー
+            const handleDragOver = (event) => {
+                event.preventDefault();
+                event.stopPropagation();
+                setIsDragOver(true);
+            };
+
+            const handleDragLeave = (event) => {
+                event.preventDefault();
+                event.stopPropagation();
+                setIsDragOver(false);
+            };
+
+            const handleDrop = (event) => {
+                event.preventDefault();
+                event.stopPropagation();
+                setIsDragOver(false);
+
+                const droppedFiles = event.dataTransfer.files;
+                if (droppedFiles && droppedFiles.length > 0) {
+                    handleCsvUpload(droppedFiles[0]);
+                    event.dataTransfer.clearData();
+                }
+            };
+
+            // CSVをリストデータから出力する関数（UTF-8とShift-JIS）
+            const exportListToCsv = (exportEncoding) => {
+                if (listData.length === 0) return;
+                let csv;
+                if (exportEncoding === 'shift-jis') {
+                    // Shift-JISにエンコード
+                    const utf8Csv = Papa.unparse(listData);
+                    const sjisBytes = Encoding.convert(utf8Csv, {
+                        to: 'SJIS',
+                        from: 'UNICODE',
+                        type: 'array'
+                    });
+                    csv = new Uint8Array(sjisBytes);
+                } else {
+                    // UTF-8エンコード
+                    csv = Papa.unparse(listData);
+                }
+
+                const blob = new Blob([csv], { type: exportEncoding === 'shift-jis' ? 'text/csv;charset=shift_jis;' : 'text/csv;charset=utf-8;' });
+                const url = URL.createObjectURL(blob);
+                const link = document.createElement("a");
+                link.setAttribute("href", url);
+                // 現在の日時を取得
+                const now = new Date();
+                const formattedDate = now.getFullYear() + 
+                                      String(now.getMonth() + 1).padStart(2, '0') + 
+                                      String(now.getDate()).padStart(2, '0') + "_" + 
+                                      String(now.getHours()).padStart(2, '0') + 
+                                      String(now.getMinutes()).padStart(2, '0') + 
+                                      String(now.getSeconds()).padStart(2, '0');
+                const encodingLabel = exportEncoding === 'shift-jis' ? 'shift_jis' : 'utf8';
+                const fileName = tableName ? `${tableName}_${formattedDate}_${encodingLabel}.csv` : `list_${formattedDate}_${encodingLabel}.csv`;
+                link.setAttribute("download", fileName);
+                link.style.visibility = 'hidden';
+                document.body.appendChild(link);
+                link.click();
+                document.body.removeChild(link);
+            };
+
+            const dropzoneStyle = {
+                margin: '10px 0',
+                padding: '20px',
+                border: '2px dashed #cccccc',
+                borderRadius: '10px',
+                textAlign: 'center',
+                color: '#cccccc',
+                transition: 'background-color 0.3s, border-color 0.3s',
+                cursor: 'pointer',
+                backgroundColor: isDragOver ? '#f0f0f0' : '#ffffff',
+                borderColor: isDragOver ? '#000000' : '#cccccc',
+                color: isDragOver ? '#000000' : '#cccccc',
+            };
+
+            return (
+                <div style={{ padding: '20px' }}>
+                    <Typography variant="h4" gutterBottom>
+                        クロス集計表をリストに戻す
+                    </Typography>
+
+                    {/* テーブル名の表示と入力 */}
+                    <div style={{ marginBottom: '20px' }}>
+                        <Typography variant="h6">テーブル名:</Typography>
+                        <TextField
+                            variant="outlined"
+                            value={tableName}
+                            onChange={(e) => setTableName(e.target.value)}
+                            placeholder="テーブル名を入力またはファイル名が設定されます"
+                            fullWidth
+                            disabled={file !== null} // ファイルがアップロードされている場合は手動入力を無効化
+                            style={{ marginTop: '10px' }}
+                        />
+                    </div>
+
+                    <FormControl variant="outlined" style={{ margin: '10px', minWidth: 120 }}>
+                        <InputLabel id="encoding-label">エンコーディング</InputLabel>
+                        <Select
+                            labelId="encoding-label"
+                            value={encoding}
+                            onChange={handleEncodingChange}
+                            label="エンコーディング"
+                        >
+                            <MenuItem value="utf-8">UTF-8</MenuItem>
+                            <MenuItem value="shift-jis">Shift-JIS</MenuItem>
+                            <MenuItem value="euc-jp">EUC-JP</MenuItem> {/* 追加: EUC-JP */}
+                        </Select>
+                    </FormControl>
+                    {/* ドラッグアンドドロップ領域 */}
+                    <div
+                        className={`dropzone ${isDragOver ? 'dragover' : ''}`}
+                        style={dropzoneStyle}
+                        onDragOver={handleDragOver}
+                        onDragLeave={handleDragLeave}
+                        onDrop={handleDrop}
+                        onClick={() => document.getElementById('fileInput').click()} // クリックでファイル選択ダイアログを開く
+                    >
+                        {isDragOver ? "ここにCSVファイルをドロップしてください" : "CSVファイルをドラッグ＆ドロップするか、クリックして選択してください"}
+                    </div>
+                    <input
+                        id="fileInput"
+                        type="file"
+                        accept=".csv"
+                        onChange={(e) => handleCsvUpload(e.target.files[0])}
+                        style={{ display: 'none' }} // 非表示にする
+                    />
+                    <TextareaAutosize
+                        minRows={5}
+                        placeholder="CSV形式のテキストを入力してください"
+                        value={textData}
+                        onChange={handleTextChange}
+                        style={{ width: '100%', marginTop: '10px' }}
+                    />
+                    <div style={{ margin: '10px 0', display: 'flex', flexWrap: 'wrap', gap: '10px' }}>
+                        <Button variant="contained" color="primary" onClick={handleTextSubmit}>
+                            テキストから表を作成
+                        </Button>
+                        <Button variant="contained" color="primary" onClick={convertToList}>
+                            リスト化
+                        </Button>
+                        <Button variant="contained" color="primary" onClick={reConvertToList}>
+                            再リスト化
+                        </Button>
+                        {/* CSV出力ボタンをUTF-8とShift-JISで分ける */}
+                        <Button variant="contained" color="success" onClick={() => exportListToCsv('utf-8')}>
+                            CSV出力 (UTF-8)
+                        </Button>
+                        <Button variant="contained" color="success" onClick={() => exportListToCsv('shift-jis')}>
+                            CSV出力 (Shift-JIS)
+                        </Button>
+                        <Button variant="contained" color="secondary" onClick={handleReset}>
+                            初期化
+                        </Button>
+                    </div>
+
+                    {errors.length > 0 && (
+                        <div style={{ margin: '10px' }}>
+                            <Typography color="error" variant="h6">
+                                エラー:
+                            </Typography>
+                            <ul>
+                                {errors.map((error, index) => (
+                                    <li key={index}>
+                                        <Typography color="error">{error}</Typography>
+                                    </li>
+                                ))}
+                            </ul>
+                        </div>
+                    )}
+
+                    {tableData.length > 0 && (
+                        <>
+                            <Typography variant="h6" style={{ marginTop: '20px' }}>
+                                テーブル: {tableName}
+                            </Typography>
+                            <TableContainer component={Paper} style={{ marginTop: '10px', width: '100%' }}>
+                                <Table size="small">
+                                    <TableHead className="custom-table-header">
+                                        <TableRow>
+                                            {tableData[0].map((header, index) => (
+                                                <TableCell key={index} style={{ padding: '4px' }}>
+                                                    <Tooltip title="この列をグルーピングキーとして使用します">
+                                                        <FormControlLabel
+                                                            control={
+                                                                <Checkbox
+                                                                    checked={groupingKeys[index]}
+                                                                    onChange={() => handleGroupingKeyChange(index)}
+                                                                    size="small"
+                                                                />
+                                                            }
+                                                            label={`${header} (グルーピング)`}
+                                                            style={{ margin: 0 }}
+                                                        />
+                                                    </Tooltip>
+                                                </TableCell>
+                                            ))}
+                                        </TableRow>
+                                    </TableHead>
+                                    <TableBody>
+                                        {tableData.slice(page * rowsPerPage + 1, page * rowsPerPage + 1 + rowsPerPage).map((row, rowIndex) => (
+                                            <TableRow key={rowIndex}>
+                                                {row.map((cell, cellIndex) => (
+                                                    <TableCell key={cellIndex} style={{ padding: '4px' }}>{cell}</TableCell>
+                                                ))}
+                                            </TableRow>
+                                        ))}
+                                    </TableBody>
+                                    {/* テーブルフッターを追加（オプション） */}
+                                    <TableRow className="custom-table-footer">
+                                        <TableCell colSpan={tableData[0].length} style={{ padding: '4px' }}>
+                                            {/* フッターに任意の内容を追加できます。例として総行数を表示 */}
+                                            総行数: {tableData.length - 1}
+                                        </TableCell>
+                                    </TableRow>
+                                </Table>
+                                <TablePagination
+                                    rowsPerPageOptions={[10, 20, 50, { label: '全て', value: -1 }]}
+                                    component="div"
+                                    count={tableData.length - 1}
+                                    rowsPerPage={rowsPerPage}
+                                    page={page}
+                                    onPageChange={handleChangePage}
+                                    onRowsPerPageChange={handleChangeRowsPerPage}
+                                />
+                            </TableContainer>
+                        </>
+                    )}
+
+                    {listData.length > 0 && (
+                        <>
+                            <Typography variant="h6" style={{ marginTop: '20px' }}>
+                                リスト化されたテーブル: {tableName}
+                            </Typography>
+                            <TableContainer component={Paper} style={{ marginTop: '10px', width: '100%' }}>
+                                <Table size="small">
+                                    <TableHead className="custom-table-header">
+                                        <TableRow>
+                                            {/* グルーピングキーのヘッダー */}
+                                            {tableData[0].filter((_, index) => groupingKeys[index]).map((header, index) => (
+                                                <TableCell key={`group-${index}`} style={{ padding: '4px' }}>{header}</TableCell>
+                                            ))}
+                                            {/* ラベルと値のヘッダー */}
+                                            <TableCell style={{ padding: '4px' }}>ラベル</TableCell>
+                                            <TableCell style={{ padding: '4px' }}>値</TableCell>
+                                        </TableRow>
+                                    </TableHead>
+                                    <TableBody>
+                                        {listData.slice(listPage * listRowsPerPage, listPage * listRowsPerPage + listRowsPerPage).map((item, rowIndex) => (
+                                            <TableRow key={rowIndex}>
+                                                {/* グルーピングキーの値 */}
+                                                {tableData[0].filter((_, index) => groupingKeys[index]).map((header, index) => (
+                                                    <TableCell key={`group-value-${index}`} style={{ padding: '4px' }}>{item[header]}</TableCell>
+                                                ))}
+                                                {/* ラベルと値 */}
+                                                <TableCell style={{ padding: '4px' }}>{item.label}</TableCell>
+                                                <TableCell style={{ padding: '4px' }}>{item.value}</TableCell>
+                                            </TableRow>
+                                        ))}
+                                    </TableBody>
+                                    {/* テーブルフッターを追加（オプション） */}
+                                    <TableRow className="custom-table-footer">
+                                        <TableCell colSpan={tableData[0].filter((_, index) => groupingKeys[index]).length + 2} style={{ padding: '4px' }}>
+                                            {/* フッターに任意の内容を追加できます。例として総行数を表示 */}
+                                            総行数: {listData.length}
+                                        </TableCell>
+                                    </TableRow>
+                                </Table>
+                                <TablePagination
+                                    rowsPerPageOptions={[10, 20, 50, { label: '全て', value: -1 }]}
+                                    component="div"
+                                    count={listData.length}
+                                    rowsPerPage={listRowsPerPage}
+                                    page={listPage}
+                                    onPageChange={handleChangeListPage}
+                                    onRowsPerPageChange={handleChangeListRowsPerPage}
+                                />
+                            </TableContainer>
+                        </>
+                    )}
+                </div>
+            );
+
+        }
+
+        ReactDOM.render(<CsvToTable />, document.getElementById('root'));
+    </script>
+</body>
+</html>
