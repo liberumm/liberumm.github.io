@@ -1,0 +1,1648 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <title>CSV操作ツール</title>
+<!-- React and ReactDOM -->
+<script src="https://cdn.jsdelivr.net/npm/react@18/umd/react.production.min.js"  crossorigin="anonymous"></script>
+<script src="https://cdn.jsdelivr.net/npm/react-dom@18/umd/react-dom.production.min.js"  crossorigin="anonymous"></script>
+<!-- MUI (Material-UI) v5 -->
+<script src="https://cdn.jsdelivr.net/npm/@mui/material@5.11.15/umd/material-ui.production.min.js"  crossorigin="anonymous"></script>
+<!-- Babel for JSX -->
+<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.21.0/babel.min.js"  crossorigin="anonymous"></script>
+<!-- Encoding.js for Shift_JIS support -->
+<script src="https://cdnjs.cloudflare.com/ajax/libs/encoding-japanese/1.0.30/encoding.min.js"  crossorigin="anonymous"></script>
+<!-- Emotion ライブラリ -->
+<script src="https://cdn.jsdelivr.net/npm/@emotion/react@11.11.0/dist/emotion-react.umd.min.js"  crossorigin="anonymous"></script>
+<script src="https://cdn.jsdelivr.net/npm/@emotion/styled@11.11.0/dist/emotion-styled.umd.min.js"  crossorigin="anonymous"></script>
+  <style>
+    .upload-area {
+      border: 2px dashed #ccc;
+      padding: 40px;
+      text-align: center;
+      color: #aaa;
+      margin-top: 20px;
+      cursor: pointer;
+      transition: border-color 0.3s, background-color 0.3s, color 0.3s;
+      position: relative;
+    }
+    .upload-area.drag-over {
+      border-color: #007bff;
+      background-color: #e9f5ff;
+      color: #007bff;
+    }
+    body {
+      margin: 0;
+      padding: 0;
+      font-family: Roboto, sans-serif;
+    }
+    .table-responsive {
+      width: 100%;
+      overflow-x: auto;
+    }
+    .no-wrap {
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .header-input {
+      width: 100%;
+      box-sizing: border-box;
+    }
+    .editing-cell {
+      background-color: #ffffcc;
+    }
+    .hidden-file-input {
+      display: none;
+    }
+    .checkbox-cell {
+      padding: 0;
+      text-align: center;
+      position: relative;
+      white-space: nowrap;
+    }
+    .dragging {
+      opacity: 0.5;
+    }
+    .header-actions {
+      display: flex;
+      gap: 5px;
+      margin-top: 5px;
+    }
+    .resize-handle {
+      position: absolute;
+      top: 0;
+      right: 0;
+      width: 15px;
+      height: 100%;
+      cursor: col-resize;
+      user-select: none;
+      z-index: 1;
+    }
+    .header-content {
+      position: relative;
+      height: 100%;
+      display: flex;
+      flex-direction: column;
+      justify-content: center;
+    }
+    .header-row {
+      background-color: #e0f7fa;
+    }
+    .header-text {
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+
+  <script type="text/babel" data-type="module">
+    const { useState, useEffect, useRef, useMemo } = React;
+    const {
+      Container,
+      Button,
+      TextField,
+      Table,
+      TableBody,
+      TableCell,
+      TableContainer,
+      TableHead,
+      TableRow,
+      Select,
+      MenuItem,
+      FormControl,
+      InputLabel,
+      Switch,
+      FormControlLabel,
+      Typography,
+      TablePagination,
+      TableSortLabel,
+      Tooltip,
+      IconButton,
+      Autocomplete,
+      Dialog,
+      DialogActions,
+      DialogContent,
+      DialogContentText,
+      DialogTitle,
+      Checkbox,
+      Snackbar,
+      CircularProgress,
+    } = MaterialUI;
+
+    // ユニークID生成のための関数
+    const generateUUID = () => {
+      // 簡易的なUUID生成
+      return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function(c) {
+        const r = Math.random() * 16 | 0, v = c === 'x' ? r : (r & 0x3 | 0x8);
+        return v.toString(16);
+      });
+    };
+
+    // Comparator関数の定義
+    function descendingComparator(a, b, orderByIndex) {
+      if (b.row[orderByIndex] < a.row[orderByIndex]) {
+        return -1;
+      }
+      if (b.row[orderByIndex] > a.row[orderByIndex]) {
+        return 1;
+      }
+      return 0;
+    }
+
+    function getComparator(order, orderByIndex) {
+      return order === 'desc'
+        ? (a, b) => descendingComparator(a, b, orderByIndex)
+        : (a, b) => -descendingComparator(a, b, orderByIndex);
+    }
+
+    function stableSort(array, comparator) {
+      const stabilizedThis = array.map((el, index) => [el, index]);
+      stabilizedThis.sort((a, b) => {
+        const cmp = comparator(a[0], b[0]);
+        if (cmp !== 0) return cmp;
+        return a[1] - b[1];
+      });
+      return stabilizedThis.map(el => el[0]);
+    }
+
+    // ヘッダーとデータのフィルタリングおよびソート処理を行う関数
+    const getFilteredAndSortedData = (csvData, useHeader, searchQuery, order, orderBy, page, rowsPerPage) => {
+      let data = useHeader ? csvData.slice(1) : csvData;
+      // フィルタリング
+      if (searchQuery.trim() !== '') {
+        const lowerCaseQuery = searchQuery.toLowerCase();
+        data = data.filter(item =>
+          item.row.some(cell => cell.toString().toLowerCase().includes(lowerCaseQuery))
+        );
+      }
+
+      const totalMatched = data.length; // フィルタリング後の総行数
+
+      // ソート
+      if (orderBy !== '') {
+        data = stableSort(data, getComparator(order, orderBy));
+      }
+
+      // ページネーション
+      if (rowsPerPage > 0) {
+        const start = page * rowsPerPage;
+        const end = start + rowsPerPage;
+        data = data.slice(start, end);
+      }
+
+      return { data, totalMatched };
+    };
+
+    // FileUploadコンポーネント（ドラッグ＆ドロップとファイル選択を統合）
+    const FileUpload = ({ onFileUpload, isDragOver, setIsDragOver }) => {
+      const fileInputRef = useRef(null);
+
+      const handleDragOver = (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        setIsDragOver(true);
+      };
+
+      const handleDragLeave = (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        setIsDragOver(false);
+      };
+
+      const handleDrop = (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        setIsDragOver(false);
+        const files = e.dataTransfer.files;
+        if (files && files.length > 0) {
+          onFileUpload(files[0]);
+        }
+      };
+
+      const handleClick = () => {
+        fileInputRef.current.click();
+      };
+
+      const handleChange = (e) => {
+        if (e.target.files && e.target.files.length > 0) {
+          onFileUpload(e.target.files[0]);
+        }
+      };
+
+      return (
+        <div
+          className={`upload-area ${isDragOver ? 'drag-over' : ''}`}
+          onDragOver={handleDragOver}
+          onDragLeave={handleDragLeave}
+          onDrop={handleDrop}
+          onClick={handleClick}
+        >
+          <Typography>
+            CSVファイルをドラッグ＆ドロップするか、クリックしてファイルを選択してください
+          </Typography>
+          <input
+            type="file"
+            accept=".csv"
+            ref={fileInputRef}
+            className="hidden-file-input"
+            onChange={handleChange}
+          />
+        </div>
+      );
+    };
+
+    // EncodingSelectorコンポーネント
+    const EncodingSelector = ({ label, value, onChange }) => (
+      <FormControl fullWidth margin="normal">
+        <InputLabel id={`${label.toLowerCase()}-encoding-label`}>{label}エンコード</InputLabel>
+        <Select
+          labelId={`${label.toLowerCase()}-encoding-label`}
+          value={value}
+          label={`${label}エンコード`}
+          onChange={onChange}
+        >
+          <MenuItem value="UTF-8">UTF-8</MenuItem>
+          <MenuItem value="Shift_JIS">Shift_JIS</MenuItem>
+        </Select>
+      </FormControl>
+    );
+
+    // HeaderToggleコンポーネント
+    const HeaderToggle = ({ useHeader, onToggle }) => (
+      <FormControlLabel
+        control={
+          <Switch
+            checked={useHeader}
+            onChange={onToggle}
+            color="primary"
+          />
+        }
+        label="1行目をヘッダーとして使用"
+        style={{ marginTop: '10px' }}
+      />
+    );
+
+    // SearchFieldコンポーネント
+    const SearchField = ({ searchQuery, onSearchChange }) => (
+      <FormControl fullWidth margin="normal">
+        <TextField
+          label="検索"
+          variant="outlined"
+          value={searchQuery}
+          onChange={onSearchChange}
+          placeholder="データを検索"
+        />
+      </FormControl>
+    );
+
+    // ActionButtonsコンポーネント（削除と追加のボタンを追加）
+    const ActionButtons = ({
+      onReset,
+      onUndo,
+      undoDisabled,
+      onRedo,
+      redoDisabled,
+      onToggleEdit,
+      isEditMode,
+      onDeleteRows,
+      onAddRow,
+      deleteDisabled,
+      addDisabled
+    }) => (
+      <div style={{ display: 'flex', gap: '10px', marginTop: '20px', flexWrap: 'wrap' }}>
+        <Button variant="contained" color="error" onClick={onReset}>
+          リセット
+        </Button>
+        <Button variant="outlined" onClick={onUndo} disabled={undoDisabled}>
+          Undo
+        </Button>
+        <Button variant="outlined" onClick={onRedo} disabled={redoDisabled}>
+          Redo
+        </Button>
+        <Button
+          variant="outlined"
+          onClick={onToggleEdit}
+        >
+          {isEditMode ? '参照モードに切替' : '編集モードに切替'}
+        </Button>
+        <Button
+          variant="outlined"
+          color="secondary"
+          onClick={onDeleteRows}
+          disabled={deleteDisabled}
+        >
+          選択した行を削除
+        </Button>
+        <Button
+          variant="outlined"
+          color="primary"
+          onClick={onAddRow}
+          disabled={addDisabled}
+        >
+          選択した行の下に行を追加
+        </Button>
+      </div>
+    );
+
+    // DownloadSectionコンポーネント
+    const DownloadSection = ({ onDownloadClick, downloadDialogOpen, downloadFileName, setDownloadFileName, onDownloadConfirm, onDownloadCancel }) => (
+      <React.Fragment>
+        {/* CSVダウンロードボタン */}
+        <div style={{ display: 'flex', justifyContent: 'flex-start', gap: '10px', marginTop: '20px' }}>
+          <Button
+            variant="contained"
+            color="primary"
+            onClick={onDownloadClick}
+          >
+            CSVダウンロード
+          </Button>
+        </div>
+
+        {/* ダウンロードダイアログ */}
+        <Dialog open={downloadDialogOpen} onClose={onDownloadCancel}>
+          <DialogTitle>CSVダウンロード</DialogTitle>
+          <DialogContent>
+            <DialogContentText>
+              ダウンロードするファイル名を指定してください。ファイル名には現在の日時が自動的に付加されます。
+            </DialogContentText>
+            <TextField
+              autoFocus
+              margin="dense"
+              label="ファイル名"
+              type="text"
+              fullWidth
+              variant="standard"
+              value={downloadFileName}
+              onChange={(e) => setDownloadFileName(e.target.value)}
+            />
+          </DialogContent>
+          <DialogActions>
+            <Button onClick={onDownloadCancel}>キャンセル</Button>
+            <Button onClick={onDownloadConfirm} color="primary">ダウンロード</Button>
+          </DialogActions>
+        </Dialog>
+      </React.Fragment>
+    );
+
+    // CsvTableコンポーネント
+    const CsvTable = ({
+      csvData,
+      modifiedHeaders,
+      columnWidths,
+      handleHeaderChange,
+      handleAddColumn,
+      handleDeleteColumn,
+      handleRequestSort,
+      order,
+      orderBy,
+      handleCellChange,
+      isEditMode,
+      editingCell,
+      setEditingCell,
+      handleMouseDown,
+      selectedColumns,
+      setSelectedColumns,
+      selectedRows,
+      setSelectedRows,
+      useHeader,
+      onAddRowAt,
+      onDeleteRowAt,
+      firstColumnWidth
+    }) => {
+      // ヘッダー選択候補
+      const headerOptions = [
+        "First Name",
+        "Middle Name",
+        "Last Name",
+        "E-mail Address"
+      ];
+
+      // 全列選択チェックボックスのハンドラー
+      const handleSelectAllColumnsChange = (e) => {
+        const checked = e.target.checked;
+        setSelectedColumns(selectedColumns.map(() => checked));
+      };
+
+      // 全行選択チェックボックスのハンドラー
+      const handleSelectAllRowsChange = (e) => {
+        const checked = e.target.checked;
+        if (checked) {
+          // 全ての表示行のidを選択
+          const allIds = csvData.map(item => item.id);
+          setSelectedRows([...new Set([...selectedRows, ...allIds])]);
+        } else {
+          // 表示行のidを選択から解除
+          const newSelected = selectedRows.filter(id => !csvData.some(item => item.id === id));
+          setSelectedRows(newSelected);
+        }
+      };
+
+      // 個別行選択のハンドラー
+      const handleRowSelectChange = (e, id) => {
+        const checked = e.target.checked;
+        if (checked) {
+          setSelectedRows([...selectedRows, id]);
+        } else {
+          setSelectedRows(selectedRows.filter(selectedId => selectedId !== id));
+        }
+      };
+
+      // ドラッグアンドドロップによる列順序の変更
+      const [draggedColumn, setDraggedColumn] = useState(null);
+
+      const handleDragStart = (e, index) => {
+        setDraggedColumn(index);
+        e.dataTransfer.effectAllowed = 'move';
+        // 列インデックスをデータ転送に設定
+        e.dataTransfer.setData('text/plain', index);
+      };
+
+      const handleDragOver = (e, index) => {
+        e.preventDefault();
+        e.dataTransfer.dropEffect = 'move';
+      };
+
+      const handleDrop = (e, index) => {
+        e.preventDefault();
+        const draggedIndex = parseInt(e.dataTransfer.getData('text/plain'), 10);
+        if (isNaN(draggedIndex) || draggedIndex === index) return;
+
+        const headers = [...modifiedHeaders];
+        const [movedHeader] = headers.splice(draggedIndex, 1);
+        headers.splice(index, 0, movedHeader);
+        handleHeaderChangeOrder(headers);
+
+        const widths = [...columnWidths];
+        const [movedWidth] = widths.splice(draggedIndex, 1);
+        widths.splice(index, 0, movedWidth);
+        handleColumnWidthsChange(widths);
+
+        const selectedCols = [...selectedColumns];
+        const [movedSelected] = selectedCols.splice(draggedIndex, 1);
+        selectedCols.splice(index, 0, movedSelected);
+        setSelectedColumns(selectedCols);
+
+        // データ行の列順序も変更
+        const updatedCsvData = csvData.map(item => {
+          const newRow = [...item.row];
+          const [movedCell] = newRow.splice(draggedIndex, 1);
+          newRow.splice(index, 0, movedCell);
+          return { ...item, row: newRow };
+        });
+        setCsvData(updatedCsvData);
+
+        setDraggedColumn(null);
+      };
+
+      return (
+        <React.Fragment>
+          <Typography variant="h5" gutterBottom style={{ marginTop: '30px' }}>CSVデータ</Typography>
+
+          <div className="table-responsive">
+            <TableContainer style={{ overflowX: 'auto' }}>
+              <Table size="small" style={{ tableLayout: 'fixed', width: '100%' }}>
+                <TableHead>
+                  {/* 新しい列選択用のヘッダー行 */}
+                  <TableRow className="header-row">
+                    {/* 全列選択チェックボックス */}
+                    <TableCell
+                      className="checkbox-cell no-wrap"
+                      style={{ width: firstColumnWidth }}
+                    >
+                      <Checkbox
+                        indeterminate={selectedColumns.some(c => c) && !selectedColumns.every(c => c)}
+                        checked={selectedColumns.length > 0 && selectedColumns.every(c => c)}
+                        onChange={handleSelectAllColumnsChange}
+                        color="primary"
+                        inputProps={{ 'aria-label': '全ての列を選択/解除' }}
+                      />
+                    </TableCell>
+                    {/* 各列の選択チェックボックス */}
+                    {modifiedHeaders.map((header, idx) => (
+                      <TableCell
+                        key={`column-select-${idx}`}
+                        className={`checkbox-cell no-wrap ${draggedColumn === idx ? 'dragging' : ''}`}
+                        style={{ width: columnWidths[idx], position: 'relative' }}
+                      >
+                        <Checkbox
+                          checked={selectedColumns[idx] || false}
+                          onChange={(e) => {
+                            const updated = [...selectedColumns];
+                            updated[idx] = e.target.checked;
+                            setSelectedColumns(updated);
+                          }}
+                          color="primary"
+                          inputProps={{ 'aria-label': `列${idx + 1}を選択` }}
+                        />
+                      </TableCell>
+                    ))}
+                    {/* 最後の列の後は空にする */}
+                    <TableCell key={`add-sort-last`} className="checkbox-cell no-wrap" style={{ position: 'relative', width: '150px' }}>
+                      {/* 空のセル */}
+                    </TableCell>
+                  </TableRow>
+                  {/* 既存のヘッダー行 */}
+                  <TableRow className="header-row">
+                    {/* 全行選択チェックボックス */}
+                    <TableCell
+                      className="checkbox-cell no-wrap"
+                      style={{ width: firstColumnWidth, position: 'relative' }}
+                    >
+                      <Checkbox
+                        indeterminate={selectedRows.length > 0 && selectedRows.length < csvData.length}
+                        checked={csvData.length > 0 && selectedRows.length === csvData.length}
+                        onChange={handleSelectAllRowsChange}
+                        color="primary"
+                        inputProps={{ 'aria-label': '全ての行を選択/解除' }}
+                      />
+                      {/* 列幅調整ハンドル */}
+                      <div
+                        className="resize-handle"
+                        onMouseDown={(e) => handleMouseDown(e, -1)} // -1を特別な値として使用
+                      />
+                    </TableCell>
+                    {/* 各列のヘッダー */}
+                    {modifiedHeaders.map((header, idx) => (
+                      <TableCell
+                        key={`header-${idx}`}
+                        className={`no-wrap ${draggedColumn === idx ? 'dragging' : ''}`}
+                        style={{ width: columnWidths[idx], position: 'relative' }}
+                        draggable
+                        onDragStart={(e) => handleDragStart(e, idx)}
+                        onDragOver={(e) => handleDragOver(e, idx)}
+                        onDrop={(e) => handleDrop(e, idx)}
+                      >
+                        <div className="header-content">
+                          <Tooltip
+                            title={header}
+                            arrow
+                            enterDelay={500}
+                          >
+                            <div>
+                              <Autocomplete
+                                freeSolo
+                                options={headerOptions}
+                                value={modifiedHeaders[idx] || ''}
+                                onChange={(event, newValue) => {
+                                  handleHeaderChange(idx, newValue || '');
+                                }}
+                                onInputChange={(event, newInputValue) => {
+                                  handleHeaderChange(idx, newInputValue);
+                                }}
+                                renderInput={(params) => (
+                                  <TextField
+                                    {...params}
+                                    className="header-input"
+                                    variant="standard"
+                                    label={`列${idx + 1}`}
+                                    InputProps={{
+                                      ...params.InputProps,
+                                      className: 'header-text',
+                                    }}
+                                  />
+                                )}
+                              />
+                            </div>
+                          </Tooltip>
+                          {/* ソートラベルの追加 */}
+                          <TableSortLabel
+                            active={orderBy === idx}
+                            direction={orderBy === idx ? order : 'asc'}
+                            onClick={() => handleRequestSort(idx)}
+                          />
+                          {/* 編集モードの時だけ列ヘッダーのアクションボタンを表示 */}
+                          {isEditMode && (
+                            <div className="header-actions">
+                              <Tooltip title={`列${idx + 1}の後に列を追加`}>
+                                <IconButton
+                                  size="small"
+                                  onClick={() => handleAddColumn(idx + 1)}
+                                  color="primary"
+                                  aria-label={`列${idx + 1}の後に列を追加`}
+                                >
+                                  ➕
+                                </IconButton>
+                              </Tooltip>
+                              <Tooltip title={`列${idx + 1}を削除`}>
+                                <IconButton
+                                  size="small"
+                                  onClick={() => handleDeleteColumn(idx)}
+                                  color="secondary"
+                                  aria-label={`列${idx + 1}を削除`}
+                                  disabled={modifiedHeaders.length <= 1}
+                                >
+                                  🗑️
+                                </IconButton>
+                              </Tooltip>
+                            </div>
+                          )}
+                        </div>
+                        {/* 列幅調整ハンドル */}
+                        <div
+                          className="resize-handle"
+                          onMouseDown={(e) => handleMouseDown(e, idx)}
+                        />
+                      </TableCell>
+                    ))}
+                    {/* 最後の列の後にも追加ボタンと削除ボタンを配置（既に各ヘッダーに配置済みなので空にする） */}
+                    <TableCell key={`add-sort-last-header`} className="no-wrap" style={{ width: '150px' }}>
+                      {/* 空のセル */}
+                    </TableCell>
+                  </TableRow>
+                </TableHead>
+                <TableBody>
+                  {csvData.map((item, rowIndex) => (
+                    <TableRow key={item.id}>
+                      {/* 行選択用チェックボックスと➕🗑️ボタンを同セルに配置 */}
+                      <TableCell
+                        className="checkbox-cell no-wrap"
+                        style={{ width: firstColumnWidth, display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '5px', position: 'relative' }}
+                      >
+                        <Checkbox
+                          checked={selectedRows.includes(item.id)}
+                          onChange={(e) => handleRowSelectChange(e, item.id)}
+                          color="primary"
+                          inputProps={{ 'aria-label': `行を選択` }}
+                        />
+                        {/* 編集モードの時だけ➕🗑️ボタンを表示 */}
+                        {isEditMode && (
+                          <React.Fragment>
+                            <Tooltip title={`この行の下に行を追加`}>
+                              <IconButton
+                                size="small"
+                                onClick={() => onAddRowAt(item.id)}
+                                color="primary"
+                                aria-label={`この行の下に行を追加`}
+                              >
+                                ➕
+                              </IconButton>
+                            </Tooltip>
+                            <Tooltip title={`この行を削除`}>
+                              <IconButton
+                                size="small"
+                                onClick={() => onDeleteRowAt(item.id)}
+                                color="secondary"
+                                aria-label={`この行を削除`}
+                                disabled={useHeader && item.id === 'header'}
+                              >
+                                🗑️
+                              </IconButton>
+                            </Tooltip>
+                          </React.Fragment>
+                        )}
+                      </TableCell>
+                      {/* 各セルのデータ */}
+                      {item.row.map((cell, cellIndex) => (
+                        <TableCell
+                          key={cellIndex}
+                          className={`no-wrap ${isEditMode && editingCell.rowId === item.id && editingCell.cellIndex === cellIndex ? 'editing-cell' : ''}`}
+                          style={{ width: columnWidths[cellIndex] }}
+                          onClick={() => {
+                            if (isEditMode) {
+                              setEditingCell({ rowId: item.id, cellIndex });
+                            }
+                          }}
+                        >
+                          {isEditMode && editingCell.rowId === item.id && editingCell.cellIndex === cellIndex ? (
+                            <TextField
+                              value={cell}
+                              onChange={(e) => handleCellChange(item.id, cellIndex, e.target.value)}
+                              variant="standard"
+                              autoFocus
+                              onBlur={() => setEditingCell({ rowId: null, cellIndex: null })}
+                              onKeyDown={(e) => {
+                                if (e.key === 'Enter') {
+                                  setEditingCell({ rowId: null, cellIndex: null });
+                                }
+                              }}
+                              fullWidth
+                            />
+                          ) : (
+                            <span>{cell}</span>
+                          )}
+                        </TableCell>
+                      ))}
+                    </TableRow>
+                  ))}
+                </TableBody>
+              </Table>
+            </TableContainer>
+          </div>
+        </React.Fragment>
+      );
+    };
+
+    const App = () => {
+      // 既存のステート宣言
+      const [csvData, setCsvData] = useState([]);
+      const [fileData, setFileData] = useState(null); // ファイルのArrayBufferを保持
+      const [inputEncoding, setInputEncoding] = useState('UTF-8');
+      const [outputEncoding, setOutputEncoding] = useState('UTF-8');
+      const [useHeader, setUseHeader] = useState(true);
+      const [isDragOver, setIsDragOver] = useState(false);
+      const [searchQuery, setSearchQuery] = useState(''); // 検索クエリの状態
+
+      // ページネーション用の状態
+      const [page, setPage] = useState(0);
+      const [rowsPerPage, setRowsPerPage] = useState(10); // デフォルトを10に設定
+
+      // ソート用の状態
+      const [order, setOrder] = useState('asc');
+      const [orderBy, setOrderBy] = useState('');
+
+      // ヘッダーの変更用の状態
+      const [modifiedHeaders, setModifiedHeaders] = useState([]);
+
+      // 列幅の状態
+      const [columnWidths, setColumnWidths] = useState([]);
+      const [firstColumnWidth, setFirstColumnWidth] = useState(150); // 追加
+
+      // 履歴管理
+      const [history, setHistory] = useState([]);
+      const [future, setFuture] = useState([]);
+
+      // 編集モードの状態
+      const [isEditMode, setIsEditMode] = useState(false);
+
+      // 編集中のセルを追跡する状態
+      const [editingCell, setEditingCell] = useState({
+        rowId: null,
+        cellIndex: null,
+      });
+
+      // 列幅調整用の状態を useRef に変更
+      const resizingRef = useRef({
+        columnIndex: null,
+        startX: 0,
+        startWidth: 0,
+      });
+
+      // ダイアログの状態
+      const [downloadDialogOpen, setDownloadDialogOpen] = useState(false);
+      const [downloadFileName, setDownloadFileName] = useState('');
+
+      // CSVダウンロード時に出力する列を管理するステート
+      const [selectedColumns, setSelectedColumns] = useState([]);
+
+      // 行選択用のステート
+      const [selectedRows, setSelectedRows] = useState([]);
+
+      // Snackbar用のステート
+      const [snackbarOpen, setSnackbarOpen] = useState(false);
+      const [snackbarMessage, setSnackbarMessage] = useState('');
+
+      // ローディングインジケーターの状態
+      const [isLoading, setIsLoading] = useState(false); // 追加
+
+      // CSVデータをデコードする関数
+      const decodeFileData = (arrayBuffer, encoding) => {
+        let decodedText = '';
+        if (encoding === 'Shift_JIS') {
+          const uint8Array = new Uint8Array(arrayBuffer);
+          decodedText = Encoding.convert(uint8Array, {
+            to: 'UNICODE',
+            from: 'SJIS',
+            type: 'string'
+          });
+        } else {
+          const decoder = new TextDecoder(encoding);
+          decodedText = decoder.decode(arrayBuffer);
+        }
+        const rows = decodedText.split(/\r\n|\n/).filter(row => row.trim() !== '').map(row => row.split(','));
+        return rows;
+      };
+
+      // CSVデータをエンコードする関数
+      const encodeCsvData = (data, encoding) => {
+        let encodedContent = '';
+        if (encoding === 'Shift_JIS') {
+          const unicodeString = data.map(row => row.join(',')).join('\n');
+          const encodedArray = Encoding.convert(unicodeString, {
+            to: 'SJIS',
+            from: 'UNICODE',
+            type: 'array'
+          });
+          return new Uint8Array(encodedArray);
+        } else {
+          // UTF-8の場合はBlobをそのまま使用
+          const utf8Encoder = new TextEncoder();
+          encodedContent = utf8Encoder.encode(data.map(row => row.join(',')).join('\n'));
+          return encodedContent;
+        }
+      };
+
+      // 操作前の状態を履歴に保存する関数
+      const pushToHistory = () => {
+        const currentState = {
+          csvData: JSON.parse(JSON.stringify(csvData)),
+          modifiedHeaders: [...modifiedHeaders],
+          columnWidths: [...columnWidths],
+          selectedColumns: [...selectedColumns],
+          selectedRows: [...selectedRows],
+          firstColumnWidth: firstColumnWidth // 追加
+        };
+        setHistory([...history, currentState]);
+        setFuture([]); // 新しい操作が行われたため、将来の操作はクリア
+      };
+
+      // ファイルアップロード処理
+      const handleFileUpload = (file) => {
+        if (file) {
+          setIsLoading(true); // ローディング開始
+          const reader = new FileReader();
+          reader.onload = (e) => {
+            const arrayBuffer = e.target.result;
+            setFileData(arrayBuffer); // ArrayBufferを保存
+            try {
+              const rows = decodeFileData(arrayBuffer, inputEncoding);
+              // 各行に一意のIDを付与
+              const dataWithId = rows.map((row, idx) => ({
+                id: useHeader && idx === 0 ? 'header' : generateUUID(),
+                row
+              }));
+              setCsvData(dataWithId);
+              // ヘッダーの初期化
+              initializeHeaders(dataWithId);
+              // ページネーションとソートをリセット
+              setPage(0);
+              setOrder('asc');
+              setOrderBy('');
+              // 検索クエリをリセット
+              setSearchQuery('');
+              // 履歴をリセット
+              setHistory([]);
+              setFuture([]);
+              // 列幅の調整は useEffect で自動的に行われる
+            } catch (error) {
+              alert('ファイルの読み込みに失敗しました。エンコーディングやファイル形式を確認してください。');
+              console.error('ファイルの読み込みエラー:', error);
+            } finally {
+              setIsLoading(false); // ローディング終了
+            }
+          };
+          reader.onerror = (e) => {
+            alert('ファイルの読み込み中にエラーが発生しました。');
+            console.error('ファイル読み込みエラー:', e);
+            setIsLoading(false); // ローディング終了
+          };
+          reader.readAsArrayBuffer(file);
+        }
+      };
+
+      // ヘッダーの初期化
+      const initializeHeaders = (data) => {
+        if (useHeader && data.length > 0 && data[0].id === 'header') {
+          setModifiedHeaders([...data[0].row]);
+          // selectedColumnsを全てtrueで初期化
+          setSelectedColumns(data[0].row.map(() => true));
+        } else if (data.length > 0) {
+          const syntheticHeaders = data[0].row.map((_, idx) => `列${idx + 1}`);
+          setModifiedHeaders(syntheticHeaders);
+          // selectedColumnsを全てtrueで初期化
+          setSelectedColumns(data[0].row.map(() => true));
+        } else {
+          setModifiedHeaders([]);
+          setSelectedColumns([]);
+        }
+
+        // 列幅の初期化はadjustColumnWidthsで行うため、ここでは設定しない
+      };
+
+      // エンコーディング変更時の処理
+      const handleEncodingChange = (encoding) => {
+        setInputEncoding(encoding);
+        if (fileData) {
+          setIsLoading(true); // ローディング開始
+          try {
+            const rows = decodeFileData(fileData, encoding);
+            // 各行に一意のIDを付与
+            const dataWithId = rows.map((row, idx) => ({
+              id: useHeader && idx === 0 ? 'header' : generateUUID(),
+              row
+            }));
+            setCsvData(dataWithId);
+            // ヘッダーの再初期化
+            initializeHeaders(dataWithId);
+            // ページネーションとソートをリセット
+            setPage(0);
+            setOrder('asc');
+            setOrderBy('');
+            // 検索クエリをリセット
+            setSearchQuery('');
+            // 履歴をリセット
+            setHistory([]);
+            setFuture([]);
+            // 列幅の調整は useEffect で自動的に行われる
+          } catch (error) {
+            alert('エンコーディングの変換に失敗しました。');
+            console.error('エンコーディング変換エラー:', error);
+          } finally {
+            setIsLoading(false); // ローディング終了
+          }
+        }
+      };
+
+      // CSVダウンロード処理
+      const handleDownload = async (filename) => {
+        // ファイル名が指定されていない場合、デフォルト名を使用
+        if (!filename) {
+          const now = new Date();
+          const pad = (num) => String(num).padStart(2, '0');
+          const formattedDate = `${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}_${pad(now.getHours())}${pad(now.getMinutes())}${pad(now.getSeconds())}`;
+          filename = `transformed_${formattedDate}.csv`;
+        }
+
+        let dataToDownload = [...csvData];
+        if (useHeader && dataToDownload.length > 0 && dataToDownload[0].id === 'header') {
+          // ヘッダーをmodifiedHeadersに置き換える
+          dataToDownload[0].row = [...modifiedHeaders];
+        }
+
+        // 選択された列のみを抽出
+        const selectedIndices = selectedColumns.map((selected, idx) => selected ? idx : null).filter(idx => idx !== null);
+        dataToDownload = dataToDownload.map(item => ({
+          id: item.id,
+          row: selectedIndices.map(idx => item.row[idx])
+        }));
+
+        // 選択された行のみを抽出
+        if (selectedRows.length > 0) {
+          dataToDownload = dataToDownload.filter(item => selectedRows.includes(item.id));
+        }
+
+        // エクスポートするデータを抽出
+        const exportData = dataToDownload.map(item => item.row);
+
+        const encodedContent = encodeCsvData(exportData, outputEncoding);
+        const blob = new Blob([encodedContent], { type: 'text/csv;charset=' + (outputEncoding === 'Shift_JIS' ? 'Shift_JIS' : 'UTF-8') });
+
+        if ('showSaveFilePicker' in window) {
+          try {
+            const options = {
+              suggestedName: filename,
+              types: [{
+                description: 'CSV Files',
+                accept: { 'text/csv': ['.csv'] },
+              }],
+            };
+            const handle = await window.showSaveFilePicker(options);
+            const writable = await handle.createWritable();
+            await writable.write(blob);
+            await writable.close();
+          } catch (err) {
+            console.error('ファイルの保存がキャンセルされました:', err);
+          }
+        } else {
+          // サポートされていない場合、従来の方法でダウンロード
+          const url = URL.createObjectURL(blob);
+          const a = document.createElement('a');
+          a.href = url;
+          a.download = filename;
+          a.click();
+          URL.revokeObjectURL(url);
+        }
+      };
+
+      // ダウンロードダイアログのハンドラー
+      const openDownloadDialog = () => {
+        // ダイアログを開く
+        setDownloadFileName(getDefaultFileName());
+        setDownloadDialogOpen(true);
+      };
+
+      const getDefaultFileName = () => {
+        const now = new Date();
+        const pad = (num) => String(num).padStart(2, '0');
+        const formattedDate = `${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}_${pad(now.getHours())}${pad(now.getMinutes())}${pad(now.getSeconds())}`;
+        return `transformed_${formattedDate}.csv`;
+      };
+
+      const handleDownloadConfirm = () => {
+        // ファイル名が空でないことを確認
+        if (downloadFileName.trim() === '') {
+          alert('ファイル名を入力してください。');
+          return;
+        }
+        // .csv 拡張子がない場合は追加
+        let filename = downloadFileName.trim();
+        if (!filename.toLowerCase().endsWith('.csv')) {
+          filename += '.csv';
+        }
+        handleDownload(filename);
+        setDownloadDialogOpen(false);
+      };
+
+      const handleDownloadCancel = () => {
+        setDownloadDialogOpen(false);
+      };
+
+      // CSVダウンロードボタンのクリック時の処理
+      const handleDownloadButtonClick = () => {
+        if ('showSaveFilePicker' in window) {
+          // File System Access API が利用可能な場合、直接ダウンロード
+          handleDownload();
+        } else {
+          // 利用できない場合、ファイル名を指定するダイアログを表示
+          openDownloadDialog();
+        }
+      };
+
+      // リセット処理
+      const handleReset = () => {
+        setCsvData([]);
+        setFileData(null);
+        setInputEncoding('UTF-8');
+        setOutputEncoding('UTF-8');
+        setUseHeader(true);
+        setPage(0);
+        setRowsPerPage(10); // リセット時にデフォルトを10に戻す
+        setOrder('asc');
+        setOrderBy('');
+        setModifiedHeaders([]);
+        setSelectedColumns([]);
+        setSearchQuery('');
+        setHistory([]);
+        setFuture([]);
+        setIsEditMode(false); // 編集モードをリセット
+        setColumnWidths([]);
+        setFirstColumnWidth(150); // 追加
+        setEditingCell({ rowId: null, cellIndex: null });
+        setSelectedRows([]);
+      };
+
+      // ヘッダー切替時の処理
+      const handleHeaderToggle = (e) => {
+        setUseHeader(e.target.checked);
+        if (csvData.length > 0) {
+          initializeHeaders(csvData);
+        }
+        // ページネーションとソートをリセット
+        setPage(0);
+        setOrder('asc');
+        setOrderBy('');
+        // 検索クエリをリセット
+        setSearchQuery('');
+        // 履歴をリセット
+        setHistory([]);
+        setFuture([]);
+        // 列幅の調整は useEffect で自動的に行われる
+      };
+
+      // ページ変更時のハンドラー
+      const handleChangePage = (event, newPage) => {
+        setPage(newPage);
+      };
+
+      // 表示行数変更時のハンドラー
+      const handleChangeRowsPerPage = (event) => {
+        const value = event.target.value === 'all' ? -1 : parseInt(event.target.value, 10);
+        setRowsPerPage(value);
+        setPage(0);
+      };
+
+      // ソートリクエスト時のハンドラー
+      const handleRequestSort = (property) => {
+        const isAsc = orderBy === property && order === 'asc';
+        setOrder(isAsc ? 'desc' : 'asc');
+        setOrderBy(property);
+        setPage(0);
+      };
+
+      // ヘッダーのテキストボックス変更時のハンドラー
+      const handleHeaderChange = (index, value) => {
+        pushToHistory();
+        const updatedHeaders = [...modifiedHeaders];
+        updatedHeaders[index] = value;
+        setModifiedHeaders(updatedHeaders);
+      };
+
+      // 列順序変更用のハンドラー
+      const handleHeaderChangeOrder = (newHeaders) => {
+        pushToHistory();
+        setModifiedHeaders(newHeaders);
+      };
+
+      // 列幅変更用のハンドラー
+      const handleColumnWidthsChange = (newWidths) => {
+        pushToHistory();
+        setColumnWidths(newWidths);
+      };
+
+      // 列を追加する関数（指定されたインデックス位置に追加）
+      const handleAddColumn = (insertIndex) => {
+        pushToHistory();
+        // 新しいヘッダー名を設定
+        const newHeader = `列${modifiedHeaders.length + 1}`;
+        const updatedHeaders = [...modifiedHeaders];
+        updatedHeaders.splice(insertIndex, 0, newHeader); // 指定位置に挿入
+        setModifiedHeaders(updatedHeaders);
+
+        // 列幅を追加
+        const updatedWidths = [...columnWidths];
+        updatedWidths.splice(insertIndex, 0, 150); // 新しい列にデフォルト幅を設定
+        setColumnWidths(updatedWidths);
+
+        // selectedColumnsを更新（新しい列はデフォルトで選択状態）
+        const updatedSelected = [...selectedColumns];
+        updatedSelected.splice(insertIndex, 0, true);
+        setSelectedColumns(updatedSelected);
+
+        // データ行に空のセルを追加
+        const updatedData = csvData.map((item, idx) => {
+          if (useHeader && item.id === 'header') {
+            return item;
+          } else {
+            const newRow = [...item.row];
+            newRow.splice(insertIndex, 0, ''); // 指定位置に空セルを挿入
+            return { ...item, row: newRow };
+          }
+        });
+        setCsvData(updatedData);
+      };
+
+      // 列を削除する関数（指定されたインデックス位置から削除）
+      const handleDeleteColumn = (deleteIndex) => {
+        if (modifiedHeaders.length <= 1) {
+          alert("最低でも1列は保持する必要があります。");
+          return;
+        }
+
+        const confirmDelete = window.confirm(`列「${modifiedHeaders[deleteIndex]}」を削除しますか？`);
+        if (!confirmDelete) return;
+
+        pushToHistory();
+        const updatedHeaders = [...modifiedHeaders];
+        updatedHeaders.splice(deleteIndex, 1); // 指定位置から1つ削除
+        setModifiedHeaders(updatedHeaders);
+
+        // 列幅を削除
+        const updatedWidths = [...columnWidths];
+        updatedWidths.splice(deleteIndex, 1);
+        setColumnWidths(updatedWidths);
+
+        // selectedColumnsを削除
+        const updatedSelected = [...selectedColumns];
+        updatedSelected.splice(deleteIndex, 1);
+        setSelectedColumns(updatedSelected);
+
+        const updatedData = csvData.map((item, idx) => {
+          if (useHeader && item.id === 'header') {
+            return item;
+          } else {
+            const newRow = [...item.row];
+            if (deleteIndex < newRow.length) {
+              newRow.splice(deleteIndex, 1); // 指定位置から1つ削除
+            }
+            return { ...item, row: newRow };
+          }
+        });
+        setCsvData(updatedData);
+      };
+
+      // Undo操作のハンドラー
+      const handleUndo = () => {
+        if (history.length === 0) return;
+        const previousState = history[history.length - 1];
+        const newHistory = history.slice(0, history.length - 1);
+        setHistory(newHistory);
+        setFuture([{ 
+          csvData: JSON.parse(JSON.stringify(csvData)), 
+          modifiedHeaders: [...modifiedHeaders], 
+          columnWidths: [...columnWidths], 
+          selectedColumns: [...selectedColumns], 
+          selectedRows: [...selectedRows],
+          firstColumnWidth: firstColumnWidth
+        }, ...future]);
+        setCsvData(previousState.csvData);
+        setModifiedHeaders(previousState.modifiedHeaders);
+        setColumnWidths(previousState.columnWidths);
+        setSelectedColumns(previousState.selectedColumns);
+        setSelectedRows(previousState.selectedRows);
+        setFirstColumnWidth(previousState.firstColumnWidth);
+        setSearchQuery('');
+        setEditingCell({ rowId: null, cellIndex: null });
+      };
+
+      // Redo操作のハンドラー
+      const handleRedo = () => {
+        if (future.length === 0) return;
+        const nextState = future[0];
+        const newFuture = future.slice(1);
+        setFuture(newFuture);
+        setHistory([...history, { 
+          csvData: JSON.parse(JSON.stringify(csvData)), 
+          modifiedHeaders: [...modifiedHeaders], 
+          columnWidths: [...columnWidths], 
+          selectedColumns: [...selectedColumns], 
+          selectedRows: [...selectedRows],
+          firstColumnWidth: firstColumnWidth
+        }]);
+        setCsvData(nextState.csvData);
+        setModifiedHeaders(nextState.modifiedHeaders);
+        setColumnWidths(nextState.columnWidths);
+        setSelectedColumns(nextState.selectedColumns);
+        setSelectedRows(nextState.selectedRows);
+        setFirstColumnWidth(nextState.firstColumnWidth);
+        setSearchQuery('');
+        setEditingCell({ rowId: null, cellIndex: null });
+      };
+
+      // セルの値を変更するハンドラー（編集モード用）
+      const handleCellChange = (rowId, cellIndex, newValue) => {
+        pushToHistory(); // 変更前の状態を履歴に保存
+
+        const updatedData = csvData.map(item => {
+          if (item.id === rowId) {
+            const updatedRow = [...item.row];
+            updatedRow[cellIndex] = newValue;
+            return { ...item, row: updatedRow };
+          }
+          return item;
+        });
+        setCsvData(updatedData);
+        // 列幅を再調整
+        adjustColumnWidth(cellIndex, newValue);
+      };
+
+      // 列幅を自動調整する関数
+      const adjustColumnWidth = (colIndex, newValue) => {
+        const canvas = document.createElement('canvas');
+        const context = canvas.getContext('2d');
+        context.font = '16px Roboto'; // 使用しているフォントに合わせる
+        const metrics = context.measureText(newValue.toString());
+        const padding = 20; // パディング（ピクセル単位）
+        const newWidth = padding + metrics.width;
+        if (newWidth > columnWidths[colIndex]) {
+          const updatedWidths = [...columnWidths];
+          updatedWidths[colIndex] = newWidth;
+          setColumnWidths(updatedWidths);
+        }
+      };
+
+      // 列幅調整のハンドラーロジック
+      const handleMouseDown = (e, index) => {
+        e.preventDefault(); // テキスト選択を防ぐ
+        resizingRef.current = {
+          columnIndex: index,
+          startX: e.clientX,
+          startWidth: index === -1 ? firstColumnWidth : columnWidths[index],
+        };
+
+        // イベントリスナーを追加
+        window.addEventListener('mousemove', handleMouseMove);
+        window.addEventListener('mouseup', handleMouseUp);
+      };
+
+      const handleMouseMove = (e) => {
+        const { columnIndex, startX, startWidth } = resizingRef.current;
+        if (columnIndex === null) return;
+
+        const deltaX = e.clientX - startX;
+        const newWidth = startWidth + deltaX;
+        if (newWidth > 50) { // 最小幅を50pxに設定
+          if (columnIndex === -1) {
+            setFirstColumnWidth(newWidth);
+          } else {
+            const updatedWidths = [...columnWidths];
+            updatedWidths[columnIndex] = newWidth;
+            setColumnWidths(updatedWidths);
+          }
+        }
+      };
+
+      const handleMouseUp = () => {
+        // リサイズを終了
+        resizingRef.current = {
+          columnIndex: null,
+          startX: 0,
+          startWidth: 0,
+        };
+        // イベントリスナーを削除
+        window.removeEventListener('mousemove', handleMouseMove);
+        window.removeEventListener('mouseup', handleMouseUp);
+      };
+
+      // 列幅を自動調整する関数（Canvas APIを使用）
+      const adjustColumnWidths = () => {
+        const canvas = document.createElement('canvas');
+        const context = canvas.getContext('2d');
+        context.font = '16px Roboto'; // 使用しているフォントに合わせる
+
+        const padding = 20; // パディング（ピクセル単位）
+
+        // 1列目の幅を計算
+        let maxFirstColWidth = context.measureText("操作").width + padding; // "操作" はヘッダーの想定
+        csvData.forEach((item) => {
+          // チェックボックスとアイコンボタンの幅を考慮
+          const checkboxWidth = 40; // チェックボックスの幅の目安
+          const iconsWidth = isEditMode ? 60 : 0; // アイコンボタンの幅の目安
+          const totalWidth = checkboxWidth + iconsWidth;
+          if (totalWidth > maxFirstColWidth) {
+            maxFirstColWidth = totalWidth;
+          }
+        });
+        setFirstColumnWidth(maxFirstColWidth);
+
+        const newWidths = modifiedHeaders.map((header, colIndex) => {
+          let maxWidth = context.measureText(header).width;
+
+          csvData.forEach((item) => {
+            if (useHeader && item.id === 'header') return; // ヘッダー行はスキップ
+            const cell = item.row[colIndex];
+            if (cell) {
+              const cellWidth = context.measureText(cell.toString()).width;
+              if (cellWidth > maxWidth) {
+                maxWidth = cellWidth;
+              }
+            }
+          });
+
+          return padding + maxWidth;
+        });
+
+        setColumnWidths(newWidths);
+      };
+
+      // useEffect フックを追加して自動列幅調整を実行
+      useEffect(() => {
+        if (csvData.length > 0) {
+          requestAnimationFrame(() => {
+            adjustColumnWidths();
+          });
+        }
+      }, [csvData, modifiedHeaders, useHeader, isEditMode]);
+
+      // 編集モード切替時の処理
+      const toggleEditMode = () => {
+        setIsEditMode(!isEditMode);
+        setEditingCell({ rowId: null, cellIndex: null }); // 編集中のセルをリセット
+        // 列幅の調整は useEffect で自動的に行われる
+      };
+
+      // 選択した行を削除するハンドラー
+      const handleDeleteRows = () => {
+        if (selectedRows.length === 0) {
+          alert('削除する行を選択してください。');
+          return;
+        }
+
+        const confirmDelete = window.confirm(`選択した${selectedRows.length}行を削除しますか？`);
+        if (!confirmDelete) return;
+
+        pushToHistory();
+
+        const updatedCsvData = csvData.filter(item => !selectedRows.includes(item.id));
+        setCsvData(updatedCsvData);
+
+        // 選択状態をクリア
+        setSelectedRows([]);
+        showSnackbar(`${selectedRows.length}行を削除しました。`);
+      };
+
+      // 選択した行の下に新しい行を追加するハンドラー
+      const handleAddRow = () => {
+        if (selectedRows.length === 0) {
+          alert('追加する行を選択してください。');
+          return;
+        }
+
+        pushToHistory();
+
+        // 選択された行の中で最小のインデックスを取得
+        const selectedIndices = selectedRows.map(id => csvData.findIndex(item => item.id === id));
+        const minIndex = Math.min(...selectedIndices);
+
+        // 新しい行を挿入する位置
+        const insertIndex = minIndex + 1;
+
+        // 新しい行のデータ（空セルで初期化）
+        const newRow = modifiedHeaders.map(() => '');
+
+        // 新しい行に一意のIDを付与
+        const newRowWithId = { id: generateUUID(), row: newRow };
+
+        const updatedCsvData = [...csvData];
+        updatedCsvData.splice(insertIndex, 0, newRowWithId);
+        setCsvData(updatedCsvData);
+
+        // 新しく追加した行を選択状態にする
+        setSelectedRows([...selectedRows, newRowWithId.id]);
+
+        // ページネーションをリセット
+        setPage(0);
+        showSnackbar('行を追加しました。');
+      };
+
+      // 各行に対する追加・削除処理
+      const handleAddRowAt = (rowId) => {
+        pushToHistory();
+
+        const index = csvData.findIndex(item => item.id === rowId);
+        if (index === -1) return;
+
+        // 新しい行を挿入する位置
+        const insertIndex = index + 1;
+
+        // 新しい行のデータ（空セルで初期化）
+        const newRow = modifiedHeaders.map(() => '');
+
+        // 新しい行に一意のIDを付与
+        const newRowWithId = { id: generateUUID(), row: newRow };
+
+        const updatedCsvData = [...csvData];
+        updatedCsvData.splice(insertIndex, 0, newRowWithId);
+        setCsvData(updatedCsvData);
+
+        // 新しく追加した行を選択状態にする
+        setSelectedRows([...selectedRows, newRowWithId.id]);
+
+        // ページネーションをリセット
+        setPage(0);
+        showSnackbar('行を追加しました。');
+      };
+
+      const handleDeleteRowAt = (rowId) => {
+        if (useHeader && rowId === 'header') {
+          alert('ヘッダー行は削除できません。');
+          return;
+        }
+
+        const confirmDelete = window.confirm(`この行を削除しますか？`);
+        if (!confirmDelete) return;
+
+        pushToHistory();
+
+        const updatedCsvData = csvData.filter(item => item.id !== rowId);
+        setCsvData(updatedCsvData);
+
+        // 選択状態から削除
+        setSelectedRows(selectedRows.filter(id => id !== rowId));
+        showSnackbar('行を削除しました。');
+      };
+
+      // フィルタリングおよびソートされたデータとヒット行数をメモ化
+      const filteredAndSorted = useMemo(() => getFilteredAndSortedData(csvData, useHeader, searchQuery, order, orderBy, page, rowsPerPage), [csvData, useHeader, searchQuery, order, orderBy, page, rowsPerPage]);
+
+      const { data: paginatedData, totalMatched } = filteredAndSorted;
+
+      // Snackbarを表示する関数
+      const showSnackbar = (message) => {
+        setSnackbarMessage(message);
+        setSnackbarOpen(true);
+      };
+
+      return (
+        <Container style={{ marginTop: '20px', marginBottom: '20px' }}>
+          {/* ローディングインジケーター */}
+          {isLoading && (
+            <div
+              style={{
+                position: 'fixed',
+                top: 0,
+                left: 0,
+                width: '100%',
+                height: '100%',
+                backgroundColor: 'rgba(255, 255, 255, 0.7)',
+                zIndex: 9999,
+                display: 'flex',
+                justifyContent: 'center',
+                alignItems: 'center'
+              }}
+            >
+              <CircularProgress size={80} /> {/* sizeプロパティを追加して大きくします */}
+            </div>
+          )}
+
+          <Typography variant="h4" gutterBottom>CSV操作ツール</Typography>
+
+          {/* ファイルアップロードとドラッグ＆ドロップ */}
+          <FileUpload
+            onFileUpload={handleFileUpload}
+            isDragOver={isDragOver}
+            setIsDragOver={setIsDragOver}
+          />
+
+          {/* 入力エンコーディング選択 */}
+          <EncodingSelector
+            label="入力"
+            value={inputEncoding}
+            onChange={(e) => handleEncodingChange(e.target.value)}
+          />
+
+          {/* 出力エンコーディング選択 */}
+          <EncodingSelector
+            label="出力"
+            value={outputEncoding}
+            onChange={(e) => setOutputEncoding(e.target.value)}
+          />
+
+          {/* ヘッダー使用切替 */}
+          <HeaderToggle
+            useHeader={useHeader}
+            onToggle={handleHeaderToggle}
+          />
+
+          {/* 検索入力フィールド */}
+          <SearchField
+            searchQuery={searchQuery}
+            onSearchChange={(e) => setSearchQuery(e.target.value)}
+          />
+
+          {/* ヒットした行数の表示 */}
+          {csvData.length > 0 && (
+            <Typography variant="body1" style={{ marginTop: '10px' }}>
+              {totalMatched} 件のデータがヒットしました。
+            </Typography>
+          )}
+
+          {/* ボタン群 */}
+          <ActionButtons
+            onReset={handleReset}
+            onUndo={handleUndo}
+            undoDisabled={history.length === 0}
+            onRedo={handleRedo}
+            redoDisabled={future.length === 0}
+            onToggleEdit={toggleEditMode}
+            isEditMode={isEditMode}
+            onDeleteRows={handleDeleteRows}
+            onAddRow={handleAddRow}
+            deleteDisabled={selectedRows.length === 0}
+            addDisabled={selectedRows.length === 0}
+          />
+
+          {/* CSVダウンロードセクション */}
+          <DownloadSection
+            onDownloadClick={handleDownloadButtonClick}
+            downloadDialogOpen={downloadDialogOpen}
+            downloadFileName={downloadFileName}
+            setDownloadFileName={setDownloadFileName}
+            onDownloadConfirm={handleDownloadConfirm}
+            onDownloadCancel={handleDownloadCancel}
+          />
+
+          {/* CSVデータ表示 */}
+          {csvData.length > 0 && (
+            <React.Fragment>
+              <CsvTable
+                csvData={paginatedData}
+                modifiedHeaders={modifiedHeaders}
+                columnWidths={columnWidths}
+                handleHeaderChange={handleHeaderChange}
+                handleAddColumn={handleAddColumn}
+                handleDeleteColumn={handleDeleteColumn}
+                handleRequestSort={handleRequestSort}
+                order={order}
+                orderBy={orderBy}
+                handleCellChange={handleCellChange}
+                isEditMode={isEditMode}
+                editingCell={editingCell}
+                setEditingCell={setEditingCell}
+                handleMouseDown={handleMouseDown}
+                selectedColumns={selectedColumns}
+                setSelectedColumns={setSelectedColumns}
+                selectedRows={selectedRows}
+                setSelectedRows={setSelectedRows}
+                useHeader={useHeader}
+                onAddRowAt={handleAddRowAt}
+                onDeleteRowAt={handleDeleteRowAt}
+                firstColumnWidth={firstColumnWidth}
+              />
+              {/* ページネーションの追加 */}
+              <TablePagination
+                component="div"
+                count={totalMatched}
+                page={page}
+                onPageChange={handleChangePage}
+                rowsPerPage={rowsPerPage === -1 ? (useHeader ? csvData.length - 1 : csvData.length) : rowsPerPage}
+                onRowsPerPageChange={handleChangeRowsPerPage}
+                rowsPerPageOptions={[
+                  { label: '10', value: 10 },
+                  { label: '30', value: 30 },
+                  { label: '50', value: 50 },
+                  { label: '全て', value: -1 } // "全て" を値として設定
+                ]}
+                labelRowsPerPage="表示件数"
+                labelDisplayedRows={({ from, to, count }) => rowsPerPage === -1 ? `全て${count !== -1 ? `（${count}件）` : ''}` : `${from}-${to} / ${count}`}
+              />
+            </React.Fragment>
+          )}
+
+          {/* Snackbarコンポーネント */}
+          <Snackbar
+            open={snackbarOpen}
+            autoHideDuration={3000}
+            onClose={() => setSnackbarOpen(false)}
+            message={snackbarMessage}
+          />
+        </Container>
+      );
+    };
+
+    ReactDOM.render(<App />, document.getElementById('root'));
+  </script>
+</body>
+</html>
