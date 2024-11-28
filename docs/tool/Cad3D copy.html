@@ -1,0 +1,736 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <title>3D CADデータ表示サンプル</title>
+  
+  <!-- React and ReactDOM -->
+  <script src="https://cdn.jsdelivr.net/npm/react@18/umd/react.production.min.js" crossorigin="anonymous"></script>
+  <script src="https://cdn.jsdelivr.net/npm/react-dom@18/umd/react-dom.production.min.js" crossorigin="anonymous"></script>
+  
+  <!-- MUI (Material-UI) v5 -->
+  <script src="https://cdn.jsdelivr.net/npm/@mui/material@5.11.15/umd/material-ui.production.min.js" crossorigin="anonymous"></script>
+  
+  <!-- Emotion ライブラリ (MUI v5 の依存関係) -->
+  <script src="https://cdn.jsdelivr.net/npm/@emotion/react@11.11.0/dist/emotion-react.umd.min.js" crossorigin="anonymous"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@emotion/styled@11.11.0/dist/emotion-styled.umd.min.js" crossorigin="anonymous"></script>
+  
+  <!-- Babel for JSX -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.21.0/babel.min.js" crossorigin="anonymous"></script>
+  
+  <!-- Three.js CDN -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js" crossorigin="anonymous"></script>
+  
+  <!-- Three.js Loaders (バージョンr128) -->
+  <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/loaders/STLLoader.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/loaders/OBJLoader.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/loaders/GLTFLoader.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/loaders/FBXLoader.js"></script>
+  
+  <!-- Material-UI CDN -->
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Roboto:300,400,500,700&display=swap"/>
+  <link rel="stylesheet" href="https://fonts.googleapis.com/icon?family=Material+Icons"/>
+  
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "https://unpkg.com/three@v0.159.0/build/three.module.js",
+        "three/addons/": "https://unpkg.com/three@v0.159.0/examples/jsm/"
+      }
+    }
+  </script>
+
+  <style>
+    /* 3Dレンダリング用のキャンバススタイル */
+    #three-canvas {
+      width: 100%;
+      height: 600px;
+      display: block;
+      cursor: grab;
+      border: 1px solid #ccc;
+    }
+    #three-canvas:active {
+      cursor: grabbing;
+    }
+  </style>
+  
+  <!-- Faviconを指定（エラー対策） -->
+  <link rel="icon" href="data:,">
+</head>
+<body>
+  <div id="root"></div>
+
+  <script type="text/babel">
+
+    const { useEffect, useRef, useState } = React;
+    const { AppBar, Toolbar, Typography, Container, Box, Switch, FormControlLabel, FormGroup, Button } = MaterialUI;
+
+    function App() {
+      const mountRef = useRef(null);
+      const sceneRef = useRef(null); // シーンへの参照
+      const cameraRef = useRef(null); // カメラへの参照
+      const rendererRef = useRef(null); // レンダラーへの参照
+
+      const autoRotationSpeed = useRef({ x: 0, y: 0 });
+      const userRotationSpeed = useRef({ x: 0, y: 0 });
+      const isDragging = useRef(false);
+      const previousMousePosition = useRef({ x: 0, y: 0 });
+      const [isRotating, setIsRotating] = useState(false);
+      const [isInertiaEnabled, setIsInertiaEnabled] = useState(false);
+      const [mode, setMode] = useState('rotation'); // 'rotation' または 'translation'
+
+      const isRotatingRef = useRef(isRotating);
+      const isInertiaEnabledRef = useRef(isInertiaEnabled);
+      const lastUserRotationSpeed = useRef({ x: 0, y: 0 });
+
+      // 操作モードの種類を管理 ('modelRotation', 'modelTranslation', 'cameraPan')
+      const currentManipulation = useRef(null);
+
+      // ダブルクリック検出用
+      const clickTimer = useRef(null);
+      const clickThreshold = 300; // ミリ秒
+
+      // Raycaster と Plane の初期化
+      const raycaster = useRef(new THREE.Raycaster());
+      const mouse = useRef(new THREE.Vector2());
+      const plane = useRef(new THREE.Plane()); // 動的に設定
+
+      // 回転速度の上限を設定
+      const maxRotationSpeed = 0.05;
+
+      // 回転感度の設定（基本感度と慣性無効時の感度）
+      const baseRotationSensitivity = 0.00225; // 基本感度
+      const increasedRotationSensitivity = baseRotationSensitivity * 1.5; // 慣性無効時の感度
+
+      // カメラとモデルの座標状態を管理
+      const [cameraPosition, setCameraPosition] = useState({ x: 0, y: 0, z: 0 });
+      const [modelPosition, setModelPosition] = useState({ x: 0, y: 0, z: 0 });
+
+      // ロードしたモデルのリストを保持
+      const modelsRef = useRef([]);
+
+      // isRotating 状態のリファレンスを更新
+      useEffect(() => {
+        isRotatingRef.current = isRotating;
+        if (isRotating) {
+          autoRotationSpeed.current = { ...lastUserRotationSpeed.current };
+          if (autoRotationSpeed.current.x === 0 && autoRotationSpeed.current.y === 0) {
+            autoRotationSpeed.current = { x: 0.001, y: 0.001 };
+          }
+        } else {
+          autoRotationSpeed.current = { x: 0, y: 0 };
+        }
+      }, [isRotating]);
+
+      // isInertiaEnabled 状態のリファレンスを更新
+      useEffect(() => {
+        isInertiaEnabledRef.current = isInertiaEnabled;
+      }, [isInertiaEnabled]);
+
+      // モードに応じてモデルの透明度を管理
+      useEffect(() => {
+        modelsRef.current.forEach((model) => {
+          model.traverse((child) => {
+            if (child.isMesh) {
+              if (mode === 'translation') {
+                child.material.transparent = true;
+                child.material.opacity = 0.5;
+              } else {
+                child.material.transparent = false;
+                child.material.opacity = 1;
+              }
+            }
+          });
+        });
+      }, [mode]);
+
+      useEffect(() => {
+        // シーン、カメラ、レンダラーの初期化
+        const scene = new THREE.Scene();
+        scene.background = new THREE.Color(0xeeeeee);
+        sceneRef.current = scene; // シーンへの参照を保存
+
+        const camera = new THREE.PerspectiveCamera(
+          75,
+          mountRef.current.clientWidth / mountRef.current.clientHeight,
+          0.1,
+          1000
+        );
+        camera.position.z = 5;
+        cameraRef.current = camera; // カメラへの参照を保存
+
+        const renderer = new THREE.WebGLRenderer({ antialias: true });
+        renderer.setSize(mountRef.current.clientWidth, mountRef.current.clientHeight);
+        mountRef.current.appendChild(renderer.domElement);
+        rendererRef.current = renderer;
+
+        // ライトの追加
+        const ambientLight = new THREE.AmbientLight(0x404040); // ソフトな白色光
+        scene.add(ambientLight);
+
+        const directionalLight = new THREE.DirectionalLight(0xffffff, 0.5);
+        directionalLight.position.set(1, 1, 1).normalize();
+        scene.add(directionalLight);
+
+        // 立方体の作成（初期モデル）
+        const geometry = new THREE.BoxGeometry();
+        const material = new THREE.MeshPhongMaterial({ color: 0x00ff00, transparent: false, opacity: 1 });
+        const cube = new THREE.Mesh(geometry, material);
+        scene.add(cube);
+        modelsRef.current.push(cube); // モデルリストに追加
+
+        // アニメーションループ
+        const animate = function () {
+          requestAnimationFrame(animate);
+
+          // 自動回転の適用（回転モードのみ）
+          if (isRotatingRef.current && mode === 'rotation') {
+            modelsRef.current.forEach((model) => {
+              model.rotation.x += autoRotationSpeed.current.x;
+              model.rotation.y += autoRotationSpeed.current.y;
+            });
+          }
+
+          // 回転モードの場合、ユーザー操作による回転の適用
+          if (mode === 'rotation') {
+            modelsRef.current.forEach((model) => {
+              model.rotation.x += userRotationSpeed.current.x;
+              model.rotation.y += userRotationSpeed.current.y;
+            });
+          }
+
+          // 回転速度の上限制限
+          userRotationSpeed.current.x = Math.max(-maxRotationSpeed, Math.min(maxRotationSpeed, userRotationSpeed.current.x));
+          userRotationSpeed.current.y = Math.max(-maxRotationSpeed, Math.min(maxRotationSpeed, userRotationSpeed.current.y));
+
+          // 慣性効果の適用（回転モードのみ）
+          if (isInertiaEnabledRef.current && mode === 'rotation') {
+            userRotationSpeed.current.x *= 0.98;
+            userRotationSpeed.current.y *= 0.98;
+          } else {
+            if (!isDragging.current) {
+              userRotationSpeed.current.x = 0;
+              userRotationSpeed.current.y = 0;
+            }
+          }
+
+          renderer.render(scene, camera);
+        };
+
+        animate();
+
+        // 座標更新用のタイマーをセット
+        const interval = setInterval(() => {
+          if (cameraRef.current && modelsRef.current.length > 0) {
+            const camPos = cameraRef.current.position;
+            setCameraPosition({ x: camPos.x.toFixed(2), y: camPos.y.toFixed(2), z: camPos.z.toFixed(2) });
+
+            const modelPos = modelsRef.current[modelsRef.current.length - 1].position;
+            setModelPosition({ x: modelPos.x.toFixed(2), y: modelPos.y.toFixed(2), z: modelPos.z.toFixed(2) });
+          }
+        }, 100); // 100ミリ秒ごとに更新
+
+        // リサイズ対応
+        const handleResize = () => {
+          const width = mountRef.current.clientWidth;
+          const height = mountRef.current.clientHeight;
+          renderer.setSize(width, height);
+          camera.aspect = width / height;
+          camera.updateProjectionMatrix();
+        };
+
+        window.addEventListener('resize', handleResize);
+
+        // クリーンアップ
+        return () => {
+          window.removeEventListener('resize', handleResize);
+          mountRef.current.removeChild(renderer.domElement);
+          clearInterval(interval); // タイマーのクリア
+        };
+      }, []); // 初回のみ実行
+
+      // モデルの読み込み関数
+      const loadModel = (file, mode) => {
+        const reader = new FileReader();
+        const fileExtension = file.name.split('.').pop().toLowerCase();
+
+        reader.onload = (event) => {
+          const contents = event.target.result;
+          let loader;
+          let object;
+
+          switch (fileExtension) {
+            case 'stl':
+              loader = new THREE.STLLoader();
+              try {
+                object = loader.parse(contents);
+              } catch (error) {
+                console.error('STLモデルの解析に失敗しました。', error);
+                alert('STLモデルの解析に失敗しました。ファイル形式を確認してください。');
+                return;
+              }
+              break;
+
+            case 'obj':
+              loader = new THREE.OBJLoader();
+              try {
+                object = loader.parse(contents);
+              } catch (error) {
+                console.error('OBJモデルの解析に失敗しました。', error);
+                alert('OBJモデルの解析に失敗しました。ファイル形式を確認してください。');
+                return;
+              }
+              break;
+
+            case 'gltf':
+            case 'glb':
+              loader = new THREE.GLTFLoader();
+              loader.parse(contents, '', (gltf) => {
+                if (mode === 'new') {
+                  // 既存のモデルを削除
+                  modelsRef.current.forEach((model) => {
+                    sceneRef.current.remove(model);
+                  });
+                  modelsRef.current = [];
+                }
+                sceneRef.current.add(gltf.scene);
+                modelsRef.current.push(gltf.scene);
+                console.log('GLTFモデルを読み込みました。');
+              }, (error) => {
+                console.error('GLTFモデルの読み込みに失敗しました。', error);
+                alert('GLTFモデルの読み込みに失敗しました。ファイル形式を確認してください。');
+              });
+              return; // 非同期処理のためここで終了
+
+            case 'fbx':
+              loader = new THREE.FBXLoader();
+              loader.parse(contents, '', (fbx) => {
+                if (mode === 'new') {
+                  // 既存のモデルを削除
+                  modelsRef.current.forEach((model) => {
+                    sceneRef.current.remove(model);
+                  });
+                  modelsRef.current = [];
+                }
+                sceneRef.current.add(fbx);
+                modelsRef.current.push(fbx);
+                console.log('FBXモデルを読み込みました。');
+              }, (error) => {
+                console.error('FBXモデルの読み込みに失敗しました。', error);
+                alert('FBXモデルの読み込みに失敗しました。ファイル形式を確認してください。');
+              });
+              return; // 非同期処理のためここで終了
+
+            default:
+              alert('サポートされていないファイル形式です。');
+              return;
+          }
+
+          if (object) {
+            if (mode === 'new') {
+              // 既存のモデルを削除
+              modelsRef.current.forEach((model) => {
+                sceneRef.current.remove(model);
+              });
+              modelsRef.current = [];
+            }
+
+            sceneRef.current.add(object);
+            modelsRef.current.push(object);
+            console.log('モデルを読み込みました。');
+          }
+        };
+
+        // ファイルの読み込み方法を拡張子ごとに分ける
+        if (fileExtension === 'obj') {
+          reader.readAsText(file);
+        } else if (fileExtension === 'stl' || fileExtension === 'gltf' || fileExtension === 'glb' || fileExtension === 'fbx') {
+          reader.readAsArrayBuffer(file);
+        } else {
+          alert('サポートされていないファイル形式です。');
+        }
+      };
+
+      // ファイルダイアログからモデルを読み込む
+      const handleFileInput = (event, mode) => {
+        const file = event.target.files[0];
+        if (file) {
+          loadModel(file, mode);
+        }
+      };
+
+      // ドラッグアンドドロップでモデルを読み込む
+      const handleDrop = (event) => {
+        event.preventDefault();
+        const file = event.dataTransfer.files[0];
+        if (file) {
+          // デフォルトは新規モードとしますが、必要に応じて変更可能
+          loadModel(file, 'new');
+        }
+      };
+
+      const handleDragOver = (event) => {
+        event.preventDefault();
+      };
+
+      // ダブルクリック検出用のmousedownハンドラー
+      const handleMouseDown = (event) => {
+        const rect = mountRef.current.getBoundingClientRect();
+        const mouseX = ((event.clientX - rect.left) / rect.width) * 2 - 1;
+        const mouseY = -((event.clientY - rect.top) / rect.height) * 2 + 1;
+        mouse.current.set(mouseX, mouseY);
+        raycaster.current.setFromCamera(mouse.current, cameraRef.current);
+        const intersects = raycaster.current.intersectObjects(modelsRef.current, true); // 子オブジェクトも含める
+
+        if (clickTimer.current) {
+          // 2回目のmousedownが閾値内に発生した場合、ダブルクリックと判定
+          clearTimeout(clickTimer.current);
+          clickTimer.current = null;
+
+          // ダブルクリックとして移動モードに切り替え
+          setMode('translation');
+          console.log('ダブルクリック検出: 移動モードに切り替えました。');
+
+          // 自動回転を停止し、回転速度をゼロに設定
+          setIsRotating(false);
+          userRotationSpeed.current = { x: 0, y: 0 };
+          autoRotationSpeed.current = { x: 0, y: 0 };
+          lastUserRotationSpeed.current = { x: 0, y: 0 };
+
+          // モデルを半透明に設定
+          modelsRef.current.forEach((model) => {
+            model.traverse((child) => {
+              if (child.isMesh) {
+                child.material.transparent = true;
+                child.material.opacity = 0.5;
+                child.material.needsUpdate = true;
+              }
+            });
+          });
+          console.log('モデルを半透明に設定しました。');
+
+          // 平面（Plane）をモデルの現在位置とカメラの視点に基づいて設定
+          const planeNormal = new THREE.Vector3();
+          cameraRef.current.getWorldDirection(planeNormal);
+          planeNormal.normalize();
+          plane.current.setFromNormalAndCoplanarPoint(planeNormal, modelsRef.current[modelsRef.current.length - 1].position);
+          console.log('平面をモデルの現在位置に合わせて設定しました。');
+
+          // 操作モードを操作種類に設定
+          currentManipulation.current = 'modelTranslation';
+
+          // ドラッグを開始
+          isDragging.current = true;
+          previousMousePosition.current = {
+            x: event.clientX,
+            y: event.clientY
+          };
+        } else {
+          // 1回目のmousedownの場合、タイマーをセット
+          clickTimer.current = setTimeout(() => {
+            // タイムアウト後にクリックカウントをリセット
+            clickTimer.current = null;
+          }, clickThreshold);
+
+          // クリックがモデル上か背景上かを判定
+          if (intersects.length > 0) {
+            // モデル上をクリック
+            currentManipulation.current = 'modelRotation';
+            console.log('モデル上をクリックしました。操作モード: modelRotation');
+          } else {
+            // 背景上をクリック
+            currentManipulation.current = 'cameraPan';
+            console.log('背景上をクリックしました。操作モード: cameraPan');
+          }
+
+          // ドラッグ開始
+          isDragging.current = true;
+          previousMousePosition.current = {
+            x: event.clientX,
+            y: event.clientY
+          };
+        }
+      };
+
+      const handleMouseMove = (event) => {
+        if (isDragging.current && currentManipulation.current) {
+          const deltaMove = {
+            x: event.clientX - previousMousePosition.current.x,
+            y: event.clientY - previousMousePosition.current.y
+          };
+
+          if (currentManipulation.current === 'modelRotation') {
+            if (mode === 'rotation') {
+              // 回転感度を設定（慣性効果の状態に応じて感度を調整）
+              const currentSensitivity = isInertiaEnabledRef.current ? baseRotationSensitivity : increasedRotationSensitivity;
+              userRotationSpeed.current.y += deltaMove.x * currentSensitivity;
+              userRotationSpeed.current.x += deltaMove.y * currentSensitivity;
+
+              // 回転速度の上限を超えないように制限
+              userRotationSpeed.current.x = Math.max(-maxRotationSpeed, Math.min(maxRotationSpeed, userRotationSpeed.current.x));
+              userRotationSpeed.current.y = Math.max(-maxRotationSpeed, Math.min(maxRotationSpeed, userRotationSpeed.current.y));
+
+              // 自動回転が有効な場合、自動回転速度をユーザー操作に合わせて更新
+              if (isRotatingRef.current) {
+                autoRotationSpeed.current = { ...userRotationSpeed.current };
+                lastUserRotationSpeed.current = { ...userRotationSpeed.current };
+              }
+              console.log(`モデル回転: Δx=${deltaMove.x}, Δy=${deltaMove.y}`);
+            }
+          } else if (currentManipulation.current === 'modelTranslation') {
+            if (mode === 'translation') {
+              // 移動モードの場合、マウスの位置から3D座標を計算する
+              const rect = mountRef.current.getBoundingClientRect();
+              const mouseX = ((event.clientX - rect.left) / rect.width) * 2 - 1;
+              const mouseY = -((event.clientY - rect.top) / rect.height) * 2 + 1;
+              mouse.current.set(mouseX, mouseY);
+
+              raycaster.current.setFromCamera(mouse.current, cameraRef.current);
+              const intersection = new THREE.Vector3();
+              const intersect = raycaster.current.ray.intersectPlane(plane.current, intersection);
+
+              if (intersect) {
+                // ドラッグ中にモデルの位置を更新
+                modelsRef.current[modelsRef.current.length - 1].position.set(intersection.x, intersection.y, intersection.z);
+                console.log(`モデルを移動: (${intersection.x.toFixed(2)}, ${intersection.y.toFixed(2)}, ${intersection.z.toFixed(2)})`);
+              } else {
+                console.log('交差点が見つかりませんでした。');
+              }
+            }
+          } else if (currentManipulation.current === 'cameraPan') {
+            // カメラの平面移動（パン）の実装
+            const panSpeed = 0.005; // パン速度の調整
+            const camera = cameraRef.current;
+
+            // カメラの右方向と上方向を計算
+            const right = new THREE.Vector3();
+            camera.getWorldDirection(right);
+            right.cross(camera.up).normalize();
+            const up = new THREE.Vector3();
+            up.copy(camera.up).normalize();
+
+            // カメラの位置を更新
+            camera.position.x -= deltaMove.x * panSpeed * right.x;
+            camera.position.y -= deltaMove.x * panSpeed * right.y;
+            camera.position.z -= deltaMove.x * panSpeed * right.z;
+
+            camera.position.x += deltaMove.y * panSpeed * up.x;
+            camera.position.y += deltaMove.y * panSpeed * up.y;
+            camera.position.z += deltaMove.y * panSpeed * up.z;
+
+            console.log(`カメラをパン: Δx=${deltaMove.x}, Δy=${deltaMove.y}`);
+          }
+
+          previousMousePosition.current = {
+            x: event.clientX,
+            y: event.clientY
+          };
+        }
+      };
+
+      const handleMouseUp = (event) => {
+        if (isDragging.current) {
+          if (currentManipulation.current === 'modelTranslation') {
+            // ドラッグ終了時に移動モードを無効化し、モデルを不透明に戻す
+            setMode('rotation');
+            console.log('移動モードを終了し、回転モードに戻ります。');
+            // モデルを不透明に戻す
+            modelsRef.current.forEach((model) => {
+              model.traverse((child) => {
+                if (child.isMesh) {
+                  child.material.transparent = false;
+                  child.material.opacity = 1;
+                  child.material.needsUpdate = true;
+                }
+              });
+            });
+            console.log('モデルを不透明に設定しました。');
+          }
+          isDragging.current = false;
+          currentManipulation.current = null;
+          if (mode === 'rotation' && !isInertiaEnabledRef.current) {
+            // 慣性が無効でマウス操作が終了した場合、回転速度をゼロにリセット
+            userRotationSpeed.current = { x: 0, y: 0 };
+            console.log('回転速度をリセットしました。');
+          }
+        }
+      };
+
+      // Reactのイベントハンドラーを使用して、キャンバスにイベントを追加
+      useEffect(() => {
+        const canvas = mountRef.current;
+        if (!canvas) return;
+
+        canvas.addEventListener('mousedown', handleMouseDown);
+        canvas.addEventListener('mousemove', handleMouseMove);
+        canvas.addEventListener('mouseup', handleMouseUp);
+        canvas.addEventListener('mouseleave', handleMouseUp);
+
+        // ドラッグアンドドロップイベントの追加
+        canvas.addEventListener('dragover', handleDragOver);
+        canvas.addEventListener('drop', handleDrop);
+
+        // クリーンアップ
+        return () => {
+          canvas.removeEventListener('mousedown', handleMouseDown);
+          canvas.removeEventListener('mousemove', handleMouseMove);
+          canvas.removeEventListener('mouseup', handleMouseUp);
+          canvas.removeEventListener('mouseleave', handleMouseUp);
+
+          canvas.removeEventListener('dragover', handleDragOver);
+          canvas.removeEventListener('drop', handleDrop);
+        };
+      }, [mode, isInertiaEnabled]); // 依存関係を追加
+
+      // トグルスイッチのハンドラー
+      const handleToggleRotation = () => {
+        setIsRotating((prev) => !prev);
+      };
+
+      const handleToggleInertia = () => {
+        setIsInertiaEnabled((prev) => !prev);
+      };
+
+      // モードを手動でリセットするボタンのハンドラー
+      const handleResetMode = () => {
+        setMode('rotation');
+        // モードリセット時にモデルを不透明に戻す
+        modelsRef.current.forEach((model) => {
+          model.traverse((child) => {
+            if (child.isMesh) {
+              child.material.opacity = 1;
+              child.material.transparent = false;
+              child.material.needsUpdate = true;
+            }
+          });
+        });
+        console.log('モードを回転に戻し、モデルを不透明にしました。');
+      };
+
+      // ファイル選択ボタンのハンドラー
+      const fileInputRefNew = useRef(null);
+      const fileInputRefAppend = useRef(null);
+
+      const handleLoadNewModel = () => {
+        fileInputRefNew.current.click();
+      };
+
+      const handleLoadAppendModel = () => {
+        fileInputRefAppend.current.click();
+      };
+
+      return (
+        <div>
+          {/* AppBar コンポーネント */}
+          <AppBar position="static" id="app-bar">
+            <Toolbar id="toolbar">
+              <Typography variant="h6" id="title">3D CADデータ表示</Typography>
+            </Toolbar>
+          </AppBar>
+          {/* メインコンテナ */}
+          <Container style={{ marginTop: '20px' }} id="main-container">
+            {/* Three.jsのキャンバス */}
+            <div ref={mountRef} id="three-canvas"></div>
+            {/* コントロールボックス */}
+            <Box display="flex" justifyContent="center" alignItems="center" mt={2} id="control-box">
+              <FormGroup>
+                {/* 自動回転のトグルスイッチ */}
+                <FormControlLabel
+                  control={
+                    <Switch
+                      checked={isRotating}
+                      onChange={handleToggleRotation}
+                      color="primary"
+                      id="rotation-switch"
+                    />
+                  }
+                  label={isRotating ? '自動回転中' : '自動回転停止'}
+                  id="form-control-label-rotation"
+                />
+                {/* 慣性効果のトグルスイッチ */}
+                <FormControlLabel
+                  control={
+                    <Switch
+                      checked={isInertiaEnabled}
+                      onChange={handleToggleInertia}
+                      color="primary"
+                      id="inertia-switch"
+                    />
+                  }
+                  label={isInertiaEnabled ? '慣性効果有効' : '慣性効果無効'}
+                  id="form-control-label-inertia"
+                />
+                {/* モード表示の追加 */}
+                <FormControlLabel
+                  control={<div />} // スイッチではなくラベルのみ表示
+                  label={`現在のモード: ${mode === 'rotation' ? '回転' : '移動'}`}
+                  id="form-control-label-mode"
+                />
+              </FormGroup>
+            </Box>
+            {/* 座標表示ボックス */}
+            <Box display="flex" justifyContent="center" alignItems="center" mt={2} id="coordinates-box">
+              <Box mr={4}>
+                <Typography variant="subtitle1" id="camera-coordinates">
+                  カメラ座標: (x: {cameraPosition.x}, y: {cameraPosition.y}, z: {cameraPosition.z})
+                </Typography>
+              </Box>
+              <Box>
+                <Typography variant="subtitle1" id="model-coordinates">
+                  モデル座標: (x: {modelPosition.x}, y: {modelPosition.y}, z: {modelPosition.z})
+                </Typography>
+              </Box>
+            </Box>
+            {/* モードを手動でリセットするボタンの追加（オプション） */}
+            <Box display="flex" justifyContent="center" alignItems="center" mt={2} id="reset-button-box">
+              <Button
+                variant="contained"
+                color="secondary"
+                onClick={handleResetMode}
+                style={{ marginRight: '10px' }}
+              >
+                モードを回転に戻す
+              </Button>
+              {/* モデルを読み込む（新規）ボタン */}
+              <Button
+                variant="contained"
+                color="primary"
+                onClick={handleLoadNewModel}
+                style={{ marginRight: '10px' }}
+              >
+                モデルを読み込む（新規）
+              </Button>
+              {/* モデルを読み込む（追加）ボタン */}
+              <Button
+                variant="contained"
+                color="primary"
+                onClick={handleLoadAppendModel}
+              >
+                モデルを読み込む（追加）
+              </Button>
+              {/* ファイル入力（非表示） */}
+              <input
+                type="file"
+                accept=".stl,.obj,.gltf,.glb,.fbx"
+                ref={fileInputRefNew}
+                style={{ display: 'none' }}
+                onChange={(e) => handleFileInput(e, 'new')}
+              />
+              <input
+                type="file"
+                accept=".stl,.obj,.gltf,.glb,.fbx"
+                ref={fileInputRefAppend}
+                style={{ display: 'none' }}
+                onChange={(e) => handleFileInput(e, 'append')}
+              />
+            </Box>
+          </Container>
+        </div>
+      );
+    }
+
+    const root = ReactDOM.createRoot(document.getElementById('root'));
+    root.render(<App />);
+  </script>
+</body>
+</html>
