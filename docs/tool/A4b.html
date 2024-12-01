@@ -1,0 +1,465 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <title>MediaPipe Face Mesh with Gaze Tracking and Head Pose Estimation</title>
+  <!-- MediaPipeのライブラリを読み込み -->
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh@0.4/face_mesh.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils@0.3/drawing_utils.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils@0.3/camera_utils.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/mathjs/9.4.4/math.min.js"></script>
+  <style>
+    body { margin: 0; overflow: hidden; }
+    video, canvas {
+      position: absolute;
+      width: 100%;
+      height: 100%;
+      object-fit: cover;
+    }
+    canvas { pointer-events: none; }
+    #menuButton {
+      position: absolute;
+      bottom: 10px;
+      right: 10px;
+      z-index: 1;
+      padding: 10px 20px;
+      font-size: 16px;
+    }
+    #settingsWindow {
+      position: absolute;
+      top: 20%;
+      left: 50%;
+      transform: translate(-50%, -20%);
+      background-color: rgba(255, 255, 255, 0.9);
+      padding: 20px;
+      border-radius: 10px;
+      display: none;
+      z-index: 2;
+    }
+    #settingsWindow label {
+      display: block;
+      margin-bottom: 10px;
+    }
+    #settingsWindow input[type="range"],
+    #settingsWindow input[type="number"],
+    #settingsWindow select {
+      width: 100%;
+    }
+    #settingsWindow button {
+      margin-top: 10px;
+      padding: 5px 10px;
+    }
+    /* FPS表示のスタイル */
+    #fpsDisplay {
+      position: absolute;
+      top: 10px;
+      left: 10px;
+      z-index: 1;
+      color: white;
+      font-size: 24px;
+      background-color: rgba(0, 0, 0, 0.5);
+      padding: 5px 10px;
+      border-radius: 5px;
+    }
+    /* 視線ポイントのスタイル */
+    #gazePoint {
+      position: absolute;
+      width: 20px;
+      height: 20px;
+      background-color: rgba(255, 0, 0, 0.5);
+      border-radius: 50%;
+      pointer-events: none;
+      transform: translate(-50%, -50%);
+      z-index: 2;
+    }
+    /* キャリブレーション中の表示 */
+    #calibrationMessage {
+      position: absolute;
+      bottom: 50px;
+      left: 50%;
+      transform: translateX(-50%);
+      z-index: 1;
+      color: white;
+      font-size: 24px;
+      background-color: rgba(0, 0, 0, 0.5);
+      padding: 10px 20px;
+      border-radius: 5px;
+    }
+  </style>
+</head>
+<body>
+  <video class="input_video"></video>
+  <canvas class="output_canvas"></canvas>
+
+  <!-- メニューボタン -->
+  <button id="menuButton">設定</button>
+
+  <!-- FPS表示 -->
+  <div id="fpsDisplay">FPS: 0</div>
+
+  <!-- 視線ポイントを表示する要素 -->
+  <div id="gazePoint"></div>
+
+  <!-- キャリブレーション中のメッセージ -->
+  <div id="calibrationMessage" style="display: none;">キャリブレーション中... クリックして下さい。</div>
+
+  <!-- 設定ウィンドウ -->
+  <div id="settingsWindow">
+    <h2>設定</h2>
+    <label>
+      解像度:
+      <select id="resolutionSelect">
+        <option value="640x480">640x480</option>
+        <option value="1280x720">1280x720</option>
+        <option value="1920x1080" selected>1920x1080</option>
+      </select>
+    </label>
+    <label>
+      ビデオの反転:
+      <input type="checkbox" id="flipVideo" checked>
+    </label>
+    <label>
+      フレームレート:
+      <input type="number" id="frameRate" min="1" max="60" value="30">
+    </label>
+    <label>
+      検出の信頼度: <span id="detectionConfidenceValue">0.5</span>
+      <input type="range" id="detectionConfidence" min="0" max="1" step="0.01" value="0.5">
+    </label>
+    <label>
+      トラッキングの信頼度: <span id="trackingConfidenceValue">0.5</span>
+      <input type="range" id="trackingConfidence" min="0" max="1" step="0.01" value="0.5">
+    </label>
+    <button id="startCalibration">キャリブレーション開始</button>
+    <button id="applySettings">適用</button>
+    <button id="closeSettings">閉じる</button>
+  </div>
+
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/mathjs/9.4.4/math.min.js"></script>
+  <script>
+    let videoWidth = 1920;
+    let videoHeight = 1080;
+    let frameRate = 30;
+    let videoStream = null;
+    let processFrame = null;
+    const videoElement = document.getElementsByClassName('input_video')[0];
+    const canvasElement = document.getElementsByClassName('output_canvas')[0];
+    const canvasCtx = canvasElement.getContext('2d');
+    const fpsDisplay = document.getElementById('fpsDisplay');
+    const gazePoint = document.getElementById('gazePoint');
+    const calibrationMessage = document.getElementById('calibrationMessage');
+    let faceMesh;
+
+    // FPS計測用の変数
+    let fps = 0;
+    let frames = 0;
+    let startTime = Date.now();
+
+    // キャリブレーション用の変数
+    let isCalibrating = false;
+    let gazeData = [];
+    let screenData = [];
+    let regressionModel = null;
+
+    // 視線予測位置
+    let predictedGaze = { x: 0, y: 0 };
+
+    // 頭部姿勢
+    let currentHeadPose = { yaw: 0, pitch: 0 };
+
+    // 初期設定
+    function initialize() {
+      faceMesh = new FaceMesh({
+        locateFile: (file) => {
+          return `https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh@0.4/${file}`;
+        }
+      });
+      faceMesh.setOptions({
+        maxNumFaces: 1,
+        refineLandmarks: true, // 瞳孔の検出を有効化
+        minDetectionConfidence: 0.5,
+        minTrackingConfidence: 0.5
+      });
+      faceMesh.onResults(onResults);
+
+      // ビデオの反転設定（初期値で反転）
+      videoElement.style.transform = 'scaleX(-1)';
+      canvasElement.style.transform = 'scaleX(-1)';
+
+      // カメラのセットアップ
+      startCamera();
+
+      // マウスクリックイベントのリスナーを追加
+      document.addEventListener('click', onClick);
+    }
+
+    function startCamera() {
+      // 既存のストリームを停止
+      if (videoStream) {
+        videoStream.getTracks().forEach(track => track.stop());
+      }
+      if (processFrame) {
+        clearTimeout(processFrame);
+      }
+
+      // メディアストリームの取得
+      const constraints = {
+        audio: false,
+        video: {
+          width: videoWidth,
+          height: videoHeight,
+          frameRate: { ideal: frameRate, max: frameRate }
+        }
+      };
+
+      navigator.mediaDevices.getUserMedia(constraints)
+        .then(function(stream) {
+          videoStream = stream;
+          videoElement.srcObject = stream;
+          videoElement.play();
+
+          videoElement.onloadedmetadata = () => {
+            // キャンバスのサイズを設定
+            canvasElement.width = videoElement.videoWidth;
+            canvasElement.height = videoElement.videoHeight;
+
+            // フレーム処理を開始
+            processVideo();
+          };
+        })
+        .catch(function(err) {
+          console.error("メディアデバイスへのアクセスに失敗しました。", err);
+        });
+    }
+
+    function processVideo() {
+      faceMesh.send({image: videoElement});
+    }
+
+    function onResults(results) {
+      // FPS計算
+      frames++;
+      const currentTime = Date.now();
+      if (currentTime - startTime >= 1000) {
+        fps = frames;
+        frames = 0;
+        startTime = currentTime;
+        // FPSを表示
+        fpsDisplay.innerText = `FPS: ${fps}`;
+      }
+
+      // キャンバスをクリア
+      canvasCtx.save();
+      canvasCtx.clearRect(0, 0, canvasElement.width, canvasElement.height);
+
+      // ビデオフレームをキャンバスに描画
+      canvasCtx.drawImage(
+        videoElement, 0, 0, canvasElement.width, canvasElement.height);
+
+      // 顔のランドマークを描画
+      if (results.multiFaceLandmarks && results.multiFaceLandmarks.length > 0) {
+        const landmarks = results.multiFaceLandmarks[0];
+
+        // 頭部姿勢の推定
+        const headPose = estimateHeadPose(landmarks);
+        currentHeadPose = headPose;
+
+        // 視線予測位置を計算（頭部姿勢を考慮）
+        let predictedX = headPose.yaw * window.innerWidth / 90 + window.innerWidth / 2;
+        let predictedY = -headPose.pitch * window.innerHeight / 90 + window.innerHeight / 2;
+
+        // キャリブレーションが完了している場合、補正を適用
+        if (regressionModel) {
+          const corrected = regressionModel.predict([headPose.yaw / 90, headPose.pitch / 90]);
+          predictedX = corrected[0] * window.innerWidth;
+          predictedY = corrected[1] * window.innerHeight;
+        }
+
+        // 視線予測位置を更新
+        predictedGaze.x = predictedX;
+        predictedGaze.y = predictedY;
+
+        // 視線ポイントを更新
+        gazePoint.style.left = `${predictedX}px`;
+        gazePoint.style.top = `${predictedY}px`;
+
+        // ランドマークの描画
+        drawConnectors(canvasCtx, landmarks, FaceMesh.FACEMESH_TESSELATION, {color: '#C0C0C070', lineWidth: 1});
+        drawConnectors(canvasCtx, landmarks, FaceMesh.FACEMESH_LEFT_EYE, {color: '#30FF30', lineWidth: 1});
+        drawConnectors(canvasCtx, landmarks, FaceMesh.FACEMESH_RIGHT_EYE, {color: '#30FF30', lineWidth: 1});
+        drawConnectors(canvasCtx, landmarks, FaceMesh.FACEMESH_LEFT_IRIS, {color: '#FF3030', lineWidth: 1});
+        drawConnectors(canvasCtx, landmarks, FaceMesh.FACEMESH_RIGHT_IRIS, {color: '#FF3030', lineWidth: 1});
+        drawLandmarks(canvasCtx, [landmarks[468], landmarks[473]], {color: '#FFFF00', lineWidth: 2}); // 左右の瞳孔
+      }
+      canvasCtx.restore();
+
+      // 次のフレームをスケジュール
+      const interval = 1000 / frameRate;
+      processFrame = setTimeout(() => {
+        processVideo();
+      }, interval);
+    }
+
+    function estimateHeadPose(landmarks) {
+      // 頭部のヨー角とピッチ角を推定します
+      const leftEye = landmarks[33];
+      const rightEye = landmarks[263];
+      const noseTip = landmarks[1];
+      const mouthLeft = landmarks[61];
+      const mouthRight = landmarks[291];
+
+      // ヨー角の推定（左右の回転）
+      const eyeDx = rightEye.x - leftEye.x;
+      const eyeDy = rightEye.y - leftEye.y;
+      const yaw = Math.atan2(eyeDy, eyeDx) * (180 / Math.PI);
+
+      // ピッチ角の推定（上下の回転）
+      const noseToMouthY = ((mouthLeft.y + mouthRight.y) / 2) - noseTip.y;
+      const noseToEyesY = noseTip.y - ((leftEye.y + rightEye.y) / 2);
+      const pitch = Math.atan2(noseToMouthY, noseToEyesY) * (180 / Math.PI);
+
+      return { yaw: yaw, pitch: pitch };
+    }
+
+    function onClick(event) {
+      if (isCalibrating) {
+        // クリック位置（スクリーン座標を0～1に正規化）
+        const clickX = event.clientX / window.innerWidth;
+        const clickY = event.clientY / window.innerHeight;
+
+        // 現在の頭部姿勢データを使用
+        const inputFeatures = [currentHeadPose.yaw / 90, currentHeadPose.pitch / 90];
+
+        // データを記録
+        gazeData.push(inputFeatures);
+        screenData.push([clickX, clickY]);
+
+        // 一定数のキャリブレーションデータが集まったら補正を計算
+        if (gazeData.length >= 9) {
+          calculateCalibration();
+          isCalibrating = false;
+          calibrationMessage.style.display = 'none';
+          alert('キャリブレーションが完了しました。');
+        } else {
+          calibrationMessage.innerText = `キャリブレーション中... 残り${9 - gazeData.length}回クリックしてください。`;
+        }
+      }
+    }
+
+    function calculateCalibration() {
+      // 多変量線形回帰モデルを使用して視線予測を補正
+      regressionModel = createRegressionModel(gazeData, screenData);
+    }
+
+    function createRegressionModel(gazeData, screenData) {
+      // XとYそれぞれに対して線形回帰を行う
+      const xData = gazeData;
+      const yData = gazeData;
+      const xLabel = screenData.map(d => d[0]);
+      const yLabel = screenData.map(d => d[1]);
+
+      const xModel = new SimpleLinearRegression(xData, xLabel);
+      const yModel = new SimpleLinearRegression(yData, yLabel);
+
+      return {
+        predict: (input) => {
+          const x = xModel.predict(input);
+          const y = yModel.predict(input);
+          return [x, y];
+        }
+      };
+    }
+
+    class SimpleLinearRegression {
+      constructor(features, labels) {
+        // 特徴量とラベルから線形回帰モデルを作成
+        const X = math.matrix(features);
+        const Y = math.matrix(labels);
+
+        const Xt = math.transpose(X);
+        const XtX = math.multiply(Xt, X);
+        const XtY = math.multiply(Xt, Y);
+
+        this.weights = math.lusolve(XtX, XtY);
+      }
+
+      predict(input) {
+        // 入力データに対して予測を行う
+        const X = math.matrix([input]);
+        const result = math.multiply(X, this.weights);
+        return result._data[0];
+      }
+    }
+
+    // メニューボタンのイベントリスナー
+    document.getElementById('menuButton').addEventListener('click', () => {
+      document.getElementById('settingsWindow').style.display = 'block';
+    });
+
+    // 閉じるボタンのイベントリスナー
+    document.getElementById('closeSettings').addEventListener('click', () => {
+      document.getElementById('settingsWindow').style.display = 'none';
+    });
+
+    // キャリブレーション開始ボタンのイベントリスナー
+    document.getElementById('startCalibration').addEventListener('click', () => {
+      isCalibrating = true;
+      calibrationMessage.style.display = 'block';
+      calibrationMessage.innerText = 'キャリブレーション中... 9回クリックしてください。';
+      gazeData = [];
+      screenData = [];
+    });
+
+    // 適用ボタンのイベントリスナー
+    document.getElementById('applySettings').addEventListener('click', () => {
+      // 設定値の取得
+      const resolution = document.getElementById('resolutionSelect').value;
+      [videoWidth, videoHeight] = resolution.split('x').map(Number);
+      const flip = document.getElementById('flipVideo').checked;
+      frameRate = parseInt(document.getElementById('frameRate').value);
+      const minDetectionConfidence = parseFloat(document.getElementById('detectionConfidence').value);
+      const minTrackingConfidence = parseFloat(document.getElementById('trackingConfidence').value);
+
+      // ビデオの反転設定
+      if (flip) {
+        videoElement.style.transform = 'scaleX(-1)';
+        canvasElement.style.transform = 'scaleX(-1)';
+      } else {
+        videoElement.style.transform = 'none';
+        canvasElement.style.transform = 'none';
+      }
+
+      // FaceMeshオブジェクトの設定更新
+      faceMesh.setOptions({
+        maxNumFaces: 1,
+        refineLandmarks: true,
+        minDetectionConfidence: minDetectionConfidence,
+        minTrackingConfidence: minTrackingConfidence
+      });
+
+      // カメラを再起動
+      startCamera();
+
+      // 設定ウィンドウを閉じる
+      document.getElementById('settingsWindow').style.display = 'none';
+
+      // FPS計測のリセット
+      fps = 0;
+      frames = 0;
+      startTime = Date.now();
+      fpsDisplay.innerText = `FPS: 0`;
+    });
+
+    // スライダーの値をリアルタイムで表示
+    document.getElementById('detectionConfidence').addEventListener('input', (event) => {
+      document.getElementById('detectionConfidenceValue').innerText = event.target.value;
+    });
+    document.getElementById('trackingConfidence').addEventListener('input', (event) => {
+      document.getElementById('trackingConfidenceValue').innerText = event.target.value;
+    });
+
+    // 初期化関数の呼び出し
+    initialize();
+  </script>
+</body>
+</html>
