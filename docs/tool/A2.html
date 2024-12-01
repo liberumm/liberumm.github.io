@@ -1,0 +1,15 @@
+<!DOCTYPE html>
+<html>
+<head>
+	<meta charset="UTF-8"/>
+	<script src="https://aframe.io/releases/1.2.0/aframe.min.js"></script>
+	<script src="https://unpkg.com/aframe-environment-component/dist/aframe-environment-component.min.js"></script>
+	<script src="./main.js"></script>
+</head>
+<body>
+	<a-scene stats loading-screen="dotsColor: gray; backgroundColor: lightgray">
+		<a-sky color="#ECECEC"></a-sky>
+		<a-plane position="0 0 -5" rotation="-90 0 0" width="6" height="6" color="#7BC8A4"></a-plane>
+	</a-scene>
+</body>
+</html>
