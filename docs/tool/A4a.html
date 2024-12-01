@@ -1,0 +1,303 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <title>MediaPipe Hands Detection with Adjustable FPS</title>
+  <!-- MediaPipeのライブラリを読み込み -->
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4/hands.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils@0.3/drawing_utils.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils@0.3/camera_utils.js"></script>
+  <style>
+    body { margin: 0; overflow: hidden; }
+    video, canvas {
+      position: absolute;
+      width: 100%;
+      height: 100%;
+      object-fit: cover;
+    }
+    canvas { pointer-events: none; }
+    #menuButton {
+      position: absolute;
+      bottom: 10px;
+      right: 10px;
+      z-index: 1;
+      padding: 10px 20px;
+      font-size: 16px;
+    }
+    #settingsWindow {
+      position: absolute;
+      top: 20%;
+      left: 50%;
+      transform: translate(-50%, -20%);
+      background-color: rgba(255, 255, 255, 0.9);
+      padding: 20px;
+      border-radius: 10px;
+      display: none;
+      z-index: 2;
+    }
+    #settingsWindow label {
+      display: block;
+      margin-bottom: 10px;
+    }
+    #settingsWindow input[type="range"],
+    #settingsWindow input[type="number"],
+    #settingsWindow select {
+      width: 100%;
+    }
+    #settingsWindow button {
+      margin-top: 10px;
+      padding: 5px 10px;
+    }
+    /* FPS表示のスタイル */
+    #fpsDisplay {
+      position: absolute;
+      top: 10px;
+      left: 10px;
+      z-index: 1;
+      color: white;
+      font-size: 24px;
+      background-color: rgba(0, 0, 0, 0.5);
+      padding: 5px 10px;
+      border-radius: 5px;
+    }
+  </style>
+</head>
+<body>
+  <video class="input_video"></video>
+  <canvas class="output_canvas"></canvas>
+
+  <!-- メニューボタン -->
+  <button id="menuButton">設定</button>
+
+  <!-- FPS表示 -->
+  <div id="fpsDisplay">FPS: 0</div>
+
+  <!-- 設定ウィンドウ -->
+  <div id="settingsWindow">
+    <h2>設定</h2>
+    <label>
+      解像度:
+      <select id="resolutionSelect">
+        <option value="640x480">640x480</option>
+        <option value="1280x720">1280x720</option>
+        <option value="1920x1080" selected>1920x1080</option>
+      </select>
+    </label>
+    <label>
+      ビデオの反転:
+      <input type="checkbox" id="flipVideo" checked>
+    </label>
+    <label>
+      モデルの複雑さ:
+      <select id="modelComplexity">
+        <option value="0" selected>0 (高速)</option>
+        <option value="1">1 (標準)</option>
+        <option value="2">2 (高精度)</option>
+      </select>
+    </label>
+    <label>
+      フレームレート:
+      <input type="number" id="frameRate" min="1" max="60" value="30">
+    </label>
+    <label>
+      検出の信頼度: <span id="detectionConfidenceValue">0.5</span>
+      <input type="range" id="detectionConfidence" min="0" max="1" step="0.01" value="0.5">
+    </label>
+    <label>
+      トラッキングの信頼度: <span id="trackingConfidenceValue">0.5</span>
+      <input type="range" id="trackingConfidence" min="0" max="1" step="0.01" value="0.5">
+    </label>
+    <button id="applySettings">適用</button>
+    <button id="closeSettings">閉じる</button>
+  </div>
+
+  <script>
+    let videoWidth = 1920;
+    let videoHeight = 1080;
+    let frameRate = 30; // 初期フレームレートを30に設定
+    let videoStream = null;
+    let processFrame = null;
+    const videoElement = document.getElementsByClassName('input_video')[0];
+    const canvasElement = document.getElementsByClassName('output_canvas')[0];
+    const canvasCtx = canvasElement.getContext('2d');
+    const fpsDisplay = document.getElementById('fpsDisplay');
+    let hands;
+
+    // FPS計測用の変数
+    let fps = 0;
+    let frames = 0;
+    let startTime = Date.now();
+
+    // 初期設定
+    function initialize() {
+      // Handsオブジェクトの作成
+      hands = new Hands({
+        locateFile: (file) => {
+          return `https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4/${file}`;
+        }
+      });
+      hands.setOptions({
+        maxNumHands: 2,
+        modelComplexity: 0,
+        minDetectionConfidence: 0.5,
+        minTrackingConfidence: 0.5
+      });
+      hands.onResults(onResults);
+
+      // ビデオの反転設定（初期値で反転）
+      videoElement.style.transform = 'scaleX(-1)';
+      canvasElement.style.transform = 'scaleX(-1)';
+
+      // カメラのセットアップ
+      startCamera();
+    }
+
+    function startCamera() {
+      // 既存のストリームを停止
+      if (videoStream) {
+        videoStream.getTracks().forEach(track => track.stop());
+      }
+      if (processFrame) {
+        clearTimeout(processFrame);
+      }
+
+      // メディアストリームの取得
+      const constraints = {
+        audio: false,
+        video: {
+          width: videoWidth,
+          height: videoHeight,
+          frameRate: { ideal: frameRate, max: frameRate }
+        }
+      };
+
+      navigator.mediaDevices.getUserMedia(constraints)
+        .then(function(stream) {
+          videoStream = stream;
+          videoElement.srcObject = stream;
+          videoElement.play();
+
+          videoElement.onloadedmetadata = () => {
+            // キャンバスのサイズを設定
+            canvasElement.width = videoElement.videoWidth;
+            canvasElement.height = videoElement.videoHeight;
+
+            // フレーム処理を開始
+            processVideo();
+          };
+        })
+        .catch(function(err) {
+          console.error("メディアデバイスへのアクセスに失敗しました。", err);
+        });
+    }
+
+    function processVideo() {
+      hands.send({image: videoElement});
+    }
+
+    function onResults(results) {
+      // FPS計算
+      frames++;
+      const currentTime = Date.now();
+      if (currentTime - startTime >= 1000) {
+        fps = frames;
+        frames = 0;
+        startTime = currentTime;
+        // FPSを表示
+        fpsDisplay.innerText = `FPS: ${fps}`;
+      }
+
+      // キャンバスをクリア
+      canvasCtx.save();
+      canvasCtx.clearRect(0, 0, canvasElement.width, canvasElement.height);
+
+      // ビデオフレームをキャンバスに描画
+      canvasCtx.drawImage(
+        videoElement, 0, 0, canvasElement.width, canvasElement.height);
+
+      // 手のランドマークを描画
+      if (results.multiHandLandmarks && results.multiHandedness) {
+        for (let index = 0; index < results.multiHandLandmarks.length; index++) {
+          const classification = results.multiHandedness[index];
+          const isRightHand = classification.label === 'Right';
+
+          // ランドマークの描画
+          drawConnectors(canvasCtx, results.multiHandLandmarks[index], HAND_CONNECTIONS,
+            {color: isRightHand ? '#00FF00' : '#FF0000', lineWidth: 5});
+          drawLandmarks(canvasCtx, results.multiHandLandmarks[index],
+            {color: isRightHand ? '#00FF00' : '#FF0000', lineWidth: 2});
+        }
+      }
+      canvasCtx.restore();
+
+      // 次のフレームをスケジュール
+      const interval = 1000 / frameRate;
+      processFrame = setTimeout(() => {
+        processVideo();
+      }, interval);
+    }
+
+    // メニューボタンのイベントリスナー
+    document.getElementById('menuButton').addEventListener('click', () => {
+      document.getElementById('settingsWindow').style.display = 'block';
+    });
+
+    // 閉じるボタンのイベントリスナー
+    document.getElementById('closeSettings').addEventListener('click', () => {
+      document.getElementById('settingsWindow').style.display = 'none';
+    });
+
+    // 適用ボタンのイベントリスナー
+    document.getElementById('applySettings').addEventListener('click', () => {
+      // 設定値の取得
+      const resolution = document.getElementById('resolutionSelect').value;
+      [videoWidth, videoHeight] = resolution.split('x').map(Number);
+      const flip = document.getElementById('flipVideo').checked;
+      const modelComplexity = parseInt(document.getElementById('modelComplexity').value);
+      frameRate = parseInt(document.getElementById('frameRate').value);
+      const minDetectionConfidence = parseFloat(document.getElementById('detectionConfidence').value);
+      const minTrackingConfidence = parseFloat(document.getElementById('trackingConfidence').value);
+
+      // ビデオの反転設定
+      if (flip) {
+        videoElement.style.transform = 'scaleX(-1)';
+        canvasElement.style.transform = 'scaleX(-1)';
+      } else {
+        videoElement.style.transform = 'none';
+        canvasElement.style.transform = 'none';
+      }
+
+      // Handsオブジェクトの設定更新
+      hands.setOptions({
+        maxNumHands: 2,
+        modelComplexity: modelComplexity,
+        minDetectionConfidence: minDetectionConfidence,
+        minTrackingConfidence: minTrackingConfidence
+      });
+
+      // カメラを再起動
+      startCamera();
+
+      // 設定ウィンドウを閉じる
+      document.getElementById('settingsWindow').style.display = 'none';
+
+      // FPS計測のリセット
+      fps = 0;
+      frames = 0;
+      startTime = Date.now();
+      fpsDisplay.innerText = `FPS: 0`;
+    });
+
+    // スライダーの値をリアルタイムで表示
+    document.getElementById('detectionConfidence').addEventListener('input', (event) => {
+      document.getElementById('detectionConfidenceValue').innerText = event.target.value;
+    });
+    document.getElementById('trackingConfidence').addEventListener('input', (event) => {
+      document.getElementById('trackingConfidenceValue').innerText = event.target.value;
+    });
+
+    // 初期化関数の呼び出し
+    initialize();
+  </script>
+</body>
+</html>
