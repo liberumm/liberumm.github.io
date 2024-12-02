@@ -1,0 +1,602 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <title>A-Frame 物理演算サンプル - スナップ切り替えとHigh Drop Destruction機能</title>
+  
+  <!-- A-Frameライブラリ -->
+  <script src="https://aframe.io/releases/1.6.0/aframe.min.js"></script>
+  <!-- A-Frame Physics System -->
+  <script src="https://cdn.jsdelivr.net/gh/c-frame/aframe-physics-system@v4.2.2/dist/aframe-physics-system.min.js"></script>
+  
+  <!-- カスタムコンポーネント -->
+  <script>
+    // state-manager コンポーネント: スナップモードとHigh Drop Destructionのモードを管理
+    AFRAME.registerComponent('state-manager', {
+      schema: {
+        autoSnap: { type: 'boolean', default: true },
+        highDropDestructionMode: { type: 'number', default: 0 } // 0: Always Destroy, 1: Conditional Destroy, 2: Never Destroy
+      },
+      init: function () {
+        const el = this.el;
+
+        // snap-toggle イベントリスナー
+        el.sceneEl.addEventListener('snap-toggle', (e) => {
+          this.data.autoSnap = e.detail.isAutoSnap;
+          console.log(`スナップモードが ${this.data.autoSnap ? 'ON' : 'OFF'} に切り替わりました`);
+        });
+
+        // high-drop-toggle イベントリスナー
+        el.sceneEl.addEventListener('high-drop-toggle', (e) => {
+          this.data.highDropDestructionMode = e.detail.mode;
+          const modeNames = ['Always Destroy', 'Conditional Destroy', 'Never Destroy'];
+          console.log(`High Drop Destruction モードが ${modeNames[this.data.highDropDestructionMode]} に切り替わりました`);
+        });
+      }
+    });
+
+    // breakable コンポーネント: オブジェクトが一定速度以上で衝突、またはHigh Drop Destructionのモードに応じて破壊
+    AFRAME.registerComponent('breakable', {
+      schema: {
+        threshold: { type: 'number', default: 5 } // 衝突速度の閾値
+      },
+      init: function () {
+        const el = this.el;
+        const data = this.data;
+        const sceneEl = el.sceneEl;
+        const stateManager = sceneEl.components['state-manager'];
+
+        if (!el.body) {
+          console.warn('breakable コンポーネントは dynamic-body コンポーネントが必要です。');
+          return;
+        }
+
+        el.body.addEventListener('collide', (e) => {
+          const collision = e.contact;
+          const impactVelocity = collision.getImpactVelocityAlongNormal();
+
+          console.log(`オブジェクトID: ${el.id || el.object3D.uuid}, 衝突速度: ${impactVelocity}`);
+
+          const mode = stateManager.data.highDropDestructionMode;
+
+          if (mode === 0) { // Always Destroy
+            console.log(`オブジェクトが破壊されました（Always Destroy）: ${el.id || el.object3D.uuid}`);
+            this.createExplosion(el.object3D.position);
+            el.parentNode.removeChild(el);
+          } else if (mode === 1) { // Conditional Destroy
+            const highDrop = el.getAttribute('data-high-drop') === 'true';
+            if (impactVelocity > data.threshold || highDrop) {
+              console.log(`オブジェクトが破壊されました（Conditional Destroy）: ${el.id || el.object3D.uuid}`);
+              this.createExplosion(el.object3D.position);
+              el.parentNode.removeChild(el);
+            }
+          } else if (mode === 2) { // Never Destroy
+            // 破壊しない
+            console.log(`オブジェクトは破壊されません（Never Destroy）: ${el.id || el.object3D.uuid}`);
+          }
+        });
+      },
+      createExplosion: function (position) {
+        const scene = this.el.sceneEl;
+        const explosion = document.createElement('a-entity');
+
+        // パーティクルシステムを使用した簡易爆発エフェクト
+        explosion.setAttribute('particle-system', {
+          preset: 'dust',
+          position: `${position.x} ${position.y} ${position.z}`,
+          color: '#FF0000, #FFA500, #FFFF00',
+          size: 0.1,
+          particleCount: 200,
+          opacity: 0.7
+        });
+
+        scene.appendChild(explosion);
+
+        // エフェクトを一定時間後に削除
+        setTimeout(() => {
+          scene.removeChild(explosion);
+        }, 1000); // 1秒後に削除
+      }
+    });
+
+    // free-fall-monitor コンポーネント: オブジェクトが自由落下しているかを監視
+    AFRAME.registerComponent('free-fall-monitor', {
+      schema: {
+        heightThreshold: { type: 'number', default: 4 }, // 高さの閾値
+        minVelocity: { type: 'number', default: 0.1 } // 最小速度
+      },
+      init: function () {
+        this.initialY = this.el.object3D.position.y;
+        this.falling = false;
+      },
+      tick: function (time, timeDelta) {
+        const currentY = this.el.object3D.position.y;
+        const body = this.el.body;
+        if (!body) return;
+
+        const velocityY = body.velocity.y;
+
+        const stateManager = this.el.sceneEl.components['state-manager'];
+        const mode = stateManager.data.highDropDestructionMode;
+
+        if (mode === 0) { // Always Destroy
+          if (!this.falling) {
+            this.falling = true;
+            console.log(`オブジェクトが自由落下しています（Always Destroy）: ${this.el.id || this.el.object3D.uuid}`);
+            // 破壊は breakable コンポーネントで行うため、ここでは何もしません
+          }
+        } else if (mode === 1) { // Conditional Destroy
+          if (currentY < this.initialY - this.data.heightThreshold && velocityY < -this.data.minVelocity) {
+            if (!this.falling) {
+              this.falling = true;
+              this.el.setAttribute('data-high-drop', 'true');
+              console.log(`オブジェクトが高い位置から自由落下しています（Conditional Destroy）: ${this.el.id || this.el.object3D.uuid}`);
+            }
+          } else {
+            if (this.falling) {
+              this.falling = false;
+              this.el.removeAttribute('data-high-drop');
+              console.log(`オブジェクトが自由落下状態から離れました（Conditional Destroy）: ${this.el.id || this.el.object3D.uuid}`);
+            }
+          }
+        } else if (mode === 2) { // Never Destroy
+          if (this.falling) {
+            this.falling = false;
+            this.el.removeAttribute('data-high-drop');
+            console.log(`オブジェクトが自由落下状態から離れました（Never Destroy）: ${this.el.id || this.el.object3D.uuid}`);
+          }
+        }
+      }
+    });
+
+    // double-click-drag コンポーネント: オブジェクトのドラッグ＆ドロップ機能
+    AFRAME.registerComponent('double-click-drag', {
+      schema: {
+        enabled: { default: true }
+      },
+      init: function () {
+        this.grabbedEl = null;
+        this.raycaster = new THREE.Raycaster();
+        this.mouse = new THREE.Vector2();
+        this.camera = this.el.sceneEl.camera;
+        this.canvas = this.el.sceneEl.canvas;
+        this.isDragging = false;
+        this.shiftPressed = false;
+        
+        // インジケーターの作成
+        this.indicator = document.createElement('a-box');
+        this.indicator.setAttribute('position', '0 0 0');
+        this.indicator.setAttribute('depth', '1.1');
+        this.indicator.setAttribute('height', '1.1');
+        this.indicator.setAttribute('width', '1.1');
+        this.indicator.setAttribute('color', '#00FF00');
+        this.indicator.setAttribute('opacity', '0.5');
+        this.indicator.setAttribute('visible', 'false');
+        this.el.sceneEl.appendChild(this.indicator);
+        
+        // イベントハンドラーをバインド
+        this.onDblClick = this.onDblClick.bind(this);
+        this.onMouseMove = this.onMouseMove.bind(this);
+        this.onMouseUp = this.onMouseUp.bind(this);
+        this.onKeyDown = this.onKeyDown.bind(this);
+        this.onKeyUp = this.onKeyUp.bind(this);
+        
+        // キャンバスにイベントリスナーを追加
+        if (this.canvas) {
+          this.canvas.addEventListener('dblclick', this.onDblClick);
+          this.canvas.addEventListener('mousemove', this.onMouseMove);
+          this.canvas.addEventListener('mouseup', this.onMouseUp);
+        } else {
+          this.el.sceneEl.addEventListener('renderstart', () => {
+            this.canvas = this.el.sceneEl.canvas;
+            this.canvas.addEventListener('dblclick', this.onDblClick);
+            this.canvas.addEventListener('mousemove', this.onMouseMove);
+            this.canvas.addEventListener('mouseup', this.onMouseUp);
+          });
+        }
+        
+        // ドキュメントにキーイベントリスナーを追加
+        document.addEventListener('keydown', this.onKeyDown);
+        document.addEventListener('keyup', this.onKeyUp);
+        
+        // ドロップ開始高さを記録するプロパティ
+        this.dropStartHeight = 0;
+      },
+      remove: function () {
+        // イベントリスナーの解除
+        if (this.canvas) {
+          this.canvas.removeEventListener('dblclick', this.onDblClick);
+          this.canvas.removeEventListener('mousemove', this.onMouseMove);
+          this.canvas.removeEventListener('mouseup', this.onMouseUp);
+        }
+        document.removeEventListener('keydown', this.onKeyDown);
+        document.removeEventListener('keyup', this.onKeyUp);
+        
+        // インジケーターの削除
+        if (this.indicator) {
+          this.el.sceneEl.removeChild(this.indicator);
+        }
+      },
+      onKeyDown: function (event) {
+        if (event.key === 'Shift') {
+          this.shiftPressed = true;
+          console.log('Shiftキーが押されました');
+          if (this.grabbedEl) {
+            // 衝突応答を無効化
+            this.grabbedEl.body.collisionResponse = false;
+            console.log('衝突応答を無効化');
+            
+            // 重力を無効化（キネマティックに変更）
+            this.grabbedEl.body.type = 2; // 2はキネマティック
+            console.log('重力を無効化（キネマティックに変更）');
+          }
+        }
+      },
+      onKeyUp: function (event) {
+        if (event.key === 'Shift') {
+          this.shiftPressed = false;
+          console.log('Shiftキーが離されました');
+          if (this.grabbedEl) {
+            // 衝突応答を再有効化
+            this.grabbedEl.body.collisionResponse = true;
+            console.log('衝突応答を再有効化');
+            
+            // 重力を再有効化（ダイナミックに変更）
+            this.grabbedEl.body.type = 1; // 1はダイナミック
+            console.log('重力を再有効化（ダイナミックに変更）');
+          }
+        }
+      },
+      onDblClick: function (event) {
+        if (!this.data.enabled) return;
+
+        console.log('ダブルクリック検出');
+
+        // マウス位置を正規化デバイス座標 (-1 to +1) に変換
+        const rect = this.canvas.getBoundingClientRect();
+        this.mouse.x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
+        this.mouse.y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
+
+        // Raycasterを設定
+        this.raycaster.setFromCamera(this.mouse, this.camera);
+
+        // 動的および静的オブジェクトを対象にRaycasterを設定
+        const targetObjects = [];
+        this.el.sceneEl.object3D.traverse((obj) => {
+          if (obj.el && (obj.el.components['dynamic-body'] || obj.el.components['static-body'])) {
+            targetObjects.push(obj);
+          }
+        });
+
+        const intersected = this.raycaster.intersectObjects(targetObjects, true);
+
+        if (intersected.length > 0) {
+          const intersectedEl = intersected[0].object.el;
+          console.log('交差したオブジェクト:', intersectedEl);
+
+          if (intersectedEl && intersectedEl.components['dynamic-body']) {
+            // オブジェクトを掴む
+            this.grabbedEl = intersectedEl;
+
+            // ドロップ開始高さを記録
+            this.dropStartHeight = intersectedEl.object3D.position.y;
+            console.log(`ドロップ開始高さ: ${this.dropStartHeight}`);
+
+            // 物理演算を一時的に無効化
+            intersectedEl.body.sleep();
+            console.log('オブジェクトを掴みました:', intersectedEl);
+
+            // Shiftキーが押されている場合のみ、衝突応答と重力を無効化
+            if (this.shiftPressed) {
+              // 衝突応答を無効化
+              intersectedEl.body.collisionResponse = false;
+              console.log('衝突応答を無効化');
+
+              // 重力を無効化（キネマティックに変更）
+              intersectedEl.body.type = 2; // キネマティック
+              console.log('重力を無効化（キネマティックに変更）');
+            }
+
+            // 視覚的フィードバック（色変更）
+            intersectedEl.setAttribute('color', '#FFD700');
+
+            this.isDragging = true;
+          }
+        }
+      },
+      onMouseMove: function (event) {
+        if (!this.grabbedEl || !this.isDragging) return;
+
+        // マウス位置を正規化デバイス座標 (-1 to +1) に変換
+        const rect = this.canvas.getBoundingClientRect();
+        this.mouse.x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
+        this.mouse.y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
+
+        // Raycasterを設定
+        this.raycaster.setFromCamera(this.mouse, this.camera);
+
+        // 掴んだオブジェクトと同じ高さの平面を定義
+        const grabbedPos = this.grabbedEl.object3D.position.clone();
+        const plane = new THREE.Plane(new THREE.Vector3(0, 1, 0), -grabbedPos.y);
+
+        // 平面との交点を計算
+        const intersectPoint = new THREE.Vector3();
+        this.raycaster.ray.intersectPlane(plane, intersectPoint);
+
+        if (intersectPoint) {
+          let yPos = grabbedPos.y; // 初期高さ
+          let targetEl = null; // インジケーターを表示する対象
+
+          const sceneEl = this.el.sceneEl;
+          const stateManager = sceneEl.components['state-manager'];
+          const mode = stateManager.data.highDropDestructionMode;
+
+          if (this.shiftPressed) {
+            let maxY = 0;
+            const grabbedBox = new THREE.Box3().setFromObject(this.grabbedEl.object3D);
+            const grabbedSize = new THREE.Vector3();
+            grabbedBox.getSize(grabbedSize);
+            const halfHeight = grabbedSize.y / 2;
+
+            // 他のオブジェクトとの接触判定（動的および静的オブジェクトを含む）
+            sceneEl.object3D.traverse((obj) => {
+              if (obj.el && obj.el !== this.grabbedEl && (obj.el.components['dynamic-body'] || obj.el.components['static-body'])) {
+                const otherBox = new THREE.Box3().setFromObject(obj.el.object3D);
+                const xOverlap = grabbedBox.min.x <= otherBox.max.x && grabbedBox.max.x >= otherBox.min.x;
+                const zOverlap = grabbedBox.min.z <= otherBox.max.z && grabbedBox.max.z >= otherBox.min.z;
+
+                if (xOverlap && zOverlap) {
+                  maxY = Math.max(maxY, otherBox.max.y);
+                  if (maxY === otherBox.max.y) {
+                    targetEl = obj.el; // 最も高いオブジェクトをターゲットとする
+                  }
+                }
+              }
+            });
+
+            yPos = maxY + halfHeight + 0.1; // 少しオフセットを追加
+
+            // Y座標の最低値を設定（地面の上）
+            const minY = halfHeight + 0.2; // 地面が y=0 の場合に少しオフセットを追加
+            yPos = Math.max(yPos, minY);
+
+            // 自動スナップモードの場合
+            if (stateManager.data.autoSnap) {
+              const gridSize = 1; // グリッドサイズを1に設定
+              intersectPoint.x = Math.round(intersectPoint.x / gridSize) * gridSize;
+              intersectPoint.z = Math.round(intersectPoint.z / gridSize) * gridSize;
+            }
+
+            // インジケーターの位置を設定
+            if (targetEl) {
+              const targetPos = targetEl.object3D.position.clone();
+              this.indicator.setAttribute('position', `${targetPos.x} ${maxY + halfHeight + 0.1} ${targetPos.z}`);
+              this.indicator.setAttribute('visible', 'true');
+            } else {
+              this.indicator.setAttribute('visible', 'false');
+            }
+          } else {
+            // Shiftキーが押されていない場合、インジケーターを非表示にする
+            this.indicator.setAttribute('visible', 'false');
+          }
+
+          // 物理ボディの位置を更新
+          const body = this.grabbedEl.body;
+          body.position.set(intersectPoint.x, yPos, intersectPoint.z);
+          body.velocity.set(0, 0, 0);
+          body.angularVelocity.set(0, 0, 0);
+        }
+      },
+      onMouseUp: function (event) {
+        if (this.grabbedEl && this.isDragging) {
+          const sceneEl = this.el.sceneEl;
+          const stateManager = sceneEl.components['state-manager'];
+          const mode = stateManager.data.highDropDestructionMode;
+
+          // Shiftキーが押されている場合はキネマティックをダイナミックに変更
+          if (this.shiftPressed) {
+            // 衝突応答を再有効化
+            this.grabbedEl.body.collisionResponse = true;
+            console.log('衝突応答を再有効化');
+
+            // 重力を再有効化（ダイナミックに変更）
+            this.grabbedEl.body.type = 1; // 1はダイナミック
+            console.log('重力を再有効化（ダイナミックに変更）');
+          }
+
+          // 物理演算を再開
+          this.grabbedEl.body.wakeUp();
+
+          // 視覚的フィードバックを元に戻す
+          this.grabbedEl.setAttribute('color', '#4CC3D9');
+
+          // インジケーターを非表示にする
+          this.indicator.setAttribute('visible', 'false');
+
+          // High Drop Destructionモードに応じた破壊フラグの設定
+          if (mode === 0) { // Always Destroy
+            this.grabbedEl.setAttribute('data-high-drop', 'true');
+            console.log('オブジェクトが高落下フラグを持ちました（Always Destroy）:', this.grabbedEl);
+          } else if (mode === 1) { // Conditional Destroy
+            if (this.dropStartHeight >= 4) { // 指定高さ以上からの放下
+              this.grabbedEl.setAttribute('data-high-drop', 'true');
+              console.log('オブジェクトが高落下フラグを持ちました（Conditional Destroy）:', this.grabbedEl);
+            } else {
+              this.grabbedEl.removeAttribute('data-high-drop');
+              console.log('オブジェクトから高落下フラグを削除しました（Conditional Destroy）:', this.grabbedEl);
+            }
+          } else if (mode === 2) { // Never Destroy
+            this.grabbedEl.removeAttribute('data-high-drop');
+            console.log('オブジェクトから高落下フラグを削除しました（Never Destroy）:', this.grabbedEl);
+          }
+
+          console.log('オブジェクトを放しました:', this.grabbedEl);
+          this.grabbedEl = null;
+          this.isDragging = false;
+          this.dropStartHeight = 0;
+        }
+      }
+    });
+
+    // ボタンの機能を実装するスクリプト
+    document.addEventListener('DOMContentLoaded', () => {
+      // Snapボタン
+      const snapButton = document.getElementById('snap-button');
+      let isAutoSnap = true; // 初期モードは自動スナップ
+
+      snapButton.addEventListener('click', () => {
+        isAutoSnap = !isAutoSnap;
+        // ボタンのラベルを更新
+        const buttonText = snapButton.querySelector('.button-text');
+        if (buttonText) {
+          buttonText.textContent = `Snap: ${isAutoSnap ? 'ON' : 'OFF'}`;
+        }
+        // state-manager コンポーネントにスナップモードの変更を通知
+        const sceneEl = document.querySelector('a-scene');
+        sceneEl.emit('snap-toggle', { isAutoSnap: isAutoSnap });
+      });
+
+      // High Drop Destructionボタン
+      const highDropButton = document.getElementById('high-drop-button');
+      let highDropMode = 0; // 0: Always Destroy, 1: Conditional Destroy, 2: Never Destroy
+
+      highDropButton.addEventListener('click', () => {
+        // モードを順に切り替える
+        highDropMode = (highDropMode + 1) % 3;
+        const modeNames = ['Always Destroy', 'Conditional Destroy', 'Never Destroy'];
+
+        // ボタンのラベルを更新
+        const buttonText = highDropButton.querySelector('.high-drop-button-text');
+        if (buttonText) {
+          buttonText.textContent = `High Drop Destruction: ${modeNames[highDropMode]}`;
+        }
+
+        // state-manager コンポーネントにHigh Drop Destructionのモード変更を通知
+        const sceneEl = document.querySelector('a-scene');
+        sceneEl.emit('high-drop-toggle', { mode: highDropMode });
+      });
+    });
+  </script>
+  
+  <style>
+    body { 
+      margin: 0; 
+      overflow: hidden; 
+    }
+    a-scene { 
+      width: 100vw; 
+      height: 100vh; 
+    }
+    
+    /* オーバーレイボタンのスタイリング */
+    .overlay-button {
+      position: absolute;
+      left: 20px;
+      width: 220px;
+      height: 50px;
+      background-color: rgba(255, 255, 255, 0.8);
+      border: 2px solid #000;
+      border-radius: 8px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      cursor: pointer;
+      user-select: none;
+      font-family: Arial, sans-serif;
+      z-index: 1000; /* シーンより前面に表示 */
+      margin-bottom: 10px;
+    }
+    
+    #snap-button {
+      top: 20px; /* Snapボタンは20px */
+    }
+    
+    #high-drop-button {
+      top: 80px; /* High Dropボタンは80px */
+    }
+    
+    .overlay-button:hover {
+      background-color: rgba(200, 200, 200, 0.8);
+    }
+    
+    .button-text, .high-drop-button-text {
+      pointer-events: none;
+      font-size: 16px;
+      color: #000;
+    }
+
+    /* モバイルデバイス向けの調整 */
+    @media (max-width: 600px) {
+      .overlay-button {
+        width: 180px;
+        height: 40px;
+        left: 10px;
+      }
+      
+      #high-drop-button {
+        top: 60px;
+      }
+      
+      .button-text, .high-drop-button-text {
+        font-size: 14px;
+      }
+    }
+  </style>
+</head>
+<body>
+  <!-- スナップモード切り替えボタン（オーバーレイ） -->
+  <div id="snap-button" class="overlay-button">
+    <span class="button-text">Snap: ON</span>
+  </div>
+  
+  <!-- High Drop Destructionモード切り替えボタン（オーバーレイ） -->
+  <div id="high-drop-button" class="overlay-button">
+    <span class="high-drop-button-text">High Drop Destruction: Always Destroy</span>
+  </div>
+  
+  <a-scene physics="debug: true; gravity: -9.8" state-manager double-click-drag>
+    <!-- 地面 -->
+    <a-plane position="0 0 0" rotation="-90 0 0" width="20" height="20" color="#7BC8A4" static-body></a-plane>
+    
+    <!-- 静的なボックス -->
+    <a-box position="5 0.25 0" rotation="-30 0 0" width="10" height="0.5" depth="5" color="#FFC65D" static-body></a-box>
+    
+    <!-- 動的なボックスの生成スクリプト -->
+    <script>
+      document.addEventListener('DOMContentLoaded', () => {
+        const scene = document.querySelector('a-scene');
+        const colors = ['#4CC3D9', '#EF2D5E', '#7BC8A4', '#FFC65D', '#FF6347', '#32CD32', '#8A2BE2', '#FFD700', '#00CED1'];
+        let index = 0;
+        const spacing = 2;
+
+        for (let i = 0; i < 5; i++) { // 5x5グリッドに拡大
+          for (let j = 0; j < 5; j++) {
+            const box = document.createElement('a-box');
+            box.setAttribute('position', `${(i - 2) * spacing} 1 ${(j - 2) * spacing}`);
+            box.setAttribute('depth', '1');
+            box.setAttribute('height', '1');
+            box.setAttribute('width', '1');
+            box.setAttribute('color', colors[index % colors.length]);
+            box.setAttribute('dynamic-body', ''); // 動的ボディ
+            box.setAttribute('breakable', 'threshold: 5'); // breakableコンポーネントを追加
+            box.setAttribute('free-fall-monitor', 'heightThreshold: 4; minVelocity: 0.1'); // free-fall-monitorコンポーネントを追加
+            scene.appendChild(box);
+            index++;
+          }
+        }
+      });
+    </script>
+    
+    <!-- カメラ -->
+    <a-entity position="0 5 10">
+      <a-camera></a-camera>
+    </a-entity>
+    
+    <!-- 環境光 -->
+    <a-entity light="type: ambient; color: #445451"></a-entity>
+    
+    <!-- 方向性ライト -->
+    <a-entity light="type: directional; color: #ffffff; intensity: 0.5" position="1 1 0"></a-entity>
+  </a-scene>
+</body>
+</html>
