@@ -2,7 +2,7 @@
 <html lang="ja">
 <head>
   <meta charset="UTF-8">
-  <title>A-Frame 物理演算サンプル - スナップ切り替えとHigh Drop Destruction機能</title>
+  <title>A-Frame 物理演算サンプル - スナップ切り替え、High Drop Destruction機能、キューブ生成・破壊機能、リセット機能、初期キューブ生成機能</title>
   
   <!-- A-Frameライブラリ -->
   <script src="https://aframe.io/releases/1.6.0/aframe.min.js"></script>
@@ -15,7 +15,8 @@
     AFRAME.registerComponent('state-manager', {
       schema: {
         autoSnap: { type: 'boolean', default: true },
-        highDropDestructionMode: { type: 'number', default: 0 } // 0: Always Destroy, 1: Conditional Destroy, 2: Never Destroy
+        highDropDestructionMode: { type: 'number', default: 1 }, // 0: Always Destroy, 1: Conditional Destroy, 2: Never Destroy
+        fragmentBehavior: { type: 'number', default: 0 } // 0: Fragments Disappear, 1: Fragments Remain
       },
       init: function () {
         const el = this.el;
@@ -31,6 +32,21 @@
           this.data.highDropDestructionMode = e.detail.mode;
           const modeNames = ['Always Destroy', 'Conditional Destroy', 'Never Destroy'];
           console.log(`High Drop Destruction モードが ${modeNames[this.data.highDropDestructionMode]} に切り替わりました`);
+        });
+
+        // fragment-behavior-toggle イベントリスナー
+        el.sceneEl.addEventListener('fragment-behavior-toggle', (e) => {
+          this.data.fragmentBehavior = e.detail.behavior;
+          const behaviorNames = ['Fragments Disappear', 'Fragments Remain'];
+          console.log(`フラグメント動作が ${behaviorNames[this.data.fragmentBehavior]} に切り替わりました`);
+        });
+
+        // reset シーン用イベントリスナー
+        el.sceneEl.addEventListener('reset-scene', () => {
+          this.data.autoSnap = true;
+          this.data.highDropDestructionMode = 1; // Conditional Destroyにリセット
+          this.data.fragmentBehavior = 0;
+          console.log('シーンがリセットされました');
         });
       }
     });
@@ -61,14 +77,24 @@
 
           if (mode === 0) { // Always Destroy
             console.log(`オブジェクトが破壊されました（Always Destroy）: ${el.id || el.object3D.uuid}`);
-            this.createExplosion(el.object3D.position);
-            el.parentNode.removeChild(el);
+            this.createExplosion(el.object3D.position, el.getAttribute('color'));
+            // 即時削除を避け、次のフレームで削除
+            setTimeout(() => {
+              if (el.parentNode) { // 削除前に親が存在するか確認
+                el.parentNode.removeChild(el);
+              }
+            }, 0);
           } else if (mode === 1) { // Conditional Destroy
             const highDrop = el.getAttribute('data-high-drop') === 'true';
             if (impactVelocity > data.threshold || highDrop) {
               console.log(`オブジェクトが破壊されました（Conditional Destroy）: ${el.id || el.object3D.uuid}`);
-              this.createExplosion(el.object3D.position);
-              el.parentNode.removeChild(el);
+              this.createExplosion(el.object3D.position, el.getAttribute('color'));
+              // 即時削除を避け、次のフレームで削除
+              setTimeout(() => {
+                if (el.parentNode) { // 削除前に親が存在するか確認
+                  el.parentNode.removeChild(el);
+                }
+              }, 0);
             }
           } else if (mode === 2) { // Never Destroy
             // 破壊しない
@@ -76,11 +102,22 @@
           }
         });
       },
-      createExplosion: function (position) {
+      createExplosion: function (position, originalColor) {
         const scene = this.el.sceneEl;
+        const stateManager = scene.components['state-manager'];
+        const fragmentBehavior = stateManager.data.fragmentBehavior;
+
+        if (fragmentBehavior === 0) {
+          // フラグメントが消えるモード
+          createFragmentExplosion(scene, position, true, originalColor);
+        } else {
+          // フラグメントが残るモード
+          createFragmentExplosion(scene, position, false, originalColor);
+        }
+
+        // パーティクルシステムを使用した簡易爆発エフェクト（オプション）
         const explosion = document.createElement('a-entity');
 
-        // パーティクルシステムを使用した簡易爆発エフェクト
         explosion.setAttribute('particle-system', {
           preset: 'dust',
           position: `${position.x} ${position.y} ${position.z}`,
@@ -94,10 +131,65 @@
 
         // エフェクトを一定時間後に削除
         setTimeout(() => {
-          scene.removeChild(explosion);
+          if (explosion.parentNode) { // 削除前に親が存在するか確認
+            scene.removeChild(explosion);
+          }
         }, 1000); // 1秒後に削除
       }
     });
+
+    // フラグメント生成関数
+    function createFragmentExplosion(scene, position, fragmentsDisappear, originalColor) {
+      const fragmentCount = 10; // フラグメントの数
+      const fragmentSize = 0.2; // フラグメントの大きさ
+
+      for (let i = 0; i < fragmentCount; i++) {
+        const fragment = document.createElement('a-box');
+
+        // 元の位置を基準に少しランダムにずらす
+        const offset = new THREE.Vector3(
+          (Math.random() - 0.5) * 0.2,
+          (Math.random() - 0.5) * 0.2,
+          (Math.random() - 0.5) * 0.2
+        );
+
+        fragment.setAttribute('position', `${position.x + offset.x} ${position.y + offset.y} ${position.z + offset.z}`);
+        fragment.setAttribute('depth', fragmentSize);
+        fragment.setAttribute('height', fragmentSize);
+        fragment.setAttribute('width', fragmentSize);
+        fragment.setAttribute('color', originalColor);
+        fragment.setAttribute('dynamic-body', 'mass: 0.1'); // フラグメントは軽量
+        fragment.classList.add('fragment'); // クラス 'fragment' を追加
+
+        // ランダムな初速度を設定
+        const randomVelocity = new THREE.Vector3(
+          (Math.random() - 0.5) * 5,
+          Math.random() * 5,
+          (Math.random() - 0.5) * 5
+        );
+        fragment.setAttribute('velocity', `${randomVelocity.x} ${randomVelocity.y} ${randomVelocity.z}`);
+
+        // フラグメントが消える場合、フェードアウトアニメーションを適用
+        if (fragmentsDisappear) {
+          fragment.setAttribute('animation__fade', {
+            property: 'material.opacity',
+            to: 0,
+            dur: 2000,
+            easing: 'linear',
+            loop: false
+          });
+
+          // フラグメントをフェードアウト後に削除
+          fragment.addEventListener('animationcomplete__fade', () => {
+            if (fragment.parentNode) {
+              fragment.parentNode.removeChild(fragment);
+            }
+          });
+        }
+
+        scene.appendChild(fragment);
+      }
+    }
 
     // free-fall-monitor コンポーネント: オブジェクトが自由落下しているかを監視
     AFRAME.registerComponent('free-fall-monitor', {
@@ -440,6 +532,52 @@
 
     // ボタンの機能を実装するスクリプト
     document.addEventListener('DOMContentLoaded', () => {
+      const sceneEl = document.querySelector('a-scene');
+
+      // 初期の25キューブを生成する関数
+      function generateInitialCubes() {
+        // 既存のキューブを削除
+        const existingCubes = sceneEl.querySelectorAll('.cube');
+        existingCubes.forEach(cube => {
+          if (cube.parentNode) {
+            cube.parentNode.removeChild(cube);
+            console.log(`既存のキューブが削除されました: ${cube.id || cube.object3D.uuid}`);
+          }
+        });
+
+        const colors = ['#4CC3D9', '#EF2D5E', '#7BC8A4', '#FFC65D', '#FF6347', '#32CD32', '#8A2BE2', '#FFD700', '#00CED1'];
+        let index = 0;
+        const spacing = 2;
+
+        for (let i = 0; i < 5; i++) { // 5x5グリッド
+          for (let j = 0; j < 5; j++) {
+            const box = document.createElement('a-box');
+            box.setAttribute('position', `${(i - 2) * spacing} 1 ${(j - 2) * spacing}`);
+            box.setAttribute('depth', '1');
+            box.setAttribute('height', '1');
+            box.setAttribute('width', '1');
+            box.setAttribute('color', colors[index % colors.length]);
+            box.setAttribute('dynamic-body', ''); // 動的ボディ
+            box.setAttribute('breakable', 'threshold: 5'); // breakableコンポーネントを追加
+            box.setAttribute('free-fall-monitor', 'heightThreshold: 4; minVelocity: 0.1'); // free-fall-monitorコンポーネントを追加
+            box.classList.add('cube'); // クラス 'cube' を追加
+
+            // ユニークなIDを付与
+            box.setAttribute('id', `initial-cube-${Date.now()}-${i}-${j}`);
+
+            // シーンに追加
+            sceneEl.appendChild(box);
+
+            index++;
+          }
+        }
+
+        console.log('初期の25キューブが生成されました');
+      }
+
+      // 初期キューブを生成
+      generateInitialCubes();
+
       // Snapボタン
       const snapButton = document.getElementById('snap-button');
       let isAutoSnap = true; // 初期モードは自動スナップ
@@ -452,13 +590,12 @@
           buttonText.textContent = `Snap: ${isAutoSnap ? 'ON' : 'OFF'}`;
         }
         // state-manager コンポーネントにスナップモードの変更を通知
-        const sceneEl = document.querySelector('a-scene');
         sceneEl.emit('snap-toggle', { isAutoSnap: isAutoSnap });
       });
 
       // High Drop Destructionボタン
       const highDropButton = document.getElementById('high-drop-button');
-      let highDropMode = 0; // 0: Always Destroy, 1: Conditional Destroy, 2: Never Destroy
+      let highDropMode = 1; // 0: Always Destroy, 1: Conditional Destroy, 2: Never Destroy (デフォルトを1に設定)
 
       highDropButton.addEventListener('click', () => {
         // モードを順に切り替える
@@ -472,10 +609,127 @@
         }
 
         // state-manager コンポーネントにHigh Drop Destructionのモード変更を通知
-        const sceneEl = document.querySelector('a-scene');
         sceneEl.emit('high-drop-toggle', { mode: highDropMode });
       });
+
+      // Destroy All Cubesボタン
+      const destroyAllButton = document.getElementById('destroy-all-button');
+
+      destroyAllButton.addEventListener('click', () => {
+        const cubes = sceneEl.querySelectorAll('.cube'); // クラス 'cube' を持つエンティティを選択
+        cubes.forEach(cube => {
+          if (cube.components['breakable']) { // breakable コンポーネントがある場合
+            cube.components['breakable'].createExplosion(cube.object3D.position, cube.getAttribute('color'));
+            // 削除を遅延させる
+            setTimeout(() => {
+              if (cube.parentNode) { // 削除前に親が存在するか確認
+                cube.parentNode.removeChild(cube);
+                console.log(`キューブが破壊されました: ${cube.id || cube.object3D.uuid}`);
+              }
+            }, 0);
+          }
+        });
+      });
+
+      // Generate Cubeボタン
+      const generateCubeButton = document.getElementById('generate-cube-button');
+
+      generateCubeButton.addEventListener('click', () => {
+        const colors = ['#4CC3D9', '#EF2D5E', '#7BC8A4', '#FFC65D', '#FF6347', '#32CD32', '#8A2BE2', '#FFD700', '#00CED1'];
+        const randomColor = colors[Math.floor(Math.random() * colors.length)];
+
+        // ランダムな位置を生成（例: x: -5から5, y: 5から10, z: -5から5）
+        const x = (Math.random() * 10) - 5;
+        const y = (Math.random() * 5) + 5;
+        const z = (Math.random() * 10) - 5;
+
+        // 新しいボックスエンティティを作成
+        const box = document.createElement('a-box');
+        box.setAttribute('position', `${x} ${y} ${z}`);
+        box.setAttribute('depth', '1');
+        box.setAttribute('height', '1');
+        box.setAttribute('width', '1');
+        box.setAttribute('color', randomColor);
+        box.setAttribute('dynamic-body', ''); // 動的ボディ
+        box.setAttribute('breakable', 'threshold: 5'); // breakableコンポーネントを追加
+        box.setAttribute('free-fall-monitor', 'heightThreshold: 4; minVelocity: 0.1'); // free-fall-monitorコンポーネントを追加
+        box.classList.add('cube'); // クラス 'cube' を追加
+
+        // ユニークなIDを付与
+        box.setAttribute('id', `cube-${Date.now()}`);
+
+        // シーンに追加
+        sceneEl.appendChild(box);
+
+        console.log(`新しいキューブが生成されました: ${box.id || box.object3D.uuid}`);
+      });
+
+      // Fragment Behavior Toggleボタン
+      const fragmentBehaviorButton = document.getElementById('fragment-behavior-button');
+      let fragmentBehaviorMode = 0; // 0: Fragments Disappear, 1: Fragments Remain
+
+      fragmentBehaviorButton.addEventListener('click', () => {
+        fragmentBehaviorMode = (fragmentBehaviorMode + 1) % 2;
+        const behaviorNames = ['Fragments Disappear', 'Fragments Remain'];
+
+        // ボタンのラベルを更新
+        const buttonText = fragmentBehaviorButton.querySelector('.fragment-behavior-button-text');
+        if (buttonText) {
+          buttonText.textContent = `Fragment Behavior: ${behaviorNames[fragmentBehaviorMode]}`;
+        }
+
+        // state-manager コンポーネントにフラグメント動作の変更を通知
+        sceneEl.emit('fragment-behavior-toggle', { behavior: fragmentBehaviorMode });
+      });
+
+      // Generate Initial 25 Cubesボタン
+      const generateInitialButton = document.getElementById('generate-initial-button');
+
+      generateInitialButton.addEventListener('click', () => {
+        generateInitialCubes();
+      });
+
+      // Resetシーンボタン
+      const resetButton = document.getElementById('reset-button');
+
+      resetButton.addEventListener('click', () => {
+        // すべてのキューブを削除
+        const cubes = sceneEl.querySelectorAll('.cube');
+        cubes.forEach(cube => {
+          if (cube.parentNode) {
+            cube.parentNode.removeChild(cube);
+            console.log(`キューブが削除されました: ${cube.id || cube.object3D.uuid}`);
+          }
+        });
+
+        // すべてのフラグメントを削除
+        const fragments = sceneEl.querySelectorAll('.fragment');
+        fragments.forEach(fragment => {
+          if (fragment.parentNode) {
+            fragment.parentNode.removeChild(fragment);
+            console.log(`フラグメントが削除されました: ${fragment.id || fragment.object3D.uuid}`);
+          }
+        });
+
+        // state-manager コンポーネントにシーンリセットを通知
+        sceneEl.emit('reset-scene');
+
+        // ボタンラベルを初期状態に戻す
+        snapButton.querySelector('.button-text').textContent = 'Snap: ON';
+        highDropButton.querySelector('.high-drop-button-text').textContent = 'High Drop Destruction: Conditional Destroy'; // デフォルトを1に合わせて変更
+        fragmentBehaviorButton.querySelector('.fragment-behavior-button-text').textContent = 'Fragment Behavior: Disappear';
+
+        // High Drop DestructionとFragment Behaviorの状態をリセット
+        highDropMode = 1; // デフォルトを1に合わせて設定
+        fragmentBehaviorMode = 0;
+
+        // 初期キューブを再生成
+        generateInitialCubes();
+
+        console.log('シーンがリセットされました');
+      });
     });
+
   </script>
   
   <style>
@@ -508,18 +762,38 @@
     }
     
     #snap-button {
-      top: 20px; /* Snapボタンは20px */
+      top: 20px; /* 追加 */
     }
     
     #high-drop-button {
-      top: 80px; /* High Dropボタンは80px */
+      top: 80px; /* 追加 */
+    }
+
+    #destroy-all-button {
+      top: 140px; /* SnapボタンとHigh Dropボタンの下に配置 */
+    }
+
+    #generate-cube-button {
+      top: 200px; /* Destroy All Cubesボタンの下に配置 */
+    }
+
+    #fragment-behavior-button {
+      top: 260px; /* Generate Cubeボタンの下に配置 */
+    }
+
+    #generate-initial-button {
+      top: 320px; /* Fragment Behavior Toggleボタンの下に配置 */
+    }
+    
+    #reset-button {
+      top: 380px; /* Generate Initial 25 Cubesボタンの下に配置 */
     }
     
     .overlay-button:hover {
       background-color: rgba(200, 200, 200, 0.8);
     }
     
-    .button-text, .high-drop-button-text {
+    .button-text, .high-drop-button-text, .destroy-all-button-text, .generate-cube-button-text, .fragment-behavior-button-text, .generate-initial-button-text, .reset-button-text {
       pointer-events: none;
       font-size: 16px;
       color: #000;
@@ -536,8 +810,28 @@
       #high-drop-button {
         top: 60px;
       }
+
+      #destroy-all-button {
+        top: 100px; /* モバイル用に調整 */
+      }
+
+      #generate-cube-button {
+        top: 140px; /* モバイル用に調整 */
+      }
+
+      #fragment-behavior-button {
+        top: 180px; /* モバイル用に調整 */
+      }
+
+      #generate-initial-button {
+        top: 220px; /* モバイル用に調整 */
+      }
+
+      #reset-button {
+        top: 260px; /* モバイル用に調整 */
+      }
       
-      .button-text, .high-drop-button-text {
+      .button-text, .high-drop-button-text, .destroy-all-button-text, .generate-cube-button-text, .fragment-behavior-button-text, .generate-initial-button-text, .reset-button-text {
         font-size: 14px;
       }
     }
@@ -551,7 +845,32 @@
   
   <!-- High Drop Destructionモード切り替えボタン（オーバーレイ） -->
   <div id="high-drop-button" class="overlay-button">
-    <span class="high-drop-button-text">High Drop Destruction: Always Destroy</span>
+    <span class="high-drop-button-text">High Drop Destruction: Conditional Destroy</span>
+  </div>
+  
+  <!-- Destroy All Cubesボタン（オーバーレイ） -->
+  <div id="destroy-all-button" class="overlay-button">
+    <span class="destroy-all-button-text">Destroy All Cubes</span>
+  </div>
+  
+  <!-- Generate Cubeボタン（オーバーレイ） -->
+  <div id="generate-cube-button" class="overlay-button">
+    <span class="generate-cube-button-text">Generate Cube</span>
+  </div>
+  
+  <!-- Fragment Behavior Toggleボタン（オーバーレイ） -->
+  <div id="fragment-behavior-button" class="overlay-button">
+    <span class="fragment-behavior-button-text">Fragment Behavior: Disappear</span>
+  </div>
+  
+  <!-- Generate Initial 25 Cubesボタン（オーバーレイ） -->
+  <div id="generate-initial-button" class="overlay-button">
+    <span class="generate-initial-button-text">Generate Initial 25 Cubes</span>
+  </div>
+  
+  <!-- Resetシーンボタン（オーバーレイ） -->
+  <div id="reset-button" class="overlay-button">
+    <span class="reset-button-text">Reset Scene</span>
   </div>
   
   <a-scene physics="debug: true; gravity: -9.8" state-manager double-click-drag>
@@ -560,32 +879,6 @@
     
     <!-- 静的なボックス -->
     <a-box position="5 0.25 0" rotation="-30 0 0" width="10" height="0.5" depth="5" color="#FFC65D" static-body></a-box>
-    
-    <!-- 動的なボックスの生成スクリプト -->
-    <script>
-      document.addEventListener('DOMContentLoaded', () => {
-        const scene = document.querySelector('a-scene');
-        const colors = ['#4CC3D9', '#EF2D5E', '#7BC8A4', '#FFC65D', '#FF6347', '#32CD32', '#8A2BE2', '#FFD700', '#00CED1'];
-        let index = 0;
-        const spacing = 2;
-
-        for (let i = 0; i < 5; i++) { // 5x5グリッドに拡大
-          for (let j = 0; j < 5; j++) {
-            const box = document.createElement('a-box');
-            box.setAttribute('position', `${(i - 2) * spacing} 1 ${(j - 2) * spacing}`);
-            box.setAttribute('depth', '1');
-            box.setAttribute('height', '1');
-            box.setAttribute('width', '1');
-            box.setAttribute('color', colors[index % colors.length]);
-            box.setAttribute('dynamic-body', ''); // 動的ボディ
-            box.setAttribute('breakable', 'threshold: 5'); // breakableコンポーネントを追加
-            box.setAttribute('free-fall-monitor', 'heightThreshold: 4; minVelocity: 0.1'); // free-fall-monitorコンポーネントを追加
-            scene.appendChild(box);
-            index++;
-          }
-        }
-      });
-    </script>
     
     <!-- カメラ -->
     <a-entity position="0 5 10">
