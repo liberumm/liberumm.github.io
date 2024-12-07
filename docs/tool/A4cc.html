@@ -1,0 +1,495 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <title>MediaPipe Hands Detection with Video Overlay</title>
+  <!-- MediaPipeライブラリの読み込み -->
+  <script src="https://unpkg.com/@mediapipe/hands/hands.js"></script>
+  <script src="https://unpkg.com/@mediapipe/drawing_utils/drawing_utils.js"></script>
+  <script src="https://unpkg.com/@mediapipe/camera_utils/camera_utils.js"></script>
+  <style>
+    /* 全体のスタイル */
+    html, body {
+      margin: 0;
+      padding: 0;
+      height: 100%;
+      width: 100%;
+      background-color: #000;
+      position: relative;
+      overflow: hidden;
+      font-family: Arial, sans-serif;
+    }
+
+    /* キャンバスコンテナのスタイル */
+    #canvasContainer {
+      position: relative;
+      width: 100%;
+      height: 100%;
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      overflow: hidden;
+    }
+
+    /* ビデオのスタイル */
+    video.input_video {
+      position: absolute;
+      top: 0;
+      left: 0;
+      width: 100%;
+      height: 100%;
+      object-fit: cover; /* アスペクト比を維持してコンテナ全体をカバー */
+      background-color: #000;
+    }
+
+    /* オーバーレイキャンバスのスタイル */
+    canvas.output_canvas {
+      position: absolute;
+      top: 0;
+      left: 0;
+      width: 100%;
+      height: 100%;
+      pointer-events: none; /* キャンバス上のマウスイベントを無効化 */
+      background: transparent;
+    }
+
+    /* 情報表示コンテナのスタイル */
+    #infoContainer {
+      position: absolute;
+      top: 10px;
+      left: 50%;
+      transform: translateX(-50%);
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 5px;
+      z-index: 100; /* 表示要素がボタンの下に表示されるように設定 */
+    }
+
+    /* 各情報表示のスタイル */
+    #fpsDisplay, #cameraResolution, #canvasSize {
+      color: white;
+      font-size: 16px;
+      background-color: rgba(0, 0, 0, 0.5);
+      padding: 5px 10px;
+      border-radius: 5px;
+      width: fit-content;
+    }
+
+    /* ボタンコンテナのスタイル */
+    #buttonContainer {
+      position: absolute;
+      bottom: 20px;
+      left: 50%;
+      transform: translateX(-50%);
+      display: flex;
+      gap: 20px;
+      z-index: 100; /* ボタンがキャンバスの上に表示されるように設定 */
+    }
+
+    /* ボタンの共通スタイル */
+    #menuButton, #startButton {
+      padding: 10px 20px;
+      font-size: 16px;
+      border: none;
+      background-color: rgba(0, 123, 255, 0.9);
+      color: white;
+      border-radius: 5px;
+      cursor: pointer;
+      opacity: 0.9;
+      box-shadow: 0 2px 5px rgba(0,0,0,0.3);
+      transition: opacity 0.3s;
+    }
+
+    /* ボタンのホバー効果 */
+    #menuButton:hover, #startButton:hover {
+      opacity: 1;
+    }
+
+    /* 設定ウィンドウのスタイル */
+    #settingsWindow {
+      position: absolute;
+      top: 50%;
+      left: 50%;
+      transform: translate(-50%, -50%);
+      background-color: rgba(255, 255, 255, 0.95);
+      padding: 20px;
+      border-radius: 10px;
+      display: none;
+      z-index: 200; /* 設定ウィンドウがボタンより前面に表示されるように設定 */
+      box-shadow: 0 4px 8px rgba(0,0,0,0.2);
+      max-width: 300px;
+      width: 90%;
+    }
+
+    #settingsWindow h2 {
+      margin-top: 0;
+      font-size: 20px;
+      text-align: center;
+    }
+
+    #settingsWindow label {
+      display: block;
+      margin-bottom: 10px;
+      font-size: 14px;
+    }
+
+    #settingsWindow input[type="range"],
+    #settingsWindow input[type="number"],
+    #settingsWindow select {
+      width: 100%;
+      margin-top: 5px;
+    }
+
+    #settingsWindow button {
+      margin-top: 15px;
+      padding: 8px 12px;
+      font-size: 14px;
+      border: none;
+      background-color: #28A745;
+      color: white;
+      border-radius: 5px;
+      cursor: pointer;
+      width: 100%;
+      box-shadow: 0 2px 5px rgba(0,0,0,0.3);
+      transition: background-color 0.3s;
+    }
+
+    /* 「閉じる」ボタンのスタイル */
+    #settingsWindow button:last-child {
+      background-color: #DC3545;
+      margin-top: 10px;
+    }
+
+    #settingsWindow button:hover {
+      background-color: #218838; /* 「適用」ボタンのホバー色 */
+    }
+
+    #settingsWindow button:last-child:hover {
+      background-color: #C82333; /* 「閉じる」ボタンのホバー色 */
+    }
+
+    /* エラーメッセージのスタイル */
+    #errorMessage {
+      position: absolute;
+      top: 50%;
+      left: 50%;
+      transform: translate(-50%, -50%);
+      background-color: rgba(255, 0, 0, 0.8);
+      color: white;
+      padding: 20px;
+      border-radius: 10px;
+      display: none;
+      z-index: 300; /* エラーメッセージが最前面に表示されるように設定 */
+      text-align: center;
+      max-width: 80%;
+      font-size: 16px;
+    }
+
+    /* レスポンシブデザインの追加 */
+    @media (max-width: 600px) {
+      #menuButton, #startButton {
+        padding: 8px 16px;
+        font-size: 14px;
+      }
+      #fpsDisplay, #cameraResolution, #canvasSize {
+        font-size: 14px;
+        padding: 4px 8px;
+      }
+      #settingsWindow {
+        width: 95%;
+      }
+    }
+  </style>
+</head>
+<body>
+  <div id="canvasContainer">
+    <!-- ビデオ要素 -->
+    <video class="input_video" playsinline autoplay muted></video>
+
+    <!-- オーバーレイキャンバス要素 -->
+    <canvas class="output_canvas"></canvas>
+
+    <!-- 情報表示コンテナ -->
+    <div id="infoContainer">
+      <!-- FPS表示 -->
+      <div id="fpsDisplay">FPS: 0</div>
+      <!-- カメラ解像度表示 -->
+      <div id="cameraResolution">解像度: 1280×720</div>
+      <!-- キャンバスサイズ表示 -->
+      <div id="canvasSize">キャンバス: 1280×720</div>
+    </div>
+
+    <!-- ボタンコンテナ -->
+    <div id="buttonContainer">
+      <!-- メニューボタン -->
+      <button id="menuButton">設定</button>
+      
+      <!-- カメラ開始ボタン -->
+      <button id="startButton">カメラ開始</button>
+    </div>
+
+    <!-- エラーメッセージ -->
+    <div id="errorMessage">エラーが発生しました。</div>
+
+    <!-- 設定ウィンドウ -->
+    <div id="settingsWindow">
+      <h2>設定</h2>
+      <label>
+        解像度:
+        <select id="resolutionSelect">
+          <option value="640x480">640×480</option>
+          <option value="1280x720" selected>1280×720</option>
+          <option value="1920x1080">1920×1080</option>
+        </select>
+      </label>
+      <label>
+        フレームレート:
+        <input type="number" id="frameRate" min="1" max="60" value="30">
+      </label>
+      <label>
+        モデルの複雑さ:
+        <select id="modelComplexity">
+          <option value="0">0 (高速)</option>
+          <option value="1" selected>1 (標準)</option>
+          <option value="2">2 (高精度)</option>
+        </select>
+      </label>
+      <label>
+        検出の信頼度: <span id="detectionConfidenceValue">0.5</span>
+        <input type="range" id="detectionConfidence" min="0" max="1" step="0.01" value="0.5">
+      </label>
+      <label>
+        トラッキングの信頼度: <span id="trackingConfidenceValue">0.5</span>
+        <input type="range" id="trackingConfidence" min="0" max="1" step="0.01" value="0.5">
+      </label>
+      <label>
+        検出する手の数:
+        <select id="handCountSelect">
+          <option value="1">1</option>
+          <option value="2" selected>2</option>
+        </select>
+      </label>
+      <button id="applySettings">適用</button>
+      <button id="closeSettings">閉じる</button>
+    </div>
+  </div>
+
+  <script>
+    // 初期設定
+    let videoWidth = 1280; // 初期解像度を1280x720に設定
+    let videoHeight = 720;
+    let frameRate = 30; // 初期フレームレートを30fpsに設定
+    let maxNumHands = 2; // 初期検出手数
+    let modelComplexity = 1; // 初期モデル複雑さ
+    let minDetectionConfidence = 0.5;
+    let minTrackingConfidence = 0.5;
+
+    const videoElement = document.querySelector('.input_video');
+    const canvasElement = document.querySelector('.output_canvas');
+    const canvasCtx = canvasElement.getContext('2d');
+    const fpsDisplay = document.getElementById('fpsDisplay');
+    const cameraResolutionDisplay = document.getElementById('cameraResolution');
+    const canvasSizeDisplay = document.getElementById('canvasSize');
+    const errorMessage = document.getElementById('errorMessage');
+    const menuButton = document.getElementById('menuButton');
+    const startButton = document.getElementById('startButton');
+    const settingsWindow = document.getElementById('settingsWindow');
+    const closeSettings = document.getElementById('closeSettings');
+    const applySettings = document.getElementById('applySettings');
+
+    const detectionConfidenceSlider = document.getElementById('detectionConfidence');
+    const detectionConfidenceValue = document.getElementById('detectionConfidenceValue');
+    const trackingConfidenceSlider = document.getElementById('trackingConfidence');
+    const trackingConfidenceValue = document.getElementById('trackingConfidenceValue');
+
+    // FPS計測用の変数
+    let fps = 0;
+    let frames = 0;
+    let startTime = Date.now();
+
+    // MediaPipe Handsのインスタンス
+    let hands;
+
+    // Cameraインスタンス
+    let camera = null;
+
+    // 初期化関数
+    function initializeHands() {
+      hands = new Hands({
+        locateFile: (file) => {
+          return `https://unpkg.com/@mediapipe/hands/${file}`;
+        }
+      });
+
+      hands.setOptions({
+        maxNumHands: maxNumHands,
+        modelComplexity: modelComplexity,
+        minDetectionConfidence: minDetectionConfidence,
+        minTrackingConfidence: minTrackingConfidence
+      });
+
+      hands.onResults(onResults);
+
+      console.log("MediaPipe Hands initialized with options:", hands.options);
+    }
+
+    // カメラ開始関数
+    function startCamera() {
+      if (camera) {
+        camera.stop();
+      }
+
+      camera = new Camera(videoElement, {
+        onFrame: async () => {
+          try {
+            await hands.send({image: videoElement});
+          } catch (error) {
+            console.error("Error sending frame to MediaPipe Hands:", error);
+            showError("MediaPipe Handsの処理中にエラーが発生しました。");
+          }
+        },
+        width: videoWidth,
+        height: videoHeight,
+        frameRate: frameRate
+      });
+
+      camera.start().then(() => {
+        // キャンバスの内部解像度を設定
+        canvasElement.width = videoWidth;
+        canvasElement.height = videoHeight;
+      }).catch(err => {
+        console.error("カメラの開始に失敗しました:", err);
+        showError(`カメラの開始に失敗しました: ${err.message}`);
+      });
+    }
+
+    // 結果処理関数
+    function onResults(results) {
+      // FPS計算
+      frames++;
+      const currentTime = Date.now();
+      if (currentTime - startTime >= 1000) {
+        fps = frames;
+        frames = 0;
+        startTime = currentTime;
+        fpsDisplay.innerText = `FPS: ${fps}`;
+      }
+
+      // キャンバスをクリア
+      canvasCtx.save();
+      canvasCtx.clearRect(0, 0, canvasElement.width, canvasElement.height);
+
+      // 手のランドマークを描画
+      if (results.multiHandLandmarks && results.multiHandedness) {
+        for (let index = 0; index < results.multiHandLandmarks.length; index++) {
+          const classification = results.multiHandedness[index];
+          const isRightHand = classification.label === 'Right';
+
+          // ランドマークの描画
+          drawConnectors(canvasCtx, results.multiHandLandmarks[index], HAND_CONNECTIONS,
+            {color: isRightHand ? '#00FF00' : '#FF0000', lineWidth: 2});
+          drawLandmarks(canvasCtx, results.multiHandLandmarks[index],
+            {color: isRightHand ? '#00FF00' : '#FF0000', lineWidth: 1});
+        }
+      }
+
+      // キャンバスサイズ表示を更新
+      canvasSizeDisplay.innerText = `キャンバス: ${canvasElement.width}×${canvasElement.height}`;
+
+      canvasCtx.restore();
+    }
+
+    // 設定ウィンドウの表示
+    menuButton.addEventListener('click', () => {
+      settingsWindow.style.display = 'block';
+    });
+
+    // 設定ウィンドウの閉じるボタン
+    closeSettings.addEventListener('click', () => {
+      settingsWindow.style.display = 'none';
+    });
+
+    // 設定ウィンドウの適用ボタン
+    applySettings.addEventListener('click', () => {
+      // 設定値の取得
+      const resolution = document.getElementById('resolutionSelect').value;
+      [videoWidth, videoHeight] = resolution.split('x').map(Number);
+      modelComplexity = parseInt(document.getElementById('modelComplexity').value);
+      frameRate = parseInt(document.getElementById('frameRate').value);
+      minDetectionConfidence = parseFloat(detectionConfidenceSlider.value);
+      minTrackingConfidence = parseFloat(trackingConfidenceSlider.value);
+      maxNumHands = parseInt(document.getElementById('handCountSelect').value);
+
+      // 信頼度の表示更新
+      detectionConfidenceValue.innerText = minDetectionConfidence;
+      trackingConfidenceValue.innerText = minTrackingConfidence;
+
+      // Handsオブジェクトの設定更新
+      hands.setOptions({
+        maxNumHands: maxNumHands,
+        modelComplexity: modelComplexity,
+        minDetectionConfidence: minDetectionConfidence,
+        minTrackingConfidence: minTrackingConfidence
+      });
+
+      console.log("Updated Hands options:", hands.options);
+
+      // キャンバスの内部解像度を更新
+      canvasElement.width = videoWidth;
+      canvasElement.height = videoHeight;
+
+      // カメラ解像度表示を更新
+      cameraResolutionDisplay.innerText = `解像度: ${videoWidth}×${videoHeight}`;
+
+      // カメラを再起動
+      startCamera();
+
+      // 設定ウィンドウを閉じる
+      settingsWindow.style.display = 'none';
+
+      // FPS計測のリセット
+      fps = 0;
+      frames = 0;
+      startTime = Date.now();
+      fpsDisplay.innerText = `FPS: 0`;
+    });
+
+    // スライダーの値をリアルタイムで表示
+    detectionConfidenceSlider.addEventListener('input', (event) => {
+      detectionConfidenceValue.innerText = event.target.value;
+    });
+    trackingConfidenceSlider.addEventListener('input', (event) => {
+      trackingConfidenceValue.innerText = event.target.value;
+    });
+
+    // エラーメッセージ表示関数
+    function showError(message) {
+      errorMessage.innerText = message;
+      errorMessage.style.display = 'block';
+      setTimeout(() => {
+        errorMessage.style.display = 'none';
+      }, 5000);
+    }
+
+    // カメラ開始ボタンのイベントリスナー
+    startButton.addEventListener('click', () => {
+      initializeHands();
+      startCamera();
+      startButton.style.display = 'none'; // ボタンを非表示にする
+    });
+
+    // ウィンドウサイズ変更時にキャンバスをリサイズ
+    window.addEventListener('resize', () => {
+      // CSSでvideoとcanvasが100%に設定されているため、特別なリサイズ処理は不要
+      // ただし、必要に応じてキャンバスの内部解像度を更新する場合はここで行う
+    });
+
+    // ページ読み込み時に初期表示を設定
+    window.addEventListener('load', () => {
+      cameraResolutionDisplay.innerText = `解像度: ${videoWidth}×${videoHeight}`;
+      canvasSizeDisplay.innerText = `キャンバス: ${canvasElement.width}×${canvasElement.height}`;
+    });
+  </script>
+</body>
+</html>
