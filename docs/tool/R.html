@@ -1,0 +1,388 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>複数タブ・ウィンドウ対応 画面キャプチャ共有</title>
+  <style>
+    body, html {
+      margin: 0;
+      padding: 0;
+      width: 100%;
+      height: 100%;
+      overflow: hidden;
+      background: black;
+    }
+    canvas {
+      display: block;
+      width: 100%;
+      height: 100%;
+    }
+    #info {
+      position: absolute;
+      top: 10px;
+      left: 10px;
+      color: white;
+      background: rgba(0, 0, 0, 0.5);
+      padding: 5px 10px;
+      border-radius: 5px;
+      z-index: 10;
+    }
+    #buttons {
+      position: absolute;
+      bottom: 20px;
+      left: 50%;
+      transform: translateX(-50%);
+      display: flex;
+      gap: 10px;
+      z-index: 15;
+    }
+    button {
+      padding: 10px 20px;
+      font-size: 16px;
+      cursor: pointer;
+      border: none;
+      border-radius: 5px;
+      background-color: #444;
+      color: white;
+    }
+    button:hover {
+      background-color: #666;
+    }
+    .tab-selector {
+      position: absolute;
+      top: 50%;
+      left: 50%;
+      transform: translate(-50%, -50%);
+      background: rgba(0, 0, 0, 0.8);
+      color: white;
+      padding: 20px;
+      border-radius: 10px;
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+    }
+  </style>
+</head>
+<body>
+  <div id="info">画面キャプチャを待機中...</div>
+  <div id="buttons">
+    <button id="startCapture">画面キャプチャを開始</button>
+    <button id="getStream">他のタブの映像を取得</button>
+    <button id="stopStream" style="display: none;">配信停止</button>
+    <button id="stopAllStreams" style="display: none;">一括配信停止</button>
+  </div>
+  <canvas id="screenCanvas"></canvas>
+
+  <script>
+    document.addEventListener("DOMContentLoaded", () => {
+      const channel = new BroadcastChannel('screen_capture_channel');
+      const canvas = document.getElementById("screenCanvas");
+      const ctx = canvas.getContext("2d");
+      const info = document.getElementById("info");
+      const tabId = generateTabId();
+      const peerConnections = {}; // 接続先のRTCPeerConnectionを保持
+      const tabs = {}; // 他のタブの情報を保持
+      let videoElement;
+      let sharedStream; // 現在配信中のストリームを保持
+      let stateInterval;  // 状態通知用のインターバルID
+      let activeConnections = 0; // 現在接続しているタブの数
+      let activeStreams = 0; // 現在接続が確立しているストリーム数
+      let isServer = false; // 配信中かどうか
+      let isReceivingStream = false; // ストリームを受信しているかどうか
+
+      function generateTabId() {
+        return Math.random().toString(36).substr(2, 9);
+      }
+
+      function drawVideoToCanvas(video) {
+        const resizeCanvas = () => {
+          canvas.width = window.innerWidth;
+          canvas.height = window.innerHeight;
+        };
+        resizeCanvas();
+
+        window.addEventListener("resize", resizeCanvas);
+
+        const draw = () => {
+          if (video.readyState >= video.HAVE_CURRENT_DATA) {
+            ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+          }
+          requestAnimationFrame(draw);
+        };
+        draw();
+      }
+
+      async function startScreenCapture() {
+        try {
+          const stream = await navigator.mediaDevices.getDisplayMedia({
+            video: true,
+            audio: false,
+          });
+
+          // 新しいストリームを保存し、配信を開始
+          sharedStream = stream;
+          videoElement = document.createElement("video");
+          videoElement.srcObject = stream;
+          await videoElement.play();
+
+          console.log(`画面キャプチャが開始されました: Stream ID - ${stream.id}`);
+
+          drawVideoToCanvas(videoElement);
+
+          // 状態通知を開始（5秒ごと）
+          stateInterval = setInterval(() => {
+            channel.postMessage({
+              type: "state",
+              tabId,
+              status: "capturing",
+              streamId: stream.id,
+              title: "現在の画面キャプチャ"  // タイトルを追加
+            });
+            updateConnectionCount();
+            updateActiveStreams();
+            isServer = true;
+            isReceivingStream = false; // 配信中はストリーム受信していない
+            info.textContent = `サーバー中: 配信先タブ数 ${activeConnections} - 確立したストリーム数 ${activeStreams}`;
+          }, 5000); // 5秒ごとに通知
+
+          document.getElementById("stopStream").style.display = "inline";
+          document.getElementById("stopAllStreams").style.display = "inline";
+        } catch (err) {
+          console.error(`画面キャプチャエラー: ${err.message}`);
+          info.textContent = `エラー: ${err.message}`;
+        }
+      }
+
+      function updateConnectionCount() {
+        activeConnections = Object.values(tabs).filter(tab => tab.status === "capturing").length;
+        info.textContent = `${isServer ? 'サーバー中' : (isReceivingStream ? 'クライアント中' : 'ストリーム停止中')}: 配信先タブ数 ${activeConnections} - 確立したストリーム数 ${activeStreams}`;
+      }
+
+      function updateActiveStreams() {
+        activeStreams = Object.values(peerConnections).filter(connection => connection.iceConnectionState === 'connected').length;
+        info.textContent = `${isServer ? 'サーバー中' : (isReceivingStream ? 'クライアント中' : 'ストリーム停止中')}: 配信先タブ数 ${activeConnections} - 確立したストリーム数 ${activeStreams}`;
+      }
+
+      function getStreamFromOtherTab() {
+        // 利用可能なストリームをタブの状態を基に取得
+        const availableStreams = Object.values(tabs).filter(tab => tab.status === "capturing" && tab.tabId !== tabId);
+
+        if (availableStreams.length > 0) {
+          const streamSelector = document.createElement("div");
+          streamSelector.classList.add('tab-selector');
+
+          availableStreams.forEach(stream => {
+            const button = document.createElement("button");
+            button.textContent = `タブ: ${stream.tabId} (タイトル: ${stream.title})`; // タイトルも表示
+            button.addEventListener("click", () => {
+              if (document.body.contains(streamSelector)) {
+                document.body.removeChild(streamSelector);
+              }
+              const peerConnection = new RTCPeerConnection();
+              peerConnections[stream.tabId] = peerConnection;
+
+              peerConnection.onicecandidate = (event) => {
+                if (event.candidate) {
+                  const candidate = event.candidate.toJSON();
+                  channel.postMessage({
+                    type: "iceCandidate",
+                    targetId: stream.tabId,
+                    senderId: tabId,
+                    candidate: candidate
+                  });
+                }
+              };
+
+              peerConnection.ontrack = (event) => {
+                videoElement = document.createElement("video");
+                videoElement.srcObject = event.streams[0];
+                videoElement.play();
+                drawVideoToCanvas(videoElement);
+                console.log(`ストリームが他のタブから受信されました: Stream ID - ${event.streams[0].id}`);
+                isReceivingStream = true; // ストリームを受信中
+                info.textContent = `クライアント中: 配信先タブ数 ${activeConnections} - 確立したストリーム数 ${activeStreams}`;
+              };
+
+              channel.postMessage({ type: "requestOffer", targetId: stream.tabId, senderId: tabId });
+            });
+            streamSelector.appendChild(button);
+          });
+
+          const cancelButton = document.createElement("button");
+          cancelButton.textContent = "キャンセル";
+          cancelButton.addEventListener("click", () => {
+            document.body.removeChild(streamSelector);
+          });
+          streamSelector.appendChild(cancelButton);
+
+          document.body.appendChild(streamSelector);
+        } else {
+          info.textContent = "利用可能なストリームはありません。";
+        }
+      }
+
+      // 配信停止機能
+      function stopStream(targetTabId) {
+        if (targetTabId) {
+          const peerConnection = peerConnections[targetTabId];
+          if (peerConnection) {
+            peerConnection.close();
+            delete peerConnections[targetTabId];
+            tabs[targetTabId].status = "stopped"; // タブの状態を停止に変更
+            console.log(`ストリーム配信を停止しました: タブ ID - ${targetTabId}`);
+            info.textContent = `タブ ${targetTabId} への配信停止が完了しました`;
+            updateConnectionCount();
+            updateActiveStreams();
+            // 配信停止されたことを受信側に通知
+            channel.postMessage({
+              type: "stopNotification",
+              tabId: targetTabId,
+            });
+            // 配信停止後は「クライアント中」→「ストリーム停止中」に更新
+            isReceivingStream = false;
+            info.textContent = `ストリーム停止中: 配信先タブ数 ${activeConnections} - 確立したストリーム数 0`;
+          }
+        }
+      }
+
+      // 一括配信停止機能
+      function stopAllStreams() {
+        Object.keys(peerConnections).forEach(tabId => {
+          stopStream(tabId);
+        });
+        if (sharedStream) {
+          sharedStream.getTracks().forEach(track => track.stop()); // 画面共有停止
+          sharedStream = null;
+          clearInterval(stateInterval); // 通知の停止
+          console.log("すべてのストリーム配信が停止され、画面共有も終了されました");
+          info.textContent = "すべてのストリーム配信が停止され、画面共有も終了されました";
+        }
+        document.getElementById("stopStream").style.display = "none";
+        document.getElementById("stopAllStreams").style.display = "none";
+      }
+
+      // 状態通知のメッセージ処理
+      channel.onmessage = async (event) => {
+        const message = event.data;
+
+        if (message.type === "state") {
+          tabs[message.tabId] = message;
+          updateConnectionCount();
+        } else if (message.type === "stopNotification") {
+          // 配信停止の通知を受け取った場合
+          console.log(`タブ ${message.tabId} からの配信停止通知を受信しました`);
+          // ストリームを停止する処理をここで実行
+          isReceivingStream = false; // ストリーム受信していない
+          info.textContent = `タブ ${message.tabId} からの配信停止通知を受け取りました。ストリームが停止されました。`;
+          updateConnectionCount();
+        } else if (message.type === "requestOffer" && message.targetId === tabId) {
+          const peerConnection = new RTCPeerConnection();
+          peerConnections[message.senderId] = peerConnection;
+
+          peerConnection.onicecandidate = (event) => {
+            if (event.candidate) {
+              const candidate = event.candidate.toJSON();
+              channel.postMessage({
+                type: "iceCandidate",
+                targetId: message.senderId,
+                senderId: tabId,
+                candidate: candidate
+              });
+            }
+          };
+
+          if (sharedStream) { // 既存のストリームがあればそれを使用
+            sharedStream.getTracks().forEach(track => peerConnection.addTrack(track, sharedStream));
+          }
+
+          const offer = await peerConnection.createOffer();
+          await peerConnection.setLocalDescription(offer);
+          channel.postMessage({
+            type: "offer",
+            targetId: message.senderId,
+            senderId: tabId,
+            offer
+          });
+        } else if (message.type === "offer" && message.targetId === tabId) {
+          const peerConnection = new RTCPeerConnection();
+          peerConnections[message.senderId] = peerConnection;
+
+          peerConnection.onicecandidate = (event) => {
+            if (event.candidate) {
+              const candidate = event.candidate.toJSON();
+              channel.postMessage({
+                type: "iceCandidate",
+                targetId: message.senderId,
+                senderId: tabId,
+                candidate: candidate
+              });
+            }
+          };
+
+          peerConnection.ontrack = (event) => {
+            videoElement = document.createElement("video");
+            videoElement.srcObject = event.streams[0];
+            videoElement.play();
+            drawVideoToCanvas(videoElement);
+            console.log(`ストリームが受信されました: Stream ID - ${event.streams[0].id}`);
+            isReceivingStream = true; // ストリームを受信中
+            info.textContent = `クライアント中: 配信先タブ数 ${activeConnections} - 確立したストリーム数 ${activeStreams}`;
+          };
+
+          await peerConnection.setRemoteDescription(new RTCSessionDescription(message.offer));
+          const answer = await peerConnection.createAnswer();
+          await peerConnection.setLocalDescription(answer);
+          channel.postMessage({
+            type: "answer",
+            targetId: message.senderId,
+            senderId: tabId,
+            answer
+          });
+        } else if (message.type === "answer" && message.targetId === tabId) {
+          const peerConnection = peerConnections[message.senderId];
+          if (peerConnection) {
+            await peerConnection.setRemoteDescription(new RTCSessionDescription(message.answer));
+          }
+        } else if (message.type === "iceCandidate" && message.targetId === tabId) {
+          const peerConnection = peerConnections[message.senderId];
+          if (peerConnection) {
+            await peerConnection.addIceCandidate(new RTCIceCandidate(message.candidate));
+          }
+        }
+      };
+
+      document.getElementById("startCapture").addEventListener("click", startScreenCapture);
+      document.getElementById("getStream").addEventListener("click", getStreamFromOtherTab);
+      document.getElementById("stopStream").addEventListener("click", () => {
+        const tabSelector = document.createElement("div");
+        tabSelector.classList.add('tab-selector');
+        Object.keys(peerConnections).forEach(tabId => {
+          const button = document.createElement("button");
+          button.textContent = `タブ: ${tabId} (タイトル: ${tabs[tabId]?.title || '未設定'})`;  // タイトルも表示
+          button.addEventListener("click", () => {
+            stopStream(tabId);
+            document.body.removeChild(tabSelector);
+          });
+          tabSelector.appendChild(button);
+        });
+        const cancelButton = document.createElement("button");
+        cancelButton.textContent = "キャンセル";
+        cancelButton.addEventListener("click", () => {
+          document.body.removeChild(tabSelector);
+        });
+        tabSelector.appendChild(cancelButton);
+        document.body.appendChild(tabSelector);
+      });
+      document.getElementById("stopAllStreams").addEventListener("click", stopAllStreams);
+
+      window.addEventListener("beforeunload", () => {
+        clearInterval(stateInterval); // ページを閉じる前にインターバルをクリア
+        channel.postMessage({ type: "tabClosed", tabId });
+      });
+
+      channel.postMessage({ type: "state", tabId, status: "ready" });
+    });
+  </script>
+</body>
+</html>
