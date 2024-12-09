@@ -1,0 +1,305 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>複数タブ対応 画面キャプチャ共有</title>
+  <style>
+    body, html {
+      margin: 0;
+      padding: 0;
+      width: 100%;
+      height: 100%;
+      overflow: hidden;
+      background: black;
+    }
+    canvas {
+      display: block;
+      width: 100%;
+      height: 100%;
+    }
+    #info {
+      position: absolute;
+      top: 10px;
+      left: 10px;
+      color: white;
+      background: rgba(0, 0, 0, 0.5);
+      padding: 5px 10px;
+      border-radius: 5px;
+      z-index: 10;
+    }
+    #buttons {
+      position: absolute;
+      bottom: 20px;
+      left: 50%;
+      transform: translateX(-50%);
+      display: flex;
+      gap: 10px;
+      z-index: 15;
+    }
+    button {
+      padding: 10px 20px;
+      font-size: 16px;
+      cursor: pointer;
+      border: none;
+      border-radius: 5px;
+      background-color: #444;
+      color: white;
+    }
+    button:hover {
+      background-color: #666;
+    }
+  </style>
+</head>
+<body>
+  <div id="info">画面キャプチャを待機中...</div>
+  <div id="buttons">
+    <button id="startCapture">画面キャプチャを開始</button>
+    <button id="getStream">他のタブの映像を取得</button>
+    <button id="reselectWindow">ウィンドウを再選択</button> <!-- 追加ボタン -->
+  </div>
+  <canvas id="screenCanvas"></canvas>
+
+  <script>
+    document.addEventListener("DOMContentLoaded", () => {
+      const channel = new BroadcastChannel('screen_capture_channel');
+      const canvas = document.getElementById("screenCanvas");
+      const ctx = canvas.getContext("2d");
+      const info = document.getElementById("info");
+      const tabId = generateTabId();
+      const peerConnections = {};
+      const tabs = {};
+      let videoElement;
+      let sharedStream; // 追加: 画面キャプチャのストリームを保持
+
+      function generateTabId() {
+        return Math.random().toString(36).substr(2, 9);
+      }
+
+      function drawVideoToCanvas(video) {
+        const resizeCanvas = () => {
+          canvas.width = window.innerWidth;
+          canvas.height = window.innerHeight;
+        };
+        resizeCanvas();
+
+        window.addEventListener("resize", resizeCanvas);
+
+        const draw = () => {
+          if (video.readyState >= video.HAVE_CURRENT_DATA) {
+            ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+          }
+          requestAnimationFrame(draw);
+        };
+        draw();
+      }
+
+      // 画面キャプチャを開始
+      async function startScreenCapture() {
+        try {
+          const stream = await navigator.mediaDevices.getDisplayMedia({
+            video: true,
+            audio: false,
+          });
+
+          sharedStream = stream; // 画面キャプチャのストリームを保持
+          videoElement = document.createElement("video");
+          videoElement.srcObject = stream;
+          await videoElement.play();
+
+          console.log(`画面キャプチャが開始されました: Stream ID - ${stream.id}`);
+
+          drawVideoToCanvas(videoElement);
+
+          channel.postMessage({ type: "state", tabId, status: "capturing" });
+          info.textContent = "画面キャプチャ中";
+        } catch (err) {
+          console.error(`画面キャプチャエラー: ${err.message}`);
+          info.textContent = `エラー: ${err.message}`;
+        }
+      }
+
+      // ウィンドウを再選択
+      async function reselectWindow() {
+        try {
+          const newStream = await navigator.mediaDevices.getDisplayMedia({
+            video: true,
+            audio: false,
+          });
+
+          sharedStream = newStream; // 新しいストリームに切り替え
+          videoElement.srcObject = newStream;
+          await videoElement.play();
+
+          console.log(`新しいウィンドウが選択されました: Stream ID - ${newStream.id}`);
+
+          // 各タブにストリームを再配信
+          Object.keys(peerConnections).forEach(tabId => {
+            const peerConnection = peerConnections[tabId];
+            if (peerConnection) {
+              sharedStream.getTracks().forEach(track => peerConnection.addTrack(track, sharedStream));
+            }
+          });
+
+          channel.postMessage({ type: "state", tabId, status: "capturing" });
+          info.textContent = "新しいウィンドウがキャプチャ中";
+        } catch (err) {
+          console.error(`ウィンドウ選択エラー: ${err.message}`);
+          info.textContent = `エラー: ${err.message}`;
+        }
+      }
+
+      function getStreamFromOtherTab() {
+        const availableStreams = Object.values(tabs).filter(tab => tab.status === "capturing" && tab.tabId !== tabId);
+
+        if (availableStreams.length > 0) {
+          const streamSelector = document.createElement("div");
+          streamSelector.style.position = "absolute";
+          streamSelector.style.top = "50%";
+          streamSelector.style.left = "50%";
+          streamSelector.style.transform = "translate(-50%, -50%)";
+          streamSelector.style.background = "rgba(0, 0, 0, 0.8)";
+          streamSelector.style.color = "white";
+          streamSelector.style.padding = "20px";
+          streamSelector.style.borderRadius = "10px";
+
+          availableStreams.forEach(stream => {
+            const button = document.createElement("button");
+            button.textContent = `タブ: ${stream.tabId}`;
+            button.addEventListener("click", () => {
+              if (document.body.contains(streamSelector)) {
+                document.body.removeChild(streamSelector);
+              }
+              const peerConnection = new RTCPeerConnection();
+              peerConnections[stream.tabId] = peerConnection;
+
+              peerConnection.onicecandidate = (event) => {
+                if (event.candidate) {
+                  const candidate = event.candidate.toJSON();
+                  channel.postMessage({
+                    type: "iceCandidate",
+                    targetId: stream.tabId,
+                    senderId: tabId,
+                    candidate: candidate
+                  });
+                }
+              };
+
+              peerConnection.ontrack = (event) => {
+                videoElement = document.createElement("video");
+                videoElement.srcObject = event.streams[0];
+                videoElement.play();
+                drawVideoToCanvas(videoElement);
+                console.log(`ストリームが他のタブから受信されました: Stream ID - ${event.streams[0].id}`);
+              };
+
+              channel.postMessage({ type: "requestOffer", targetId: stream.tabId, senderId: tabId });
+            });
+            streamSelector.appendChild(button);
+          });
+
+          const cancelButton = document.createElement("button");
+          cancelButton.textContent = "キャンセル";
+          cancelButton.addEventListener("click", () => {
+            document.body.removeChild(streamSelector);
+          });
+          streamSelector.appendChild(cancelButton);
+
+          document.body.appendChild(streamSelector);
+        } else {
+          info.textContent = "利用可能なストリームはありません。";
+        }
+      }
+
+      channel.onmessage = async (event) => {
+        const message = event.data;
+
+        if (message.type === "state") {
+          tabs[message.tabId] = message;
+        } else if (message.type === "requestOffer" && message.targetId === tabId) {
+          const peerConnection = new RTCPeerConnection();
+          peerConnections[message.senderId] = peerConnection;
+
+          peerConnection.onicecandidate = (event) => {
+            if (event.candidate) {
+              const candidate = event.candidate.toJSON();
+              channel.postMessage({
+                type: "iceCandidate",
+                targetId: message.senderId,
+                senderId: tabId,
+                candidate: candidate
+              });
+            }
+          };
+
+          if (sharedStream) { // 既存のストリームがあればそれを使用
+            sharedStream.getTracks().forEach(track => peerConnection.addTrack(track, sharedStream));
+          }
+
+          const offer = await peerConnection.createOffer();
+          await peerConnection.setLocalDescription(offer);
+          channel.postMessage({
+            type: "offer",
+            targetId: message.senderId,
+            senderId: tabId,
+            offer
+          });
+        } else if (message.type === "offer" && message.targetId === tabId) {
+          const peerConnection = new RTCPeerConnection();
+          peerConnections[message.senderId] = peerConnection;
+
+          peerConnection.onicecandidate = (event) => {
+            if (event.candidate) {
+              const candidate = event.candidate.toJSON();
+              channel.postMessage({
+                type: "iceCandidate",
+                targetId: message.senderId,
+                senderId: tabId,
+                candidate: candidate
+              });
+            }
+          };
+
+          peerConnection.ontrack = (event) => {
+            videoElement = document.createElement("video");
+            videoElement.srcObject = event.streams[0];
+            videoElement.play();
+            drawVideoToCanvas(videoElement);
+            console.log(`ストリームが受信されました: Stream ID - ${event.streams[0].id}`);
+          };
+
+          await peerConnection.setRemoteDescription(new RTCSessionDescription(message.offer));
+          const answer = await peerConnection.createAnswer();
+          await peerConnection.setLocalDescription(answer);
+          channel.postMessage({
+            type: "answer",
+            targetId: message.senderId,
+            senderId: tabId,
+            answer
+          });
+        } else if (message.type === "answer" && message.targetId === tabId) {
+          const peerConnection = peerConnections[message.senderId];
+          if (peerConnection) {
+            await peerConnection.setRemoteDescription(new RTCSessionDescription(message.answer));
+          }
+        } else if (message.type === "iceCandidate" && message.targetId === tabId) {
+          const peerConnection = peerConnections[message.senderId];
+          if (peerConnection) {
+            await peerConnection.addIceCandidate(new RTCIceCandidate(message.candidate));
+          }
+        }
+      };
+
+      document.getElementById("startCapture").addEventListener("click", startScreenCapture);
+      document.getElementById("getStream").addEventListener("click", getStreamFromOtherTab);
+      document.getElementById("reselectWindow").addEventListener("click", reselectWindow); // ボタンイベント追加
+
+      window.addEventListener("beforeunload", () => {
+        channel.postMessage({ type: "tabClosed", tabId });
+      });
+
+      channel.postMessage({ type: "state", tabId, status: "ready" });
+    });
+  </script>
+</body>
+</html>
