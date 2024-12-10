@@ -209,8 +209,8 @@
       const [subMenuAction, setSubMenuAction] = useState("");
       const [currentRow, setCurrentRow] = useState(null);
 
-      // 選択されたメーターのステート
-      const [selectedMeterId, setSelectedMeterId] = useState(null);
+      // 選択されたメーターのステート（複数選択）
+      const [selectedMeterIds, setSelectedMeterIds] = useState([]);
 
       // フィルター関連（拠点名と設備カテゴリー）
       const uniqueLocations = Array.isArray(meters) ? [...new Set(meters.map(m => m.locationName))] : [];
@@ -406,9 +406,7 @@
           setMeters(meters.filter(m => m.id !== id));
           setEquipments(equipments.filter(eq => eq.equipmentId !== meterToDelete?.meterId));
           setMeterSnackbar({ open: true, message: "メーターを削除しました。", severity: "info" });
-          if (selectedMeterId === id) {
-            setSelectedMeterId(null);
-          }
+          setSelectedMeterIds(selectedMeterIds.filter(mid => mid !== id));
         }
       };
 
@@ -447,13 +445,26 @@
 
       // セル変更ハンドラー（確定前の変更をeditStatesに保存）
       const handleCellValueChange = (meterId, field, newValue) => {
-        setEditStates(prev => ({
-          ...prev,
-          [meterId]: {
+        const updatedFieldValue = field.includes('Value') ? parseFloat(newValue) || 0 : newValue;
+
+        setEditStates(prev => {
+          const updatedMeterState = {
             ...prev[meterId],
-            [field]: field.includes('Value') ? parseFloat(newValue) || 0 : newValue
-          }
-        }));
+            [field]: updatedFieldValue
+          };
+
+          // 利用量の計算
+          const previousValue = updatedMeterState.previousValue !== undefined ? parseFloat(updatedMeterState.previousValue) : meters.find(m => m.id === meterId).previousValue;
+          const currentValue = updatedMeterState.currentValue !== undefined ? parseFloat(updatedMeterState.currentValue) : meters.find(m => m.id === meterId).currentValue;
+          const updatedUsage = currentValue - previousValue;
+
+          updatedMeterState.usage = updatedUsage;
+
+          return {
+            ...prev,
+            [meterId]: updatedMeterState
+          };
+        });
       };
 
       // インポートハンドラー
@@ -573,12 +584,27 @@
         // editStatesをmetersに適用
         const updatedMeters = meters.map(meter => {
           if (editStates[meter.id]) {
+            // 新しい値を取得、既存の値がない場合は元の値を使用
+            const newPreviousValue = editStates[meter.id].previousValue !== undefined ? parseFloat(editStates[meter.id].previousValue) : meter.previousValue;
+            const newCurrentValue = editStates[meter.id].currentValue !== undefined ? parseFloat(editStates[meter.id].currentValue) : meter.currentValue;
+            const newUsage = newCurrentValue - newPreviousValue;
+
+            const newPreviousConfirmationDate = editStates[meter.id].previousConfirmationDate !== undefined ? editStates[meter.id].previousConfirmationDate : meter.previousConfirmationDate;
+            const newConfirmationDate = editStates[meter.id].confirmationDate !== undefined ? editStates[meter.id].confirmationDate : meter.confirmationDate;
+
+            const newPreviousRegistrant = editStates[meter.id].previousRegistrant !== undefined ? editStates[meter.id].previousRegistrant : meter.previousRegistrant;
+            const newRegistrant = editStates[meter.id].registrant !== undefined ? editStates[meter.id].registrant : meter.registrant;
+
             return {
               ...meter,
               ...editStates[meter.id],
-              usage: ('currentValue' in editStates[meter.id] && 'previousValue' in editStates[meter.id]) ?
-                     (parseFloat(editStates[meter.id].currentValue) - parseFloat(editStates[meter.id].previousValue)) :
-                     (meter.currentValue - meter.previousValue)
+              previousValue: newPreviousValue,
+              currentValue: newCurrentValue,
+              usage: newUsage,
+              previousConfirmationDate: newPreviousConfirmationDate,
+              confirmationDate: newConfirmationDate,
+              previousRegistrant: newPreviousRegistrant,
+              registrant: newRegistrant,
             };
           }
           return meter;
@@ -602,6 +628,26 @@
           setSnackbar({ open: true, message: "変更を元に戻しました。", severity: "warning" });
         }
       };
+
+      // テーブルの選択ハンドラー
+      const handleSelectAllClick = (event) => {
+        if (event.target.checked) {
+          const newSelecteds = filteredMeters.map((meter) => meter.id);
+          setSelectedMeterIds(newSelecteds);
+          return;
+        }
+        setSelectedMeterIds([]);
+      };
+
+      const handleRowClick = (event, id) => {
+        if (selectedMeterIds.includes(id)) {
+          setSelectedMeterIds(selectedMeterIds.filter((selectedId) => selectedId !== id));
+        } else {
+          setSelectedMeterIds([...selectedMeterIds, id]);
+        }
+      };
+
+      const isSelected = (id) => selectedMeterIds.includes(id);
 
       // デバッグ用コンソールログ
       useEffect(() => {
@@ -703,79 +749,99 @@
               </Grid>
             </Paper>
 
-            {/* 関連設備情報セクション（選択されたメーターに限定） */}
+            {/* 関連設備情報セクション（選択されたメーターに限定、複数選択時は統合リスト表示） */}
             <Paper style={{ padding: 20, marginBottom: 40 }}>
               <Typography variant="h6" gutterBottom>
                 選択されたメーターに関連する設備情報
               </Typography>
-              {selectedMeterId ? (
-                equipments.filter(eq => eq.equipmentId === meters.find(m => m.id === selectedMeterId)?.meterId).length > 0 ? (
-                  <TableContainer component={Paper}>
-                    <Table size="small">
-                      <TableHead>
-                        <TableRow>
-                          <TableCell>No.</TableCell>
-                          <TableCell>設備ID</TableCell>
-                          <TableCell>設備カテゴリー</TableCell>
-                          <TableCell>設備名</TableCell>
-                          <TableCell>型番</TableCell>
-                          <TableCell>購入日</TableCell>
-                          <TableCell>拠点</TableCell>
-                          <TableCell>設置場所</TableCell>
-                          <TableCell>管理者</TableCell>
-                          <TableCell>状態</TableCell>
-                          <TableCell>メンテナンス予定日</TableCell>
-                          <TableCell>メンテナンス前回実施日</TableCell>
-                          <TableCell>メンテナンス周期（月）</TableCell>
-                          <TableCell>耐用年数（月）</TableCell>
-                          <TableCell>更新予定日</TableCell>
-                          <TableCell>備考</TableCell>
-                          <TableCell>有効</TableCell>
-                        </TableRow>
-                      </TableHead>
-                      <TableBody>
-                        {equipments.filter(eq => eq.equipmentId === meters.find(m => m.id === selectedMeterId)?.meterId).map((eq) => (
-                          <TableRow key={eq.no}>
-                            <TableCell>{eq.no}</TableCell>
-                            <TableCell>{eq.equipmentId}</TableCell>
-                            <TableCell>{eq.equipmentCategory}</TableCell>
-                            <TableCell>{eq.equipmentName}</TableCell>
-                            <TableCell>{eq.modelNumber}</TableCell>
-                            <TableCell>{eq.purchaseDate}</TableCell>
-                            <TableCell>{eq.location}</TableCell>
-                            <TableCell>{eq.installationPlace}</TableCell>
-                            <TableCell>{eq.manager}</TableCell>
-                            <TableCell>{eq.status}</TableCell>
-                            <TableCell>{eq.nextMaintenanceDate || "未設定"}</TableCell>
-                            <TableCell>{eq.lastMaintenanceDate || "未設定"}</TableCell>
-                            <TableCell>{eq.maintenanceInterval || "未設定"}</TableCell>
-                            <TableCell>{eq.usefulLife || "未設定"}</TableCell>
-                            <TableCell>{eq.scheduledUpdateDate || "未設定"}</TableCell>
-                            <TableCell>{eq.notes}</TableCell>
-                            <TableCell>
-                              <FormControlLabel
-                                control={
-                                  <Switch
-                                    checked={eq.active}
-                                    onChange={() => {
-                                      const updatedEquipments = equipments.map(equipment => equipment.no === eq.no ? { ...equipment, active: !equipment.active } : equipment);
-                                      setEquipments(updatedEquipments);
-                                      setSnackbar({ open: true, message: "設備の状態を更新しました。", severity: "success" });
-                                    }}
-                                    color="primary"
-                                  />
-                                }
-                                label={eq.active ? "有効" : "無効"}
-                              />
-                            </TableCell>
-                          </TableRow>
-                        ))}
-                      </TableBody>
-                    </Table>
-                  </TableContainer>
-                ) : (
-                  <Typography>選択されたメーターに関連する設備が見つかりません。</Typography>
-                )
+              {selectedMeterIds.length > 0 ? (
+                (() => {
+                  // 選択されたメーターのmeterIdsを取得
+                  const selectedMeters = meters.filter(m => selectedMeterIds.includes(m.id));
+                  const selectedMeterIdsList = selectedMeters.map(m => m.meterId);
+
+                  // 選択されたメーターに関連する全設備を取得
+                  const relatedEquipments = equipments.filter(eq => selectedMeterIdsList.includes(eq.equipmentId));
+
+                  if (relatedEquipments.length > 0) {
+                    return (
+                      <TableContainer component={Paper}>
+                        <Table size="small">
+                          <TableHead>
+                            <TableRow>
+                              <TableCell>No.</TableCell>
+                              <TableCell>メーターID</TableCell>
+                              <TableCell>メーター名</TableCell>
+                              <TableCell>設備ID</TableCell>
+                              <TableCell>設備カテゴリー</TableCell>
+                              <TableCell>設備名</TableCell>
+                              <TableCell>型番</TableCell>
+                              <TableCell>購入日</TableCell>
+                              <TableCell>拠点</TableCell>
+                              <TableCell>設置場所</TableCell>
+                              <TableCell>管理者</TableCell>
+                              <TableCell>状態</TableCell>
+                              <TableCell>メンテナンス予定日</TableCell>
+                              <TableCell>メンテナンス前回実施日</TableCell>
+                              <TableCell>メンテナンス周期（月）</TableCell>
+                              <TableCell>耐用年数（月）</TableCell>
+                              <TableCell>更新予定日</TableCell>
+                              <TableCell>備考</TableCell>
+                              <TableCell>有効</TableCell>
+                            </TableRow>
+                          </TableHead>
+                          <TableBody>
+                            {relatedEquipments.map((eq, idx) => {
+                              const meter = meters.find(m => m.meterId === eq.equipmentId);
+                              return (
+                                <TableRow key={eq.no}>
+                                  <TableCell>{idx + 1}</TableCell>
+                                  <TableCell>{meter?.meterId || "N/A"}</TableCell>
+                                  <TableCell>{meter?.meterName || "N/A"}</TableCell>
+                                  <TableCell>{eq.equipmentId}</TableCell>
+                                  <TableCell>{eq.equipmentCategory}</TableCell>
+                                  <TableCell>{eq.equipmentName}</TableCell>
+                                  <TableCell>{eq.modelNumber}</TableCell>
+                                  <TableCell>{eq.purchaseDate}</TableCell>
+                                  <TableCell>{eq.location}</TableCell>
+                                  <TableCell>{eq.installationPlace}</TableCell>
+                                  <TableCell>{eq.manager}</TableCell>
+                                  <TableCell>{eq.status}</TableCell>
+                                  <TableCell>{eq.nextMaintenanceDate || "未設定"}</TableCell>
+                                  <TableCell>{eq.lastMaintenanceDate || "未設定"}</TableCell>
+                                  <TableCell>{eq.maintenanceInterval || "未設定"}</TableCell>
+                                  <TableCell>{eq.usefulLife || "未設定"}</TableCell>
+                                  <TableCell>{eq.scheduledUpdateDate || "未設定"}</TableCell>
+                                  <TableCell>{eq.notes}</TableCell>
+                                  <TableCell>
+                                    <FormControlLabel
+                                      control={
+                                        <Switch
+                                          checked={eq.active}
+                                          onChange={() => {
+                                            const updatedEquipments = equipments.map(equipment => equipment.no === eq.no ? { ...equipment, active: !equipment.active } : equipment);
+                                            setEquipments(updatedEquipments);
+                                            setSnackbar({ open: true, message: "設備の状態を更新しました。", severity: "success" });
+                                          }}
+                                          color="primary"
+                                        />
+                                      }
+                                      label={eq.active ? "有効" : "無効"}
+                                    />
+                                  </TableCell>
+                                </TableRow>
+                              );
+                            })}
+                          </TableBody>
+                        </Table>
+                      </TableContainer>
+                    );
+                  } else {
+                    return (
+                      <Typography>選択されたメーターに関連する設備が見つかりません。</Typography>
+                    );
+                  }
+                })()
               ) : (
                 <Typography>メーターが選択されていません。</Typography>
               )}
@@ -845,28 +911,9 @@
                     <TableRow>
                       <TableCell padding="checkbox">
                         <Checkbox
-                          indeterminate={Object.keys(editStates).length > 0 && Object.keys(editStates).length < meters.length}
-                          checked={meters.length > 0 && Object.keys(editStates).length === meters.length}
-                          onChange={(e) => {
-                            if (e.target.checked) {
-                              const allEditStates = {};
-                              meters.forEach(meter => {
-                                allEditStates[meter.id] = {
-                                  previousValue: meter.previousValue,
-                                  previousConfirmationDate: meter.previousConfirmationDate,
-                                  previousRegistrant: meter.previousRegistrant,
-                                  currentValue: meter.currentValue,
-                                  confirmationDate: meter.confirmationDate,
-                                  registrant: meter.registrant,
-                                };
-                              });
-                              setEditStates(allEditStates);
-                              setSelectedMeterId(null); // 全選択時はメーターを選択解除
-                            } else {
-                              setEditStates({});
-                              setSelectedMeterId(null);
-                            }
-                          }}
+                          indeterminate={selectedMeterIds.length > 0 && selectedMeterIds.length < filteredMeters.length}
+                          checked={filteredMeters.length > 0 && selectedMeterIds.length === filteredMeters.length}
+                          onChange={handleSelectAllClick}
                           color="primary"
                         />
                       </TableCell>
@@ -890,26 +937,33 @@
                       ? filteredMeters.slice(page * rowsPerPage, page * rowsPerPage + rowsPerPage)
                       : filteredMeters
                     ).map((meter, index) => {
-                      const isSelected = selectedMeterId === meter.id;
+                      const isItemSelected = isSelected(meter.id);
+                      const labelId = `enhanced-table-checkbox-${index}`;
+
+                      // 編集された値を取得
+                      const editedMeter = editStates[meter.id] || {};
+                      const previousValue = editedMeter.previousValue !== undefined ? editedMeter.previousValue : meter.previousValue;
+                      const currentValue = editedMeter.currentValue !== undefined ? editedMeter.currentValue : meter.currentValue;
+                      const usage = currentValue - previousValue;
+
                       return (
                         <TableRow 
                           key={meter.id} 
                           hover 
-                          selected={isSelected}
-                          onClick={() => setSelectedMeterId(meter.id)}
+                          role="checkbox"
+                          aria-checked={isItemSelected}
+                          selected={isItemSelected}
+                          onClick={() => handleRowClick(null, meter.id)}
                           style={{ cursor: 'pointer' }}
                         >
                           <TableCell padding="checkbox">
                             <Checkbox
-                              checked={isSelected}
-                              onChange={(e) => {
-                                if (e.target.checked) {
-                                  setSelectedMeterId(meter.id);
-                                } else {
-                                  setSelectedMeterId(null);
-                                }
-                              }}
+                              checked={isItemSelected}
+                              onChange={(event) => handleRowClick(event, meter.id)}
                               color="primary"
+                              inputProps={{
+                                'aria-labelledby': labelId,
+                              }}
                               onClick={(e) => e.stopPropagation()} // チェックボックスのクリックで行選択を防ぐ
                             />
                           </TableCell>
@@ -919,7 +973,7 @@
                           <TableCell>{meter.installationPlace}</TableCell>
                           <TableCell>{meter.locationName}</TableCell>
                           <TableCell>{meter.manager}</TableCell>
-                          <TableCell>{meter.usage}</TableCell>
+                          <TableCell>{usage}</TableCell>
                           {/* Editable Cells */}
                           {['previousValue', 'previousConfirmationDate', 'previousRegistrant', 'currentValue', 'confirmationDate', 'registrant'].map(field => {
                             const hasEdit = editStates[meter.id] && field in editStates[meter.id];
