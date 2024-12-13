@@ -1,0 +1,559 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>React Leaflet with GSI Tiles</title>
+  <!-- React and ReactDOM -->
+  <script src="https://cdn.jsdelivr.net/npm/react@18/umd/react.production.min.js" ></script>
+  <script src="https://cdn.jsdelivr.net/npm/react-dom@18/umd/react-dom.production.min.js" ></script>
+  <!-- MUI (Material-UI) -->
+  <script src="https://cdn.jsdelivr.net/npm/@mui/material@5.11.15/umd/material-ui.production.min.js" ></script>
+  <!-- Babel for JSX -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.21.0/babel.min.js" ></script>
+  <!-- Emotion ライブラリ -->
+  <script src="https://cdn.jsdelivr.net/npm/@emotion/react@11.11.0/dist/emotion-react.umd.min.js" ></script>
+  <script src="https://cdn.jsdelivr.net/npm/@emotion/styled@11.11.0/dist/emotion-styled.umd.min.js" ></script>
+  <!-- Material-UI Styles -->
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Roboto:300,400,500,700&display=swap" />
+  <link rel="stylesheet" href="https://fonts.googleapis.com/icon?family=Material+Icons" />
+  <!-- Leaflet CSS -->
+  <link
+    rel="stylesheet"
+    href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
+    crossorigin=""
+  />
+  <style>
+    #root {
+      display: flex;
+      flex-direction: column;
+      height: 100vh;
+    }
+    footer {
+      text-align: center;
+      background-color: #1976d2;
+      color: white;
+      padding: 0.5rem;
+    }
+    .drop-zone {
+      border: 2px dashed #1976d2;
+      border-radius: 4px;
+      padding: 20px;
+      text-align: center;
+      color: #1976d2;
+      cursor: pointer;
+      transition: background-color 0.2s;
+    }
+    .drop-zone.dragover {
+      background-color: #e3f2fd;
+    }
+
+    /* テーブルセル内で折り畳まないように */
+    td, th {
+      white-space: nowrap;
+    }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+  <!-- Leaflet JS -->
+  <script
+    src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
+    crossorigin=""
+  ></script>
+  <script type="text/babel">
+    const {
+      AppBar,
+      Toolbar,
+      Typography,
+      CssBaseline,
+      Box,
+      Table,
+      TableBody,
+      TableCell,
+      TableContainer,
+      TableHead,
+      TableRow,
+      TablePagination,
+      Paper,
+      TextField,
+      Button,
+      Collapse,
+      Radio,
+      RadioGroup,
+      FormControlLabel,
+      FormControl,
+      FormLabel,
+    } = MaterialUI;
+
+    const App = () => {
+      const initialStores = Array.from({ length: 5 }, (_, i) => ({
+        storeCode: `S${i + 1}`,
+        name: `Store ${i + 1}`,
+        sales: (Math.random() * 100000).toFixed(2),
+        budget: (Math.random() * 120000).toFixed(2),
+        startDate: `2024-01-${String(i % 28 + 1).padStart(2, "0")}`,
+        endDate: `2024-12-${String(i % 28 + 1).padStart(2, "0")}`,
+        days: 365,
+        address: `Address ${i + 1}`,
+        lat: 35.6895 + (i % 5) * 0.01,
+        lng: 139.6917 + (i % 5) * 0.01,
+        businessType: "Retail",
+        block: `Block ${i + 1}`,
+        area: `${(Math.random() * 500).toFixed(2)}㎡`,
+        isActive: i % 2 === 0 ? "有効" : "無効",
+        posCode: `POS${i + 1}`,
+        market: `Market ${i + 1}`,
+        marketId: `M${i + 1}`,
+      }));
+
+      const [stores, setStores] = React.useState(initialStores);
+      const [filteredStores, setFilteredStores] = React.useState(initialStores);
+      const [page, setPage] = React.useState(0);
+      const [rowsPerPage, setRowsPerPage] = React.useState(10);
+      const [globalFilterText, setGlobalFilterText] = React.useState("");
+      const [expandedCSV, setExpandedCSV] = React.useState(false);
+      const [expandedMap, setExpandedMap] = React.useState(true);
+      const [expandedTable, setExpandedTable] = React.useState(true);
+
+      const mapRef = React.useRef(null);
+
+      // 列フィルター用
+      const [columnFilters, setColumnFilters] = React.useState({
+        storeCode: "",
+        name: "",
+        sales: "",
+        budget: "",
+        startDate: "",
+        endDate: "",
+        days: "",
+        address: "",
+        lat: "",
+        lng: "",
+        businessType: "",
+        block: "",
+        area: "",
+        isActive: "",
+        posCode: "",
+        market: "",
+        marketId: "",
+      });
+
+      // サークル表示モード
+      const [circleMode, setCircleMode] = React.useState("none"); 
+      // 商圏用半径
+      const [tradingRadius, setTradingRadius] = React.useState("1500"); 
+
+      React.useEffect(() => {
+        if (!mapRef.current) {
+          mapRef.current = L.map("map").setView([35.6895, 139.6917], 13);
+          L.tileLayer(
+            "https://cyberjapandata.gsi.go.jp/xyz/std/{z}/{x}/{y}.png",
+            {
+              attribution:
+                '&copy; <a href="https://www.gsi.go.jp/" target="_blank">国土地理院</a>',
+            }
+          ).addTo(mapRef.current);
+        }
+
+        const mapInstance = mapRef.current;
+        // 既存マーカー・サークルを削除
+        mapInstance.eachLayer((layer) => {
+          if (layer instanceof L.Marker || layer instanceof L.Circle) {
+            mapInstance.removeLayer(layer);
+          }
+        });
+
+        filteredStores.forEach((store) => {
+          // マーカー
+          L.marker([store.lat, store.lng])
+            .addTo(mapInstance)
+            .bindPopup(`<b>${store.name}</b><br>${store.address}`);
+
+          // サークル描画
+          let radius = null;
+          if (circleMode === "trade") {
+            // 商圏モード
+            radius = parseFloat(tradingRadius) || 1500;
+          } else if (circleMode === "sales") {
+            // 売上ベース
+            radius = parseFloat(store.sales) || 0;
+          } else if (circleMode === "budget") {
+            // 予算ベース
+            radius = parseFloat(store.budget) || 0;
+          } else if (circleMode === "area") {
+            // 面積ベース (末尾の㎡を削除してパース)
+            const areaVal = parseFloat(store.area.replace("㎡","")) || 0;
+            radius = areaVal;
+          } else {
+            // noneの場合はサークル表示しない
+            radius = null;
+          }
+
+          if (radius && radius > 0) {
+            L.circle([store.lat, store.lng], {
+              radius: radius,
+              color: "blue",
+              fillColor: "#f03",
+              fillOpacity: 0.2,
+            }).addTo(mapInstance);
+          }
+        });
+      }, [filteredStores, circleMode, tradingRadius]);
+
+      // フィルタリング関数
+      const applyFilters = () => {
+        let filtered = stores.filter((store) => {
+          // 全体フィルター判定
+          const globalMatch = globalFilterText
+            ? Object.values(store).some((value) =>
+                String(value).toLowerCase().includes(globalFilterText.toLowerCase())
+              )
+            : true;
+
+          // 列フィルター判定
+          const columnMatch = Object.entries(columnFilters).every(([col, val]) => {
+            if (!val) return true;
+            return String(store[col]).toLowerCase().includes(val.toLowerCase());
+          });
+
+          return globalMatch && columnMatch;
+        });
+
+        setFilteredStores(filtered);
+        setPage(0);
+      };
+
+      const handleFilterChange = (event) => {
+        setGlobalFilterText(event.target.value);
+      };
+
+      const handleColumnFilterChange = (column) => (event) => {
+        setColumnFilters((prev) => ({
+          ...prev,
+          [column]: event.target.value,
+        }));
+      };
+
+      const handleFilterApply = () => {
+        applyFilters();
+      };
+
+      const handleFilterClear = () => {
+        setGlobalFilterText("");
+        setColumnFilters({
+          storeCode: "",
+          name: "",
+          sales: "",
+          budget: "",
+          startDate: "",
+          endDate: "",
+          days: "",
+          address: "",
+          lat: "",
+          lng: "",
+          businessType: "",
+          block: "",
+          area: "",
+          isActive: "",
+          posCode: "",
+          market: "",
+          marketId: "",
+        });
+        setFilteredStores(stores);
+        setPage(0);
+      };
+
+      const fetchCoordinates = async (address) => {
+        try {
+          const response = await fetch(
+            `https://msearch.gsi.go.jp/address-search/AddressSearch?q=${encodeURIComponent(
+              address
+            )}`
+          );
+          const data = await response.json();
+          if (data.length > 0) {
+            return {
+              lat: data[0].geometry.coordinates[1],
+              lng: data[0].geometry.coordinates[0],
+            };
+          }
+        } catch (error) {
+          console.error("Error fetching coordinates:", error);
+        }
+        return { lat: 35.6895, lng: 139.6917 }; 
+      };
+
+      const handleCSVUpload = async (file) => {
+        if (file) {
+          const reader = new FileReader();
+          reader.onload = async () => {
+            const rows = reader.result.split("\n").slice(1);
+            const parsedStores = await Promise.all(
+              rows
+                .filter((row) => row.trim() !== "")
+                .map(async (row, idx) => {
+                  const [
+                    storeCode,
+                    name,
+                    sales,
+                    budget,
+                    startDate,
+                    endDate,
+                    days,
+                    address,
+                    lat,
+                    lng,
+                    businessType,
+                    block,
+                    area,
+                    isActive,
+                    posCode,
+                    market,
+                    marketId,
+                  ] = row.split(",");
+
+                  let coordinates = { lat: parseFloat(lat), lng: parseFloat(lng) };
+                  if ((!lat || !lng) && address) {
+                    coordinates = await fetchCoordinates(address);
+                  }
+
+                  return {
+                    storeCode: storeCode || `CSV${idx + 1}`,
+                    name: name || `CSV Store ${idx + 1}`,
+                    sales: sales || "0.00",
+                    budget: budget || "0.00",
+                    startDate: startDate || "2024-01-01",
+                    endDate: endDate || "2024-12-31",
+                    days: days || 365,
+                    address: address || "Unknown",
+                    lat: coordinates.lat,
+                    lng: coordinates.lng,
+                    businessType: businessType || "Unknown",
+                    block: block || "Unknown",
+                    area: area || "0㎡",
+                    isActive: isActive || "無効",
+                    posCode: posCode || "Unknown",
+                    market: market || "Unknown",
+                    marketId: marketId || `M${idx + 1}`,
+                  };
+                })
+            );
+            setStores(parsedStores);
+            setFilteredStores(parsedStores);
+            setPage(0);
+          };
+          reader.readAsText(file);
+        }
+      };
+
+      const handleDrop = async (event) => {
+        event.preventDefault();
+        const file = event.dataTransfer.files[0];
+        if (file) {
+          await handleCSVUpload(file);
+        }
+      };
+
+      const handleDragOver = (event) => {
+        event.preventDefault();
+      };
+
+      const handleDownloadTemplate = () => {
+        const csvContent = `storeCode,name,sales,budget,startDate,endDate,days,address,lat,lng,businessType,block,area,isActive,posCode,market,marketId\nS1,Sample Store,10000,15000,2024-01-01,2024-12-31,365,Sample Address,35.6895,139.6917,Retail,Block A,100㎡,有効,POS1,Market 1,M1\n`;
+        const blob = new Blob([csvContent], { type: "text/csv" });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        a.href = url;
+        a.download = "template.csv";
+        a.click();
+        URL.revokeObjectURL(url);
+      };
+
+      const toggleExpand = (type) => {
+        if (type === "csv") setExpandedCSV(!expandedCSV);
+        if (type === "map") setExpandedMap(!expandedMap);
+        if (type === "table") setExpandedTable(!expandedTable);
+      };
+
+      const columns = [
+        { key: "storeCode", label: "店舗コード" },
+        { key: "name", label: "店舗名" },
+        { key: "sales", label: "売上" },
+        { key: "budget", label: "予算" },
+        { key: "startDate", label: "開始日" },
+        { key: "endDate", label: "終了日" },
+        { key: "days", label: "日数" },
+        { key: "address", label: "住所" },
+        { key: "lat", label: "緯度" },
+        { key: "lng", label: "経度" },
+        { key: "businessType", label: "事業区分" },
+        { key: "block", label: "ブロック" },
+        { key: "area", label: "面積" },
+        { key: "isActive", label: "有効無効" },
+        { key: "posCode", label: "POSコード" },
+        { key: "market", label: "市場" },
+        { key: "marketId", label: "市場ID" },
+      ];
+
+      return (
+        <Box id="root" sx={{ display: "flex", flexDirection: "column", height: "100vh" }}>
+          <CssBaseline />
+          <AppBar position="static">
+            <Toolbar>
+              <Typography variant="h6" component="div">
+                Store Locator
+              </Typography>
+            </Toolbar>
+          </AppBar>
+
+          {/* 地図エリア */}
+          <Box sx={{ flexGrow: 1, padding: 2 }}>
+            <Collapse in={expandedMap}>
+              <Box id="map" sx={{ height: "70vh", marginTop: 1 }} />
+            </Collapse>
+            <Button onClick={() => toggleExpand("map")} variant="text">
+              {expandedMap ? "Hide Map" : "Show Map"}
+            </Button>
+          </Box>
+
+          {/* CSVアップロードエリア */}
+          <Box sx={{ padding: 1 }}>
+            <Button onClick={() => toggleExpand("csv")} variant="text">
+              {expandedCSV ? "Hide CSV Upload" : "Show CSV Upload"}
+            </Button>
+            <Collapse in={expandedCSV}>
+              <Box
+                className="drop-zone"
+                onDrop={handleDrop}
+                onDragOver={handleDragOver}
+              >
+                Drag and drop a CSV file here or click the button below
+              </Box>
+              <Box sx={{ display: "flex", gap: 2, alignItems: "center", marginTop: 2 }}>
+                <Button
+                  variant="contained"
+                  color="primary"
+                  onClick={handleDownloadTemplate}
+                >
+                  Download Template
+                </Button>
+                <input
+                  type="file"
+                  accept=".csv"
+                  onChange={(e) => handleCSVUpload(e.target.files[0])}
+                  style={{ display: "block" }}
+                />
+              </Box>
+            </Collapse>
+          </Box>
+
+          {/* 全体フィルター */}
+          <Box sx={{ padding: 1, display: "flex", gap: 1, alignItems: "center" }}>
+            <TextField
+              label="Global Filter"
+              variant="outlined"
+              size="small"
+              value={globalFilterText}
+              onChange={handleFilterChange}
+            />
+            <Button variant="contained" color="primary" onClick={handleFilterApply}>
+              Apply Filter
+            </Button>
+            <Button variant="outlined" color="secondary" onClick={handleFilterClear}>
+              Clear Filter
+            </Button>
+          </Box>
+
+          {/* サークル表示オプション */}
+          <Box sx={{ padding: 1, display: "flex", gap: 2, alignItems: "center" }}>
+            <FormControl component="fieldset">
+              <FormLabel component="legend">Circle Mode</FormLabel>
+              <RadioGroup
+                row
+                value={circleMode}
+                onChange={(e) => setCircleMode(e.target.value)}
+              >
+                <FormControlLabel value="none" control={<Radio />} label="なし" />
+                <FormControlLabel value="trade" control={<Radio />} label="商圏" />
+                <FormControlLabel value="sales" control={<Radio />} label="売上" />
+                <FormControlLabel value="budget" control={<Radio />} label="予算" />
+                <FormControlLabel value="area" control={<Radio />} label="面積" />
+              </RadioGroup>
+            </FormControl>
+            {circleMode === "trade" && (
+              <TextField
+                label="商圏半径(m)"
+                variant="outlined"
+                size="small"
+                value={tradingRadius}
+                onChange={(e) => setTradingRadius(e.target.value)}
+                style={{ width: "100px" }}
+              />
+            )}
+          </Box>
+
+          {/* テーブルエリア */}
+          <Box sx={{ padding: 2 }}>
+            <Button onClick={() => toggleExpand("table")} variant="text">
+              {expandedTable ? "Hide Table" : "Show Table"}
+            </Button>
+            <Collapse in={expandedTable}>
+              <TableContainer component={Paper} sx={{ marginTop: 1, overflow: 'auto' }}>
+                <Table size="small">
+                  <TableHead>
+                    <TableRow>
+                      {columns.map((col) => (
+                        <TableCell key={col.key}>{col.label}</TableCell>
+                      ))}
+                    </TableRow>
+                    <TableRow>
+                      {columns.map((col) => (
+                        <TableCell key={col.key}>
+                          <TextField
+                            variant="outlined"
+                            size="small"
+                            value={columnFilters[col.key]}
+                            onChange={handleColumnFilterChange(col.key)}
+                            placeholder={`Filter ${col.label}`}
+                          />
+                        </TableCell>
+                      ))}
+                    </TableRow>
+                  </TableHead>
+                  <TableBody>
+                    {filteredStores
+                      .slice(page * rowsPerPage, page * rowsPerPage + rowsPerPage)
+                      .map((store) => (
+                        <TableRow key={store.storeCode}>
+                          {columns.map((col) => (
+                            <TableCell key={col.key}>{store[col.key]}</TableCell>
+                          ))}
+                        </TableRow>
+                      ))}
+                  </TableBody>
+                </Table>
+                <TablePagination
+                  component="div"
+                  count={filteredStores.length}
+                  rowsPerPage={rowsPerPage}
+                  page={page}
+                  onPageChange={(event, newPage) => setPage(newPage)}
+                  onRowsPerPageChange={(event) =>
+                    setRowsPerPage(parseInt(event.target.value, 10))
+                  }
+                  rowsPerPageOptions={[5, 10, 25]}
+                />
+              </TableContainer>
+            </Collapse>
+          </Box>
+
+          <footer>&copy; 2024 Store Locator Inc. All Rights Reserved.</footer>
+        </Box>
+      );
+    };
+
+    ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+  </script>
+</body>
+</html>
