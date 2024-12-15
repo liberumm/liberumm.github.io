@@ -1,0 +1,174 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>人口データ取得と地図表示</title>
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+    <style>
+        #map {
+            height: 500px;
+            margin-top: 10px;
+        }
+    </style>
+</head>
+<body>
+    <h1>人口データ取得と地図表示</h1>
+    <label for="address">住所:</label>
+    <input type="text" id="address" placeholder="例: 東京都千代田区丸の内1-1">
+    <button onclick="searchAddress()">住所から検索</button>
+    <br>
+    <label for="latitude">緯度:</label>
+    <input type="text" id="latitude" placeholder="例: 35.6895">
+    <label for="longitude">経度:</label>
+    <input type="text" id="longitude" placeholder="例: 139.6917">
+    <label for="radius">半径 (m):</label>
+    <input type="number" id="radius" placeholder="例: 1500" value="1500">
+    <button onclick="searchAndDisplay()">範囲指定して表示</button>
+
+    <div id="map"></div>
+
+    <script>
+        // URLクエリパラメータを取得する関数
+        function getQueryParam(param) {
+            const urlParams = new URLSearchParams(window.location.search);
+            return urlParams.get(param);
+        }
+
+        // e-Stat APIキーをURLクエリから取得
+        const estatApiKey = getQueryParam("apiKey");
+        if (!estatApiKey) {
+            alert("URLにapiKeyパラメータを指定してください。例: ?apiKey=YOUR_ESTAT_API_KEY");
+            throw new Error("APIキーが指定されていません。");
+        }
+
+        // 地図の初期設定（国土地理院のタイル使用）
+        const map = L.map('map').setView([35.6895, 139.6917], 14); // 初期位置: 東京駅付近
+        L.tileLayer(
+            'https://cyberjapandata.gsi.go.jp/xyz/std/{z}/{x}/{y}.png', // 国土地理院の標準地図タイル
+            {
+                attribution: '<a href="https://maps.gsi.go.jp/development/ichiran.html" target="_blank">© 国土地理院</a>',
+                maxZoom: 18,
+            }
+        ).addTo(map);
+
+        // 国土地理院の逆ジオコーディングAPIで住所から緯度経度を取得
+        async function searchAddress() {
+            const address = document.getElementById('address').value;
+            if (!address) {
+                alert("住所を入力してください。");
+                return;
+            }
+
+            const geocodeUrl = `https://msearch.gsi.go.jp/address-search/AddressSearch?q=${encodeURIComponent(address)}`;
+
+            try {
+                const response = await fetch(geocodeUrl);
+                const data = await response.json();
+
+                if (data.length === 0) {
+                    alert("該当する住所が見つかりませんでした。");
+                    return;
+                }
+
+                const location = data[0].geometry.coordinates;
+                const lng = location[0];
+                const lat = location[1];
+
+                // 緯度経度を入力欄にセット
+                document.getElementById('latitude').value = lat;
+                document.getElementById('longitude').value = lng;
+
+                // 地図の中心を更新
+                map.setView([lat, lng], 15);
+
+                // マーカーを表示
+                L.marker([lat, lng]).addTo(map)
+                    .bindPopup(`住所: ${address}<br>緯度: ${lat}<br>経度: ${lng}`)
+                    .openPopup();
+            } catch (error) {
+                console.error("住所検索エラー:", error);
+                alert("住所検索中にエラーが発生しました。");
+            }
+        }
+
+        // 人口データ取得と表示
+        async function searchAndDisplay() {
+            const lat = parseFloat(document.getElementById('latitude').value);
+            const lng = parseFloat(document.getElementById('longitude').value);
+            const radius = parseInt(document.getElementById('radius').value) || 1500;
+
+            if (isNaN(lat) || isNaN(lng)) {
+                alert("有効な緯度・経度を入力してください。");
+                return;
+            }
+
+            // 地図を更新
+            map.setView([lat, lng], 15);
+
+            // 半径範囲を円で表示
+            L.circle([lat, lng], {
+                color: 'red',
+                fillColor: '#f03',
+                fillOpacity: 0.3,
+                radius: radius
+            }).addTo(map);
+
+            // e-Stat APIで人口データを取得
+            const statsTableId = "0003410441"; // 統計表ID（例: 国勢調査）
+            const url = `https://api.e-stat.go.jp/rest/3.0/app/json/getStatsData?appId=${estatApiKey}&statsDataId=${statsTableId}`;
+
+            try {
+                const response = await fetch(url);
+                const data = await response.json();
+
+                console.log("APIレスポンス:", data);
+
+                if (data.GET_STATS_DATA && data.GET_STATS_DATA.STATISTICAL_DATA && data.GET_STATS_DATA.STATISTICAL_DATA.DATA_INF) {
+                    const populationData = data.GET_STATS_DATA.STATISTICAL_DATA.DATA_INF.VALUE;
+                    displayPopulationData(lat, lng, populationData, radius);
+                } else {
+                    console.error("データが取得できませんでした。レスポンス:", data);
+                    alert("データが取得できませんでした。統計IDが間違っている可能性があります。");
+                }
+            } catch (error) {
+                console.error("人口データ取得エラー:", error);
+                alert("人口データ取得中にエラーが発生しました。");
+            }
+        }
+
+        // 人口データを地図に表示
+        function displayPopulationData(centerLat, centerLng, data, radius) {
+            data.forEach((item) => {
+                const areaLat = parseFloat(item["@latitude"]); // 地域の緯度（仮の例）
+                const areaLng = parseFloat(item["@longitude"]); // 地域の経度（仮の例）
+                const population = item["$"];
+
+                // 中心からの距離を計算
+                const distance = calculateDistance(centerLat, centerLng, areaLat, areaLng);
+                if (distance <= radius / 1000) { // 指定半径内
+                    L.marker([areaLat, areaLng]).addTo(map)
+                        .bindPopup(`<b>${item["@areaName"]}</b><br>人口: ${population}人`);
+                }
+            });
+        }
+
+        // 緯度経度間の距離を計算 (Haversine公式)
+        function calculateDistance(lat1, lng1, lat2, lng2) {
+            const R = 6371; // 地球の半径 (km)
+            const dLat = (lat2 - lat1) * (Math.PI / 180);
+            const dLng = (lng2 - lng1) * (Math.PI / 180);
+
+            const a =
+                Math.sin(dLat / 2) * Math.sin(dLat / 2) +
+                Math.cos(lat1 * (Math.PI / 180)) *
+                    Math.cos(lat2 * (Math.PI / 180)) *
+                    Math.sin(dLng / 2) * Math.sin(dLng / 2);
+
+            const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+            return R * c; // 距離 (km)
+        }
+    </script>
+</body>
+</html>
