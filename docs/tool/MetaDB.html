@@ -1,0 +1,663 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>POC Data Management</title>
+
+<!-- React and ReactDOM -->
+<script src="https://cdn.jsdelivr.net/npm/react@18/umd/react.production.min.js" crossorigin="anonymous"></script>
+<script src="https://cdn.jsdelivr.net/npm/react-dom@18/umd/react-dom.production.min.js" crossorigin="anonymous"></script>
+
+<!-- MUI (Material-UI) v5 -->
+<script src="https://cdn.jsdelivr.net/npm/@mui/material@5.11.15/umd/material-ui.production.min.js" crossorigin="anonymous"></script>
+
+<!-- Babel for JSX -->
+<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.21.0/babel.min.js" crossorigin="anonymous"></script>
+
+<!-- Emotion ライブラリ -->
+<script src="https://cdn.jsdelivr.net/npm/@emotion/react@11.11.0/dist/emotion-react.umd.min.js" crossorigin="anonymous"></script>
+<script src="https://cdn.jsdelivr.net/npm/@emotion/styled@11.11.0/dist/emotion-styled.umd.min.js" crossorigin="anonymous"></script>
+
+<link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Roboto" />
+<link rel="stylesheet" href="https://fonts.googleapis.com/icon?family=Material+Icons" />
+
+<style>
+  body {
+    margin: 0;
+    font-family: Roboto, sans-serif;
+  }
+  #root {
+    padding: 20px;
+  }
+  .upload-area {
+    border: 2px dashed #ccc;
+    padding: 20px;
+    text-align: center;
+    margin-bottom: 20px;
+    color: #666;
+    cursor: pointer;
+    transition: background-color 0.3s, border-color 0.3s;
+  }
+  .upload-area.dragover {
+    border-color: #333;
+    background-color: #fafafa;
+  }
+</style>
+</head>
+<body>
+<div id="root"></div>
+
+<script type="text/babel">
+
+const {
+  Button, TextField, Table, TableBody, TableCell, TableContainer, TableHead, TableRow, Paper,
+  FormControl, InputLabel, Select, MenuItem, Tabs, Tab, Dialog, DialogTitle, DialogContent, DialogActions,
+  Checkbox
+} = MaterialUI;
+
+const { useState, useRef } = React;
+
+const initialHeaders = [
+  {StructureID: 1, StructureName: "Product", Description: "商品情報"},
+  {StructureID: 2, StructureName: "Customer", Description: "顧客情報"}
+];
+
+const initialFields = [
+  {FieldID:1, StructureID:1, FieldName:"Name",DataType:"String",IsRequired:true,DefaultValue:null},
+  {FieldID:2, StructureID:1, FieldName:"Price",DataType:"Number",IsRequired:true,DefaultValue:"0"},
+  {FieldID:3, StructureID:2, FieldName:"Name",DataType:"String",IsRequired:true,DefaultValue:null},
+  {FieldID:4, StructureID:2, FieldName:"Email",DataType:"String",IsRequired:false,DefaultValue:null}
+];
+
+const initialData = [
+  {DataID:1, StructureID:1, FieldID:1, FieldValue:"Apple"},
+  {DataID:2, StructureID:1, FieldID:2, FieldValue:"100"},
+  {DataID:3, StructureID:2, FieldID:3, FieldValue:"John Doe"},
+  {DataID:4, StructureID:2, FieldID:4, FieldValue:"john@example.com"}
+];
+
+// StructureIDに紐づくデータをVIEW的に整形するヘルパー
+function createViewData(structureID, data, fields) {
+  const byDataID = {};
+  data.filter(d => d.StructureID === structureID).forEach(d=>{
+    if(!byDataID[d.DataID]) byDataID[d.DataID] = {DataID:d.DataID, StructureID:d.StructureID};
+    const field = fields.find(f=>f.FieldID===d.FieldID);
+    if(field) byDataID[d.DataID][field.FieldName] = d.FieldValue;
+  });
+  return Object.values(byDataID);
+}
+
+// SQL生成系
+function generateSQLForHeaders(headers) {
+  const createTableSQL = `CREATE TABLE DataStructureHeader (
+  StructureID INTEGER PRIMARY KEY,
+  StructureName TEXT,
+  Description TEXT
+);`;
+
+  const insertSQLs = headers.map(h=>{
+    const nameVal = h.StructureName ? `'${h.StructureName.replace(/'/g,"''")}'` : "NULL";
+    const descVal = h.Description ? `'${h.Description.replace(/'/g,"''")}'` : "NULL";
+    return `INSERT INTO DataStructureHeader (StructureID, StructureName, Description) VALUES (${h.StructureID}, ${nameVal}, ${descVal});`;
+  });
+
+  return createTableSQL + "\n\n" + insertSQLs.join("\n");
+}
+
+function generateSQLForFields(fields) {
+  const createTableSQL = `CREATE TABLE DataStructureField (
+  FieldID INTEGER PRIMARY KEY,
+  StructureID INTEGER,
+  FieldName TEXT,
+  DataType TEXT,
+  IsRequired INTEGER,
+  DefaultValue TEXT
+);`;
+
+  const insertSQLs = fields.map(f=>{
+    const fname = f.FieldName ? `'${f.FieldName.replace(/'/g,"''")}'` : "NULL";
+    const dtype = f.DataType ? `'${f.DataType}'` : "NULL";
+    const req = f.IsRequired ? 1 : 0;
+    const defVal = f.DefaultValue!=null? `'${String(f.DefaultValue).replace(/'/g,"''")}'` : "NULL";
+    return `INSERT INTO DataStructureField (FieldID, StructureID, FieldName, DataType, IsRequired, DefaultValue)
+VALUES (${f.FieldID}, ${f.StructureID}, ${fname}, ${dtype}, ${req}, ${defVal});`;
+  });
+
+  return createTableSQL + "\n\n" + insertSQLs.join("\n");
+}
+
+function generateSQLForData(structure, fields, viewData) {
+  if(!structure) return "";
+  const tableName = structure.StructureName;
+  const mapType = (dt) => dt==="Number"?"INTEGER":"TEXT";
+  const columns = fields.map(f=>{
+    let colDef = f.FieldName + " " + mapType(f.DataType);
+    if(f.IsRequired) colDef += " NOT NULL";
+    if(f.DefaultValue!=null && f.DefaultValue!=="") {
+      const defVal = f.DataType==="Number"?f.DefaultValue:`'${f.DefaultValue}'`;
+      colDef += ` DEFAULT ${defVal}`;
+    }
+    return colDef;
+  });
+  const createTableSQL = `CREATE TABLE ${tableName} (
+  DataID INTEGER PRIMARY KEY,
+  ${columns.join(",\n  ")}
+);`
+
+  const fieldNames = fields.map(f=>f.FieldName);
+  const insertSQLs = viewData.map(row=>{
+    const values = fields.map(f=>{
+      let val = row[f.FieldName];
+      if(val==null) return "NULL";
+      if(f.DataType==="Number") {
+        return isNaN(val)? "NULL" : val;
+      } else {
+        return `'${val.replace(/'/g,"''")}'`;
+      }
+    });
+    return `INSERT INTO ${tableName} (DataID, ${fieldNames.join(", ")}) VALUES (${row.DataID}, ${values.join(", ")});`
+  });
+
+  return createTableSQL + "\n\n" + insertSQLs.join("\n");
+}
+
+// CSV出力ヘルパー
+function downloadCSV(filename, rows, encoding='utf-8') {
+  const csvContent = rows.map(r=>r.map(v=>{
+    if(v==null) return "";
+    const val = String(v);
+    if(val.includes('"') || val.includes(',') || val.includes('\n') || val.includes('\r')) {
+      return `"${val.replace(/"/g,'""')}"`;
+    }
+    return val;
+  }).join(",")).join("\r\n");
+
+  const mimeType = encoding==='shift_jis' ? 'text/csv;charset=shift_jis' : 'text/csv;charset=utf-8';
+  const blob = new Blob([csvContent], {type: mimeType});
+
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename;
+  a.click();
+  URL.revokeObjectURL(url);
+}
+
+function App() {
+  const [headers, setHeaders] = useState(initialHeaders);
+  const [fields, setFields] = useState(initialFields);
+  const [datas, setDatas] = useState(initialData);
+
+  const [selectedStructureID, setSelectedStructureID] = useState(1);
+  const [newFieldValues, setNewFieldValues] = useState({});
+  const [dragOver, setDragOver] = useState(false);
+  const [encoding, setEncoding] = useState('utf-8');
+  const [currentTab, setCurrentTab] = useState(0);
+
+  const [sqlDialogOpen, setSqlDialogOpen] = useState(false);
+  const [sqlText, setSqlText] = useState('');
+
+  const currentStructure = headers.find(h=>h.StructureID===selectedStructureID);
+  const currentFields = fields.filter(f=>f.StructureID===selectedStructureID);
+  const viewData = createViewData(selectedStructureID, datas, fields);
+
+  // Selection states
+  const [selectedHeaderIDs, setSelectedHeaderIDs] = useState([]);
+  const [selectedFieldIDs, setSelectedFieldIDs] = useState([]);
+  const [selectedDataIDs, setSelectedDataIDs] = useState([]);
+
+  // Header追加
+  const [newHeaderValues, setNewHeaderValues] = useState({StructureName:"", Description:""});
+  function handleAddHeader() {
+    const newID = headers.length>0?Math.max(...headers.map(h=>h.StructureID))+1:1;
+    setHeaders([...headers, {StructureID:newID, StructureName:newHeaderValues.StructureName, Description:newHeaderValues.Description}]);
+    setNewHeaderValues({StructureName:"", Description:""});
+  }
+
+  // Field追加
+  const [newFieldForm, setNewFieldForm] = useState({StructureID:1, FieldName:"", DataType:"String", IsRequired:false, DefaultValue:""});
+  function handleAddField() {
+    const newFieldID = fields.length>0?Math.max(...fields.map(f=>f.FieldID))+1:1;
+    setFields([...fields, {FieldID:newFieldID,...newFieldForm, DefaultValue:newFieldForm.DefaultValue||null}]);
+    setNewFieldForm({StructureID:1, FieldName:"", DataType:"String", IsRequired:false, DefaultValue:""});
+  }
+
+  // Data追加
+  function handleStructureChange(e) {
+    setSelectedStructureID(e.target.value);
+  }
+  function handleFieldChange(fieldName, value) {
+    setNewFieldValues({...newFieldValues, [fieldName]: value});
+  }
+  function handleAddData() {
+    const newDataID = datas.length > 0 ? Math.max(...datas.map(d=>d.DataID))+1 : 1;
+    const newRows = currentFields.map(f=>{
+      return {
+        DataID:newDataID,
+        StructureID:selectedStructureID,
+        FieldID:f.FieldID,
+        FieldValue:newFieldValues[f.FieldName] || f.DefaultValue || null
+      };
+    });
+    setDatas([...datas, ...newRows]);
+    setNewFieldValues({});
+  }
+
+  // CSVインポート
+  function handleFileSelect(file, enc=encoding) {
+    if(!file) return;
+    const reader = new FileReader();
+    reader.onload = () => {
+      const text = reader.result;
+      const lines = text.split(/\r?\n/).map(l=>l.trim()).filter(l=>l.length>0);
+      if(lines.length<2) return;
+      const cols = lines[0].split(",");
+      const contentLines = lines.slice(1);
+
+      let maxID = datas.length>0?Math.max(...datas.map(d=>d.DataID)):0;
+      const newDatasArray = [];
+
+      contentLines.forEach(line=>{
+        const vals = line.split(",");
+        maxID++;
+        currentFields.forEach(f=>{
+          const idx = cols.indexOf(f.FieldName);
+          if(idx>=0) {
+            newDatasArray.push({
+              DataID: maxID,
+              StructureID:selectedStructureID,
+              FieldID: f.FieldID,
+              FieldValue: vals[idx] || f.DefaultValue || null
+            });
+          }
+        });
+      });
+      setDatas([...datas, ...newDatasArray]);
+    };
+
+    if(enc==='shift_jis') {
+      const shiftReader = new FileReader();
+      shiftReader.onload = () => {
+        const decoder = new TextDecoder('shift_jis');
+        const text = decoder.decode(shiftReader.result);
+        reader.readAsText(new Blob([text], {type:"text/plain"}), 'utf-8');
+      };
+      shiftReader.readAsArrayBuffer(file);
+    } else {
+      reader.readAsText(file, enc);
+    }
+  }
+
+  function handleUploadClick() {
+    document.getElementById('file-input').click();
+  }
+
+  function handleDragOver(e) {
+    e.preventDefault();
+    setDragOver(true);
+  }
+  function handleDragLeave(e) {
+    setDragOver(false);
+  }
+  function handleDrop(e) {
+    e.preventDefault();
+    setDragOver(false);
+    const file = e.dataTransfer.files[0];
+    if(file) {
+      handleFileSelect(file, encoding);
+    }
+  }
+
+  // SQL Export
+  function handleExportSQLFromHeaders() {
+    const sql = generateSQLForHeaders(headers);
+    setSqlText(sql);
+    setSqlDialogOpen(true);
+  }
+
+  function handleExportSQLFromFields() {
+    const sql = generateSQLForFields(fields);
+    setSqlText(sql);
+    setSqlDialogOpen(true);
+  }
+
+  function handleExportSQLFromData() {
+    if(!currentStructure) return;
+    const sql = generateSQLForData(currentStructure, currentFields, viewData);
+    setSqlText(sql);
+    setSqlDialogOpen(true);
+  }
+
+  // CSV Export
+  function handleExportCSVFromHeaders() {
+    const rows = [["StructureID","StructureName","Description"]];
+    headers.forEach(h=>{
+      rows.push([h.StructureID, h.StructureName, h.Description]);
+    });
+    downloadCSV("DataStructureHeader.csv", rows, encoding);
+  }
+
+  function handleExportCSVFromFields() {
+    const rows = [["FieldID","StructureID","FieldName","DataType","IsRequired","DefaultValue"]];
+    fields.forEach(f=>{
+      rows.push([f.FieldID, f.StructureID, f.FieldName, f.DataType, f.IsRequired, f.DefaultValue]);
+    });
+    downloadCSV("DataStructureField.csv", rows, encoding);
+  }
+
+  function handleExportCSVFromData() {
+    if(!currentStructure) return;
+    const fieldNames = currentFields.map(f=>f.FieldName);
+    const headerRow = ["DataID", "StructureID", ...fieldNames];
+    const rows = [headerRow];
+    viewData.forEach(row=>{
+      const values = fieldNames.map(fn=>row[fn]);
+      rows.push([row.DataID, row.StructureID, ...values]);
+    });
+    downloadCSV(`${currentStructure.StructureName}.csv`, rows, encoding);
+  }
+
+  // 選択トグル
+  function toggleHeaderSelected(id) {
+    setSelectedHeaderIDs(prev=> prev.includes(id)? prev.filter(x=>x!==id) : [...prev,id]);
+  }
+  function toggleAllHeaders() {
+    if(selectedHeaderIDs.length === headers.length) {
+      setSelectedHeaderIDs([]);
+    } else {
+      setSelectedHeaderIDs(headers.map(h=>h.StructureID));
+    }
+  }
+
+  function toggleFieldSelected(id) {
+    setSelectedFieldIDs(prev=> prev.includes(id)? prev.filter(x=>x!==id) : [...prev,id]);
+  }
+  function toggleAllFields() {
+    if(selectedFieldIDs.length === fields.length) {
+      setSelectedFieldIDs([]);
+    } else {
+      setSelectedFieldIDs(fields.map(f=>f.FieldID));
+    }
+  }
+
+  function toggleDataSelected(id) {
+    setSelectedDataIDs(prev=> prev.includes(id)? prev.filter(x=>x!==id) : [...prev,id]);
+  }
+  function toggleAllData() {
+    if(selectedDataIDs.length === viewData.length) {
+      setSelectedDataIDs([]);
+    } else {
+      setSelectedDataIDs(viewData.map(d=>d.DataID));
+    }
+  }
+
+  return (
+    <div>
+      <h1>POC Data Management</h1>
+      <div style={{display:"flex", gap:"10px", marginBottom:"20px", alignItems:"center"}}>
+        <Tabs value={currentTab} onChange={(e,newVal)=>setCurrentTab(newVal)}>
+          <Tab label="DataStructureHeader" />
+          <Tab label="DataStructureField" />
+          <Tab label="DataTable" />
+        </Tabs>
+        <FormControl variant="outlined" style={{minWidth:"120px"}}>
+          <InputLabel id="global-encoding-label">Encoding</InputLabel>
+          <Select
+            labelId="global-encoding-label"
+            label="Encoding"
+            value={encoding}
+            onChange={e=>setEncoding(e.target.value)}
+          >
+            <MenuItem value="utf-8">UTF-8</MenuItem>
+            <MenuItem value="shift_jis">Shift-JIS</MenuItem>
+          </Select>
+        </FormControl>
+      </div>
+
+      {currentTab===0 && (
+        <div>
+          <h2>DataStructureHeader</h2>
+          <div style={{display:"flex", gap:"10px", marginBottom:"10px"}}>
+            <TextField label="StructureName" value={newHeaderValues.StructureName} onChange={e=>setNewHeaderValues({...newHeaderValues, StructureName:e.target.value})}/>
+            <TextField label="Description" value={newHeaderValues.Description} onChange={e=>setNewHeaderValues({...newHeaderValues, Description:e.target.value})}/>
+            <Button variant="contained" onClick={handleAddHeader}>Add Header</Button>
+          </div>
+          <div style={{display:"flex", gap:"10px", marginBottom:"10px"}}>
+            <Button variant="outlined" onClick={handleExportSQLFromHeaders}>Export SQL</Button>
+            <Button variant="outlined" onClick={handleExportCSVFromHeaders}>Export CSV</Button>
+          </div>
+
+          <TableContainer component={Paper}>
+            <Table>
+              <TableHead>
+                <TableRow>
+                  <TableCell padding="checkbox">
+                    <Checkbox
+                      checked={selectedHeaderIDs.length===headers.length && headers.length>0}
+                      indeterminate={selectedHeaderIDs.length>0 && selectedHeaderIDs.length<headers.length}
+                      onChange={toggleAllHeaders}
+                    />
+                  </TableCell>
+                  <TableCell>StructureID</TableCell>
+                  <TableCell>StructureName</TableCell>
+                  <TableCell>Description</TableCell>
+                </TableRow>
+              </TableHead>
+              <TableBody>
+                {headers.map(h=>(
+                  <TableRow key={h.StructureID} selected={selectedHeaderIDs.includes(h.StructureID)}>
+                    <TableCell padding="checkbox">
+                      <Checkbox
+                        checked={selectedHeaderIDs.includes(h.StructureID)}
+                        onChange={()=>toggleHeaderSelected(h.StructureID)}
+                      />
+                    </TableCell>
+                    <TableCell>{h.StructureID}</TableCell>
+                    <TableCell>{h.StructureName}</TableCell>
+                    <TableCell>{h.Description}</TableCell>
+                  </TableRow>
+                ))}
+              </TableBody>
+            </Table>
+          </TableContainer>
+        </div>
+      )}
+
+      {currentTab===1 && (
+        <div>
+          <h2>DataStructureField</h2>
+          <div style={{display:"flex", gap:"10px", marginBottom:"10px", flexWrap:"wrap"}}>
+            <FormControl variant="outlined" style={{minWidth:"120px"}}>
+              <InputLabel id="structure-select-label">StructureID</InputLabel>
+              <Select
+                labelId="structure-select-label"
+                label="StructureID"
+                value={newFieldForm.StructureID}
+                onChange={e=>setNewFieldForm({...newFieldForm, StructureID:e.target.value})}
+              >
+                {headers.map(h=><MenuItem key={h.StructureID} value={h.StructureID}>{h.StructureName}</MenuItem>)}
+              </Select>
+            </FormControl>
+            <TextField label="FieldName" value={newFieldForm.FieldName} onChange={e=>setNewFieldForm({...newFieldForm, FieldName:e.target.value})}/>
+            <FormControl variant="outlined" style={{minWidth:"120px"}}>
+              <InputLabel id="dtype-label">DataType</InputLabel>
+              <Select
+                labelId="dtype-label"
+                label="DataType"
+                value={newFieldForm.DataType}
+                onChange={e=>setNewFieldForm({...newFieldForm, DataType:e.target.value})}
+              >
+                <MenuItem value="String">String</MenuItem>
+                <MenuItem value="Number">Number</MenuItem>
+              </Select>
+            </FormControl>
+            <FormControl variant="outlined" style={{minWidth:"120px"}}>
+              <InputLabel id="req-label">IsRequired</InputLabel>
+              <Select
+                labelId="req-label"
+                label="IsRequired"
+                value={newFieldForm.IsRequired}
+                onChange={e=>setNewFieldForm({...newFieldForm, IsRequired:e.target.value})}
+              >
+                <MenuItem value={false}>False</MenuItem>
+                <MenuItem value={true}>True</MenuItem>
+              </Select>
+            </FormControl>
+            <TextField label="DefaultValue" value={newFieldForm.DefaultValue} onChange={e=>setNewFieldForm({...newFieldForm, DefaultValue:e.target.value})}/>
+            <Button variant="contained" onClick={handleAddField}>Add Field</Button>
+          </div>
+
+          <div style={{display:"flex", gap:"10px", marginBottom:"10px"}}>
+            <Button variant="outlined" onClick={handleExportSQLFromFields}>Export SQL</Button>
+            <Button variant="outlined" onClick={handleExportCSVFromFields}>Export CSV</Button>
+          </div>
+
+          <TableContainer component={Paper}>
+            <Table>
+              <TableHead>
+                <TableRow>
+                  <TableCell padding="checkbox">
+                    <Checkbox
+                      checked={fields.length>0 && selectedFieldIDs.length===fields.length}
+                      indeterminate={selectedFieldIDs.length>0 && selectedFieldIDs.length<fields.length}
+                      onChange={toggleAllFields}
+                    />
+                  </TableCell>
+                  <TableCell>FieldID</TableCell>
+                  <TableCell>StructureID</TableCell>
+                  <TableCell>FieldName</TableCell>
+                  <TableCell>DataType</TableCell>
+                  <TableCell>IsRequired</TableCell>
+                  <TableCell>DefaultValue</TableCell>
+                </TableRow>
+              </TableHead>
+              <TableBody>
+                {fields.map(f=>(
+                  <TableRow key={f.FieldID} selected={selectedFieldIDs.includes(f.FieldID)}>
+                    <TableCell padding="checkbox">
+                      <Checkbox
+                        checked={selectedFieldIDs.includes(f.FieldID)}
+                        onChange={()=>toggleFieldSelected(f.FieldID)}
+                      />
+                    </TableCell>
+                    <TableCell>{f.FieldID}</TableCell>
+                    <TableCell>{f.StructureID}</TableCell>
+                    <TableCell>{f.FieldName}</TableCell>
+                    <TableCell>{f.DataType}</TableCell>
+                    <TableCell>{f.IsRequired.toString()}</TableCell>
+                    <TableCell>{f.DefaultValue}</TableCell>
+                  </TableRow>
+                ))}
+              </TableBody>
+            </Table>
+          </TableContainer>
+        </div>
+      )}
+
+      {currentTab===2 && (
+        <div>
+          <h2>{currentStructure?.StructureName} Data</h2>
+          <div style={{marginBottom:"20px"}}>
+            <FormControl variant="outlined" style={{minWidth:"200px"}}>
+              <InputLabel id="select-structure-label">Structure</InputLabel>
+              <Select
+                labelId="select-structure-label"
+                label="Structure"
+                value={selectedStructureID}
+                onChange={handleStructureChange}
+              >
+                {headers.map(h=><MenuItem key={h.StructureID} value={h.StructureID}>{h.StructureName}</MenuItem>)}
+              </Select>
+            </FormControl>
+          </div>
+
+          <div style={{display:"flex", gap:"10px", marginBottom:"10px", flexWrap:"wrap"}}>
+            {currentFields.map(f=>(
+              <TextField
+                key={f.FieldID}
+                label={f.FieldName}
+                value={newFieldValues[f.FieldName]||""}
+                onChange={e=>handleFieldChange(f.FieldName, e.target.value)}
+              />
+            ))}
+            <Button variant="contained" color="primary" onClick={handleAddData}>Add</Button>
+          </div>
+
+          <div style={{display:"flex", gap:"10px", marginBottom:"10px"}}>
+            <Button variant="outlined" onClick={handleExportSQLFromData}>Export SQL</Button>
+            <Button variant="outlined" onClick={handleExportCSVFromData}>Export CSV</Button>
+          </div>
+
+          <input
+            type="file"
+            accept=".csv"
+            style={{display:"none"}}
+            id="file-input"
+            onChange={e=>handleFileSelect(e.target.files[0], encoding)}
+          />
+
+          <div
+            className={`upload-area ${dragOver?'dragover':''}`}
+            onDragOver={handleDragOver}
+            onDragLeave={handleDragLeave}
+            onDrop={handleDrop}
+            onClick={handleUploadClick}
+          >
+            クリックまたはドラッグ＆ドロップでCSVファイルをアップロード
+          </div>
+
+          <TableContainer component={Paper}>
+            <Table>
+              <TableHead>
+                <TableRow>
+                  <TableCell padding="checkbox">
+                    <Checkbox
+                      checked={viewData.length>0 && selectedDataIDs.length===viewData.length}
+                      indeterminate={selectedDataIDs.length>0 && selectedDataIDs.length<viewData.length}
+                      onChange={toggleAllData}
+                    />
+                  </TableCell>
+                  <TableCell>DataID</TableCell>
+                  <TableCell>StructureID</TableCell>
+                  {currentFields.map(f=><TableCell key={f.FieldID}>{f.FieldName}</TableCell>)}
+                </TableRow>
+              </TableHead>
+              <TableBody>
+                {viewData.map(row=>(
+                  <TableRow key={row.DataID} selected={selectedDataIDs.includes(row.DataID)}>
+                    <TableCell padding="checkbox">
+                      <Checkbox
+                        checked={selectedDataIDs.includes(row.DataID)}
+                        onChange={()=>toggleDataSelected(row.DataID)}
+                      />
+                    </TableCell>
+                    <TableCell>{row.DataID}</TableCell>
+                    <TableCell>{row.StructureID}</TableCell>
+                    {currentFields.map(f=><TableCell key={f.FieldID}>{row[f.FieldName]}</TableCell>)}
+                  </TableRow>
+                ))}
+              </TableBody>
+            </Table>
+          </TableContainer>
+        </div>
+      )}
+
+      <Dialog open={sqlDialogOpen} onClose={()=>setSqlDialogOpen(false)} maxWidth="lg" fullWidth>
+        <DialogTitle>Exported SQL</DialogTitle>
+        <DialogContent>
+          <pre>{sqlText}</pre>
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={()=>setSqlDialogOpen(false)}>Close</Button>
+        </DialogActions>
+      </Dialog>
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+</script>
+
+</body>
+</html>

@@ -1,0 +1,457 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>中野区 1500m Radius Town Boundaries</title>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+
+  <!-- Leaflet CSS -->
+  <link rel="stylesheet" href="https://unpkg.com/leaflet/dist/leaflet.css" />
+
+  <!-- Leaflet JS -->
+  <script src="https://unpkg.com/leaflet/dist/leaflet.js"></script>
+
+  <!-- osmtogeojson JS (CDN) -->
+  <script src="https://cdn.jsdelivr.net/npm/osmtogeojson@3.0.0-beta.5/osmtogeojson.min.js"></script>
+
+  <!-- turf.js for spatial operations -->
+  <script src="https://cdn.jsdelivr.net/npm/@turf/turf@6/turf.min.js"></script>
+
+  <style>
+    body { margin: 0; padding: 0; font-family: Arial, sans-serif; }
+    #map { width: 100%; height: 85vh; }
+    #controls {
+      width: 100%;
+      height: 15vh;
+      background: #f9f9f9;
+      padding: 10px;
+      box-sizing: border-box;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      border-bottom: 1px solid #ccc;
+    }
+    .input-group {
+      margin: 5px 0;
+      display: flex;
+      align-items: center;
+    }
+    .input-group label {
+      margin-right: 10px;
+      font-weight: bold;
+    }
+    #addressInput, #latInput, #lonInput {
+      width: 300px;
+      padding: 8px;
+      font-size: 16px;
+      border: 1px solid #ccc;
+      border-radius: 4px;
+    }
+    #latInput, #lonInput {
+      width: 140px;
+    }
+    #searchButton {
+      padding: 8px 16px;
+      margin-top: 10px;
+      font-size: 16px;
+      border: none;
+      border-radius: 4px;
+      background-color: #66c2a5;
+      color: white;
+      cursor: pointer;
+    }
+    #searchButton:hover {
+      background-color: #559f8f;
+    }
+    #info {
+      position: absolute;
+      top: 60px;
+      left: 50%;
+      transform: translateX(-50%);
+      background: rgba(255, 255, 255, 0.9);
+      padding: 10px;
+      border-radius: 5px;
+      z-index: 1000;
+      font-size: 14px;
+      display: none;
+      max-width: 80%;
+      word-wrap: break-word;
+    }
+    .radio-group {
+      margin: 10px 0;
+      display: flex;
+      align-items: center;
+    }
+    .radio-group input {
+      margin-right: 5px;
+    }
+  </style>
+</head>
+<body>
+  <div id="controls">
+    <div class="radio-group">
+      <input type="radio" id="searchByAddress" name="searchType" value="address" checked>
+      <label for="searchByAddress">住所で検索</label>
+      <input type="radio" id="searchByCoords" name="searchType" value="coords" style="margin-left: 20px;">
+      <label for="searchByCoords">緯度経度で検索</label>
+    </div>
+    <div class="input-group" id="addressGroup">
+      <label for="addressInput">住所:</label>
+      <input type="text" id="addressInput" placeholder="住所を入力してください" />
+    </div>
+    <div class="input-group" id="coordsGroup" style="display: none;">
+      <label for="latInput">緯度:</label>
+      <input type="text" id="latInput" placeholder="例: 35.6871682" />
+      <label for="lonInput" style="margin-left: 10px;">経度:</label>
+      <input type="text" id="lonInput" placeholder="例: 139.710645" />
+    </div>
+    <button id="searchButton">検索</button>
+  </div>
+  <div id="info">Loading data...</div>
+  <div id="map"></div>
+  <script>
+    // 初期設定（東京タワー）
+    let centerLat = 35.6586;
+    let centerLon = 139.7454;
+    const radius = 1500; // 半径1500m
+
+    // 地図の初期化
+    const map = L.map('map').setView([centerLat, centerLon], 14);
+
+    // 背景地図：国土地理院の地理院地図
+    L.tileLayer('https://cyberjapandata.gsi.go.jp/xyz/std/{z}/{x}/{y}.png', {
+      attribution: '&copy; <a href="https://maps.gsi.go.jp/">国土地理院</a>'
+    }).addTo(map);
+
+    // 初期円の描画
+    let searchCircle = L.circle([centerLat, centerLon], {
+      radius: radius, // 半径1500m
+      color: 'blue', // 境界線の色
+      weight: 2,     // 境界線の太さ
+      fillOpacity: 0.1 // 塗りつぶしの透明度
+    }).addTo(map);
+
+    // Overpass APIクエリを生成する関数
+    function generateOverpassQuery(lat, lon, radius) {
+      return `
+[out:json][timeout:100];
+(
+  relation["admin_level"="8"](around:${radius},${lat},${lon});
+  relation["admin_level"="10"](around:${radius},${lat},${lon});
+  relation["admin_level"="9"](around:${radius},${lat},${lon});
+  way["admin_level"="8"](around:${radius},${lat},${lon});
+  way["admin_level"="10"](around:${radius},${lat},${lon});
+  way["admin_level"="9"](around:${radius},${lat},${lon});
+);
+out geom;
+      `;
+    }
+
+    const overpassApiUrl = 'https://overpass-api.de/api/interpreter';
+
+    // 情報表示用要素
+    const infoDiv = document.getElementById('info');
+
+    // ポリゴンレイヤーの初期化
+    let polygonLayer = null;
+
+    // 検索した住所のマーカーを保持
+    let addressMarker = null;
+
+    // GeoJSONデータの描画
+    function renderGeoJSON(geojsonData) {
+      // デバッグ: 取得したポリゴンの数を表示
+      console.log('取得したポリゴンの数:', geojsonData.features.length);
+
+      // フィルタリングを解除してすべてのポリゴンを表示
+      const filteredFeatures = geojsonData.features;
+
+      // デバッグ: フィルタリング後のポリゴン数を表示
+      console.log('表示されるポリゴンの数:', filteredFeatures.length);
+
+      // 情報表示を更新
+      infoDiv.innerHTML = `取得したポリゴン数: ${geojsonData.features.length}<br>表示されるポリゴン数: ${filteredFeatures.length}`;
+      infoDiv.style.display = 'block';
+
+      // 既存のポリゴンレイヤーを削除
+      if (polygonLayer && map.hasLayer(polygonLayer)) {
+        map.removeLayer(polygonLayer);
+      }
+
+      // フィルタリングされたポリゴンをGeoJSONとしてまとめる
+      const filteredGeoJSON = {
+        type: "FeatureCollection",
+        features: filteredFeatures
+      };
+
+      // GeoJSONを地図に追加
+      polygonLayer = L.geoJSON(filteredGeoJSON, {
+        style: function(feature) {
+          return {
+            fillColor: '#66c2a5', // 塗りつぶし色
+            fillOpacity: 0.4,     // 塗りつぶし透明度
+            color: '#1b7837',     // 境界線の色
+            weight: 1.5           // 境界線の太さ
+          };
+        },
+        onEachFeature: function(feature, layer) {
+          const name = feature.properties && feature.properties.tags && feature.properties.tags.name
+                       ? feature.properties.tags.name
+                       : '不明';
+          const adminLevel = feature.properties && feature.properties.tags && feature.properties.tags.admin_level
+                             ? feature.properties.tags.admin_level
+                             : '不明';
+          let popupContent = `<b>町または字:</b> ${name}<br><b>Admin Level:</b> ${adminLevel}`;
+          
+          // Turf.jsを使用してポリゴンのセントロイドを計算
+          try {
+            const centroid = turf.centroid(feature);
+            const centroidCoords = centroid.geometry.coordinates;
+            const lat = centroidCoords[1].toFixed(6);
+            const lon = centroidCoords[0].toFixed(6);
+            popupContent += `<br><b>セントロイド緯度:</b> ${lat}<br><b>セントロイド経度:</b> ${lon}`;
+          } catch (error) {
+            console.error('セントロイド計算エラー:', error, 'Feature:', feature);
+            popupContent += `<br><b>セントロイド緯度:</b> 不明<br><b>セントロイド経度:</b> 不明`;
+          }
+
+          layer.bindPopup(popupContent);
+        }
+      }).addTo(map);
+    }
+
+    // Overpass APIからデータを取得する関数
+    function fetchOverpassData(lat, lon, radius) {
+      const overpassQuery = generateOverpassQuery(lat, lon, radius);
+      console.log('Overpass API クエリ:', overpassQuery); // デバッグログ
+
+      fetch(overpassApiUrl, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/x-www-form-urlencoded'
+        },
+        body: 'data=' + encodeURIComponent(overpassQuery)
+      })
+      .then(response => {
+        if (!response.ok) {
+          throw new Error('Network response was not ok: ' + response.statusText);
+        }
+        return response.json();
+      })
+      .then(data => {
+        // デバッグ用ログ
+        console.log('取得したOverpassデータ:', data);
+
+        // Overpass JSONをGeoJSONに変換
+        const geojsonData = osmtogeojson(data);
+
+        // デバッグ用ログ
+        console.log('変換後のGeoJSONデータ:', geojsonData);
+
+        // フィルタリングと描画
+        renderGeoJSON(geojsonData);
+      })
+      .catch(error => {
+        console.error('Overpass APIからのデータ取得エラー:', error);
+        infoDiv.innerHTML = 'データの取得中にエラーが発生しました。コンソールを確認してください。';
+        infoDiv.style.display = 'block';
+      });
+    }
+
+    // 国土地理院のジオコーディングAPIを使用して住所から緯度経度を取得する関数
+    function geocodeAddressGSI(address) {
+      // 国土地理院のジオコーディングAPIエンドポイント
+      const gsiGeocoderUrl = `https://msearch.gsi.go.jp/address-search/AddressSearch?q=${encodeURIComponent(address)}`;
+
+      console.log('GSI ジオコーディングリクエスト URL:', gsiGeocoderUrl); // デバッグログ
+
+      return fetch(gsiGeocoderUrl)
+        .then(response => {
+          if (!response.ok) {
+            throw new Error('Network response was not ok: ' + response.statusText);
+          }
+          return response.json();
+        })
+        .then(data => {
+          // デバッグ用ログ
+          console.log('取得したGSIジオコーディングデータ:', data);
+
+          if (!data || data.length === 0) {
+            throw new Error('住所が見つかりませんでした。');
+          }
+
+          // 「東京都」を含む結果を優先的にフィルタリング
+          const tokyoResults = data.filter(result => {
+            return result.address && result.address.includes('東京都');
+          });
+
+          let selectedResult;
+
+          if (tokyoResults.length > 0) {
+            // 「東京都」を含む最初の結果を選択
+            selectedResult = tokyoResults[0];
+          } else {
+            // 「東京都」を含まない場合は最初の結果を使用
+            selectedResult = data[0];
+          }
+
+          const coordinates = selectedResult.geometry.coordinates; // [経度, 緯度]
+
+          // displayNameの取得方法を修正
+          const displayName = selectedResult.address || address;
+
+          console.log('ジオコーディング結果:', coordinates, displayName); // デバッグログ
+
+          return {
+            lat: coordinates[1],
+            lon: coordinates[0],
+            displayName: displayName
+          };
+        });
+    }
+
+    // 緯度経度を使用して地図を更新する関数
+    function updateMapWithCoords(lat, lon, displayName = '指定座標') {
+      // 地図の中心を更新
+      map.setView([lat, lon], 14);
+
+      // 既存の円を削除して新しい円を描画
+      if (searchCircle) {
+        map.removeLayer(searchCircle);
+      }
+
+      searchCircle = L.circle([lat, lon], {
+        radius: radius, // 半径1500m
+        color: 'blue', // 境界線の色
+        weight: 2,     // 境界線の太さ
+        fillOpacity: 0.1 // 塗りつぶしの透明度
+      }).addTo(map);
+
+      // 既存の住所マーカーを削除
+      if (addressMarker) {
+        map.removeLayer(addressMarker);
+      }
+
+      // 住所マーカーを追加
+      addressMarker = L.marker([lat, lon]).addTo(map)
+        .bindPopup(`<b>検索結果:</b> ${displayName}<br><b>緯度:</b> ${lat.toFixed(6)}<br><b>経度:</b> ${lon.toFixed(6)}`)
+        .openPopup();
+
+      // グローバル変数を更新
+      centerLat = lat;
+      centerLon = lon;
+
+      // 情報表示を更新
+      infoDiv.innerHTML = 'データを取得中...';
+      infoDiv.style.display = 'block';
+
+      // Overpass APIから新しいデータを取得
+      fetchOverpassData(centerLat, centerLon, radius);
+    }
+
+    // アドレス検索機能の実装
+    document.getElementById('searchButton').addEventListener('click', () => {
+      const searchType = document.querySelector('input[name="searchType"]:checked').value;
+      
+      if (searchType === 'address') {
+        const address = document.getElementById('addressInput').value.trim();
+        if (address === '') {
+          alert('住所を入力してください。');
+          return;
+        }
+
+        // 情報表示を更新
+        infoDiv.innerHTML = 'ジオコーディング中...';
+        infoDiv.style.display = 'block';
+
+        // GSIを使用してジオコーディング（住所から緯度経度を取得）
+        geocodeAddressGSI(address)
+          .then(result => {
+            const newLat = parseFloat(result.lat);
+            const newLon = parseFloat(result.lon);
+            const displayName = result.displayName;
+
+            console.log(`新しい座標: 緯度=${newLat}, 経度=${newLon}`); // デバッグログ
+
+            // 地図の更新
+            updateMapWithCoords(newLat, newLon, displayName);
+          })
+          .catch(error => {
+            console.error('ジオコーディングエラー:', error);
+            infoDiv.innerHTML = `ジオコーディングエラー: ${error.message}`;
+            infoDiv.style.display = 'block';
+          });
+      } else if (searchType === 'coords') {
+        const latInput = document.getElementById('latInput').value.trim();
+        const lonInput = document.getElementById('lonInput').value.trim();
+
+        if (latInput === '' || lonInput === '') {
+          alert('緯度と経度の両方を入力してください。');
+          return;
+        }
+
+        const lat = parseFloat(latInput);
+        const lon = parseFloat(lonInput);
+
+        // 入力のバリデーション
+        if (isNaN(lat) || isNaN(lon)) {
+          alert('緯度と経度には有効な数値を入力してください。');
+          return;
+        }
+
+        if (lat < -90 || lat > 90) {
+          alert('緯度は -90 から 90 の範囲で入力してください。');
+          return;
+        }
+
+        if (lon < -180 || lon > 180) {
+          alert('経度は -180 から 180 の範囲で入力してください。');
+          return;
+        }
+
+        // 情報表示を更新
+        infoDiv.innerHTML = 'データを取得中...';
+        infoDiv.style.display = 'block';
+
+        // 地図の更新
+        updateMapWithCoords(lat, lon);
+      }
+    });
+
+    // Enterキーで検索を実行
+    document.getElementById('addressInput').addEventListener('keypress', (e) => {
+      if (e.key === 'Enter') {
+        document.getElementById('searchButton').click();
+      }
+    });
+    document.getElementById('latInput').addEventListener('keypress', (e) => {
+      if (e.key === 'Enter') {
+        document.getElementById('searchButton').click();
+      }
+    });
+    document.getElementById('lonInput').addEventListener('keypress', (e) => {
+      if (e.key === 'Enter') {
+        document.getElementById('searchButton').click();
+      }
+    });
+
+    // ラジオボタンの切り替えに応じて表示を変更
+    document.getElementById('searchByAddress').addEventListener('change', () => {
+      if (document.getElementById('searchByAddress').checked) {
+        document.getElementById('addressGroup').style.display = 'flex';
+        document.getElementById('coordsGroup').style.display = 'none';
+      }
+    });
+    document.getElementById('searchByCoords').addEventListener('change', () => {
+      if (document.getElementById('searchByCoords').checked) {
+        document.getElementById('addressGroup').style.display = 'none';
+        document.getElementById('coordsGroup').style.display = 'flex';
+      }
+    });
+
+    // 初期データ取得（東京タワー）
+    fetchOverpassData(centerLat, centerLon, radius);
+  </script>
+</body>
+</html>
