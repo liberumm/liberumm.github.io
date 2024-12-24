@@ -1,57 +1,63 @@
 // StoreOverview.js
 const { useState } = React;
 const { 
-    Table, TableBody, TableCell, TableContainer, TableHead, TableRow, Paper, 
-    Button, Dialog, DialogActions, DialogContent, DialogTitle, TextField, 
-    Grid, Checkbox, FormControlLabel, Typography, Switch 
+    Grid, Paper, Typography, Button, Dialog, DialogActions, DialogContent, DialogTitle, 
+    TextField, FormControlLabel, Switch, IconButton, Table, TableBody, TableCell, 
+    TableContainer, TableHead, TableRow 
 } = MaterialUI;
+const { Add, Remove } = MaterialUIIcons;
 
 function StoreOverview({ filters }) {
     const [data, setData] = useState({
-        openDate: '2020-01',
-        renovationDate: '2022-06',
-        submissionDate: '2023-04-15',
-        businessHours: '9:00 ～ 23:00',
-        parkingRequired: 10,
-        parkingSubmitted: 8,
-        bicycleParkingRequired: 5,
-        bicycleParkingSubmitted: 3,
-        deliveryAvailableTime: '6:00 ～ 21:00',
-        zoningArea: ['第一種中高層住居専用地域', '準立地法'],
-        zoningApproved: [true, false],
-        floorInfo: {
-            aboveGround: 6,
-            underground: 1,
-            occupiedFloors: '1～2',
-            ceilingHeight: '3m'
+        basicInfo: {
+            storeNumber: '001',
+            storeName: 'サンプル店舗',
+            openDate: '2020-01',
+            renovationDate: '2022-06',
+            updateDate: '2024-04-20',
         },
-        parkingDetails: {
-            onSite: {
-                total: 20,
-                handicap: 2,
-                paid: false,
-                paymentMachine: true,
-                partnerParking: 'タイムズ24',
-                partnerParkingCount: 15,
-                motorcycleCount: 5,
-                management: '自社',
-                usageConditions: '1,000円で2時間無料',
-                excessFee: '30分200円'
+        addressInfo: {
+            prefecture: '東京都',
+            city: '新宿区',
+            address: '西新宿2-8-1',
+        },
+        contactInfo: {
+            phoneNumber: '03-1234-5678',
+            faxNumber: '03-8765-4321',
+            email: 'sample@store.com',
+        },
+        businessInfo: {
+            basicBusinessHours: {
+                startTime: '09:00',
+                endTime: '21:00',
             },
-            offSite: {
-                total: 30,
-                handicap: 3,
-                paid: true,
-                paymentMachine: true,
-                partnerParking: 'ナビパーク',
-                partnerParkingCount: 20,
-                motorcycleCount: 10,
-                management: '自社',
-                usageConditions: '1,000円で3時間無料',
-                excessFee: '30分201円'
-            }
+            specialBusinessDays: [
+                {
+                    isOpen: true,
+                    reason: '祝日営業',
+                    businessHours: '10:00 ～ 18:00',
+                    startTime: '10:00',
+                    endTime: '18:00',
+                },
+                // 初期値として1つの特殊営業日を追加
+            ],
         },
-        // 他のフィールドもここに追加
+        buildingInfo: {
+            floorArea: {
+                totalArea: '500㎡',
+                salesArea: '300㎡',
+                workArea: '150㎡',
+                parkingArea: '50㎡',
+            },
+            buildingDetails: {
+                aboveGround: 6,       // 地上階数
+                underground: 1,       // 地下階数
+                numberOfFloors: 7,    // 階数（地上 + 地下）
+                use: '商業用',         // 用途
+                ceilingHeight: 3.0,   // 天井高(m)
+                remarks: '特になし',   // 備考
+            },
+        },
     });
 
     const [open, setOpen] = useState(false);
@@ -65,49 +71,79 @@ function StoreOverview({ filters }) {
 
     const handleChange = (e) => {
         const { name, value, type, checked } = e.target;
-        if (name.startsWith('zoningApproved')) {
-            const index = parseInt(name.split('_')[1]);
-            const updatedApproved = [...editData.zoningApproved];
-            updatedApproved[index] = checked;
+        const nameParts = name.split('_');
+        const category = nameParts[0];
+        const field = nameParts[1];
+        const subField = nameParts[2];
+
+        if (category === 'businessInfo' && field === 'specialBusinessDays') {
+            const index = parseInt(nameParts[3]);
+            const dayField = nameParts[4];
+            const updatedSpecialDays = [...editData.businessInfo.specialBusinessDays];
+            if (dayField === 'isOpen') {
+                updatedSpecialDays[index][dayField] = checked;
+            } else {
+                updatedSpecialDays[index][dayField] = value;
+            }
             setEditData({
                 ...editData,
-                zoningApproved: updatedApproved
+                businessInfo: {
+                    ...editData.businessInfo,
+                    specialBusinessDays: updatedSpecialDays,
+                },
             });
-        } else if (name.startsWith('zoningArea')) {
-            const index = parseInt(name.split('_')[1]);
-            const updatedAreas = [...editData.zoningArea];
-            updatedAreas[index] = value;
+        } else if (category === 'buildingInfo' && field === 'buildingDetails') {
+            const buildingField = nameParts[3];
             setEditData({
                 ...editData,
-                zoningArea: updatedAreas
-            });
-        } else if (name.startsWith('parkingDetails')) {
-            const [_, detailType, field] = name.split('_');
-            setEditData({
-                ...editData,
-                parkingDetails: {
-                    ...editData.parkingDetails,
-                    [detailType]: {
-                        ...editData.parkingDetails[detailType],
-                        [field]: type === 'checkbox' ? checked : value
+                buildingInfo: {
+                    ...editData.buildingInfo,
+                    buildingDetails: {
+                        ...editData.buildingInfo.buildingDetails,
+                        [buildingField]: type === 'checkbox' ? checked : value
                     }
-                }
-            });
-        } else if (name.startsWith('floorInfo')) {
-            const field = name.split('_')[1];
-            setEditData({
-                ...editData,
-                floorInfo: {
-                    ...editData.floorInfo,
-                    [field]: value
                 }
             });
         } else {
             setEditData({
                 ...editData,
-                [name]: type === 'checkbox' ? checked : value
+                [category]: {
+                    ...editData[category],
+                    [field]: type === 'checkbox' ? checked : value
+                }
             });
         }
+    };
+
+    const handleAddSpecialDay = () => {
+        setEditData({
+            ...editData,
+            businessInfo: {
+                ...editData.businessInfo,
+                specialBusinessDays: [
+                    ...editData.businessInfo.specialBusinessDays,
+                    {
+                        isOpen: true,
+                        reason: '',
+                        businessHours: '',
+                        startTime: '',
+                        endTime: '',
+                    },
+                ],
+            },
+        });
+    };
+
+    const handleRemoveSpecialDay = (index) => {
+        const updatedSpecialDays = [...editData.businessInfo.specialBusinessDays];
+        updatedSpecialDays.splice(index, 1);
+        setEditData({
+            ...editData,
+            businessInfo: {
+                ...editData.businessInfo,
+                specialBusinessDays: updatedSpecialDays,
+            },
+        });
     };
 
     const handleSave = () => {
@@ -115,496 +151,477 @@ function StoreOverview({ filters }) {
         setOpen(false);
     };
 
-    // フィルター適用
-    const filteredZoningArea = data.zoningArea.filter((area, index) => {
-        const matchesSearch = filters.search === '' || area.includes(filters.search);
-        // 他のフィルター条件を追加する場合はここに記述
-        return matchesSearch;
-    });
-
     return (
-        <TableContainer component={Paper} style={{ marginBottom: 20 }}>
-            <Table size="small">
-                <TableHead>
-                    <TableRow>
-                        <TableCell style={{ backgroundColor: '#f5f5f5', fontWeight: 'bold' }}>項目</TableCell>
-                        <TableCell style={{ backgroundColor: '#f5f5f5', fontWeight: 'bold' }}>内容</TableCell>
-                    </TableRow>
-                </TableHead>
-                <TableBody>
-                    <TableRow>
-                        <TableCell>開店年月</TableCell>
-                        <TableCell>{data.openDate}</TableCell>
-                    </TableRow>
-                    <TableRow>
-                        <TableCell>改装年月</TableCell>
-                        <TableCell>{data.renovationDate}</TableCell>
-                    </TableRow>
-                    <TableRow>
-                        <TableCell>提出日</TableCell>
-                        <TableCell>{data.submissionDate}</TableCell>
-                    </TableRow>
-                    <TableRow>
-                        <TableCell>営業時間</TableCell>
-                        <TableCell>{data.businessHours}</TableCell>
-                    </TableRow>
-                    <TableRow>
-                        <TableCell>駐車場必要台数</TableCell>
-                        <TableCell>{data.parkingRequired} 台</TableCell>
-                    </TableRow>
-                    <TableRow>
-                        <TableCell>駐車場届出台数</TableCell>
-                        <TableCell>{data.parkingSubmitted} 台</TableCell>
-                    </TableRow>
-                    <TableRow>
-                        <TableCell>駐輪場必要台数</TableCell>
-                        <TableCell>{data.bicycleParkingRequired} 台</TableCell>
-                    </TableRow>
-                    <TableRow>
-                        <TableCell>駐輪場届出台数</TableCell>
-                        <TableCell>{data.bicycleParkingSubmitted} 台</TableCell>
-                    </TableRow>
-                    <TableRow>
-                        <TableCell>納品可能時間</TableCell>
-                        <TableCell>{data.deliveryAvailableTime}</TableCell>
-                    </TableRow>
-                    <TableRow>
-                        <TableCell>用途地域</TableCell>
-                        <TableCell>
-                            {filteredZoningArea.map((area, index) => (
-                                <div key={index}>
-                                    <TextField
-                                        name={`zoningArea_${index}`}
-                                        value={editData.zoningArea[index]}
-                                        onChange={handleChange}
-                                        size="small"
-                                        style={{ marginRight: 8 }}
-                                    />
-                                    <FormControlLabel
-                                        control={
-                                            <Checkbox
-                                                checked={editData.zoningApproved[index]}
-                                                onChange={handleChange}
-                                                name={`zoningApproved_${index}`}
-                                                color="primary"
-                                            />
-                                        }
-                                        label="〇/×"
-                                    />
-                                </div>
-                            ))}
-                        </TableCell>
-                    </TableRow>
-                    <TableRow>
-                        <TableCell>階数</TableCell>
-                        <TableCell>
-                            地上: {data.floorInfo.aboveGround} 階,<br />
-                            地下: {data.floorInfo.underground} 階,<br />
-                            入居階: {data.floorInfo.occupiedFloors},<br />
-                            天井高: {data.floorInfo.ceilingHeight}
-                        </TableCell>
-                    </TableRow>
-                    <TableRow>
-                        <TableCell>駐車場（敷地内）</TableCell>
-                        <TableCell>
-                            台数: {data.parkingDetails.onSite.total} 台<br />
-                            身障者用台数: {data.parkingDetails.onSite.handicap} 台<br />
-                            有料／無料: {data.parkingDetails.onSite.paid ? '有料' : '無料'}<br />
-                            精算機: {data.parkingDetails.onSite.paymentMachine ? 'あり' : 'なし'}<br />
-                            提携駐車場: {data.parkingDetails.onSite.partnerParking} ({data.parkingDetails.onSite.partnerParkingCount} 台)<br />
-                            バイク台数: {data.parkingDetails.onSite.motorcycleCount} 台<br />
-                            管理: {data.parkingDetails.onSite.management}<br />
-                            利用条件: {data.parkingDetails.onSite.usageConditions}<br />
-                            超過料金: {data.parkingDetails.onSite.excessFee}
-                        </TableCell>
-                    </TableRow>
-                    <TableRow>
-                        <TableCell>駐車場（敷地外）</TableCell>
-                        <TableCell>
-                            台数: {data.parkingDetails.offSite.total} 台<br />
-                            身障者用台数: {data.parkingDetails.offSite.handicap} 台<br />
-                            有料／無料: {data.parkingDetails.offSite.paid ? '有料' : '無料'}<br />
-                            精算機: {data.parkingDetails.offSite.paymentMachine ? 'あり' : 'なし'}<br />
-                            提携駐車場: {data.parkingDetails.offSite.partnerParking} ({data.parkingDetails.offSite.partnerParkingCount} 台)<br />
-                            バイク台数: {data.parkingDetails.offSite.motorcycleCount} 台<br />
-                            管理: {data.parkingDetails.offSite.management}<br />
-                            利用条件: {data.parkingDetails.offSite.usageConditions}<br />
-                            超過料金: {data.parkingDetails.offSite.excessFee}
-                        </TableCell>
-                    </TableRow>
-                    {/* 必要に応じて他のフィールドも追加 */}
-                </TableBody>
-            </Table>
+        <div>
+            <Grid container spacing={3}>
+                {/* 店舗基本情報 */}
+                <Grid item xs={12} md={4}>
+                    <Paper style={{ padding: 16 }}>
+                        <Typography variant="h6" gutterBottom>店舗基本情報</Typography>
+                        <Typography><strong>店番:</strong> {data.basicInfo.storeNumber}</Typography>
+                        <Typography><strong>店舗名:</strong> {data.basicInfo.storeName}</Typography>
+                        <Typography><strong>開店年月:</strong> {data.basicInfo.openDate}</Typography>
+                        <Typography><strong>改装年月:</strong> {data.basicInfo.renovationDate}</Typography>
+                        <Typography><strong>データ更新日:</strong> {data.basicInfo.updateDate}</Typography>
+                    </Paper>
+                </Grid>
+
+                {/* 住所情報 */}
+                <Grid item xs={12} md={4}>
+                    <Paper style={{ padding: 16 }}>
+                        <Typography variant="h6" gutterBottom>住所情報</Typography>
+                        <Typography><strong>都道府県:</strong> {data.addressInfo.prefecture}</Typography>
+                        <Typography><strong>市区町村:</strong> {data.addressInfo.city}</Typography>
+                        <Typography><strong>番地・建物名:</strong> {data.addressInfo.address}</Typography>
+                    </Paper>
+                </Grid>
+
+                {/* 連絡情報 */}
+                <Grid item xs={12} md={4}>
+                    <Paper style={{ padding: 16 }}>
+                        <Typography variant="h6" gutterBottom>連絡情報</Typography>
+                        <Typography><strong>電話番号:</strong> {data.contactInfo.phoneNumber}</Typography>
+                        <Typography><strong>FAX番号:</strong> {data.contactInfo.faxNumber}</Typography>
+                        <Typography><strong>メールアドレス:</strong> {data.contactInfo.email}</Typography>
+                    </Paper>
+                </Grid>
+
+                {/* 営業情報 */}
+                <Grid item xs={12} md={6}>
+                    <Paper style={{ padding: 16 }}>
+                        <Typography variant="h6" gutterBottom>営業情報</Typography>
+                        <Typography variant="subtitle1" gutterBottom>基本営業時間</Typography>
+                        <Typography><strong>開始時間:</strong> {data.businessInfo.basicBusinessHours.startTime}</Typography>
+                        <Typography><strong>終了時間:</strong> {data.businessInfo.basicBusinessHours.endTime}</Typography>
+
+                        <Typography variant="subtitle1" gutterBottom style={{ marginTop: 16 }}>特殊営業日</Typography>
+                        {data.businessInfo.specialBusinessDays.length === 0 ? (
+                            <Typography>特殊営業日が設定されていません。</Typography>
+                        ) : (
+                            <TableContainer component={Paper} style={{ marginTop: 8 }}>
+                                <Table size="small">
+                                    <TableHead>
+                                        <TableRow>
+                                            <TableCell><strong>日</strong></TableCell>
+                                            <TableCell><strong>営業状況</strong></TableCell>
+                                            <TableCell><strong>理由</strong></TableCell>
+                                            <TableCell><strong>営業時間</strong></TableCell>
+                                        </TableRow>
+                                    </TableHead>
+                                    <TableBody>
+                                        {data.businessInfo.specialBusinessDays.map((day, index) => (
+                                            <TableRow key={index}>
+                                                <TableCell>日 {index + 1}</TableCell>
+                                                <TableCell>{day.isOpen ? '営業' : '休業'}</TableCell>
+                                                <TableCell>{day.reason || '-'}</TableCell>
+                                                <TableCell>{day.businessHours || '-'}</TableCell>
+                                            </TableRow>
+                                        ))}
+                                    </TableBody>
+                                </Table>
+                            </TableContainer>
+                        )}
+                    </Paper>
+                </Grid>
+
+                {/* 建物情報 */}
+                <Grid item xs={12} md={6}>
+                    <Paper style={{ padding: 16 }}>
+                        <Typography variant="h6" gutterBottom>建物情報</Typography>
+                        <Typography variant="subtitle1" gutterBottom>フロア面積</Typography>
+                        <Typography><strong>総面積:</strong> {data.buildingInfo.floorArea.totalArea}</Typography>
+                        <Typography><strong>売場面積:</strong> {data.buildingInfo.floorArea.salesArea}</Typography>
+                        <Typography><strong>作業場面積:</strong> {data.buildingInfo.floorArea.workArea}</Typography>
+                        <Typography><strong>駐車場面積:</strong> {data.buildingInfo.floorArea.parkingArea}</Typography>
+
+                        <Typography variant="subtitle1" gutterBottom style={{ marginTop: 16 }}>建物詳細</Typography>
+                        <TableContainer component={Paper} style={{ marginTop: 8 }}>
+                            <Table size="small">
+                                <TableBody>
+                                    <TableRow>
+                                        <TableCell><strong>地上階数</strong></TableCell>
+                                        <TableCell>{data.buildingInfo.buildingDetails.aboveGround} 階</TableCell>
+                                    </TableRow>
+                                    <TableRow>
+                                        <TableCell><strong>地下階数</strong></TableCell>
+                                        <TableCell>{data.buildingInfo.buildingDetails.underground} 階</TableCell>
+                                    </TableRow>
+                                    <TableRow>
+                                        <TableCell><strong>階数</strong></TableCell>
+                                        <TableCell>{data.buildingInfo.buildingDetails.numberOfFloors} 階</TableCell>
+                                    </TableRow>
+                                    <TableRow>
+                                        <TableCell><strong>用途</strong></TableCell>
+                                        <TableCell>{data.buildingInfo.buildingDetails.use}</TableCell>
+                                    </TableRow>
+                                    <TableRow>
+                                        <TableCell><strong>天井高(m)</strong></TableCell>
+                                        <TableCell>{data.buildingInfo.buildingDetails.ceilingHeight} m</TableCell>
+                                    </TableRow>
+                                    <TableRow>
+                                        <TableCell><strong>備考</strong></TableCell>
+                                        <TableCell>{data.buildingInfo.buildingDetails.remarks}</TableCell>
+                                    </TableRow>
+                                </TableBody>
+                            </Table>
+                        </TableContainer>
+                    </Paper>
+                </Grid>
+            </Grid>
             <Button variant="contained" color="primary" onClick={handleOpen} style={{ margin: 16 }}>
                 編集
             </Button>
 
-            <Dialog open={open} onClose={handleClose} maxWidth="md" fullWidth>
-                <DialogTitle>店舗概要編集</DialogTitle>
+            <Dialog open={open} onClose={handleClose} maxWidth="lg" fullWidth>
+                <DialogTitle>店舗情報編集</DialogTitle>
                 <DialogContent>
-                    <Grid container spacing={2}>
-                        <Grid item xs={12} sm={6}>
+                    <Grid container spacing={3}>
+                        {/* 店舗基本情報 */}
+                        <Grid item xs={12}>
+                            <Typography variant="h6">店舗基本情報</Typography>
+                        </Grid>
+                        <Grid item xs={12} sm={4}>
+                            <TextField
+                                label="店番"
+                                name="basicInfo_storeNumber"
+                                value={editData.basicInfo.storeNumber}
+                                onChange={handleChange}
+                                fullWidth
+                                size="small"
+                            />
+                        </Grid>
+                        <Grid item xs={12} sm={8}>
+                            <TextField
+                                label="店舗名"
+                                name="basicInfo_storeName"
+                                value={editData.basicInfo.storeName}
+                                onChange={handleChange}
+                                fullWidth
+                                size="small"
+                            />
+                        </Grid>
+                        <Grid item xs={12} sm={4}>
                             <TextField
                                 label="開店年月"
-                                name="openDate"
+                                name="basicInfo_openDate"
                                 type="month"
-                                value={editData.openDate}
+                                value={editData.basicInfo.openDate}
                                 onChange={handleChange}
                                 InputLabelProps={{ shrink: true }}
                                 fullWidth
                                 size="small"
                             />
                         </Grid>
-                        <Grid item xs={12} sm={6}>
+                        <Grid item xs={12} sm={4}>
                             <TextField
                                 label="改装年月"
-                                name="renovationDate"
+                                name="basicInfo_renovationDate"
                                 type="month"
-                                value={editData.renovationDate}
+                                value={editData.basicInfo.renovationDate}
                                 onChange={handleChange}
                                 InputLabelProps={{ shrink: true }}
                                 fullWidth
                                 size="small"
                             />
                         </Grid>
-                        <Grid item xs={12} sm={6}>
+                        <Grid item xs={12} sm={4}>
                             <TextField
-                                label="提出日"
-                                name="submissionDate"
+                                label="データ更新日"
+                                name="basicInfo_updateDate"
                                 type="date"
-                                value={editData.submissionDate}
+                                value={editData.basicInfo.updateDate}
                                 onChange={handleChange}
                                 InputLabelProps={{ shrink: true }}
                                 fullWidth
                                 size="small"
                             />
                         </Grid>
-                        <Grid item xs={12} sm={6}>
-                            <TextField
-                                label="営業時間"
-                                name="businessHours"
-                                value={editData.businessHours}
-                                onChange={handleChange}
-                                fullWidth
-                                size="small"
-                            />
-                        </Grid>
-                        <Grid item xs={12} sm={3}>
-                            <TextField
-                                label="駐車場必要台数"
-                                name="parkingRequired"
-                                type="number"
-                                value={editData.parkingRequired}
-                                onChange={handleChange}
-                                fullWidth
-                                size="small"
-                            />
-                        </Grid>
-                        <Grid item xs={12} sm={3}>
-                            <TextField
-                                label="駐車場届出台数"
-                                name="parkingSubmitted"
-                                type="number"
-                                value={editData.parkingSubmitted}
-                                onChange={handleChange}
-                                fullWidth
-                                size="small"
-                            />
-                        </Grid>
-                        <Grid item xs={12} sm={3}>
-                            <TextField
-                                label="駐輪場必要台数"
-                                name="bicycleParkingRequired"
-                                type="number"
-                                value={editData.bicycleParkingRequired}
-                                onChange={handleChange}
-                                fullWidth
-                                size="small"
-                            />
-                        </Grid>
-                        <Grid item xs={12} sm={3}>
-                            <TextField
-                                label="駐輪場届出台数"
-                                name="bicycleParkingSubmitted"
-                                type="number"
-                                value={editData.bicycleParkingSubmitted}
-                                onChange={handleChange}
-                                fullWidth
-                                size="small"
-                            />
-                        </Grid>
-                        <Grid item xs={12} sm={6}>
-                            <TextField
-                                label="納品可能時間"
-                                name="deliveryAvailableTime"
-                                type="text"
-                                value={editData.deliveryAvailableTime}
-                                onChange={handleChange}
-                                fullWidth
-                                size="small"
-                            />
-                        </Grid>
-                        {/* 用途地域の編集フィールド */}
-                        {editData.zoningArea.map((area, index) => (
-                            <React.Fragment key={index}>
-                                <Grid item xs={12} sm={6}>
-                                    <TextField
-                                        label={`用途地域 ${index + 1}`}
-                                        name={`zoningArea_${index}`}
-                                        value={editData.zoningArea[index]}
-                                        onChange={handleChange}
-                                        fullWidth
-                                        size="small"
-                                    />
-                                </Grid>
-                                <Grid item xs={12} sm={6}>
-                                    <FormControlLabel
-                                        control={
-                                            <Checkbox
-                                                checked={editData.zoningApproved[index]}
-                                                onChange={handleChange}
-                                                name={`zoningApproved_${index}`}
-                                                color="primary"
-                                            />
-                                        }
-                                        label="〇/×"
-                                    />
-                                </Grid>
-                            </React.Fragment>
-                        ))}
-                        {/* 駐車場（敷地内）の編集フィールド */}
+
+                        {/* 住所情報 */}
                         <Grid item xs={12}>
-                            <Typography variant="subtitle1">駐車場（敷地内）</Typography>
+                            <Typography variant="h6">住所情報</Typography>
                         </Grid>
-                        <Grid item xs={12} sm={3}>
+                        <Grid item xs={12} sm={4}>
                             <TextField
-                                label="台数"
-                                name="parkingDetails_onSite_total"
-                                type="number"
-                                value={editData.parkingDetails.onSite.total}
+                                label="都道府県"
+                                name="addressInfo_prefecture"
+                                value={editData.addressInfo.prefecture}
                                 onChange={handleChange}
                                 fullWidth
                                 size="small"
                             />
                         </Grid>
-                        <Grid item xs={12} sm={3}>
+                        <Grid item xs={12} sm={4}>
                             <TextField
-                                label="身障者用台数"
-                                name="parkingDetails_onSite_handicap"
-                                type="number"
-                                value={editData.parkingDetails.onSite.handicap}
+                                label="市区町村"
+                                name="addressInfo_city"
+                                value={editData.addressInfo.city}
                                 onChange={handleChange}
                                 fullWidth
                                 size="small"
                             />
                         </Grid>
-                        <Grid item xs={12} sm={3}>
-                            <FormControlLabel
-                                control={
-                                    <Switch
-                                        checked={editData.parkingDetails.onSite.paid}
-                                        onChange={handleChange}
-                                        name="parkingDetails_onSite_paid"
-                                        color="primary"
-                                    />
-                                }
-                                label="有料／無料"
-                            />
-                        </Grid>
-                        <Grid item xs={12} sm={3}>
-                            <FormControlLabel
-                                control={
-                                    <Switch
-                                        checked={editData.parkingDetails.onSite.paymentMachine}
-                                        onChange={handleChange}
-                                        name="parkingDetails_onSite_paymentMachine"
-                                        color="primary"
-                                    />
-                                }
-                                label="精算機"
-                            />
-                        </Grid>
-                        <Grid item xs={12} sm={6}>
+                        <Grid item xs={12} sm={4}>
                             <TextField
-                                label="提携駐車場名"
-                                name="parkingDetails_onSite_partnerParking"
-                                value={editData.parkingDetails.onSite.partnerParking}
+                                label="番地・建物名"
+                                name="addressInfo_address"
+                                value={editData.addressInfo.address}
                                 onChange={handleChange}
                                 fullWidth
                                 size="small"
                             />
                         </Grid>
-                        <Grid item xs={12} sm={3}>
-                            <TextField
-                                label="提携駐車場台数"
-                                name="parkingDetails_onSite_partnerParkingCount"
-                                type="number"
-                                value={editData.parkingDetails.onSite.partnerParkingCount}
-                                onChange={handleChange}
-                                fullWidth
-                                size="small"
-                            />
-                        </Grid>
-                        <Grid item xs={12} sm={3}>
-                            <TextField
-                                label="バイク台数"
-                                name="parkingDetails_onSite_motorcycleCount"
-                                type="number"
-                                value={editData.parkingDetails.onSite.motorcycleCount}
-                                onChange={handleChange}
-                                fullWidth
-                                size="small"
-                            />
-                        </Grid>
-                        <Grid item xs={12} sm={6}>
-                            <TextField
-                                label="管理"
-                                name="parkingDetails_onSite_management"
-                                type="text"
-                                value={editData.parkingDetails.onSite.management}
-                                onChange={handleChange}
-                                fullWidth
-                                size="small"
-                            />
-                        </Grid>
-                        <Grid item xs={12} sm={6}>
-                            <TextField
-                                label="利用条件"
-                                name="parkingDetails_onSite_usageConditions"
-                                type="text"
-                                value={editData.parkingDetails.onSite.usageConditions}
-                                onChange={handleChange}
-                                fullWidth
-                                size="small"
-                            />
-                        </Grid>
-                        <Grid item xs={12} sm={6}>
-                            <TextField
-                                label="超過料金"
-                                name="parkingDetails_onSite_excessFee"
-                                type="text"
-                                value={editData.parkingDetails.onSite.excessFee}
-                                onChange={handleChange}
-                                fullWidth
-                                size="small"
-                            />
-                        </Grid>
-                        {/* 駐車場（敷地外）の編集フィールド */}
+
+                        {/* 連絡情報 */}
                         <Grid item xs={12}>
-                            <Typography variant="subtitle1">駐車場（敷地外）</Typography>
+                            <Typography variant="h6">連絡情報</Typography>
                         </Grid>
-                        <Grid item xs={12} sm={3}>
+                        <Grid item xs={12} sm={4}>
                             <TextField
-                                label="台数"
-                                name="parkingDetails_offSite_total"
-                                type="number"
-                                value={editData.parkingDetails.offSite.total}
+                                label="電話番号"
+                                name="contactInfo_phoneNumber"
+                                value={editData.contactInfo.phoneNumber}
                                 onChange={handleChange}
                                 fullWidth
                                 size="small"
                             />
                         </Grid>
-                        <Grid item xs={12} sm={3}>
+                        <Grid item xs={12} sm={4}>
                             <TextField
-                                label="身障者用台数"
-                                name="parkingDetails_offSite_handicap"
-                                type="number"
-                                value={editData.parkingDetails.offSite.handicap}
+                                label="FAX番号"
+                                name="contactInfo_faxNumber"
+                                value={editData.contactInfo.faxNumber}
                                 onChange={handleChange}
                                 fullWidth
                                 size="small"
                             />
                         </Grid>
-                        <Grid item xs={12} sm={3}>
-                            <FormControlLabel
-                                control={
-                                    <Switch
-                                        checked={editData.parkingDetails.offSite.paid}
-                                        onChange={handleChange}
-                                        name="parkingDetails_offSite_paid"
-                                        color="primary"
-                                    />
-                                }
-                                label="有料／無料"
+                        <Grid item xs={12} sm={4}>
+                            <TextField
+                                label="メールアドレス"
+                                name="contactInfo_email"
+                                type="email"
+                                value={editData.contactInfo.email}
+                                onChange={handleChange}
+                                fullWidth
+                                size="small"
                             />
                         </Grid>
-                        <Grid item xs={12} sm={3}>
-                            <FormControlLabel
-                                control={
-                                    <Switch
-                                        checked={editData.parkingDetails.offSite.paymentMachine}
-                                        onChange={handleChange}
-                                        name="parkingDetails_offSite_paymentMachine"
-                                        color="primary"
-                                    />
-                                }
-                                label="精算機"
-                            />
+
+                        {/* 営業情報 */}
+                        <Grid item xs={12}>
+                            <Typography variant="h6">営業情報</Typography>
                         </Grid>
                         <Grid item xs={12} sm={6}>
+                            <Typography variant="subtitle1">基本営業時間</Typography>
                             <TextField
-                                label="提携駐車場名"
-                                name="parkingDetails_offSite_partnerParking"
-                                value={editData.parkingDetails.offSite.partnerParking}
+                                label="開始時間"
+                                name="businessInfo_basicBusinessHours_startTime"
+                                type="time"
+                                value={editData.businessInfo.basicBusinessHours.startTime}
                                 onChange={handleChange}
-                                fullWidth
-                                size="small"
-                            />
-                        </Grid>
-                        <Grid item xs={12} sm={3}>
-                            <TextField
-                                label="提携駐車場台数"
-                                name="parkingDetails_offSite_partnerParkingCount"
-                                type="number"
-                                value={editData.parkingDetails.offSite.partnerParkingCount}
-                                onChange={handleChange}
-                                fullWidth
-                                size="small"
-                            />
-                        </Grid>
-                        <Grid item xs={12} sm={3}>
-                            <TextField
-                                label="バイク台数"
-                                name="parkingDetails_offSite_motorcycleCount"
-                                type="number"
-                                value={editData.parkingDetails.offSite.motorcycleCount}
-                                onChange={handleChange}
+                                InputLabelProps={{ shrink: true }}
+                                inputProps={{ step: 300 }} // 5分刻み
                                 fullWidth
                                 size="small"
                             />
                         </Grid>
                         <Grid item xs={12} sm={6}>
                             <TextField
-                                label="管理"
-                                name="parkingDetails_offSite_management"
-                                type="text"
-                                value={editData.parkingDetails.offSite.management}
+                                label="終了時間"
+                                name="businessInfo_basicBusinessHours_endTime"
+                                type="time"
+                                value={editData.businessInfo.basicBusinessHours.endTime}
                                 onChange={handleChange}
+                                InputLabelProps={{ shrink: true }}
+                                inputProps={{ step: 300 }}
                                 fullWidth
                                 size="small"
                             />
                         </Grid>
-                        <Grid item xs={12} sm={6}>
-                            <TextField
-                                label="利用条件"
-                                name="parkingDetails_offSite_usageConditions"
-                                type="text"
-                                value={editData.parkingDetails.offSite.usageConditions}
-                                onChange={handleChange}
-                                fullWidth
-                                size="small"
-                            />
+
+                        {/* 特殊営業日 */}
+                        <Grid item xs={12}>
+                            <Typography variant="subtitle1">特殊営業日</Typography>
+                            {editData.businessInfo.specialBusinessDays.map((day, index) => (
+                                <Grid container spacing={2} key={index} alignItems="center" style={{ marginBottom: 8 }}>
+                                    <Grid item xs={12} sm={1}>
+                                        <Typography>日 {index + 1}:</Typography>
+                                    </Grid>
+                                    <Grid item xs={12} sm={2}>
+                                        <FormControlLabel
+                                            control={
+                                                <Switch
+                                                    checked={day.isOpen}
+                                                    onChange={handleChange}
+                                                    name={`businessInfo_specialBusinessDays_${index}_isOpen`}
+                                                    color="primary"
+                                                />
+                                            }
+                                            label={day.isOpen ? '営業' : '休業'}
+                                        />
+                                    </Grid>
+                                    <Grid item xs={12} sm={3}>
+                                        <TextField
+                                            label="理由"
+                                            name={`businessInfo_specialBusinessDays_${index}_reason`}
+                                            value={day.reason}
+                                            onChange={handleChange}
+                                            fullWidth
+                                            size="small"
+                                            disabled={!day.isOpen}
+                                        />
+                                    </Grid>
+                                    <Grid item xs={12} sm={2}>
+                                        <TextField
+                                            label="開始時間"
+                                            name={`businessInfo_specialBusinessDays_${index}_startTime`}
+                                            type="time"
+                                            value={day.startTime}
+                                            onChange={handleChange}
+                                            InputLabelProps={{ shrink: true }}
+                                            inputProps={{ step: 300 }}
+                                            fullWidth
+                                            size="small"
+                                            disabled={!day.isOpen}
+                                        />
+                                    </Grid>
+                                    <Grid item xs={12} sm={2}>
+                                        <TextField
+                                            label="終了時間"
+                                            name={`businessInfo_specialBusinessDays_${index}_endTime`}
+                                            type="time"
+                                            value={day.endTime}
+                                            onChange={handleChange}
+                                            InputLabelProps={{ shrink: true }}
+                                            inputProps={{ step: 300 }}
+                                            fullWidth
+                                            size="small"
+                                            disabled={!day.isOpen}
+                                        />
+                                    </Grid>
+                                    <Grid item xs={12} sm={2}>
+                                        <TextField
+                                            label="営業時間"
+                                            name={`businessInfo_specialBusinessDays_${index}_businessHours`}
+                                            value={day.businessHours}
+                                            onChange={handleChange}
+                                            fullWidth
+                                            size="small"
+                                            disabled={!day.isOpen}
+                                        />
+                                    </Grid>
+                                    <Grid item xs={12} sm={1}>
+                                        <IconButton color="secondary" onClick={() => handleRemoveSpecialDay(index)}>
+                                            <Remove />
+                                        </IconButton>
+                                    </Grid>
+                                </Grid>
+                            ))}
+                            <Button variant="outlined" color="primary" onClick={handleAddSpecialDay} startIcon={<Add />}>
+                                特殊営業日を追加
+                            </Button>
                         </Grid>
-                        <Grid item xs={12} sm={6}>
-                            <TextField
-                                label="超過料金"
-                                name="parkingDetails_offSite_excessFee"
-                                type="text"
-                                value={editData.parkingDetails.offSite.excessFee}
-                                onChange={handleChange}
-                                fullWidth
-                                size="small"
-                            />
+
+                        {/* 建物情報 */}
+                        <Grid item xs={12}>
+                            <Typography variant="h6">建物情報</Typography>
+                        </Grid>
+                        <Grid item xs={12} sm={12}>
+                            <TableContainer component={Paper}>
+                                <Table size="small">
+                                    <TableHead>
+                                        <TableRow>
+                                            <TableCell><strong>項目</strong></TableCell>
+                                            <TableCell><strong>内容</strong></TableCell>
+                                        </TableRow>
+                                    </TableHead>
+                                    <TableBody>
+                                        <TableRow>
+                                            <TableCell>地上階数</TableCell>
+                                            <TableCell>
+                                                <TextField
+                                                    name="buildingInfo_buildingDetails_aboveGround"
+                                                    type="number"
+                                                    value={editData.buildingInfo.buildingDetails.aboveGround}
+                                                    onChange={handleChange}
+                                                    fullWidth
+                                                    size="small"
+                                                    InputProps={{ inputProps: { min: 0 } }}
+                                                />
+                                            </TableCell>
+                                        </TableRow>
+                                        <TableRow>
+                                            <TableCell>地下階数</TableCell>
+                                            <TableCell>
+                                                <TextField
+                                                    name="buildingInfo_buildingDetails_underground"
+                                                    type="number"
+                                                    value={editData.buildingInfo.buildingDetails.underground}
+                                                    onChange={handleChange}
+                                                    fullWidth
+                                                    size="small"
+                                                    InputProps={{ inputProps: { min: 0 } }}
+                                                />
+                                            </TableCell>
+                                        </TableRow>
+                                        <TableRow>
+                                            <TableCell>階数</TableCell>
+                                            <TableCell>
+                                                <TextField
+                                                    name="buildingInfo_buildingDetails_numberOfFloors"
+                                                    type="number"
+                                                    value={editData.buildingInfo.buildingDetails.numberOfFloors}
+                                                    onChange={handleChange}
+                                                    fullWidth
+                                                    size="small"
+                                                    InputProps={{ inputProps: { min: 0 } }}
+                                                />
+                                            </TableCell>
+                                        </TableRow>
+                                        <TableRow>
+                                            <TableCell>用途</TableCell>
+                                            <TableCell>
+                                                <TextField
+                                                    name="buildingInfo_buildingDetails_use"
+                                                    type="text"
+                                                    value={editData.buildingInfo.buildingDetails.use}
+                                                    onChange={handleChange}
+                                                    fullWidth
+                                                    size="small"
+                                                />
+                                            </TableCell>
+                                        </TableRow>
+                                        <TableRow>
+                                            <TableCell>天井高(m)</TableCell>
+                                            <TableCell>
+                                                <TextField
+                                                    name="buildingInfo_buildingDetails_ceilingHeight"
+                                                    type="number"
+                                                    value={editData.buildingInfo.buildingDetails.ceilingHeight}
+                                                    onChange={handleChange}
+                                                    fullWidth
+                                                    size="small"
+                                                    InputProps={{ inputProps: { min: 0, step: 0.1 } }}
+                                                />
+                                            </TableCell>
+                                        </TableRow>
+                                        <TableRow>
+                                            <TableCell>備考</TableCell>
+                                            <TableCell>
+                                                <TextField
+                                                    name="buildingInfo_buildingDetails_remarks"
+                                                    type="text"
+                                                    value={editData.buildingInfo.buildingDetails.remarks}
+                                                    onChange={handleChange}
+                                                    fullWidth
+                                                    size="small"
+                                                />
+                                            </TableCell>
+                                        </TableRow>
+                                    </TableBody>
+                                </Table>
+                            </TableContainer>
                         </Grid>
                     </Grid>
                 </DialogContent>
@@ -613,6 +630,6 @@ function StoreOverview({ filters }) {
                     <Button onClick={handleSave} color="primary" variant="contained">保存</Button>
                 </DialogActions>
             </Dialog>
-        </TableContainer>
+        </div>
     );
 }
