@@ -146,7 +146,9 @@
             List,
             ListItem,
             ListItemIcon,
-            FormControlLabel
+            FormControlLabel,
+            RadioGroup,
+            Radio
         } = MaterialUI;
 
         const { useEffect, useRef, useState } = React;
@@ -228,12 +230,86 @@
             const lastDetectedCodeRef = useRef(null);
             const currentConsecutiveDetectionsRef = useRef(0);
 
+            // 既存のstate定義に追加
+            const [settingsModalOpen, setSettingsModalOpen] = useState(false);
+            const [capturedImages, setCapturedImages] = useState([]); // 読み取り成功時の画像を保存
+            const [downloadType, setDownloadType] = useState('text'); // 'text' or 'full'
+            const [resultModalOpen, setResultModalOpen] = useState(false);
+
+            // 既存のref定義の後に追加
+            const videoRef = useRef(null);
+
+            // 設定モーダルの開閉
+            const handleSettingsModal = () => {
+                setSettingsModalOpen(!settingsModalOpen);
+            };
+
+            // 読み取り結果モーダルの開閉
+            const handleResultModal = () => {
+                setResultModalOpen(!resultModalOpen);
+            };
+
+            // 画像のキャプチャ処理
+            const captureImage = async () => {
+                if (!quaggaRef.current) return null;
+                
+                const video = quaggaRef.current.querySelector('video');
+                const canvas = document.createElement('canvas');
+                canvas.width = video.videoWidth;
+                canvas.height = video.videoHeight;
+                const ctx = canvas.getContext('2d');
+                ctx.drawImage(video, 0, 0);
+                return canvas.toDataURL('image/jpeg');
+            };
+
+            // 履歴のダウンロード
+            const downloadHistory = () => {
+                const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+                if (downloadType === 'text') {
+                    // テキストのみ
+                    const content = history.map(item => 
+                        `Code: ${item.code}, Timestamp: ${item.timestamp}`
+                    ).join('\n');
+                    
+                    const blob = new Blob([content], { type: 'text/plain' });
+                    const url = URL.createObjectURL(blob);
+                    const a = document.createElement('a');
+                    a.href = url;
+                    a.download = `barcode-history-${timestamp}.txt`;
+                    a.click();
+                    URL.revokeObjectURL(url);
+                } else {
+                    // 画像付き
+                    const zip = new JSZip();
+                    let textContent = '';
+                    
+                    history.forEach((item, index) => {
+                        textContent += `Code: ${item.code}, Timestamp: ${item.timestamp}\n`;
+                        if (item.image) {
+                            const imageData = item.image.split(',')[1];
+                            zip.file(`image-${index}.jpg`, imageData, {base64: true});
+                        }
+                    });
+                    
+                    zip.file('history.txt', textContent);
+                    zip.generateAsync({type: 'blob'}).then(content => {
+                        const url = URL.createObjectURL(content);
+                        const a = document.createElement('a');
+                        a.href = url;
+                        a.download = `barcode-history-${timestamp}.zip`;
+                        a.click();
+                        URL.revokeObjectURL(url);
+                    });
+                }
+            };
+
             // イベントリスナーの設定
             useEffect(() => {
                 // バーコード検出時の処理
-                const handleDetected = (result) => {
+                const handleDetected = async (result) => {
                     const barcodeValue = result.codeResult.code;
                     const timestamp = new Date().toLocaleString();
+                    const capturedImage = await captureImage();
 
                     if (barcodeValue === lastDetectedCodeRef.current) {
                         currentConsecutiveDetectionsRef.current += 1;
@@ -242,7 +318,11 @@
                             // 認識成功
                             setResult(barcodeValue);
                             setTotalScans(prev => prev + 1);
-                            setHistory(prev => [...prev, { code: barcodeValue, timestamp }]);
+                            setHistory(prev => [...prev, { 
+                                code: barcodeValue, 
+                                timestamp,
+                                image: capturedImage 
+                            }]);
                             currentConsecutiveDetectionsRef.current = 0; // リセット
                             lastDetectedCodeRef.current = null; // リセット
 
@@ -480,7 +560,7 @@
                         </Typography>
                         <IconButton
                             color="inherit"
-                            onClick={toggleAdvancedSettings}
+                            onClick={handleSettingsModal}
                         >
                             <Icon>settings</Icon>
                         </IconButton>
@@ -495,6 +575,433 @@
                         © 2023 Barcode Scanner. All rights reserved.
                     </Typography>
                 </Box>
+            );
+
+            // 設定モーダル
+            const SettingsModal = () => (
+                <Modal
+                    open={settingsModalOpen}
+                    onClose={handleSettingsModal}
+                    aria-labelledby="settings-modal-title"
+                >
+                    <Container className="modal-content">
+                        <Typography variant="h6" id="settings-modal-title">詳細設定</Typography>
+                        {/* 既存の詳細設定のコンテンツをここに移動 */}
+                        <Grid item>
+                            <div className="advanced-settings">
+                                <Typography variant="h6">設定</Typography>
+                                {/* スキャンボックスとスキャンラインの表示切替 */}
+                                <Grid container spacing={1}>
+                                    <Grid item xs={6}>
+                                        <Typography variant="body2">スキャンボックス表示</Typography>
+                                        <Switch
+                                            checked={showBox}
+                                            onChange={(e) => {
+                                                setShowBox(e.target.checked);
+                                            }}
+                                            id="box-toggle-switch"
+                                        />
+                                    </Grid>
+                                    <Grid item xs={6}>
+                                        <Typography variant="body2">スキャンライン表示</Typography>
+                                        <Switch
+                                            checked={showLine}
+                                            onChange={(e) => setShowLine(e.target.checked)}
+                                            id="line-toggle-switch"
+                                        />
+                                    </Grid>
+                                </Grid>
+                                <Grid container spacing={1}>
+                                    {/* 連続検出回数の設定 */}
+                                    <Grid item xs={12} md={12}>
+                                        <Typography variant="subtitle1">連続検出回数</Typography>
+                                        <Grid container spacing={1}>
+                                            <Grid item xs={12}>
+                                                <TextField
+                                                    label="必要な連続検出回数"
+                                                    type="number"
+                                                    fullWidth
+                                                    value={requiredConsecutiveDetections}
+                                                    onChange={(e) => {
+                                                        const value = parseInt(e.target.value);
+                                                        if (value > 0) {
+                                                            setRequiredConsecutiveDetections(value);
+                                                        }
+                                                    }}
+                                                    inputProps={{ min: 1 }}
+                                                />
+                                            </Grid>
+                                        </Grid>
+                                    </Grid>
+                                    {/* InputStream Options */}
+                                    <Grid item xs={12} md={12}>
+                                        <Typography variant="subtitle1">Input Stream Options</Typography>
+                                        <Grid container spacing={2}>
+                                            <Grid item xs={12}>
+                                                <FormControl fullWidth>
+                                                    <InputLabel id="facing-mode-label">カメラ方向</InputLabel>
+                                                    <Select
+                                                        labelId="facing-mode-label"
+                                                        id="facing-mode-select"
+                                                        value={cameraFacingMode}
+                                                        label="カメラ方向"
+                                                        onChange={(e) => {
+                                                            const newFacingMode = e.target.value;
+                                                            setCameraFacingMode(newFacingMode);
+                                                            setInputStreamOptions(prev => ({
+                                                                ...prev,
+                                                                constraints: {
+                                                                    ...prev.constraints,
+                                                                    facingMode: newFacingMode
+                                                                }
+                                                            }));
+                                                        }}
+                                                    >
+                                                        <MenuItem value="environment">背面カメラ</MenuItem>
+                                                        <MenuItem value="user">前面カメラ</MenuItem>
+                                                    </Select>
+                                                </FormControl>
+                                            </Grid>
+                                            <Grid item xs={6}>
+                                                <TextField
+                                                    label="幅 (px)"
+                                                    type="number"
+                                                    fullWidth
+                                                    value={inputStreamOptions.constraints.width}
+                                                    onChange={(e) => setInputStreamOptions(prev => ({
+                                                        ...prev,
+                                                        constraints: {
+                                                            ...prev.constraints,
+                                                            width: parseInt(e.target.value) || 640
+                                                        }
+                                                    }))}
+                                                />
+                                            </Grid>
+                                            <Grid item xs={6}>
+                                                <TextField
+                                                    label="高さ (px)"
+                                                    type="number"
+                                                    fullWidth
+                                                    value={inputStreamOptions.constraints.height}
+                                                    onChange={(e) => setInputStreamOptions(prev => ({
+                                                        ...prev,
+                                                        constraints: {
+                                                            height: parseInt(e.target.value) || 480
+                                                        }
+                                                    }))}
+                                                />
+                                            </Grid>
+                                            <Grid item xs={12}>
+                                                <Typography variant="body2" style={{ marginTop: '10px' }}>読み取りエリア (%):</Typography>
+                                            </Grid>
+                                            <Grid item xs={3}>
+                                                <TextField
+                                                    label="Top"
+                                                    type="number"
+                                                    inputProps={{ min: 0, max: 100 }}
+                                                    fullWidth
+                                                    value={parseInt(inputStreamOptions.area.top)}
+                                                    onChange={(e) => {
+                                                        const value = Math.min(Math.max(parseInt(e.target.value) || 0, 0), 100);
+                                                        setInputStreamOptions(prev => ({
+                                                            ...prev,
+                                                            area: {
+                                                                ...prev.area,
+                                                                top: `${value}%`
+                                                            }
+                                                        }));
+                                                    }}
+                                                />
+                                            </Grid>
+                                            <Grid item xs={3}>
+                                                <TextField
+                                                    label="Bottom"
+                                                    type="number"
+                                                    inputProps={{ min: 0, max: 100 }}
+                                                    fullWidth
+                                                    value={parseInt(inputStreamOptions.area.bottom)}
+                                                    onChange={(e) => {
+                                                        const value = Math.min(Math.max(parseInt(e.target.value) || 0, 0), 100);
+                                                        setInputStreamOptions(prev => ({
+                                                            ...prev,
+                                                            area: {
+                                                                ...prev.area,
+                                                                bottom: `${value}%`
+                                                            }
+                                                        }));
+                                                    }}
+                                                />
+                                            </Grid>
+                                            <Grid item xs={3}>
+                                                <TextField
+                                                    label="Left"
+                                                    type="number"
+                                                    inputProps={{ min: 0, max: 100 }}
+                                                    fullWidth
+                                                    value={parseInt(inputStreamOptions.area.left)}
+                                                    onChange={(e) => {
+                                                        const value = Math.min(Math.max(parseInt(e.target.value) || 0, 0), 100);
+                                                        setInputStreamOptions(prev => ({
+                                                            ...prev,
+                                                            area: {
+                                                                ...prev.area,
+                                                                left: `${value}%`
+                                                            }
+                                                        }));
+                                                    }}
+                                                />
+                                            </Grid>
+                                            <Grid item xs={3}>
+                                                <TextField
+                                                    label="Right"
+                                                    type="number"
+                                                    inputProps={{ min: 0, max: 100 }}
+                                                    fullWidth
+                                                    value={parseInt(inputStreamOptions.area.right)}
+                                                    onChange={(e) => {
+                                                        const value = Math.min(Math.max(parseInt(e.target.value) || 0, 0), 100);
+                                                        setInputStreamOptions(prev => ({
+                                                            ...prev,
+                                                            area: {
+                                                                ...prev.area,
+                                                                right: `${value}%`
+                                                            }
+                                                        }));
+                                                    }}
+                                                />
+                                            </Grid>
+                                        </Grid>
+                                    </Grid>
+
+                                    {/* Decoder Options */}
+                                    <Grid item xs={12} md={6}>
+                                        <Typography variant="subtitle1">Decoder Options</Typography>
+                                        <Grid container spacing={2}>
+                                            <Grid item xs={12}>
+                                                <FormControl fullWidth>
+                                                    <InputLabel id="readers-label">読み取りフォーマット</InputLabel>
+                                                    <Select
+                                                        labelId="readers-label"
+                                                        id="readers-select"
+                                                        multiple
+                                                        value={decoderOptions.readers}
+                                                        onChange={(e) => setDecoderOptions(prev => ({
+                                                            ...prev,
+                                                            readers: e.target.value
+                                                        }))}
+                                                        input={<OutlinedInput label="読み取りフォーマット" />}
+                                                        renderValue={(selected) => selected.map(val => {
+                                                            switch(val) {
+                                                                case 'code_128_reader': return 'Code 128';
+                                                                case 'ean_reader': return 'EAN-13';
+                                                                case 'ean_8_reader': return 'EAN-8';
+                                                                case 'upc_reader': return 'UPC-A';
+                                                                case 'code_39_reader': return 'Code 39';
+                                                                case 'codabar_reader': return 'Codabar';
+                                                                case 'interleaved_2of5_reader': return 'Interleaved 2 of 5';
+                                                                default: return val;
+                                                            }
+                                                        }).join(', ')}
+                                                    >
+                                                        {[
+                                                            { label: 'Code 128', value: 'code_128_reader' },
+                                                            { label: 'EAN-13', value: 'ean_reader' },
+                                                            { label: 'EAN-8', value: 'ean_8_reader' },
+                                                            { label: 'UPC-A', value: 'upc_reader' },
+                                                            { label: 'Code 39', value: 'code_39_reader' },
+                                                            { label: 'Codabar', value: 'codabar_reader' },
+                                                            { label: 'Interleaved 2 of 5', value: 'interleaved_2of5_reader' },
+                                                        ].map((option) => (
+                                                            <MenuItem key={option.value} value={option.value}>
+                                                                <Checkbox checked={decoderOptions.readers.indexOf(option.value) > -1} />
+                                                                <ListItemText primary={option.label} />
+                                                            </MenuItem>
+                                                        ))}
+                                                    </Select>
+                                                </FormControl>
+                                            </Grid>
+                                            <Grid item xs={12}>
+                                                <FormControl fullWidth>
+                                                    <InputLabel id="patch-size-label">パッチサイズ</InputLabel>
+                                                    <Select
+                                                        labelId="patch-size-label"
+                                                        id="patch-size-select"
+                                                        value={decoderOptions.patchSize}
+                                                        label="パッチサイズ"
+                                                        onChange={(e) => setDecoderOptions(prev => ({
+                                                            ...prev,
+                                                            patchSize: e.target.value
+                                                        }))}
+                                                    >
+                                                        <MenuItem value="small">小</MenuItem>
+                                                        <MenuItem value="medium">中</MenuItem>
+                                                        <MenuItem value="large">大</MenuItem>
+                                                    </Select>
+                                                </FormControl>
+                                            </Grid>
+                                            <Grid item xs={6}>
+                                                <Grid container alignItems="center" spacing={1}>
+                                                    <Grid item>
+                                                        <Typography variant="body2">Half Sample</Typography>
+                                                    </Grid>
+                                                    <Grid item>
+                                                        <Switch
+                                                            checked={decoderOptions.halfSample}
+                                                            onChange={(e) => setDecoderOptions(prev => ({
+                                                                ...prev,
+                                                                halfSample: e.target.checked
+                                                            }))}
+                                                            id="half-sample-switch"
+                                                        />
+                                                    </Grid>
+                                                </Grid>
+                                            </Grid>
+                                            <Grid item xs={6}>
+                                                <Grid container alignItems="center" spacing={1}>
+                                                    <Grid item>
+                                                        <Typography variant="body2">複数読み取り</Typography>
+                                                    </Grid>
+                                                    <Grid item>
+                                                        <Switch
+                                                            checked={decoderOptions.multiple}
+                                                            onChange={(e) => setDecoderOptions(prev => ({
+                                                                ...prev,
+                                                                multiple: e.target.checked
+                                                            }))}
+                                                            id="multiple-switch"
+                                                        />
+                                                    </Grid>
+                                                </Grid>
+                                            </Grid>
+                                            <Grid item xs={12}>
+                                                <Grid container alignItems="center" spacing={1}>
+                                                    <Grid item>
+                                                        <Typography variant="body2">自動位置検出</Typography>
+                                                    </Grid>
+                                                    <Grid item>
+                                                        <Switch
+                                                            checked={decoderOptions.locate}
+                                                            onChange={(e) => setDecoderOptions(prev => ({
+                                                                ...prev,
+                                                                locate: e.target.checked
+                                                            }))}
+                                                            id="locate-switch"
+                                                        />
+                                                    </Grid>
+                                                </Grid>
+                                            </Grid>
+                                        </Grid>
+                                    </Grid>
+                                    {/* その他のオプション */}
+                                    <Grid item xs={12} md={6}>
+                                        <Typography variant="subtitle1">その他のオプション</Typography>
+                                        <Grid container spacing={1}>
+                                            <Grid item xs={6}>
+                                                <TextField
+                                                    label="ワーカーの数"
+                                                    type="number"
+                                                    fullWidth
+                                                    value={otherOptions.numOfWorkers}
+                                                    onChange={(e) => setOtherOptions(prev => ({
+                                                        ...prev,
+                                                        numOfWorkers: parseInt(e.target.value) || 4
+                                                    }))}
+                                                />
+                                            </Grid>
+                                            <Grid item xs={6}>
+                                                <TextField
+                                                    label="キャプチャ頻度 (フレーム/秒)"
+                                                    type="number"
+                                                    fullWidth
+                                                    value={otherOptions.frequency}
+                                                    onChange={(e) => setOtherOptions(prev => ({
+                                                        ...prev,
+                                                        frequency: parseInt(e.target.value) || 10
+                                                    }))}
+                                                />
+                                            </Grid>
+                                        </Grid>
+                                    </Grid>
+                                </Grid>
+
+                                {/* 設定を適用するボタン */}
+                                <Grid container justifyContent="flex-end" spacing={2}>
+                                    <Grid item xs={12} sm={6} md={3}>
+                                        <Button variant="contained" color="primary" onClick={applyAdvancedSettings} fullWidth id="apply_settings_button">
+                                            設定を適用
+                                        </Button>
+                                    </Grid>
+                                </Grid>
+                            </div>
+                        </Grid>
+                    </Container>
+                </Modal>
+            );
+
+            // 読み取り結果モーダル
+            const ResultModal = () => (
+                <Modal
+                    open={resultModalOpen}
+                    onClose={handleResultModal}
+                    aria-labelledby="result-modal-title"
+                >
+                    <Container className="modal-content">
+                        <Typography variant="h6" id="result-modal-title">読み取り履歴</Typography>
+                        <Grid container spacing={2}>
+                            <Grid item xs={12}>
+                                <FormControl component="fieldset">
+                                    <Typography variant="body2">ダウンロード形式</Typography>
+                                    <RadioGroup
+                                        value={downloadType}
+                                        onChange={(e) => setDownloadType(e.target.value)}
+                                    >
+                                        <FormControlLabel 
+                                            value="text" 
+                                            control={<Radio />} 
+                                            label="テキストのみ" 
+                                        />
+                                        <FormControlLabel 
+                                            value="full" 
+                                            control={<Radio />} 
+                                            label="画像付き" 
+                                        />
+                                    </RadioGroup>
+                                </FormControl>
+                            </Grid>
+                            <Grid item xs={12}>
+                                <Button 
+                                    variant="contained" 
+                                    color="primary" 
+                                    onClick={downloadHistory}
+                                    fullWidth
+                                >
+                                    履歴をダウンロード
+                                </Button>
+                            </Grid>
+                            <Grid item xs={12}>
+                                <div style={{maxHeight: '50vh', overflow: 'auto'}}>
+                                    {history.map((item, index) => (
+                                        <Box key={index} mb={2} p={1} border={1} borderColor="grey.300" borderRadius={1}>
+                                            <Typography variant="body1">
+                                                Code: {item.code}
+                                            </Typography>
+                                            <Typography variant="body2" color="textSecondary">
+                                                Timestamp: {item.timestamp}
+                                            </Typography>
+                                            {item.image && (
+                                                <img 
+                                                    src={item.image} 
+                                                    alt={`Scan ${index}`} 
+                                                    style={{maxWidth: '100%', marginTop: '8px'}}
+                                                />
+                                            )}
+                                        </Box>
+                                    ))}
+                                </div>
+                            </Grid>
+                        </Grid>
+                    </Container>
+                </Modal>
             );
 
             return (
@@ -513,7 +1020,12 @@
 
                                 {/* 認識結果 */}
                                 <Grid item xs={12}>
-                                    <Paper elevation={1} sx={{ p: 2 }}>
+                                    <Paper 
+                                        elevation={1} 
+                                        sx={{ p: 2 }} 
+                                        onClick={handleResultModal}
+                                        style={{ cursor: 'pointer' }}
+                                    >
                                         <Typography variant="h6" gutterBottom>
                                             読数: {totalScans} 結果: {result}
                                         </Typography>
@@ -1051,6 +1563,8 @@
                                         </Grid>
                                     </Container>
                                 </Modal>
+                                <SettingsModal />
+                                <ResultModal />
                             </Grid>
                         </Container>
                         <Footer />
