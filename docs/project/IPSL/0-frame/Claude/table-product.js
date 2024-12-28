@@ -218,9 +218,10 @@ const ProductTable = memo(function ProductTable() {
 
     const handleHeaderDragStart = useCallback((e, field) => {
         e.stopPropagation();
+        e.dataTransfer.effectAllowed = 'move';
+        e.dataTransfer.setData('text/plain', field); // データを設定
         setDraggedColumn(field);
         e.currentTarget.style.opacity = '0.5';
-        dragStartTimeRef.current = Date.now();
     }, []);
 
     const handleHeaderDragEnd = useCallback((e) => {
@@ -234,15 +235,10 @@ const ProductTable = memo(function ProductTable() {
         e.preventDefault();
         e.stopPropagation();
         
-        if (dragThrottleRef.current) return;
-        
-        dragThrottleRef.current = true;
-        requestAnimationFrame(() => {
-            if (draggedColumn && draggedColumn !== field) {
-                setDragOverColumn(field);
-            }
-            dragThrottleRef.current = false;
-        });
+        if (draggedColumn && draggedColumn !== field) {
+            setDragOverColumn(field);
+            e.dataTransfer.dropEffect = 'move';
+        }
     }, [draggedColumn]);
 
     const handleHeaderDragLeave = useCallback((e) => {
@@ -253,12 +249,14 @@ const ProductTable = memo(function ProductTable() {
     const handleHeaderDrop = useCallback((e, field) => {
         e.preventDefault();
         e.stopPropagation();
+
+        const draggedField = e.dataTransfer.getData('text/plain'); // データを取得
         
-        if (draggedColumn && draggedColumn !== field) {
+        if (draggedField && draggedField !== field) {
             const mode = isDetailMode ? 'detailed' : 'simple';
             setColumns(prev => {
                 const newColumns = [...prev[mode]];
-                const draggedIdx = newColumns.findIndex(col => col.field === draggedColumn);
+                const draggedIdx = newColumns.findIndex(col => col.field === draggedField);
                 const targetIdx = newColumns.findIndex(col => col.field === field);
                 
                 if (draggedIdx !== -1 && targetIdx !== -1) {
@@ -275,7 +273,7 @@ const ProductTable = memo(function ProductTable() {
         
         setDraggedColumn(null);
         setDragOverColumn(null);
-    }, [draggedColumn, isDetailMode]);
+    }, [isDetailMode]);
 
     const handleFilterKeyDown = useCallback((event) => {
         if (event.key === 'Enter') {
@@ -618,6 +616,11 @@ const ProductTable = memo(function ProductTable() {
         </Box>
     ));
 
+    const handleDragHandleClick = useCallback((e, field) => {
+        e.stopPropagation();
+        setDraggedColumn(draggedColumn === field ? null : field);
+    }, [draggedColumn]);
+
     const TableHeaderCell = memo(({ field, label }) => {
         const isOrdered = orderBy === field;
         const isDragging = draggedColumn === field;
@@ -643,10 +646,11 @@ const ProductTable = memo(function ProductTable() {
                         opacity: 1
                     }
                 }}
-                draggable
+                draggable={isDragging}
                 onDragStart={(e) => handleHeaderDragStart(e, field)}
                 onDragOver={(e) => handleHeaderDragOver(e, field)}
                 onDrop={(e) => handleHeaderDrop(e, field)}
+                onDragEnd={handleHeaderDragEnd}
             >
                 <Box sx={{ 
                     display: 'flex', 
@@ -656,18 +660,22 @@ const ProductTable = memo(function ProductTable() {
                     <Box
                         className="drag-handle"
                         component="span"
+                        onClick={(e) => handleDragHandleClick(e, field)}
                         sx={{
-                            cursor: 'move',
+                            cursor: 'pointer',
                             display: 'inline-flex',
                             alignItems: 'center',
                             opacity: 0.3,
-                            '&:hover': { opacity: 1 }
+                            '&:hover': { opacity: 1 },
+                            color: isDragging ? theme.palette.primary.main : 'inherit'
                         }}
                     >
                         <span className="material-icons" style={{ fontSize: '1.2rem' }}>
-                            drag_indicator
+                            {isDragging ? 'drag_handle' : 'drag_indicator'}
                         </span>
                     </Box>
+                    
+                    {/* 残りのコードは変更なし */}
                     <Typography 
                         variant="subtitle2" 
                         component="span"
