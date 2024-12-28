@@ -6,7 +6,7 @@ function Footer() {
             <Container maxWidth="md">
                 <Box mt={0} textAlign="center">
                     <Typography variant="body2">
-                        © {new Date().getFullYear()} SUMMIT,INC. All rights reserved.
+                        © {new Date().getFullYear()} Sense of Wonder,org. All rights reserved. Powerd by R.
                     </Typography>
                 </Box>
             </Container>
