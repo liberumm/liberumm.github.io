@@ -1720,61 +1720,77 @@ function createEmptyCoefficientRow(id) {
                     <Box mt={2}>
                         <Typography variant="h6" gutterBottom>店舗係数確認</Typography>
                         <Grid container spacing={2}>
-                            {/* 年度、月度、開始日、終了日のフィルター */}
-                            <Grid item xs={3}>
-                                <TextField
-                                    label="年度"
-                                    type="number"
-                                    value={year}
-                                    onChange={(e) => setYear(e.target.value)}
-                                    InputLabelProps={{ shrink: true }}
-                                    fullWidth
-                                    style={{ marginTop: '16px' }}
-                                />
-                            </Grid>
-                            <Grid item xs={3}>
-                                <TextField
-                                    label="月度"
-                                    type="number"
-                                    value={month}
-                                    onChange={(e) => setMonth(e.target.value)}
-                                    InputLabelProps={{ shrink: true }}
-                                    fullWidth
-                                    style={{ marginTop: '16px' }}
-                                />
-                            </Grid>
-                            <Grid item xs={3}>
-                                <TextField
-                                    label="開始日"
-                                    type="date"
-                                    value={startDate}
-                                    onChange={(e) => setStartDate(e.target.value)}
-                                    InputLabelProps={{ shrink: true }}
-                                    fullWidth
-                                    style={{ marginTop: '16px' }}
-                                />
-                            </Grid>
-                            <Grid item xs={3}>
-                                <TextField
-                                    label="終了日"
-                                    type="date"
-                                    value={endDate}
-                                    onChange={(e) => setEndDate(e.target.value)}
-                                    InputLabelProps={{ shrink: true }}
-                                    fullWidth
-                                    style={{ marginTop: '16px' }}
-                                />
-                            </Grid>
-                            <Grid item xs={12}>
-                                <Button
-                                    variant="contained"
-                                    color="primary"
-                                    fullWidth
-                                    onClick={filterCoefficientData}
-                                    style={{ marginTop: '16px' }}
-                                    startIcon={<span className="material-icons">search</span>}
-                                >フィルタリング</Button>
-                            </Grid>
+                            {/* フィルターセクション */}
+                            <Paper variant="outlined" sx={{ p: 2, mb: 2 }}>
+                                <Grid container spacing={2} alignItems="center">
+                                    <Grid item xs={12} sm={8}>
+                                        <Grid container spacing={2}>
+                                            <Grid item xs={6} sm={3}>
+                                                <TextField
+                                                    select
+                                                    label="年度"
+                                                    value={year}
+                                                    onChange={(e) => setYear(e.target.value)}
+                                                    size="small"
+                                                    fullWidth
+                                                >
+                                                    {years.map((y) => (
+                                                        <MenuItem key={y} value={y}>{y}年</MenuItem>
+                                                    ))}
+                                                </TextField>
+                                            </Grid>
+                                            <Grid item xs={6} sm={3}>
+                                                <TextField
+                                                    select
+                                                    label="月"
+                                                    value={month}
+                                                    onChange={(e) => setMonth(e.target.value)}
+                                                    size="small"
+                                                    fullWidth
+                                                >
+                                                    {months.map((m) => (
+                                                        <MenuItem key={m} value={m}>{m}</MenuItem>
+                                                    ))}
+                                                </TextField>
+                                            </Grid>
+                                            <Grid item xs={6} sm={3}>
+                                                <TextField
+                                                    label="開始日"
+                                                    type="date"
+                                                    value={startDate}
+                                                    onChange={(e) => setStartDate(e.target.value)}
+                                                    size="small"
+                                                    fullWidth
+                                                    InputLabelProps={{ shrink: true }}
+                                                />
+                                            </Grid>
+                                            <Grid item xs={6} sm={3}>
+                                                <TextField
+                                                    label="終了日"
+                                                    type="date"
+                                                    value={endDate}
+                                                    onChange={(e) => setEndDate(e.target.value)}
+                                                    size="small"
+                                                    fullWidth
+                                                    InputLabelProps={{ shrink: true }}
+                                                />
+                                            </Grid>
+                                        </Grid>
+                                    </Grid>
+                                    <Grid item xs={12} sm={4}>
+                                        <Button
+                                            variant="contained"
+                                            onClick={filterCoefficientData}
+                                            startIcon={<span className="material-icons">filter_alt</span>}
+                                            size="medium"
+                                            fullWidth
+                                            sx={{ height: '40px' }}
+                                        >
+                                            フィルター適用
+                                        </Button>
+                                    </Grid>
+                                </Grid>
+                            </Paper>
                             {/* Coefficient Table Section */}
                             <Grid item xs={12}>
                                 <Box mt={2} style={{ overflowX: 'auto', width: '100%' }}>
