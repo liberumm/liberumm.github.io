@@ -1719,7 +1719,7 @@ function createEmptyCoefficientRow(id) {
                 {activeTab === 2 && (
                     <Box mt={2}>
                         <Typography variant="h6" gutterBottom>店舗係数確認</Typography>
-                        <Grid container spacing={2}>
+                        <Grid >
                             {/* フィルターセクション */}
                             <Paper variant="outlined" sx={{ p: 2, mb: 2 }}>
                                 <Grid container spacing={2} alignItems="center">
