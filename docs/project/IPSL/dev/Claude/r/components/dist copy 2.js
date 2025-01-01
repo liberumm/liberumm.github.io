@@ -142,6 +142,128 @@ function createEmptyCoefficientRow(id) {
     };
 }
 
+// テキストフィールド入力用のカスタムフック
+const useDebounce = (callback, delay) => {
+    const timeoutRef = React.useRef();
+    
+    return React.useCallback((...args) => {
+      if (timeoutRef.current) {
+        clearTimeout(timeoutRef.current);
+      }
+      
+      timeoutRef.current = setTimeout(() => {
+        callback(...args);
+      }, delay);
+    }, [callback, delay]);
+  };
+  
+// フォーカス管理を含むテキストフィールドコンポーネント
+const FocusAwareTextField = React.memo(({ value, onChange, ...props }) => {
+  const [localValue, setLocalValue] = useState(value);
+  
+  // フォーカス喪失時に親コンポーネントに通知
+  const handleBlur = () => {
+    if (localValue !== value) {
+      onChange(localValue);
+    }
+  };
+  
+  // ローカルの値のみを更新
+  const handleChange = (e) => {
+    setLocalValue(e.target.value);
+  };
+  
+  // 親からの値の変更を反映
+  useEffect(() => {
+    setLocalValue(value);
+  }, [value]);
+  
+  return (
+    <TextField
+      {...props}
+      value={localValue}
+      onChange={handleChange}
+      onBlur={handleBlur}
+    />
+  );
+});
+
+// フォーカス管理用のテキストフィールドコンポーネント (数値入力、テキスト入力共通)
+const FocusAwareField = React.memo(({ value, onChange, type, ...props }) => {
+  const [localValue, setLocalValue] = useState(value);
+  
+  // フォーカス喪失時のみ親コンポーネントに通知
+  const handleBlur = () => {
+    if (localValue !== value) {
+      const processedValue = type === 'number' ? 
+        (parseFloat(localValue) || 0) : localValue;
+      onChange(processedValue);
+    }
+  };
+  
+  // Enterキー押下時も完了とみなす
+  const handleKeyDown = (e) => {
+    if (e.key === 'Enter') {
+      e.target.blur();
+    }
+  };
+  
+  // ローカルの値のみを更新
+  const handleChange = (e) => {
+    const newValue = e.target.value;
+    if (type === 'number' && !/^-?\d*\.?\d*$/.test(newValue)) {
+      return; // 数値以外は受け付けない
+    }
+    setLocalValue(newValue);
+  };
+  
+  // 親からの値の変更を反映
+  useEffect(() => {
+    setLocalValue(value);
+  }, [value]);
+  
+  return (
+    <TextField
+      {...props}
+      type={type}
+      value={localValue}
+      onChange={handleChange}
+      onBlur={handleBlur}
+      onKeyDown={handleKeyDown}
+    />
+  );
+});
+
+// バッチ更新管理用のカスタムフック
+const useBatchUpdate = () => {
+  const [pendingUpdates, setPendingUpdates] = useState({});
+  
+  // 更新を保留キューに追加
+  const addUpdate = (key, value) => {
+    setPendingUpdates(prev => ({
+      ...prev,
+      [key]: value
+    }));
+  };
+  
+  // 保留中の更新をすべて実行
+  const processPendingUpdates = () => {
+    if (Object.keys(pendingUpdates).length > 0) {
+      const updatedData = [...allocationData];
+      
+      Object.entries(pendingUpdates).forEach(([key, value]) => {
+        const [index, field] = key.split('-');
+        updatedData[index][field] = value;
+      });
+      
+      setAllocationData(updatedData);
+      setPendingUpdates({});
+    }
+  };
+  
+  return [addUpdate, processPendingUpdates];
+};
+
     const Distribution = () => {    
         // タブ管理のステート
         const [activeTab, setActiveTab] = useState(1); // 現在のアクティブなタブのインデックス
@@ -163,10 +285,8 @@ function createEmptyCoefficientRow(id) {
             setStartDate(futureDate.toISOString().split('T')[0]);
         }, []);  // 空の依存配列を渡すことで、この処理はコンポーネントの初回レンダリング時にのみ実行される
 
-        // allocationTableData ステートの定義
-        const [allocationTableData, setAllocationTableData] = useState(() => {
-            return Array(rowCount).fill().map((_, idx) => createEmptyAllocationRow(idx + 1, numberOfStores));
-        });
+        // 納品日の状態を追加
+        const [deliveryDate, setDeliveryDate] = useState('');
 
         // ステートの定義
         const [availableCoefficientPatterns, setAvailableCoefficientPatterns] = useState([]); // 利用可能な係数パターンを保存するステート
@@ -177,13 +297,15 @@ function createEmptyCoefficientRow(id) {
         const [tableData, setTableData] = useState([createEmptyRow(1)]); // 商品リストのデータ
         const [allocationData, setAllocationData] = useState([]); // 納品数配分データ
 
-        // 納品日の状態を追加
-        const [deliveryDate, setDeliveryDate] = useState('');
-        
         //納品数配分タブ
         const [numberOfStores, setNumberOfStores] = useState(5);  // 店舗列数を管理
-        const [storeMasterData, setStoreMasterData] = useState([]); // 店舗マスタデータ
 
+        // allocationTableData ステートの定義
+        const [allocationTableData, setAllocationTableData] = useState(() => {
+            return Array(rowCount).fill().map((_, idx) => createEmptyAllocationRow(idx + 1, numberOfStores));
+        });
+
+        const [storeMasterData, setStoreMasterData] = useState([]); // 店舗マスタデータ
 
         // チェックボックスの選択状態を管理するステート
         const [storeCheckboxState, setStoreCheckboxState] = useState(
@@ -204,6 +326,20 @@ function createEmptyCoefficientRow(id) {
         // ステートの定義部分 (Reactコンポーネントの他のuseStateと一緒に)
         const [showMasterImportControls, setShowMasterImportControls] = useState(false); 
 
+
+        // 週番号の計算関数
+        const getFiscalWeekNumber = (date) => {
+            const fiscalYearStart = new Date(date.getFullYear(), 3, 1); // 4月1日を年度開始日として設定
+            const firstMonday = new Date(fiscalYearStart);
+
+            // 4月1日が含まれる週を1週目として計算するために、その週の月曜日を探す
+            const dayOfWeek = firstMonday.getDay(); // 4月1日の曜日を取得
+            firstMonday.setDate(fiscalYearStart.getDate() - dayOfWeek + 1); // 月曜日を特定
+
+            const diffInDays = Math.floor((date - firstMonday) / (1000 * 60 * 60 * 24)); // 月曜日からの経過日数を計算
+            return Math.floor(diffInDays / 7) + 1; // 経過日数から週番号を計算
+        };
+        
         // 年度や期間の設定ステート
         const currentDate = new Date();
         const [year, setYear] = useState(new Date().getFullYear());
@@ -324,7 +460,7 @@ function createEmptyCoefficientRow(id) {
         useEffect(() => {
             // storeMasterDataが変更されたときにコンポーネントが再レンダリングされる
         }, [storeMasterData]);
-       
+
         // デフォルト行数を設定
         useEffect(() => {
             if (activeTab === 1) {
@@ -337,28 +473,30 @@ function createEmptyCoefficientRow(id) {
 
         // 商品行数や店舗列数が変更された際にテーブルデータを初期化するためのuseEffectフック
         useEffect(() => {
-            // rowCount（行数）に基づいてallocationDataを初期化する
-            const initialData = Array(rowCount).fill().map((_, idx) => ({
-                id: idx + 1,
-                selected: false, // 行の選択状態を管理するフラグ
-                deliveryDate: "", // 納品日
-                productCode: "",  // 商品コード
-                productName: "",  // 商品名
-                cost: 0,          // 原価
-                price: 0,         // 売価
-                coefficientPattern: "", // 係数パターン
-                remainingPlan: 0,       // 計画残数
-                distribution: 0,        // 配分数
-                unit: 1,               // 単位
-                minimumQuantity: 0,     // 最低導入数
-                bulkQuantity: 0,        // 一括導入数
-                stores: Array(numberOfStores).fill(0), // 店舗ごとの配分数を格納する配列
-                total: 0  // 合計（確認用）
-            }));
+            // allocationDataが空の場合のみ初期化を行う
+            if (allocationData.length === 0) {
+                const initialData = Array(rowCount).fill().map((_, idx) => ({
+                    id: idx + 1,
+                    selected: false, // 行の選択状態を管理するフラグ
+                    deliveryDate: "", // 納品日
+                    productCode: "",  // 商品コード
+                    productName: "",  // 商品名
+                    cost: 0,          // 原価
+                    price: 0,         // 売価
+                    coefficientPattern: "", // 係数パターン
+                    remainingPlan: 0,       // 計画残数
+                    distribution: 0,        // 配分数
+                    unit: 1,               // 単位
+                    minimumQuantity: 0,     // 最低導入数
+                    bulkQuantity: 0,        // 一括導入数
+                    stores: Array(numberOfStores).fill(0), // 店舗ごとの配分数を格納する配列
+                    total: 0  // 合計（確認用）
+                }));
 
-            // 初期化したデータをallocationDataステートにセットする
-            setAllocationData(initialData);
-        }, [rowCount, numberOfStores]); // rowCountまたはnumberOfStoresが変更されるたびに実行
+                // 初期化したデータをallocationDataステートにセットする
+                setAllocationData(initialData);
+            }
+        }, [rowCount, numberOfStores]); // allocationDataを依存配列から除外
 
 
         // 納品数配分タブがアクティブになったとき、または店舗数が変更されたときにテーブルデータを再初期化します。
@@ -458,29 +596,37 @@ function createEmptyCoefficientRow(id) {
             setTableData(newData);
         };
 
-
         // 配分データの各フィールドの変更を処理する関数
+        const [batchUpdates, setBatchUpdates] = useState({});
+
+        useEffect(() => {
+            if (Object.keys(batchUpdates).length > 0) {
+                const timer = setTimeout(() => {
+                    const updatedData = [...allocationData];
+                    
+                    Object.entries(batchUpdates).forEach(([key, value]) => {
+                        const [index, field] = key.split('-');
+                        updatedData[index][field] = value;
+                        
+                        // stores配列の更新時は合計も更新
+                        if (field === 'stores') {
+                            updatedData[index].total = value.reduce((acc, val) => acc + val, 0);
+                        }
+                    });
+                    
+                    setAllocationData(updatedData);
+                    setBatchUpdates({});
+                }, 50);
+                
+                return () => clearTimeout(timer);
+            }
+        }, [batchUpdates, allocationData]);
+
         const handleAllocationInputChange = (index, key, value) => {
-            // 現在の配分データをコピー（不変性を保つため） 
-            const updatedData = [...allocationData];
-            const row = updatedData[index];
-
-            // フィールドが "stores" の場合、特別な処理を行う
-            if (key === 'stores') {
-                row.stores = value;  // storesを更新
-                row.total = row.stores.reduce((acc, val) => acc + val, 0); // stores配列を合計してtotalにセット
-            } else {
-                row[key] = value;  // それ以外のフィールドを更新
-            }
-
-            // 最後の行が編集され、かつその値が空でない場合、新しい行を追加
-            if (index === allocationData.length - 1 && value !== "") {
-                // 新しい行を生成し、データに追加
-                updatedData.push(createEmptyAllocationRow(updatedData.length + 1, numberOfStores));
-            }
-
-            // 更新された配分データをステートにセット
-            setAllocationData(updatedData);
+            setBatchUpdates(prev => ({
+                ...prev,
+                [`${index}-${key}`]: value
+            }));
         };
 
         // 係数データの変更
@@ -497,10 +643,25 @@ function createEmptyCoefficientRow(id) {
             setTableData(newData);
         };
 
-        // 商品リストから納品数配分タブに選択された商品を転送
+        // 商品リストから納品数配分タブに選択された商品を転送する処理を修正
         const handleTransferSelectedRows = () => {
             const selectedRows = tableData.filter(row => row.selected);
-            setAllocationData([...selectedRows, ...allocationData]);
+            
+            // 選択された行を納品数配分用のデータ形式に変換
+            const transferredRows = selectedRows.map(row => ({
+                ...row,
+                stores: Array(numberOfStores).fill(0),  // 店舗ごとの配分数を0で初期化
+                total: 0  // 合計も0で初期化
+            }));
+        
+            // 既存のデータと結合して新しい配列を作成
+            const newAllocationData = [...transferredRows, ...allocationData];
+            setAllocationData(newAllocationData);
+            
+            // 商品リストの選択状態をリセット
+            setTableData(tableData.map(row => ({ ...row, selected: false })));
+            
+            // タブを切り替え
             setActiveTab(1);
         };
 
@@ -572,7 +733,7 @@ function createEmptyCoefficientRow(id) {
                 coefficientPattern: "",
                 remainingPlan: 0,
                 distribution: 0,
-                unit: "1",
+                unit: 1,
                 minimumQuantity: 0,
                 bulkQuantity: 0,
                 stores: Array(numberOfStores).fill(0),
@@ -599,105 +760,92 @@ function createEmptyCoefficientRow(id) {
             return coefficientMap;
         };
 
-        // 選択された行または全ての行を配分する関数
-        const distributeAllocations = (onlySelected = false) => {
-            const coefficientMap = createCoefficientMapFromData(coefficientData, patternHeaders); // Coefficient Mapを生成
-
-            // allocationData内の各行に対して処理を行う
-            const distributedData = allocationData.map(row => {
-                // 選択された行だけを処理するための条件分岐
-                if (!onlySelected || (onlySelected && row.selected)) {
-                    // storesプロパティが定義されていない場合に備えて初期化
-                    if (!row.stores) {
-                        row.stores = Array(numberOfStores).fill(0);
-                    }
-
-                    // 店舗数を取得
-                    const totalStores = row.stores.length;
-
-                    // 係数パターンの指定がある場合は、対応する係数を取得
-                    let coefficients;
-                    if (row.coefficientPattern && coefficientMap) {
-                        coefficients = row.stores.map((store, i) => {
-                            const storeCode = storeMasterData[i].storeCode; // 各店舗のコードを取得
-                            const storeCoefficient = coefficientMap[storeCode] ? coefficientMap[storeCode][row.coefficientPattern] : 1; // 指定されたパターンに基づく係数を取得
-                            console.log(`店舗コード: ${storeCode} の係数 (${row.coefficientPattern}): ${storeCoefficient}`);
-                            return storeCoefficient;
-                        });
-                    } else {
-                        coefficients = Array(totalStores).fill(1); // 指定がない場合、係数を1に初期化
-                    }
-
-                    // 配分数と単位が有効かどうかをチェック
-                    if (row.distribution <= 0 || row.unit <= 0 || isNaN(row.distribution) || isNaN(row.unit)) {
-                        console.log(`無効な配分数 (${row.distribution}) または単位 (${row.unit}) のため、計算をスキップします。`);
-                        return {
-                            ...row,
-                            stores: Array(totalStores).fill(0),
-                            total: 0
-                        };
-                    }
-
-                    // 最低導入数が設定されているか確認
-                    if (row.minimumQuantity >= 0 && !isNaN(row.minimumQuantity)) {
-                        console.log(`最低導入数が設定されています (${row.minimumQuantity})`);
-
-                        // 必要に応じて、他の処理をここに追加することができます
-                    }
-
-                    // 基本配分量を係数を使用して計算
-                    const totalCoefficient = coefficients.reduce((acc, coef) => acc + coef, 0);
-                    const baseQuantity = Math.floor((row.distribution -( totalStores * row.minimumQuantity ))/ row.unit);
-                    let remainingQuantity = baseQuantity;
-
-                    console.log(`商品コード: ${row.productCode}`);
-                    console.log(`配分数: ${row.distribution}, 単位: ${row.unit}`);
-                    console.log(`基本配分量 (配分数 / 単位): ${baseQuantity}`);
-                    console.log(`店舗数: ${totalStores}`);
-
-                    // 係数に基づいて初期配分を計算
-                    const initialAllocation = coefficients.map(coef => Math.floor((baseQuantity * coef) / totalCoefficient));
-                    remainingQuantity = baseQuantity - initialAllocation.reduce((acc, qty) => acc + qty, 0);
-
-                    console.log(`初期配分結果 (係数考慮): `, initialAllocation);
-                    console.log(`残りの基本配分量 (余り): ${remainingQuantity}`);
-
-                    // 余りを係数が高い店舗順に配分
-                    const sortedIndices = coefficients
-                        .map((coef, index) => ({ index, coef }))   // インデックスと係数をペアにする
-                        .sort((a, b) => b.coef - a.coef)           // 係数の降順でソート
-
-                    for (let i = 0; i < remainingQuantity; i++) {
-                        initialAllocation[sortedIndices[i % totalStores].index]++;
-                    }
-
-                    console.log(`余りを考慮した配分結果: `, initialAllocation);
-
-                    // row.minimumQuantityを数値に変換し、無効な場合は0に設定
-                    const minimumQuantity = isNaN(Number(row.minimumQuantity)) ? 0 : Number(row.minimumQuantity);
-
-                    // 最終的な配分に単位を掛けて実際の配分数にし、最低導入数を足す
-                    const finalAllocation = initialAllocation.map(value => (value * row.unit) + minimumQuantity);
-
-                    console.log(`最終配分結果 (単位掛け + 最低導入数): `, finalAllocation);
-
-                    const numericStores = finalAllocation.map(value => Number(value));
-
-                    const total = numericStores.reduce((acc, val) => acc + val, 0);
-
-                    console.log(`商品コード: ${row.productCode} の最終配分結果: `, numericStores);
-                    console.log(`配分合計: ${total}\n`);
-
-                    return {
-                        ...row,
-                        stores: numericStores,
-                        total: total
-                    };
+        // distributeAllocations 関数を修正
+        const distributeAllocations = async (onlySelected = false) => {
+            console.log('配分開始:', { onlySelected });
+            
+            try {
+                // バッチ更新の完了を待つ
+                if (Object.keys(batchUpdates).length > 0) {
+                    await new Promise(resolve => setTimeout(resolve, 100));
+                    setBatchUpdates({});
                 }
-                return row; // 選択されていない行はそのまま返す
-            });
 
-            setAllocationData(distributedData); // 更新されたデータをセット
+                const coefficientMap = createCoefficientMapFromData(coefficientData, patternHeaders);
+                
+                const updatedData = allocationData.map((row, index) => {
+                    if (!row || !row.id) {
+                        console.log('Invalid row data:', row);
+                        return row; // 無効な行データはスキップ
+                    }
+
+                    if (!onlySelected || row.selected) {
+                        const currentRow = { ...row }; // 現在の行データをコピー
+
+                        if (!currentRow.stores) {
+                            currentRow.stores = Array(numberOfStores).fill(0);
+                        }
+
+                        // 配分処理を実行するかどうかの検証
+                        if (currentRow.distribution <= 0 || currentRow.unit <= 0) {
+                            console.log(`行 ${index + 1}: 配分数または単位が無効`);
+                            return currentRow;
+                        }
+
+                        // 係数の準備
+                        const coefficients = currentRow.stores.map((_, i) => {
+                            const storeCode = storeMasterData[i]?.storeCode;
+                            return coefficientMap[storeCode]?.[currentRow.coefficientPattern] || 1;
+                        });
+
+                        const totalCoefficient = coefficients.reduce((acc, coef) => acc + coef, 0);
+                        const minimumQuantity = Math.max(0, parseInt(currentRow.minimumQuantity) || 0);
+                        const totalStores = currentRow.stores.length;
+                        
+                        // 基本配分量の計算
+                        const baseQuantity = Math.floor((currentRow.distribution - (totalStores * minimumQuantity)) / currentRow.unit);
+                        
+                        // 初期配分の計算
+                        const initialAllocation = coefficients.map(coef => 
+                            Math.floor((baseQuantity * coef) / totalCoefficient)
+                        );
+
+                        // 端数の処理
+                        const remainingQuantity = baseQuantity - initialAllocation.reduce((acc, qty) => acc + qty, 0);
+                        const sortedIndices = coefficients
+                            .map((coef, index) => ({ index, coef }))
+                            .sort((a, b) => b.coef - a.coef);
+
+                        for (let i = 0; i < remainingQuantity; i++) {
+                            initialAllocation[sortedIndices[i % totalStores].index]++;
+                        }
+
+                        // 最終配分量の計算
+                        const finalAllocation = initialAllocation.map(value => 
+                            (value * currentRow.unit) + minimumQuantity
+                        );
+
+                        // 結果を反映
+                        currentRow.stores = finalAllocation;
+                        currentRow.total = finalAllocation.reduce((acc, val) => acc + val, 0);
+
+                        console.log(`行 ${index + 1} 配分完了:`, {
+                            distribution: currentRow.distribution,
+                            finalAllocation,
+                            total: currentRow.total
+                        });
+
+                        return currentRow;
+                    }
+                    return row;
+                }).filter(row => row && row.id); // null, undefined, idなしの行を除外
+
+                console.log('配分処理完了');
+                setAllocationData(updatedData);
+                
+            } catch (error) {
+                console.error('配分処理でエラーが発生:', error);
+            }
         };
 
         // 選択された行の配分をクリアする関数
@@ -919,6 +1067,357 @@ function createEmptyCoefficientRow(id) {
             handleFileImport(e, type); // ドロップされたファイルを処理
         };
 
+        // データ更新をバッチ処理にまとめる
+        const handleBatchUpdate = (updates) => {
+            Object.entries(updates).forEach(([key, value]) => {
+                switch(key) {
+                    case 'tableData':
+                        setTableData(value);
+                        break;
+                    case 'allocationData':
+                        setAllocationData(value);
+                        break;
+                    // 他のステート更新...
+                }
+            });
+        };
+
+        // AllocationRowコンポーネントを追加（テーブルの行を個別のコンポーネントとして分離）
+        const AllocationRow = React.memo(({ row, index, onUpdate, storeMasterData, numberOfStores, storeCheckboxState }) => {
+            return (
+                <TableRow key={row.id} style={{ height: `${rowHeight}px` }} data-row-index={index}>
+                    <TableCell padding="none" style={{ width: allocationColumnWidths.checkbox }} align="center">
+                        <Checkbox
+                            checked={row.selected}
+                            onChange={() => onUpdate(index, 'selected', !row.selected)}
+                        />
+                    </TableCell>
+                    {/* 他のセルは既存のコードをここに移動 */}
+                    <TableCell padding="none" style={{ width: allocationColumnWidths.deliveryDate }} align="center">
+                        <TextField
+                            type="date"
+                            value={row.deliveryDate}
+                            onChange={(e) => onUpdate(index, "deliveryDate", e.target.value)}
+                            fullWidth
+                            inputProps={{ style: { height: '40px', padding: '0 8px' } }}
+                        />
+                    </TableCell>
+                    <TableCell padding="none" style={{ width: allocationColumnWidths.productCode }} align="center">
+                        <FocusAwareTextField
+                            value={row.productCode}
+                            onChange={(value) => onUpdate(index, "productCode", value)}
+                            inputProps={{ maxLength: 10, style: { height: '40px', padding: '0 8px', textAlign: "center" } }}
+                            fullWidth
+                        />
+                    </TableCell>
+                    <TableCell padding="none" style={{ width: allocationColumnWidths.productName }} align="center">
+                        <FocusAwareTextField
+                            value={row.productName}
+                            onChange={(value) => onUpdate(index, "productName", value)}
+                            inputProps={{ maxLength: 20, style: { height: '40px', padding: '0 8px' } }}
+                            fullWidth
+                        />
+                    </TableCell>
+                    <TableCell padding="none" style={{ width: allocationColumnWidths.cost }} align="center">
+                        <TextField
+                            type="number"
+                            value={row.cost}
+                            onChange={(e) => onUpdate(index, "cost", e.target.value)}
+                            inputProps={{ maxLength: 5, style: { height: '40px', padding: '0 8px', textAlign: "right" } }}
+                            fullWidth
+                        />
+                    </TableCell>
+                    <TableCell padding="none" style={{ width: allocationColumnWidths.price }} align="center">
+                        <TextField
+                            type="number"
+                            value={row.price}
+                            onChange={(e) => onUpdate(index, "price", e.target.value)}
+                            inputProps={{ maxLength: 5, style: { height: '40px', padding: '0 8px', textAlign: "right" } }}
+                            fullWidth
+                        />
+                    </TableCell>
+                    <TableCell padding="none" style={{ width: allocationColumnWidths.coefficientPattern }} align="center">
+                        <Select
+                            value={row.coefficientPattern}
+                            onChange={(e) => onUpdate(index, 'coefficientPattern', e.target.value)}
+                            fullWidth
+                            style={{ height: '40px', padding: 0 }}
+                        >
+                            {patternHeaders.map((pattern, i) =>
+                                <MenuItem key={i} value={pattern}>
+                                    {pattern}
+                                </MenuItem>
+                            )}
+                        </Select>
+                    </TableCell>
+                    <TableCell padding="none" style={{ width: allocationColumnWidths.remainingPlan }} align="center">
+                        <TextField
+                            type="number"
+                            value={row.remainingPlan}
+                            onChange={(e) => onUpdate(index, "remainingPlan", e.target.value)}
+                            inputProps={{ maxLength: 5, style: { height: '40px', padding: '0 8px', textAlign: "right" } }}
+                            fullWidth
+                        />
+                    </TableCell>
+                    <TableCell padding="none" style={{ width: allocationColumnWidths.distribution }} align="center">
+                        <FocusAwareField
+                            type="number"
+                            value={row.distribution}
+                            onChange={(value) => onUpdate(index, "distribution", value)}
+                            inputProps={{ 
+                              maxLength: 5,
+                              style: { height: '40px', padding: '0 8px', textAlign: "right" }
+                            }}
+                            fullWidth
+                            data-field="distribution"
+                          />
+                    </TableCell>
+                    <TableCell padding="none" style={{ width: allocationColumnWidths.totalCostAmount }} align="center">
+                        <TextField
+                            type="number"
+                            value={row.cost && row.total ? row.cost * row.total : 0}  // 初期値0を表示
+                            disabled
+                            fullWidth
+                            inputProps={{ style: { height: '40px', padding: '0 8px', textAlign: "right" } }}
+                        />
+                    </TableCell>
+                    <TableCell padding="none" style={{ width: allocationColumnWidths.totalPriceAmount }} align="center">
+                        <TextField
+                            type="number"
+                            value={row.price && row.total ? row.price * row.total : 0}  // 初期値0を表示
+                            disabled
+                            fullWidth
+                            inputProps={{ style: { height: '40px', padding: '0 8px', textAlign: "right" } }}
+                        />
+                    </TableCell>
+                    <TableCell padding="none" style={{ width: allocationColumnWidths.unit }} align="center">
+                        <TextField
+                            type="number"
+                            value={row.unit}
+                            onChange={(e) => onUpdate(index, "unit", e.target.value)}
+                            inputProps={{ maxLength: 5, style: { height: '40px', padding: '0 8px', textAlign: "right" } }}
+                            fullWidth
+                            data-field="unit"
+                        />
+                    </TableCell>
+                    <TableCell padding="none" style={{ width: allocationColumnWidths.minimumQuantity }} align="center">
+                        <TextField
+                            type="number"
+                            value={row.minimumQuantity}
+                            onChange={(e) => onUpdate(index, "minimumQuantity", e.target.value)}
+                            inputProps={{ maxLength: 5, style: { height: '40px', padding: '0 8px', textAlign: "right" } }}
+                            fullWidth
+                            data-field="minimumQuantity"
+                        />
+                    </TableCell>
+                    <TableCell padding="none" style={{ width: allocationColumnWidths.bulkQuantity }} align="center">
+                        <TextField
+                            type="number"
+                            value={row.bulkQuantity}
+                            onChange={(e) => {
+                                const bulkQuantity = parseInt(e.target.value, 10) || 0;
+                                // 一括導入数を全店舗に反映させる処理
+                                const updatedStores = Array(numberOfStores).fill(bulkQuantity);
+                                onUpdate(index, "bulkQuantity", bulkQuantity);
+                                onUpdate(index, "stores", updatedStores);
+                            }}
+                            inputProps={{ maxLength: 5, style: { height: '40px', padding: '0 8px', textAlign: "right" } }}
+                            fullWidth
+                        />
+                    </TableCell>
+                    <TableCell padding="none" style={{ width: allocationColumnWidths.total }} align="center">
+                        <TextField
+                            type="number"
+                            value={row.total}
+                            disabled
+                            fullWidth
+                            inputProps={{ style: { height: '40px', padding: '0 8px', textAlign: "right" } }}
+                        />
+                    </TableCell>
+                    {(storeMasterData.length > 0 ? storeMasterData : Array(numberOfStores).fill({ storeCode: '', storeName: '' })).map((store, i) =>
+                        <TableCell key={i} padding="none" style={{ width: allocationColumnWidths.storeName }} align="center">
+                            <Box>
+                                <TextField
+                                    type="number"
+                                    value={(row.stores && row.stores[i] !== undefined) ? row.stores[i] : 0}  // stores配列が存在し、その要素が定義されていることを確認
+                                    onChange={(e) => {
+                                        const updatedStores = row.stores ? [...row.stores] : Array(numberOfStores).fill(0);
+                                        updatedStores[i] = parseInt(e.target.value, 10) || 0;
+                                        onUpdate(index, 'stores', updatedStores);
+                                    }}
+                                    fullWidth
+                                    inputProps={{ style: { height: '40px', padding: '0 8px', textAlign: "right" } }}
+                                />
+                            </Box>
+                        </TableCell>
+                    )}
+                    <TableCell padding="none" style={{ width: allocationColumnWidths.total }} align="center">
+                        <TextField
+                            type="number"
+                            value={row.total}
+                            disabled
+                            fullWidth
+                            inputProps={{ style: { height: '40px', padding: '0 8px', textAlign: "right" } }}
+                        />
+                    </TableCell>
+                </TableRow>
+            );
+        });
+
+        // AllocationTableコンポーネントを修正
+        const AllocationTable = React.memo(({ data, onUpdate }) => {
+            return (
+                <Box mt={2} style={{ overflowX: 'auto', width: '100%' }}>
+                    <TableContainer component={Paper} style={{ width: '100%' }}>
+                        <Table size="small" style={{ minWidth: '1200px', tableLayout: 'fixed' }}>
+                            {/* テーブルヘッダーは既存のまま */}
+                            <TableHead>
+                                <TableRow>
+                                    {/* 全行選択用のチェックボックスヘッダー */}
+                                    <TableCell padding="none" style={{ width: allocationColumnWidths.checkbox }} align="center">
+                                        <Checkbox
+                                            inputProps={{ 'aria-label': 'select all rows' }}
+                                            onChange={(e) => {
+                                                const checked = e.target.checked;
+                                                setAllocationData(allocationData.map(row => ({ ...row, selected: checked })));
+                                            }}
+                                        />
+                                    </TableCell>
+                                    <TableCell padding="none" style={{ width: allocationColumnWidths.deliveryDate }} align="center">納品日</TableCell>
+                                    <TableCell padding="none" style={{ width: allocationColumnWidths.productCode }} align="center">商品コード</TableCell>
+                                    <TableCell padding="none" style={{ width: allocationColumnWidths.productName }} align="center">商品名</TableCell>
+                                    <TableCell padding="none" style={{ width: allocationColumnWidths.cost }} align="center">原価</TableCell>
+                                    <TableCell padding="none" style={{ width: allocationColumnWidths.price }} align="center">売価</TableCell>
+                                    <TableCell padding="none" style={{ width: allocationColumnWidths.coefficientPattern }} align="center">係数パターン</TableCell>
+                                    <TableCell padding="none" style={{ width: allocationColumnWidths.remainingPlan }} align="center">計画残数</TableCell>
+                                    <TableCell padding="none" style={{ width: allocationColumnWidths.distribution }} align="center">配分数</TableCell>
+                                    <TableCell padding="none" style={{ width: allocationColumnWidths.totalCostAmount }} align="center">原価計</TableCell>
+                                    <TableCell padding="none" style={{ width: allocationColumnWidths.totalPriceAmount }} align="center">売価計</TableCell>
+                                    <TableCell padding="none" style={{ width: allocationColumnWidths.unit }} align="center">単位</TableCell>
+                                    <TableCell padding="none" style={{ width: allocationColumnWidths.minimumQuantity }} align="center">最低導入数</TableCell>
+                                    <TableCell padding="none" style={{ width: allocationColumnWidths.bulkQuantity }} align="center">一括導入数</TableCell>
+                                    <TableCell padding="none" style={{ width: allocationColumnWidths.total }} align="center">合計</TableCell>
+
+                                    {/* 各店舗ごとの列ヘッダー */}
+                                    {(storeMasterData && storeMasterData.length > 0 ? storeMasterData : Array(numberOfStores).fill({ storeCode: '', storeName: '' })).map((store, i) =>
+                                        <TableCell key={i} padding="none" style={{ width: allocationColumnWidths.storeName }} align="center">
+                                            <Box display="flex" flexDirection="column" alignItems="center">
+                                                <Checkbox
+                                                    inputProps={{ 'aria-label': `select store ${i + 1}` }}
+                                                    checked={storeCheckboxState[i] || false} // undefined を避けるためにデフォルトで false を指定
+                                                    onChange={(e) => {
+                                                        const updatedCheckboxState = [...storeCheckboxState];
+                                                        updatedCheckboxState[i] = e.target.checked;
+                                                        setStoreCheckboxState(updatedCheckboxState);
+                                                    }}
+                                                />
+                                                <Typography variant="caption" align="center"> 
+                                                    {store.storeCode ? 
+                                                    <>
+                                                        {store.storeCode}<br />{store.storeName}
+                                                    </> : `店舗${i + 1}`}
+                                                </Typography>
+                                            </Box>
+                                        </TableCell>
+                                    )}
+                                    <TableCell padding="none" style={{ width: allocationColumnWidths.total }} align="center">合計（確認）</TableCell>
+                                </TableRow>
+                            </TableHead>
+                            <TableBody>
+                                {data.map((row, index) => (
+                                    <AllocationRow
+                                        key={row.id}
+                                        row={row}
+                                        index={index}
+                                        onUpdate={onUpdate}
+                                        storeMasterData={storeMasterData}
+                                        numberOfStores={numberOfStores}
+                                        storeCheckboxState={storeCheckboxState}
+                                    />
+                                ))}
+                            </TableBody>
+                        </Table>
+                    </TableContainer>
+                </Box>
+            );
+        });
+
+        // フィルターコンポーネントの分割
+        const FilterSection = ({ onFilter }) => {
+            return (
+                <Paper variant="outlined" sx={{ p: 2, mb: 2 }}>
+                    <Grid container spacing={2} alignItems="center">
+                        <Grid item xs={12} sm={8}>
+                            <Grid container spacing={2}>
+                                <Grid item xs={6} sm={3}>
+                                    <TextField
+                                        select
+                                        label="年度"
+                                        value={year}
+                                        onChange={(e) => setYear(e.target.value)}
+                                        size="small"
+                                        fullWidth
+                                    >
+                                        {years.map((y) => (
+                                            <MenuItem key={y} value={y}>{y}年</MenuItem>
+                                        ))}
+                                    </TextField>
+                                </Grid>
+                                <Grid item xs={6} sm={3}>
+                                    <TextField
+                                        select
+                                        label="月"
+                                        value={month}
+                                        onChange={(e) => setMonth(e.target.value)}
+                                        size="small"
+                                        fullWidth
+                                    >
+                                        {months.map((m) => (
+                                            <MenuItem key={m} value={m}>{m}</MenuItem>
+                                        ))}
+                                    </TextField>
+                                </Grid>
+                                <Grid item xs={6} sm={3}>
+                                    <TextField
+                                        label="開始日"
+                                        type="date"
+                                        value={startDate}
+                                        onChange={(e) => setStartDate(e.target.value)}
+                                        size="small"
+                                        fullWidth
+                                        InputLabelProps={{ shrink: true }}
+                                    />
+                                </Grid>
+                                <Grid item xs={6} sm={3}>
+                                    <TextField
+                                        label="終了日"
+                                        type="date"
+                                        value={endDate}
+                                        onChange={(e) => setEndDate(e.target.value)}
+                                        size="small"
+                                        fullWidth
+                                        InputLabelProps={{ shrink: true }}
+                                    />
+                                </Grid>
+                            </Grid>
+                        </Grid>
+                        <Grid item xs={12} sm={4}>
+                            <Button
+                                variant="contained"
+                                onClick={filterCoefficientData}
+                                startIcon={<span className="material-icons">filter_alt</span>}
+                                size="medium"
+                                fullWidth
+                                sx={{ height: '40px' }}
+                            >
+                                フィルター適用
+                            </Button>
+                        </Grid>
+                    </Grid>
+                </Paper>
+            );
+        };
+
         return (
             <Container style={{ paddingLeft: '0px', paddingRight: '0px', maxWidth: '100%' }}>
                 <Paper position="static" color="default">
@@ -1068,7 +1567,6 @@ function createEmptyCoefficientRow(id) {
                 {/* 商品リストタブがアクティブな場合の表示 */}
                 {activeTab === 0 && (
                     <Box mt={1}>
-
                         {/* タブのタイトルを表示 */}
                         <Typography variant="h6" gutterBottom>商品リスト</Typography>
 
@@ -1156,6 +1654,7 @@ function createEmptyCoefficientRow(id) {
                                 <Tab label="配分済" />
                             </Tabs>
                         </Grid>
+
 
                         {/* 商品リストテーブルのセクション */}
                         <Grid item xs={12}>
@@ -1297,429 +1796,180 @@ function createEmptyCoefficientRow(id) {
                 )}
                 {/* 納品数配分タブ */}
                 {activeTab === 1 && (
-    <Box mt={1}>
-        <Paper elevation={1} sx={{ p: 2, mb: 2 }}>
-            {/* ヘッダー部分 */}
-            <Grid container spacing={2} alignItems="center" sx={{ mb: 2 }}>
-                <Grid item xs>
-                    <Typography variant="h6" component="h2">納品数配分</Typography>
-                </Grid>
-                <Grid item>
-                    <Button
-                        size="small"
-                        variant="outlined"
-                        onClick={() => setShowSettings(!showSettings)}
-                        startIcon={<span className="material-icons">
-                            {showSettings ? 'settings_off' : 'settings'}
-                        </span>}
-                    >
-                        {showSettings ? "設定を閉じる" : "設定を開く"}
-                    </Button>
-                </Grid>
-            </Grid>
-
-            {/* 設定パネル */}
-            {showSettings && (
-                <Paper variant="outlined" sx={{ p: 2, mb: 2, backgroundColor: '#f8f9fa' }}>
-                    <Grid container spacing={3}>
-                        <Grid item xs={12} md={6}>
-                            <Typography variant="subtitle2" gutterBottom>商品行数</Typography>
-                            <Slider
-                                value={rowCount}
-                                min={1}
-                                max={100}
-                                onChange={(e, value) => setRowCount(value)}
-                                valueLabelDisplay="auto"
-                                marks={[
-                                    { value: 1, label: '1' },
-                                    { value: 50, label: '50' },
-                                    { value: 100, label: '100' }
-                                ]}
-                            />
-                        </Grid>
-                        <Grid item xs={12} md={6}>
-                            <Typography variant="subtitle2" gutterBottom>店舗列数</Typography>
-                            <Slider
-                                value={numberOfStores}
-                                min={1}
-                                max={100}
-                                onChange={(e, value) => setNumberOfStores(value)}
-                                valueLabelDisplay="auto"
-                                marks={[
-                                    { value: 1, label: '1' },
-                                    { value: 50, label: '50' },
-                                    { value: 100 }
-                                ]}
-                            />
-                        </Grid>
-                    </Grid>
-                </Paper>
-            )}
-
-            {/* メインアクションエリア */}
-            <Grid container spacing={2}>
-                {/* 納品日設定 */}
-                <Grid item xs={12} md={4}>
-                    <TextField
-                        label="納品日"
-                        type="date"
-                        value={deliveryDate}
-                        onChange={(e) => setDeliveryDate(e.target.value)}
-                        fullWidth
-                        InputLabelProps={{ shrink: true }}
-                        size="small"
-                    />
-                </Grid>
-                <Grid item xs={12} md={8}>
-                    <ButtonGroup fullWidth size="small">
-                        <Button
-                            onClick={setAllDeliveryDates}
-                            startIcon={<span className="material-icons">event</span>}
-                        >
-                            一括設定
-                        </Button>
-                        <Button
-                            onClick={clearAllDeliveryDates}
-                            startIcon={<span className="material-icons">event_busy</span>}
-                        >
-                            クリア
-                        </Button>
-                    </ButtonGroup>
-                </Grid>
-            </Grid>
-
-            {/* アクションボタンエリア */}
-            <Box sx={{ mt: 2, mb: 2 }}>
-                <Grid container spacing={2}>
-                    <Grid item xs={12} md={6}>
-                        <ButtonGroup fullWidth size="small">
-                            <Button
-                                onClick={clearTable}
-                                startIcon={<span className="material-icons">clear_all</span>}
-                                color="error"
-                            >
-                                全クリア
-                            </Button>
-                            <Button
-                                onClick={clearSelectedAllocations}
-                                startIcon={<span className="material-icons">playlist_remove</span>}
-                                color="warning"
-                            >
-                                選択クリア
-                            </Button>
-                            <Button
-                                onClick={() => setAllocationData(allocationData.filter(row => !row.selected))}
-                                startIcon={<span className="material-icons">delete</span>}
-                                color="warning"
-                            >
-                                選択削除
-                            </Button>
-                            <Button
-                                onClick={clearDistributionOnly}
-                                startIcon={<span className="material-icons">exposure_zero</span>}
-                                color="warning"
-                            >
-                                配分数クリア
-                            </Button>
-                        </ButtonGroup>
-                    </Grid>
-                    <Grid item xs={12} md={6}>
-                        <ButtonGroup fullWidth size="small">
-                            <Button
-                                onClick={() => distributeAllocations()}
-                                startIcon={<span className="material-icons">all_inclusive</span>}
-                                color="primary"
-                            >
-                                全配分
-                            </Button>
-                            <Button
-                                onClick={() => distributeAllocations(true)}
-                                startIcon={<span className="material-icons">checklist</span>}
-                                color="primary"
-                            >
-                                選択配分
-                            </Button>
-                        </ButtonGroup>
-                    </Grid>
-                </Grid>
-
-                <Box sx={{ mt: 2 }}>
-                    <ButtonGroup fullWidth size="small">
-                        <Button
-                            onClick={exportToExcel}
-                            startIcon={<span className="material-icons">description</span>}
-                            sx={{ backgroundColor: '#2e7d32', color: 'white' }}
-                        >
-                            Excel
-                        </Button>
-                        <Button
-                            onClick={exportToCsv}
-                            startIcon={<span className="material-icons">table_view</span>}
-                            sx={{ backgroundColor: '#616161', color: 'white' }}
-                        >
-                            CSV
-                        </Button>
-                    </ButtonGroup>
-                </Box>
-            </Box>
-        </Paper>
-
-        {/* テーブルセクション */}
-        <Box mt={2} style={{ overflowX: 'auto', width: '100%' }}>
-            <TableContainer component={Paper} style={{ width: '100%' }}>
-                <Table size="small" style={{ minWidth: '1200px', tableLayout: 'fixed' }}>
-                    {/* テーブルヘッダー */}
-                    <TableHead>
-                        <TableRow>
-                            {/* 全行選択用のチェックボックスヘッダー */}
-                            <TableCell padding="none" style={{ width: allocationColumnWidths.checkbox }} align="center">
-                                <Checkbox
-                                    inputProps={{ 'aria-label': 'select all rows' }}
-                                    onChange={(e) => {
-                                        const checked = e.target.checked;
-                                        setAllocationData(allocationData.map(row => ({ ...row, selected: checked })));
-                                    }}
-                                />
-                            </TableCell>
-                            <TableCell padding="none" style={{ width: allocationColumnWidths.deliveryDate }} align="center">納品日</TableCell>
-                            <TableCell padding="none" style={{ width: allocationColumnWidths.productCode }} align="center">商品コード</TableCell>
-                            <TableCell padding="none" style={{ width: allocationColumnWidths.productName }} align="center">商品名</TableCell>
-                            <TableCell padding="none" style={{ width: allocationColumnWidths.cost }} align="center">原価</TableCell>
-                            <TableCell padding="none" style={{ width: allocationColumnWidths.price }} align="center">売価</TableCell>
-                            <TableCell padding="none" style={{ width: allocationColumnWidths.coefficientPattern }} align="center">係数パターン</TableCell>
-                            <TableCell padding="none" style={{ width: allocationColumnWidths.remainingPlan }} align="center">計画残数</TableCell>
-                            <TableCell padding="none" style={{ width: allocationColumnWidths.distribution }} align="center">配分数</TableCell>
-                            <TableCell padding="none" style={{ width: allocationColumnWidths.totalCostAmount }} align="center">原価計</TableCell>
-                            <TableCell padding="none" style={{ width: allocationColumnWidths.totalPriceAmount }} align="center">売価計</TableCell>
-                            <TableCell padding="none" style={{ width: allocationColumnWidths.unit }} align="center">単位</TableCell>
-                            <TableCell padding="none" style={{ width: allocationColumnWidths.minimumQuantity }} align="center">最低導入数</TableCell>
-                            <TableCell padding="none" style={{ width: allocationColumnWidths.bulkQuantity }} align="center">一括導入数</TableCell>
-                            <TableCell padding="none" style={{ width: allocationColumnWidths.total }} align="center">合計</TableCell>
-
-                            {/* 各店舗ごとの列ヘッダー */}
-                            {(storeMasterData && storeMasterData.length > 0 ? storeMasterData : Array(numberOfStores).fill({ storeCode: '', storeName: '' })).map((store, i) =>
-                                <TableCell key={i} padding="none" style={{ width: allocationColumnWidths.storeName }} align="center">
-                                    <Box display="flex" flexDirection="column" alignItems="center">
-                                        <Checkbox
-                                            inputProps={{ 'aria-label': `select store ${i + 1}` }}
-                                            checked={storeCheckboxState[i] || false} // undefined を避けるためにデフォルトで false を指定
-                                            onChange={(e) => {
-                                                const updatedCheckboxState = [...storeCheckboxState];
-                                                updatedCheckboxState[i] = e.target.checked;
-                                                setStoreCheckboxState(updatedCheckboxState);
-                                            }}
-                                        />
-                                        <Typography variant="caption" align="center"> 
-                                            {store.storeCode ? 
-                                            <>
-                                                {store.storeCode}<br />{store.storeName}
-                                            </> : `店舗${i + 1}`}
-                                        </Typography>
-                                    </Box>
-                                </TableCell>
-                            )}
-                            <TableCell padding="none" style={{ width: allocationColumnWidths.total }} align="center">合計（確認）</TableCell>
-                        </TableRow>
-                    </TableHead>
-
-                    {/* テーブルボディ */}
-                    <TableBody>
-                        {allocationData.map((row, index) =>
-                            <TableRow key={row.id} style={{ height: `${rowHeight}px` }}>
-                                <TableCell padding="none" style={{ width: allocationColumnWidths.checkbox }} align="center">
-                                    <Checkbox
-                                        checked={row.selected}
-                                        onChange={() => handleAllocationInputChange(index, 'selected', !row.selected)}
-                                    />
-                                </TableCell>
-                                {/*納品日*/}
-                                <TableCell padding="none" style={{ width: allocationColumnWidths.deliveryDate }} align="center">
-                                    <TextField
-                                        type="date"
-                                        value={row.deliveryDate}
-                                        onChange={(e) => handleAllocationInputChange(index, "deliveryDate", e.target.value)}
-                                        fullWidth
-                                        inputProps={{ style: { height: '40px', padding: '0 8px' } }}
-                                    />
-                                </TableCell>
-                                {/*商品コード*/}
-                                <TableCell padding="none" style={{ width: allocationColumnWidths.productCode }} align="center">
-                                    <TextField
-                                        value={row.productCode}
-                                        onChange={(e) => handleAllocationInputChange(index, "productCode", e.target.value)}
-                                        inputProps={{ maxLength: 10, style: { height: '40px', padding: '0 8px', textAlign: "center" } }}
-                                        fullWidth
-                                    />
-                                </TableCell>
-                                {/*商品名*/}
-                                <TableCell padding="none" style={{ width: allocationColumnWidths.productName }} align="center">
-                                    <TextField
-                                        value={row.productName}
-                                        onChange={(e) => handleAllocationInputChange(index, "productName", e.target.value)}
-                                        inputProps={{ maxLength: 20, style: { height: '40px', padding: '0 8px' } }}
-                                        fullWidth
-                                    />
-                                </TableCell>
-                                {/*原価*/}
-                                <TableCell padding="none" style={{ width: allocationColumnWidths.cost }} align="center">
-                                    <TextField
-                                        type="number"
-                                        value={row.cost}
-                                        onChange={(e) => handleAllocationInputChange(index, "cost", e.target.value)}
-                                        inputProps={{ maxLength: 5, style: { height: '40px', padding: '0 8px', textAlign: "right" } }}
-                                        fullWidth
-                                    />
-                                </TableCell>
-                                {/*売価*/}
-                                <TableCell padding="none" style={{ width: allocationColumnWidths.price }} align="center">
-                                    <TextField
-                                        type="number"
-                                        value={row.price}
-                                        onChange={(e) => handleAllocationInputChange(index, "price", e.target.value)}
-                                        inputProps={{ maxLength: 5, style: { height: '40px', padding: '0 8px', textAlign: "right" } }}
-                                        fullWidth
-                                    />
-                                </TableCell>
-                                 {/* 係数パターン選択のTableCell */}
-                                <TableCell padding="none" style={{ width: allocationColumnWidths.coefficientPattern }} align="center">
-                                    <Select
-                                        value={row.coefficientPattern}
-                                        onChange={(e) => handleAllocationInputChange(index, 'coefficientPattern', e.target.value)}
-                                        fullWidth
-                                        style={{ height: '40px', padding: 0 }}
+                    <Box mt={1}>
+                        <Paper elevation={1} sx={{ p: 2, mb: 2 }}>
+                            {/* ヘッダー部分 */}
+                            <Grid container spacing={2} alignItems="center" sx={{ mb: 2 }}>
+                                <Grid item xs>
+                                    <Typography variant="h6" component="h2">納品数配分</Typography>
+                                </Grid>
+                                <Grid item>
+                                    <Button
+                                        size="small"
+                                        variant="outlined"
+                                        onClick={() => setShowSettings(!showSettings)}
+                                        startIcon={<span className="material-icons">
+                                            {showSettings ? 'settings_off' : 'settings'}
+                                        </span>}
                                     >
-                                        {patternHeaders.map((pattern, i) =>
-                                            <MenuItem key={i} value={pattern}>
-                                                {pattern}
-                                            </MenuItem>
-                                        )}
-                                    </Select>
-                                </TableCell>
-                                {/*計画数*/}
-                                <TableCell padding="none" style={{ width: allocationColumnWidths.remainingPlan }} align="center">
-                                    <TextField
-                                        type="number"
-                                        value={row.remainingPlan}
-                                        onChange={(e) => handleAllocationInputChange(index, "remainingPlan", e.target.value)}
-                                        inputProps={{ maxLength: 5, style: { height: '40px', padding: '0 8px', textAlign: "right" } }}
-                                        fullWidth
-                                    />
-                                </TableCell>
-                                {/*配分数*/}
-                                <TableCell padding="none" style={{ width: allocationColumnWidths.distribution }} align="center">
-                                    <TextField
-                                        type="number"
-                                        value={row.distribution}
-                                        onChange={(e) => handleAllocationInputChange(index, "distribution", e.target.value)}
-                                        fullWidth
-                                        inputProps={{ maxLength: 5, style: { height: '40px', padding: '0 8px', textAlign: "right" } }}
-                                    />
-                                </TableCell>
-                                {/* 原価合計 */}
-                                <TableCell padding="none" style={{ width: allocationColumnWidths.totalCostAmount }} align="center">
-                                    <TextField
-                                        type="number"
-                                        value={row.cost && row.total ? row.cost * row.total : 0}  // 初期値0を表示
-                                        disabled
-                                        fullWidth
-                                        inputProps={{ style: { height: '40px', padding: '0 8px', textAlign: "right" } }}
-                                    />
-                                </TableCell>
-                                {/* 売価合計 */}
-                                <TableCell padding="none" style={{ width: allocationColumnWidths.totalPriceAmount }} align="center">
-                                    <TextField
-                                        type="number"
-                                        value={row.price && row.total ? row.price * row.total : 0}  // 初期値0を表示
-                                        disabled
-                                        fullWidth
-                                        inputProps={{ style: { height: '40px', padding: '0 8px', textAlign: "right" } }}
-                                    />
-                                </TableCell>
-                                {/*単位*/}
-                                <TableCell padding="none" style={{ width: allocationColumnWidths.unit }} align="center">
-                                    <TextField
-                                        type="number"
-                                        value={row.unit}
-                                        onChange={(e) => handleAllocationInputChange(index, "unit", e.target.value)}
-                                        inputProps={{ maxLength: 5, style: { height: '40px', padding: '0 8px', textAlign: "right" } }}
-                                        fullWidth
-                                    />
-                                </TableCell>
-                                {/* 最低導入数量 */}
-                                <TableCell padding="none" style={{ width: allocationColumnWidths.minimumQuantity }} align="center">
-                                    <TextField
-                                        type="number"
-                                        value={row.minimumQuantity}
-                                        onChange={(e) => handleAllocationInputChange(index, "minimumQuantity", e.target.value)}
-                                        inputProps={{ maxLength: 5, style: { height: '40px', padding: '0 8px', textAlign: "right" } }}
-                                        fullWidth
-                                    />
-                                </TableCell>
-                                {/* 一括導入数量（この値を入力すると、すべての店舗にその数値が適用される） */}
-                                <TableCell padding="none" style={{ width: allocationColumnWidths.bulkQuantity }} align="center">
-                                    <TextField
-                                        type="number"
-                                        value={row.bulkQuantity}
-                                        onChange={(e) => {
-                                            const bulkQuantity = parseInt(e.target.value, 10) || 0;
-                                            // 一括導入数を全店舗に反映させる処理
-                                            const updatedStores = Array(numberOfStores).fill(bulkQuantity);
-                                            handleAllocationInputChange(index, "bulkQuantity", bulkQuantity);
-                                            handleAllocationInputChange(index, "stores", updatedStores);
-                                        }}
-                                        inputProps={{ maxLength: 5, style: { height: '40px', padding: '0 8px', textAlign: "right" } }}
-                                        fullWidth
-                                    />
-                                </TableCell>
-                                {/* 合計確認1セル */}
-                                <TableCell padding="none" style={{ width: allocationColumnWidths.total }} align="center">
-                                    <TextField
-                                        type="number"
-                                        value={row.total}
-                                        disabled
-                                        fullWidth
-                                        inputProps={{ style: { height: '40px', padding: '0 8px', textAlign: "right" } }}
-                                    />
-                                </TableCell>
-                                {/* 各店舗ごとの入力フィールド */}
-                                {(storeMasterData.length > 0 ? storeMasterData : Array(numberOfStores).fill({ storeCode: '', storeName: '' })).map((store, i) =>
-                                    <TableCell key={i} padding="none" style={{ width: allocationColumnWidths.storeName }} align="center">
-                                        <Box>
-                                            {/* 店舗コードと店舗名の表示 */}
-                                            {/*React.createElement(Typography, { variant: "caption" }, store.storeCode ? `${store.storeCode}: ${store.storeName}` : `店舗${i + 1}`)*/}
-                                            {/* 店舗ごとの配分数の入力フィールド */}
-                                            <TextField
-                                                type="number"
-                                                value={(row.stores && row.stores[i] !== undefined) ? row.stores[i] : 0}  // stores配列が存在し、その要素が定義されていることを確認
-                                                onChange={(e) => {
-                                                    const updatedStores = row.stores ? [...row.stores] : Array(numberOfStores).fill(0);
-                                                    updatedStores[i] = parseInt(e.target.value, 10) || 0;
-                                                    handleAllocationInputChange(index, 'stores', updatedStores);
-                                                }}
-                                                fullWidth
-                                                inputProps={{ style: { height: '40px', padding: '0 8px', textAlign: "right" } }}
+                                        {showSettings ? "設定を閉じる" : "設定を開く"}
+                                    </Button>
+                                </Grid>
+                            </Grid>
+
+                            {/* 設定パネル */}
+                            {showSettings && (
+                                <Paper variant="outlined" sx={{ p: 2, mb: 2, backgroundColor: '#f8f9fa' }}>
+                                    <Grid container spacing={3}>
+                                        <Grid item xs={12} md={6}>
+                                            <Typography variant="subtitle2" gutterBottom>商品行数</Typography>
+                                            <Slider
+                                                value={rowCount}
+                                                min={1}
+                                                max={100}
+                                                onChange={(e, value) => setRowCount(value)}
+                                                valueLabelDisplay="auto"
+                                                marks={[
+                                                    { value: 1, label: '1' },
+                                                    { value: 50, label: '50' },
+                                                    { value: 100, label: '100' }
+                                                ]}
                                             />
-                                        </Box>
-                                    </TableCell>
-                                )}
-                                {/* 合計確認セル */}
-                                <TableCell padding="none" style={{ width: allocationColumnWidths.total }} align="center">
+                                        </Grid>
+                                        <Grid item xs={12} md={6}>
+                                            <Typography variant="subtitle2" gutterBottom>店舗列数</Typography>
+                                            <Slider
+                                                value={numberOfStores}
+                                                min={1}
+                                                max={100}
+                                                onChange={(e, value) => setNumberOfStores(value)}
+                                                valueLabelDisplay="auto"
+                                                marks={[
+                                                    { value: 1, label: '1' },
+                                                    { value: 50, label: '50' },
+                                                    { value: 100 }
+                                                ]}
+                                            />
+                                        </Grid>
+                                    </Grid>
+                                </Paper>
+                            )}
+
+                            {/* メインアクションエリア */}
+                            <Grid container spacing={2}>
+                                {/* 納品日設定 */}
+                                <Grid item xs={12} md={4}>
                                     <TextField
-                                        type="number"
-                                        value={row.total}
-                                        disabled
+                                        label="納品日"
+                                        type="date"
+                                        value={deliveryDate}
+                                        onChange={(e) => setDeliveryDate(e.target.value)}
                                         fullWidth
-                                        inputProps={{ style: { height: '40px', padding: '0 8px', textAlign: "right" } }}
+                                        InputLabelProps={{ shrink: true }}
+                                        size="small"
                                     />
-                                </TableCell>
-                            </TableRow>
-                        )}
-                    </TableBody>
-                </Table>
-            </TableContainer>
-        </Box>
-    </Box>
-)}
+                                </Grid>
+                                <Grid item xs={12} md={8}>
+                                    <ButtonGroup fullWidth size="small">
+                                        <Button
+                                            onClick={setAllDeliveryDates}
+                                            startIcon={<span className="material-icons">event</span>}
+                                        >
+                                            一括設定
+                                        </Button>
+                                        <Button
+                                            onClick={clearAllDeliveryDates}
+                                            startIcon={<span className="material-icons">event_busy</span>}
+                                        >
+                                            クリア
+                                        </Button>
+                                    </ButtonGroup>
+                                </Grid>
+                            </Grid>
+
+                            {/* アクションボタンエリア */}
+                            <Box sx={{ mt: 2, mb: 2 }}>
+                                <Grid container spacing={2}>
+                                    <Grid item xs={12} md={6}>
+                                        <ButtonGroup fullWidth size="small">
+                                            <Button
+                                                onClick={clearTable}
+                                                startIcon={<span className="material-icons">clear_all</span>}
+                                                color="error"
+                                            >
+                                                全クリア
+                                            </Button>
+                                            <Button
+                                                onClick={clearSelectedAllocations}
+                                                startIcon={<span className="material-icons">playlist_remove</span>}
+                                                color="warning"
+                                            >
+                                                選択クリア
+                                            </Button>
+                                            <Button
+                                                onClick={() => setAllocationData(allocationData.filter(row => !row.selected))}
+                                                startIcon={<span className="material-icons">delete</span>}
+                                                color="warning"
+                                            >
+                                                選択削除
+                                            </Button>
+                                            <Button
+                                                onClick={clearDistributionOnly}
+                                                startIcon={<span className="material-icons">exposure_zero</span>}
+                                                color="warning"
+                                            >
+                                                配分数クリア
+                                            </Button>
+                                        </ButtonGroup>
+                                    </Grid>
+                                    <Grid item xs={12} md={6}>
+                                        <ButtonGroup fullWidth size="small">
+                                            <Button
+                                                onClick={() => distributeAllocations()}
+                                                startIcon={<span className="material-icons">all_inclusive</span>}
+                                                color="primary"
+                                            >
+                                                全配分
+                                            </Button>
+                                            <Button
+                                                onClick={() => distributeAllocations(true)}
+                                                startIcon={<span className="material-icons">checklist</span>}
+                                                color="primary"
+                                            >
+                                                選択配分
+                                            </Button>
+                                        </ButtonGroup>
+                                    </Grid>
+                                </Grid>
+
+                                <Box sx={{ mt: 2 }}>
+                                    <ButtonGroup fullWidth size="small">
+                                        <Button
+                                            onClick={exportToExcel}
+                                            startIcon={<span className="material-icons">description</span>}
+                                            sx={{ backgroundColor: '#2e7d32', color: 'white' }}
+                                        >
+                                            Excel
+                                        </Button>
+                                        <Button
+                                            onClick={exportToCsv}
+                                            startIcon={<span className="material-icons">table_view</span>}
+                                            sx={{ backgroundColor: '#616161', color: 'white' }}
+                                        >
+                                            CSV
+                                        </Button>
+                                    </ButtonGroup>
+                                </Box>
+                            </Box>
+                        </Paper>
+
+                        {/* テーブルセクション */}
+                        <AllocationTable 
+                            data={allocationData}
+                            onUpdate={handleAllocationInputChange}
+                        />
+                    </Box>
+                )}
 
                 {/* 店舗係数確認タブ */}
                 {activeTab === 2 && (
@@ -1727,76 +1977,7 @@ function createEmptyCoefficientRow(id) {
                         <Typography variant="h6" gutterBottom>店舗係数確認</Typography>
                         <Grid >
                             {/* フィルターセクション */}
-                            <Paper variant="outlined" sx={{ p: 2, mb: 2 }}>
-                                <Grid container spacing={2} alignItems="center">
-                                    <Grid item xs={12} sm={8}>
-                                        <Grid container spacing={2}>
-                                            <Grid item xs={6} sm={3}>
-                                                <TextField
-                                                    select
-                                                    label="年度"
-                                                    value={year}
-                                                    onChange={(e) => setYear(e.target.value)}
-                                                    size="small"
-                                                    fullWidth
-                                                >
-                                                    {years.map((y) => (
-                                                        <MenuItem key={y} value={y}>{y}年</MenuItem>
-                                                    ))}
-                                                </TextField>
-                                            </Grid>
-                                            <Grid item xs={6} sm={3}>
-                                                <TextField
-                                                    select
-                                                    label="月"
-                                                    value={month}
-                                                    onChange={(e) => setMonth(e.target.value)}
-                                                    size="small"
-                                                    fullWidth
-                                                >
-                                                    {months.map((m) => (
-                                                        <MenuItem key={m} value={m}>{m}</MenuItem>
-                                                    ))}
-                                                </TextField>
-                                            </Grid>
-                                            <Grid item xs={6} sm={3}>
-                                                <TextField
-                                                    label="開始日"
-                                                    type="date"
-                                                    value={startDate}
-                                                    onChange={(e) => setStartDate(e.target.value)}
-                                                    size="small"
-                                                    fullWidth
-                                                    InputLabelProps={{ shrink: true }}
-                                                />
-                                            </Grid>
-                                            <Grid item xs={6} sm={3}>
-                                                <TextField
-                                                    label="終了日"
-                                                    type="date"
-                                                    value={endDate}
-                                                    onChange={(e) => setEndDate(e.target.value)}
-                                                    size="small"
-                                                    fullWidth
-                                                    InputLabelProps={{ shrink: true }}
-                                                />
-                                            </Grid>
-                                        </Grid>
-                                    </Grid>
-                                    <Grid item xs={12} sm={4}>
-                                        <Button
-                                            variant="contained"
-                                            onClick={filterCoefficientData}
-                                            startIcon={<span className="material-icons">filter_alt</span>}
-                                            size="medium"
-                                            fullWidth
-                                            sx={{ height: '40px' }}
-                                        >
-                                            フィルター適用
-                                        </Button>
-                                    </Grid>
-                                </Grid>
-                            </Paper>
+                            <FilterSection onFilter={handleFilterChange} />
                             {/* Coefficient Table Section */}
                             <Grid item xs={12}>
                                 <Box mt={2} style={{ overflowX: 'auto', width: '100%' }}>
@@ -1866,3 +2047,4 @@ function createEmptyCoefficientRow(id) {
     };
 // グローバルスコープにDistributionコンポーネントを公開
 window.Distribution = Distribution;
+

@@ -144,7 +144,7 @@ function createEmptyCoefficientRow(id) {
 
     const Distribution = () => {    
         // タブ管理のステート
-        const [activeTab, setActiveTab] = useState(1); // 現在のアクティブなタブのインデックス
+        const [activeTab, setActiveTab] = useState(0); // 現在のアクティブなタブのインデックス
         const [filterTab, setFilterTab] = useState(0); // フィルタタブのインデックス
 
         // 設定セクションの表示/非表示を管理するためのステート
@@ -163,10 +163,8 @@ function createEmptyCoefficientRow(id) {
             setStartDate(futureDate.toISOString().split('T')[0]);
         }, []);  // 空の依存配列を渡すことで、この処理はコンポーネントの初回レンダリング時にのみ実行される
 
-        // allocationTableData ステートの定義
-        const [allocationTableData, setAllocationTableData] = useState(() => {
-            return Array(rowCount).fill().map((_, idx) => createEmptyAllocationRow(idx + 1, numberOfStores));
-        });
+        // 納品日の状態を追加
+        const [deliveryDate, setDeliveryDate] = useState('');
 
         // ステートの定義
         const [availableCoefficientPatterns, setAvailableCoefficientPatterns] = useState([]); // 利用可能な係数パターンを保存するステート
@@ -177,13 +175,15 @@ function createEmptyCoefficientRow(id) {
         const [tableData, setTableData] = useState([createEmptyRow(1)]); // 商品リストのデータ
         const [allocationData, setAllocationData] = useState([]); // 納品数配分データ
 
-        // 納品日の状態を追加
-        const [deliveryDate, setDeliveryDate] = useState('');
-        
         //納品数配分タブ
         const [numberOfStores, setNumberOfStores] = useState(5);  // 店舗列数を管理
-        const [storeMasterData, setStoreMasterData] = useState([]); // 店舗マスタデータ
 
+        // allocationTableData ステートの定義
+        const [allocationTableData, setAllocationTableData] = useState(() => {
+            return Array(rowCount).fill().map((_, idx) => createEmptyAllocationRow(idx + 1, numberOfStores));
+        });
+
+        const [storeMasterData, setStoreMasterData] = useState([]); // 店舗マスタデータ
 
         // チェックボックスの選択状態を管理するステート
         const [storeCheckboxState, setStoreCheckboxState] = useState(
@@ -204,6 +204,20 @@ function createEmptyCoefficientRow(id) {
         // ステートの定義部分 (Reactコンポーネントの他のuseStateと一緒に)
         const [showMasterImportControls, setShowMasterImportControls] = useState(false); 
 
+
+        // 週番号の計算関数
+        const getFiscalWeekNumber = (date) => {
+            const fiscalYearStart = new Date(date.getFullYear(), 3, 1); // 4月1日を年度開始日として設定
+            const firstMonday = new Date(fiscalYearStart);
+
+            // 4月1日が含まれる週を1週目として計算するために、その週の月曜日を探す
+            const dayOfWeek = firstMonday.getDay(); // 4月1日の曜日を取得
+            firstMonday.setDate(fiscalYearStart.getDate() - dayOfWeek + 1); // 月曜日を特定
+
+            const diffInDays = Math.floor((date - firstMonday) / (1000 * 60 * 60 * 24)); // 月曜日からの経過日数を計算
+            return Math.floor(diffInDays / 7) + 1; // 経過日数から週番号を計算
+        };
+        
         // 年度や期間の設定ステート
         const currentDate = new Date();
         const [year, setYear] = useState(new Date().getFullYear());
@@ -324,16 +338,13 @@ function createEmptyCoefficientRow(id) {
         useEffect(() => {
             // storeMasterDataが変更されたときにコンポーネントが再レンダリングされる
         }, [storeMasterData]);
-       
+
         // デフォルト行数を設定
         useEffect(() => {
             if (activeTab === 1) {
-                // 既存のデータがある場合は初期化しない
-                if (allocationData.length === 0) {
-                    setAllocationData(Array(rowCount).fill().map((_, idx) => createEmptyRow(idx + 1)));
-                }
+                setAllocationData(Array(rowCount).fill().map((_, idx) => createEmptyRow(idx + 1)));
             }
-        }, [activeTab]); // rowCountを依存配列から除外
+        }, [activeTab, rowCount]);
 
         // 商品行数や店舗列数が変更された際にテーブルデータを初期化するためのuseEffectフック
         useEffect(() => {
@@ -572,7 +583,7 @@ function createEmptyCoefficientRow(id) {
                 coefficientPattern: "",
                 remainingPlan: 0,
                 distribution: 0,
-                unit: "1",
+                unit: "",
                 minimumQuantity: 0,
                 bulkQuantity: 0,
                 stores: Array(numberOfStores).fill(0),
@@ -714,16 +725,6 @@ function createEmptyCoefficientRow(id) {
                 return row;
             });
             setAllocationData(newData); // 更新されたデータをセット
-        };
-
-        // 配分数のみをクリアする関数を追加
-        const clearDistributionOnly = () => {
-            setAllocationData(allocationData.map(row => ({
-                ...row,
-                //distribution: 0,  // 配分数をクリア
-                stores: Array(numberOfStores).fill(0),  // 店舗ごとの配分数もクリア
-                total: 0  // 合計もクリア
-            })));
         };
 
         // 店舗係数確認タブのフィルタリング処理
@@ -1413,13 +1414,6 @@ function createEmptyCoefficientRow(id) {
                                 color="warning"
                             >
                                 選択削除
-                            </Button>
-                            <Button
-                                onClick={clearDistributionOnly}
-                                startIcon={<span className="material-icons">exposure_zero</span>}
-                                color="warning"
-                            >
-                                配分数クリア
                             </Button>
                         </ButtonGroup>
                     </Grid>
