@@ -740,13 +740,6 @@ function createEmptyCoefficientRow(id) {
             setCoefficientData(filteredData);
         };
 
-        const handleMenuClick = (event) => {
-            setAnchorEl(event.currentTarget);
-        };
-        const handleMenuClose = () => {
-            setAnchorEl(null);
-        };
-
         // 店舗係数マスタテンプレートダウンロード
         const downloadCoefficientMasterTemplate = () => {
             const templateData = [
@@ -877,14 +870,20 @@ function createEmptyCoefficientRow(id) {
                 case 'storeMaster':
                     templateData = [
                         ["店舗コード", "店舗名"],
-                        ["S001", "東京本店"]
+                        ["001", "東京本店"],
+                        ["002", "大阪支店"],
+                        ["003", "名古屋支店"],
+                        ["004", "福岡支店"]
                     ];
                     break;
 
                 case 'coefficientMaster':
                     templateData = [
-                        ["店舗コード", "パターン1", "パターン2"],
-                        ["S001", 1.0, 1.1]
+                        ["店舗コード", "店舗名", "パターン1", "パターン2"],
+                        ["001", "東京本店", 1.0, 1.5],
+                        ["002", "大阪支店", 1.0, 1.0],
+                        ["003", "名古屋支店", 0.8, 1.2],
+                        ["004", "福岡支店", 1.1, 1.3]
                     ];
                     break;
 
@@ -990,7 +989,7 @@ function createEmptyCoefficientRow(id) {
                                     },
                                     {
                                         title: "店舗係数",
-                                        type: 'coefficient',
+                                        type: 'coefficientMaster',
                                         icon: 'calculate'
                                     }
                                 ].map((item) => (
