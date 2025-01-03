@@ -7,7 +7,9 @@ const Filter = () => {
     const isTablet = useMediaQuery(theme.breakpoints.down('md'));
 
     // フィルタに必要なステートの定義
-    const years = [2022, 2023, 2024];
+    const today = new Date();
+    const currentYear = today.getFullYear();
+    const years = [currentYear - 2, currentYear - 1, currentYear, currentYear + 1, currentYear + 2];
     const months = ["選択しない", "1月", "2月", "3月", "4月", "5月", "6月", "7月", "8月", "9月", "10月", "11月", "12月"];
     const weeks = ["選択しない", ...Array.from({ length: 52 }).map((_, i) => `${i + 1}`)];
     const locations = ["全社", "東京本店", "大阪支店", "名古屋支店", "福岡支店"];
@@ -61,6 +63,32 @@ const Filter = () => {
         return { startDate, endDate };
     };
 
+    // JST日付文字列を取得する関数
+    const getJSTDateString = (date) => {
+        const jstDate = new Date(date.getTime() + (9 * 60 * 60 * 1000)); // UTC+9
+        return jstDate.toISOString().split('T')[0];
+    };
+
+    // 会計年度の開始日を取得する関数
+    const getFiscalYearStart = (date) => {
+        const year = date.getMonth() >= 3 ? date.getFullYear() : date.getFullYear() - 1;
+        return new Date(year, 3, 1); // 4月1日
+    };
+
+    // 週番号を計算する関数
+    const calculateWeekNumber = (date) => {
+        const fiscalStart = getFiscalYearStart(date);
+        const firstWeekStart = new Date(fiscalStart);
+        // 4月1日の週の月曜日を取得
+        firstWeekStart.setDate(fiscalStart.getDate() - fiscalStart.getDay() + 1);
+        if (firstWeekStart.getTime() > fiscalStart.getTime()) {
+            firstWeekStart.setDate(firstWeekStart.getDate() - 7);
+        }
+        
+        const diff = date.getTime() - firstWeekStart.getTime();
+        return Math.ceil((diff + (1000 * 60 * 60 * 24)) / (7 * 24 * 60 * 60 * 1000));
+    };
+
     // 年度、月度、週番号の選択によって開始日と終了日を更新する処理
     useEffect(() => {
         let newStartDate, newEndDate;
@@ -80,23 +108,41 @@ const Filter = () => {
             newEndDate = endDate;
         }
 
-        setStartDate(newStartDate.toISOString().split('T')[0]);
-        setEndDate(newEndDate.toISOString().split('T')[0]);
+        setStartDate(getJSTDateString(newStartDate));
+        setEndDate(getJSTDateString(newEndDate));
 
     }, [year, month, weekNumber]);
 
     useEffect(() => {
         const today = new Date();
-        const firstDay = new Date(today.getFullYear(), today.getMonth(), 1);
-        const lastDay = new Date(today.getFullYear(), today.getMonth() + 1, 0);
+        const fiscalStart = getFiscalYearStart(today);
         
-        setStartDate(today.toISOString().split('T')[0]);
-        setEndDate(lastDay.toISOString().split('T')[0]);
-        setYear(today.getFullYear());
-        setMonth(`${today.getMonth() + 1}月`);
+        // 4月1日の週の月曜日を取得
+        const firstWeekMonday = new Date(fiscalStart);
+        firstWeekMonday.setDate(fiscalStart.getDate() - fiscalStart.getDay() + 1);
+        if (firstWeekMonday.getTime() > fiscalStart.getTime()) {
+            firstWeekMonday.setDate(firstWeekMonday.getDate() - 7);
+        }
+
+        // 現在の週の月曜日と日曜日を計算
+        const currentWeekMonday = new Date(today);
+        currentWeekMonday.setDate(today.getDate() - today.getDay() + 1);
+        currentWeekMonday.setHours(0, 0, 0, 0);
         
-        const weekNum = Math.ceil((today - firstDay) / (7 * 24 * 60 * 60 * 1000));
+        const currentWeekSunday = new Date(currentWeekMonday);
+        currentWeekSunday.setDate(currentWeekMonday.getDate() + 6);
+        currentWeekSunday.setHours(23, 59, 59, 999);
+
+        // 週番号を計算
+        const weekNum = calculateWeekNumber(currentWeekMonday);
+        
+        setStartDate(getJSTDateString(currentWeekMonday));
+        setEndDate(getJSTDateString(currentWeekSunday));
+        setYear(fiscalStart.getFullYear());
+        setMonth(`${currentWeekMonday.getMonth() + 1}月`);
         setWeekNumber(weekNum.toString());
+        setLocation("全社");
+        setDepartment("全部門");
     }, []);
 
     return (
