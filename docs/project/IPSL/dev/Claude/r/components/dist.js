@@ -360,20 +360,31 @@ function createEmptyCoefficientRow(id) {
             setAllocationData(initialData);
         }, [rowCount, numberOfStores]); // rowCountまたはnumberOfStoresが変更されるたびに実行
 
-
-        // 納品数配分タブがアクティブになったとき、または店舗数が変更されたときにテーブルデータを再初期化します。
         useEffect(() => {
-            if (activeTab === 1) {  // 現在アクティブなタブが納品数配分タブであるかをチェック
-                // 既存のテーブルデータを元に、新しいデータを生成します。
-                setAllocationTableData((prevData) =>
-                    prevData.map(row => ({
-                        ...row,  // 既存の行データをスプレッド演算子でコピー
-                        // 店舗数が変更された場合、新しい店舗数に合わせてstores配列を再設定します。
-                        stores: row.stores.length === numberOfStores ? row.stores : Array(numberOfStores).fill(0)
-                    }))
-                );
-            }
-        }, [activeTab, numberOfStores]);  // タブが切り替わったとき、または店舗数が変更されたときに再実行されます。
+            // 納品数配分タブがアクティブでない場合は処理をスキップ
+            if (activeTab !== 1) return;
+        
+            // 店舗数が0以下の場合は処理をスキップ
+            if (numberOfStores <= 0) return;
+        
+            setAllocationTableData(prevData => {
+                // 既存データがない場合は処理をスキップ
+                if (!prevData || prevData.length === 0) return prevData;
+        
+                // 最初の行の店舗数をチェックして、変更が必要かどうかを判断
+                const currentStoreCount = prevData[0]?.stores?.length || 0;
+                if (currentStoreCount === numberOfStores) return prevData;
+        
+                // メモリ効率を考慮して、必要な場合のみ新しい配列を生成
+                const newStoresTemplate = new Array(numberOfStores).fill(0);
+                
+                return prevData.map(row => ({
+                    ...row,
+                    stores: newStoresTemplate.slice(), // 新しい店舗配列のコピーを使用
+                    total: 0 // 店舗数が変更されたため、合計もリセット
+                }));
+            });
+        }, [activeTab, numberOfStores]);
 
         //納品日
         useEffect(() => {
@@ -418,17 +429,33 @@ function createEmptyCoefficientRow(id) {
 
         // 行数変更時の処理
         const handleRowCountChange = (value) => {
-            const count = parseInt(value, 10);
+            // 入力値を数値に変換し、有効範囲内かチェック
+            const count = Math.min(Math.max(parseInt(value, 10) || 0, 1), 100);
+            
             setRowCount(count);
-            const newAllocationData = [...allocationData];
-            if (count > allocationData.length) {
-                while (newAllocationData.length < count) {
-                    newAllocationData.push(createEmptyRow(newAllocationData.length + 1));
-                }
-            } else if (count < allocationData.length) {
-                newAllocationData.length = count;
+        
+            // 現在のデータ長と新しい長さを比較
+            if (count === allocationData.length) {
+                return; // 長さが同じ場合は何もしない
             }
-            setAllocationData(newAllocationData);
+        
+            // 新しい配列を生成する場合は、必要な分だけを生成
+            if (count > allocationData.length) {
+                // 追加が必要な要素数を計算
+                const additionalRows = count - allocationData.length;
+                const newRows = Array(additionalRows)
+                    .fill(null)
+                    .map((_, index) => createEmptyAllocationRow(
+                        allocationData.length + index + 1, 
+                        numberOfStores
+                    ));
+                    
+                // 既存の配列に新しい要素を追加
+                setAllocationData(prevData => [...prevData, ...newRows]);
+            } else {
+                // 配列を短くする場合は、単純にスライス
+                setAllocationData(prevData => prevData.slice(0, count));
+            }
         };
 
         // 商品リストタブの各行データの処理
@@ -1323,32 +1350,44 @@ function createEmptyCoefficientRow(id) {
                     <Grid container spacing={3}>
                         <Grid item xs={12} md={6}>
                             <Typography variant="subtitle2" gutterBottom>商品行数</Typography>
-                            <Slider
+                            <TextField
+                                type="number"
                                 value={rowCount}
-                                min={1}
-                                max={100}
-                                onChange={(e, value) => setRowCount(value)}
-                                valueLabelDisplay="auto"
-                                marks={[
-                                    { value: 1, label: '1' },
-                                    { value: 50, label: '50' },
-                                    { value: 100, label: '100' }
-                                ]}
+                                onChange={(e) => {
+                                    const value = parseInt(e.target.value);
+                                    if (value >= 1 && value <= 100) {
+                                        setRowCount(value);
+                                    }
+                                }}
+                                inputProps={{
+                                    min: 1,
+                                    max: 100,
+                                    style: { textAlign: 'right' }
+                                }}
+                                fullWidth
+                                size="small"
+                                helperText="1から100までの数値を入力してください"
                             />
                         </Grid>
                         <Grid item xs={12} md={6}>
                             <Typography variant="subtitle2" gutterBottom>店舗列数</Typography>
-                            <Slider
+                            <TextField
+                                type="number"
                                 value={numberOfStores}
-                                min={1}
-                                max={100}
-                                onChange={(e, value) => setNumberOfStores(value)}
-                                valueLabelDisplay="auto"
-                                marks={[
-                                    { value: 1, label: '1' },
-                                    { value: 50, label: '50' },
-                                    { value: 100 }
-                                ]}
+                                onChange={(e) => {
+                                    const value = parseInt(e.target.value);
+                                    if (value >= 1 && value <= 100) {
+                                        setNumberOfStores(value);
+                                    }
+                                }}
+                                inputProps={{
+                                    min: 1,
+                                    max: 100,
+                                    style: { textAlign: 'right' }
+                                }}
+                                fullWidth
+                                size="small"
+                                helperText="1から100までの数値を入力してください"
                             />
                         </Grid>
                     </Grid>
