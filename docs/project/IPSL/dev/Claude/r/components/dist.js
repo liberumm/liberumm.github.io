@@ -486,28 +486,31 @@ function createEmptyCoefficientRow(id) {
         };
 
 
-        // 配分データの各フィールドの変更を処理する関数
         const handleAllocationInputChange = (index, key, value) => {
-            // 現在の配分データをコピー（不変性を保つため） 
-            const updatedData = [...allocationData];
-            const row = updatedData[index];
-
-            // フィールドが "stores" の場合、特別な処理を行う
-            if (key === 'stores') {
-                row.stores = value;  // storesを更新
-                row.total = row.stores.reduce((acc, val) => acc + val, 0); // stores配列を合計してtotalにセット
-            } else {
-                row[key] = value;  // それ以外のフィールドを更新
-            }
-
-            // 最後の行が編集され、かつその値が空でない場合、新しい行を追加
-            if (index === allocationData.length - 1 && value !== "") {
-                // 新しい行を生成し、データに追加
-                updatedData.push(createEmptyAllocationRow(updatedData.length + 1, numberOfStores));
-            }
-
-            // 更新された配分データをステートにセット
-            setAllocationData(updatedData);
+            setAllocationData(prevData => {
+                // スプレッド演算子を使用して新しい配列を作成し、特定のインデックスの行だけを更新
+                const updatedData = prevData.map((row, i) => {
+                    if (i !== index) return row;  // 対象外の行はそのまま返す
+                    
+                    const updatedRow = { ...row };  // 更新対象の行のみコピー
+                    
+                    if (key === 'stores') {
+                        updatedRow.stores = value;
+                        updatedRow.total = value.reduce((acc, val) => acc + val, 0);
+                    } else {
+                        updatedRow[key] = value;
+                    }
+                    
+                    return updatedRow;
+                });
+        
+                // 最後の行が編集され、値が空でない場合のみ新しい行を追加
+                if (index === prevData.length - 1 && value !== "") {
+                    updatedData.push(createEmptyAllocationRow(prevData.length + 1, numberOfStores));
+                }
+        
+                return updatedData;
+            });
         };
 
         // 係数データの変更
@@ -945,6 +948,31 @@ function createEmptyCoefficientRow(id) {
             handleFileImport(e, type); // ドロップされたファイルを処理
         };
 
+        // 設定用の一時的な状態を保持するステートを追加
+        const [tempRowCount, setTempRowCount] = useState(rowCount);
+        const [tempNumberOfStores, setTempNumberOfStores] = useState(numberOfStores);
+
+        // 設定変更を確定する関数
+        const applySettings = () => {
+            // 行数の変更を適用
+            if (tempRowCount !== rowCount) {
+                setRowCount(tempRowCount);
+            }
+            
+            // 店舗数の変更を適用
+            if (tempNumberOfStores !== numberOfStores) {
+                setNumberOfStores(tempNumberOfStores);
+            }
+        };
+
+        // 設定をキャンセルする関数
+        const cancelSettings = () => {
+            // 一時的な値を現在の設定値に戻す
+            setTempRowCount(rowCount);
+            setTempNumberOfStores(numberOfStores);
+            setShowSettings(false);
+        };
+
         return (
             <Container style={{ paddingLeft: '0px', paddingRight: '0px', maxWidth: '100%' }}>
                 <Paper position="static" color="default">
@@ -1352,11 +1380,11 @@ function createEmptyCoefficientRow(id) {
                             <Typography variant="subtitle2" gutterBottom>商品行数</Typography>
                             <TextField
                                 type="number"
-                                value={rowCount}
+                                value={tempRowCount}
                                 onChange={(e) => {
                                     const value = parseInt(e.target.value);
                                     if (value >= 1 && value <= 100) {
-                                        setRowCount(value);
+                                        setTempRowCount(value);
                                     }
                                 }}
                                 inputProps={{
@@ -1373,11 +1401,11 @@ function createEmptyCoefficientRow(id) {
                             <Typography variant="subtitle2" gutterBottom>店舗列数</Typography>
                             <TextField
                                 type="number"
-                                value={numberOfStores}
+                                value={tempNumberOfStores}
                                 onChange={(e) => {
                                     const value = parseInt(e.target.value);
                                     if (value >= 1 && value <= 100) {
-                                        setNumberOfStores(value);
+                                        setTempNumberOfStores(value);
                                     }
                                 }}
                                 inputProps={{
@@ -1389,6 +1417,25 @@ function createEmptyCoefficientRow(id) {
                                 size="small"
                                 helperText="1から100までの数値を入力してください"
                             />
+                        </Grid>
+                        {/* 設定変更のアクションボタン */}
+                        <Grid item xs={12}>
+                            <Box sx={{ display: 'flex', justifyContent: 'flex-end', gap: 2, mt: 2 }}>
+                                <Button
+                                    variant="outlined"
+                                    onClick={cancelSettings}
+                                    startIcon={<span className="material-icons">cancel</span>}
+                                >
+                                    キャンセル
+                                </Button>
+                                <Button
+                                    variant="contained"
+                                    onClick={applySettings}
+                                    startIcon={<span className="material-icons">save</span>}
+                                >
+                                    設定を適用
+                                </Button>
+                            </Box>
                         </Grid>
                     </Grid>
                 </Paper>
