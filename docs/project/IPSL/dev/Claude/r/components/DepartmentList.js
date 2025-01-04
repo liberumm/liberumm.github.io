@@ -372,3 +372,4 @@ function DepartmentList() {
         </Box>
     );
 }
+window.DepartmentList = DepartmentList;
