@@ -1310,7 +1310,7 @@ function createEmptyCoefficientRow(id) {
                                                             <TextField
                                                                 type={key === "cost" || key === "price" || key === "distribution" || key === "minimumQuantity" || key === "bulkQuantity" || key === "totalPlanQuantity" ? "number" : "text"}
                                                                 value={row[key]}
-                                                                onChange={(e) => {
+                                                                onBlur={(e) => {
                                                                     handleInputChange(index, key, e.target.value);  // 値の変更を処理
 
                                                                     // 最後の行が入力されている場合は新しい行を追加
@@ -1641,7 +1641,12 @@ function createEmptyCoefficientRow(id) {
                                     <TextField
                                         type="date"
                                         value={row.deliveryDate}
-                                        onChange={(e) => handleAllocationInputChange(index, "deliveryDate", e.target.value)}
+                                        onChange={(e) => {
+                                            const newData = [...allocationData];
+                                            newData[index] = { ...newData[index], deliveryDate: e.target.value };
+                                            setAllocationData(newData);
+                                        }}
+                                        onBlur={(e) => handleAllocationInputChange(index, "deliveryDate", e.target.value)}
                                         fullWidth
                                         inputProps={{ style: { height: '40px', padding: '0 8px' } }}
                                     />
@@ -1650,7 +1655,12 @@ function createEmptyCoefficientRow(id) {
                                 <TableCell padding="none" style={{ width: allocationColumnWidths.productCode }} align="center">
                                     <TextField
                                         value={row.productCode}
-                                        onChange={(e) => handleAllocationInputChange(index, "productCode", e.target.value)}
+                                        onChange={(e) => {
+                                            const newData = [...allocationData];
+                                            newData[index] = { ...newData[index], productCode: e.target.value };
+                                            setAllocationData(newData);
+                                        }}
+                                        onBlur={(e) => handleAllocationInputChange(index, "productCode", e.target.value)}
                                         inputProps={{ maxLength: 10, style: { height: '40px', padding: '0 8px', textAlign: "center" } }}
                                         fullWidth
                                     />
@@ -1659,7 +1669,12 @@ function createEmptyCoefficientRow(id) {
                                 <TableCell padding="none" style={{ width: allocationColumnWidths.productName }} align="center">
                                     <TextField
                                         value={row.productName}
-                                        onChange={(e) => handleAllocationInputChange(index, "productName", e.target.value)}
+                                        onChange={(e) => {
+                                            const newData = [...allocationData];
+                                            newData[index] = { ...newData[index], productName: e.target.value };
+                                            setAllocationData(newData);
+                                        }}
+                                        onBlur={(e) => handleAllocationInputChange(index, "productName", e.target.value)}
                                         inputProps={{ maxLength: 20, style: { height: '40px', padding: '0 8px' } }}
                                         fullWidth
                                     />
@@ -1669,7 +1684,17 @@ function createEmptyCoefficientRow(id) {
                                     <TextField
                                         type="number"
                                         value={row.cost}
-                                        onChange={(e) => handleAllocationInputChange(index, "cost", e.target.value)}
+                                        onChange={(e) => {
+                                            // 入力中の値を即時反映
+                                            const newData = [...allocationData];
+                                            newData[index] = { ...newData[index], cost: e.target.value };
+                                            setAllocationData(newData);
+                                        }}
+                                        onBlur={(e) => {
+                                            // フォーカスが外れたときに値を確定
+                                            const value = parseFloat(e.target.value) || 0;
+                                            handleAllocationInputChange(index, "cost", value);
+                                        }}
                                         inputProps={{ maxLength: 5, style: { height: '40px', padding: '0 8px', textAlign: "right" } }}
                                         fullWidth
                                     />
@@ -1679,7 +1704,12 @@ function createEmptyCoefficientRow(id) {
                                     <TextField
                                         type="number"
                                         value={row.price}
-                                        onChange={(e) => handleAllocationInputChange(index, "price", e.target.value)}
+                                        onChange={(e) => {
+                                            const newData = [...allocationData];
+                                            newData[index] = { ...newData[index], price: e.target.value };
+                                            setAllocationData(newData);
+                                        }}
+                                        onBlur={(e) => handleAllocationInputChange(index, "price", e.target.value)}
                                         inputProps={{ maxLength: 5, style: { height: '40px', padding: '0 8px', textAlign: "right" } }}
                                         fullWidth
                                     />
@@ -1704,7 +1734,12 @@ function createEmptyCoefficientRow(id) {
                                     <TextField
                                         type="number"
                                         value={row.remainingPlan}
-                                        onChange={(e) => handleAllocationInputChange(index, "remainingPlan", e.target.value)}
+                                        onChange={(e) => {
+                                            const newData = [...allocationData];
+                                            newData[index] = { ...newData[index], remainingPlan: e.target.value };
+                                            setAllocationData(newData);
+                                        }}
+                                        onBlur={(e) => handleAllocationInputChange(index, "remainingPlan", e.target.value)}
                                         inputProps={{ maxLength: 5, style: { height: '40px', padding: '0 8px', textAlign: "right" } }}
                                         fullWidth
                                     />
@@ -1714,7 +1749,12 @@ function createEmptyCoefficientRow(id) {
                                     <TextField
                                         type="number"
                                         value={row.distribution}
-                                        onChange={(e) => handleAllocationInputChange(index, "distribution", e.target.value)}
+                                        onChange={(e) => {
+                                            const newData = [...allocationData];
+                                            newData[index] = { ...newData[index], distribution: e.target.value };
+                                            setAllocationData(newData);
+                                        }}
+                                        onBlur={(e) => handleAllocationInputChange(index, "distribution", e.target.value)}
                                         fullWidth
                                         inputProps={{ maxLength: 5, style: { height: '40px', padding: '0 8px', textAlign: "right" } }}
                                     />
@@ -1744,7 +1784,12 @@ function createEmptyCoefficientRow(id) {
                                     <TextField
                                         type="number"
                                         value={row.unit}
-                                        onChange={(e) => handleAllocationInputChange(index, "unit", e.target.value)}
+                                        onChange={(e) => {
+                                            const newData = [...allocationData];
+                                            newData[index] = { ...newData[index], unit: e.target.value };
+                                            setAllocationData(newData);
+                                        }}
+                                        onBlur={(e) => handleAllocationInputChange(index, "unit", e.target.value)}
                                         inputProps={{ maxLength: 5, style: { height: '40px', padding: '0 8px', textAlign: "right" } }}
                                         fullWidth
                                     />
@@ -1754,7 +1799,12 @@ function createEmptyCoefficientRow(id) {
                                     <TextField
                                         type="number"
                                         value={row.minimumQuantity}
-                                        onChange={(e) => handleAllocationInputChange(index, "minimumQuantity", e.target.value)}
+                                        onChange={(e) => {
+                                            const newData = [...allocationData];
+                                            newData[index] = { ...newData[index], minimumQuantity: e.target.value };
+                                            setAllocationData(newData);
+                                        }}
+                                        onBlur={(e) => handleAllocationInputChange(index, "minimumQuantity", e.target.value)}
                                         inputProps={{ maxLength: 5, style: { height: '40px', padding: '0 8px', textAlign: "right" } }}
                                         fullWidth
                                     />
@@ -1765,6 +1815,11 @@ function createEmptyCoefficientRow(id) {
                                         type="number"
                                         value={row.bulkQuantity}
                                         onChange={(e) => {
+                                            const newData = [...allocationData];
+                                            newData[index] = { ...newData[index], bulkQuantity: e.target.value };
+                                            setAllocationData(newData);
+                                        }}
+                                        onBlur={(e) => {
                                             const bulkQuantity = parseInt(e.target.value, 10) || 0;
                                             // 一括導入数を全店舗に反映させる処理
                                             const updatedStores = Array(numberOfStores).fill(bulkQuantity);
@@ -1796,6 +1851,13 @@ function createEmptyCoefficientRow(id) {
                                                 type="number"
                                                 value={(row.stores && row.stores[i] !== undefined) ? row.stores[i] : 0}  // stores配列が存在し、その要素が定義されていることを確認
                                                 onChange={(e) => {
+                                                    const newData = [...allocationData];
+                                                    const updatedStores = row.stores ? [...row.stores] : Array(numberOfStores).fill(0);
+                                                    updatedStores[i] = e.target.value;
+                                                    newData[index] = { ...newData[index], stores: updatedStores };
+                                                    setAllocationData(newData);
+                                                }}
+                                                onBlur={(e) => {
                                                     const updatedStores = row.stores ? [...row.stores] : Array(numberOfStores).fill(0);
                                                     updatedStores[i] = parseInt(e.target.value, 10) || 0;
                                                     handleAllocationInputChange(index, 'stores', updatedStores);
@@ -1924,7 +1986,12 @@ function createEmptyCoefficientRow(id) {
                                                             <TextField
                                                                 type="text"
                                                                 value={row.storeCode}
-                                                                onChange={(e) => handleCoefficientInputChange(rowIndex, 0, e.target.value)}
+                                                                onChange={(e) => {
+                                                                    const newData = [...coefficientData];
+                                                                    newData[rowIndex] = { ...newData[rowIndex], storeCode: e.target.value };
+                                                                    setCoefficientData(newData);
+                                                                }}
+                                                                onBlur={(e) => handleCoefficientInputChange(rowIndex, 0, e.target.value)}
                                                                 fullWidth
                                                                 inputProps={{ style: { height: '40px', padding: '0 8px', textAlign: "center" } }}
                                                             />
@@ -1933,7 +2000,12 @@ function createEmptyCoefficientRow(id) {
                                                             <TextField
                                                                 type="text"
                                                                 value={row.storeName}
-                                                                onChange={(e) => handleCoefficientInputChange(rowIndex, 1, e.target.value)}
+                                                                onChange={(e) => {
+                                                                    const newData = [...coefficientData];
+                                                                    newData[rowIndex] = { ...newData[rowIndex], storeName: e.target.value };
+                                                                    setCoefficientData(newData);
+                                                                }}
+                                                                onBlur={(e) => handleCoefficientInputChange(rowIndex, 1, e.target.value)}
                                                                 fullWidth
                                                                 inputProps={{ style: { height: '40px', padding: '0 8px', textAlign: "center" } }}
                                                             />
@@ -1944,7 +2016,14 @@ function createEmptyCoefficientRow(id) {
                                                                     type="number"
                                                                     step="any"
                                                                     value={patternValue}
-                                                                    onChange={(e) => handleCoefficientInputChange(rowIndex, patternIndex + 2, e.target.value)}
+                                                                    onChange={(e) => {
+                                                                        const newData = [...coefficientData];
+                                                                        const updatedPatterns = [...newData[rowIndex].patterns];
+                                                                        updatedPatterns[patternIndex] = e.target.value;
+                                                                        newData[rowIndex] = { ...newData[rowIndex], patterns: updatedPatterns };
+                                                                        setCoefficientData(newData);
+                                                                    }}
+                                                                    onBlur={(e) => handleCoefficientInputChange(rowIndex, patternIndex + 2, e.target.value)}
                                                                     fullWidth
                                                                     inputProps={{ style: { height: '40px', padding: '0 8px', textAlign: "center" } }}
                                                                 />
