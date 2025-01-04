@@ -80,4 +80,6 @@ function CompanySummary() {
             </Grid>
         </Paper>
     );
-}
+};
+
+window.CompanySummary = CompanySummary;

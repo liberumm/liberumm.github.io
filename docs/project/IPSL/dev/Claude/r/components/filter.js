@@ -285,3 +285,5 @@ const Filter = () => {
         </Paper>
     );
 };
+// グローバルスコープにDistributionコンポーネントを公開
+window.Filter = Filter;

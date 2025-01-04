@@ -1058,59 +1058,62 @@ function createEmptyCoefficientRow(id) {
                                                 '&:hover': { backgroundColor: '#f5f5f5' }
                                             }}
                                         >
-                                            <Box sx={{ mb: 2 }}>
-                                                <Typography variant="subtitle2" sx={{ display: 'flex', alignItems: 'center', mb: 1 }}>
-                                                    <span className="material-icons" style={{ marginRight: '8px' }}>
-                                                        {item.icon}
-                                                    </span>
-                                                    {item.title}
+                                            <Typography variant="subtitle2" sx={{ display: 'flex', alignItems: 'center', mb: 2 }}>
+                                                <span className="material-icons" style={{ marginRight: '8px' }}>
+                                                    {item.icon}
+                                                </span>
+                                                {item.title}
+                                            </Typography>
+
+                                            {/* ドロップエリアとファイル選択を統合 */}
+                                            <Box
+                                                component="label"
+                                                sx={{
+                                                    display: 'block',
+                                                    border: '1px dashed #bdbdbd',
+                                                    borderRadius: 1,
+                                                    p: 3,
+                                                    textAlign: 'center',
+                                                    backgroundColor: '#ffffff',
+                                                    cursor: 'pointer',
+                                                    mb: 2,
+                                                    '&:hover': {
+                                                        borderColor: 'primary.main',
+                                                        backgroundColor: '#f5f5f5'
+                                                    }
+                                                }}
+                                                onDrop={(e) => handleFileDrop(e, item.type)}
+                                                onDragOver={(e) => e.preventDefault()}
+                                                onClick={() => document.getElementById(`file-input-${item.type}`).click()}
+                                            >
+                                                <input
+                                                    id={`file-input-${item.type}`}
+                                                    type="file"
+                                                    accept=".xlsx, .xls"
+                                                    hidden
+                                                    onChange={(e) => handleFileImport(e, item.type)}
+                                                />
+                                                <span className="material-icons" style={{ fontSize: '48px', color: '#757575', marginBottom: '8px' }}>
+                                                    upload_file
+                                                </span>
+                                                <Typography variant="body2" color="textSecondary" gutterBottom>
+                                                    ファイルをドラッグ＆ドロップ
                                                 </Typography>
-                                                <Box
-                                                    sx={{
-                                                        border: '1px dashed #bdbdbd',
-                                                        borderRadius: 1,
-                                                        p: 2,
-                                                        textAlign: 'center',
-                                                        backgroundColor: '#ffffff',
-                                                        cursor: 'pointer',
-                                                        '&:hover': {
-                                                            borderColor: 'primary.main',
-                                                            backgroundColor: '#f5f5f5'
-                                                        }
-                                                    }}
-                                                    onDrop={(e) => handleFileDrop(e, item.type)}
-                                                    onDragOver={(e) => e.preventDefault()}
-                                                >
-                                                    <span className="material-icons" style={{ color: '#757575', fontSize: '24px' }}>
-                                                        upload_file
-                                                    </span>
-                                                    <Typography variant="caption" display="block">
-                                                        ファイルをドロップ
-                                                    </Typography>
-                                                </Box>
+                                                <Typography variant="body2" color="primary">
+                                                    またはクリックして選択
+                                                </Typography>
                                             </Box>
-                                            <ButtonGroup size="small" fullWidth>
-                                                <Button
-                                                    component="label"
-                                                    startIcon={<span className="material-icons">cloud_upload</span>}
-                                                    sx={{ flex: 2 }}
-                                                >
-                                                    取込
-                                                    <input
-                                                        type="file"
-                                                        accept=".xlsx, .xls"
-                                                        hidden
-                                                        onChange={(e) => handleFileImport(e, item.type)}
-                                                    />
-                                                </Button>
-                                                <Button
-                                                    onClick={() => downloadTemplate(item.type)}
-                                                    startIcon={<span className="material-icons">download</span>}
-                                                    sx={{ flex: 1 }}
-                                                >
-                                                    テンプレート
-                                                </Button>
-                                            </ButtonGroup>
+
+                                            {/* テンプレートダウンロードボタン */}
+                                            <Button
+                                                fullWidth
+                                                variant="outlined"
+                                                onClick={() => downloadTemplate(item.type)}
+                                                startIcon={<span className="material-icons">download</span>}
+                                                size="small"
+                                            >
+                                                テンプレートをダウンロード
+                                            </Button>
                                         </Paper>
                                     </Grid>
                                 ))}
@@ -1383,8 +1386,16 @@ function createEmptyCoefficientRow(id) {
                                 value={tempRowCount}
                                 onChange={(e) => {
                                     const value = parseInt(e.target.value);
+                                    if (!isNaN(value)) {
+                                        setTempRowCount(value);
+                                    }
+                                }}
+                                onBlur={(e) => {
+                                    const value = parseInt(e.target.value);
                                     if (value >= 1 && value <= 100) {
                                         setTempRowCount(value);
+                                    } else {
+                                        setTempRowCount(1); // 範囲外の値の場合は1にリセット
                                     }
                                 }}
                                 inputProps={{
@@ -1404,8 +1415,16 @@ function createEmptyCoefficientRow(id) {
                                 value={tempNumberOfStores}
                                 onChange={(e) => {
                                     const value = parseInt(e.target.value);
+                                    if (!isNaN(value)) {
+                                        setTempNumberOfStores(value);
+                                    }
+                                }}
+                                onBlur={(e) => {
+                                    const value = parseInt(e.target.value);
                                     if (value >= 1 && value <= 100) {
                                         setTempNumberOfStores(value);
+                                    } else {
+                                        setTempNumberOfStores(1); // 範囲外の値の場合は1にリセット
                                     }
                                 }}
                                 inputProps={{
