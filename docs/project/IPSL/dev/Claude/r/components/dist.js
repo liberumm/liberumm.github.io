@@ -952,16 +952,42 @@ function createEmptyCoefficientRow(id) {
         const [tempRowCount, setTempRowCount] = useState(rowCount);
         const [tempNumberOfStores, setTempNumberOfStores] = useState(numberOfStores);
 
-        // 設定変更を確定する関数
+        // 設定変更を確定する関数を最適化
         const applySettings = () => {
-            // 行数の変更を適用
-            if (tempRowCount !== rowCount) {
+            // 行数または店舗数が変更された場合のみ処理を実行
+            if (tempRowCount !== rowCount || tempNumberOfStores !== numberOfStores) {
+                // 行数と店舗数の変更を一度に適用
                 setRowCount(tempRowCount);
-            }
-            
-            // 店舗数の変更を適用
-            if (tempNumberOfStores !== numberOfStores) {
                 setNumberOfStores(tempNumberOfStores);
+                
+                // allocationDataを一括で更新
+                setAllocationData(prevData => {
+                    // 新しい配列を作成
+                    const newData = new Array(tempRowCount);
+                    
+                    // 既存のデータを再利用
+                    const existingLength = Math.min(prevData.length, tempRowCount);
+                    
+                    // 既存の行データを処理
+                    for (let i = 0; i < existingLength; i++) {
+                        const row = prevData[i];
+                        newData[i] = {
+                            ...row,
+                            stores: row.stores ? [
+                                ...row.stores.slice(0, tempNumberOfStores),
+                                ...new Array(Math.max(0, tempNumberOfStores - row.stores.length)).fill(0)
+                            ].slice(0, tempNumberOfStores) : new Array(tempNumberOfStores).fill(0),
+                            total: 0 // 合計を初期化
+                        };
+                    }
+                    
+                    // 新しい行を追加
+                    for (let i = existingLength; i < tempRowCount; i++) {
+                        newData[i] = createEmptyAllocationRow(i + 1, tempNumberOfStores);
+                    }
+                    
+                    return newData;
+                });
             }
         };
 
