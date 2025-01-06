@@ -28,41 +28,72 @@
   <script src="https://cdn.jsdelivr.net/npm/papaparse@5.3.0/papaparse.min.js"></script>
 
   <style>
-    /* 必要最低限のスタイル */
-    body, html {
-      margin: 0;
-      padding: 0;
-      height: 100%;
-      font-family: 'Roboto','Helvetica','Arial',sans-serif;
+    /* スタイルをMUIのテーマに合わせて更新 */
+    .map-section {
+      height: calc(100vh - 128px); /* AppBarの高さを考慮 */
+      padding: 16px;
+      background-color: #f5f5f5;
     }
-    #root {
-      display: flex;
-      flex-direction: column;
-      width: 100%;
-      height: 100%;
-    }
+
     .map-container {
-      width: 100%;
-      height: 60vh;
-      position: relative;
-    }
-    #map {
-      width: 100%;
-      height: 100%;
-    }
-    #statsContainer {
-      position: absolute;
-      top: 10px;
-      right: 10px;
-      background: rgba(255, 255, 255, 0.9);
-      padding: 10px;
       border-radius: 4px;
-      box-shadow: 0 2px 5px rgba(0,0,0,0.15);
-      display: none;
-      z-index: 1000;
+      overflow: hidden;
+      box-shadow: 0 2px 4px rgba(0,0,0,0.1);
     }
-    .custom-marker {
-      font-size: 24px;
+
+    /* 検索コントロールをMUIスタイルに */
+    .search-controls {
+      background-color: white;
+      padding: 16px;
+      border-radius: 4px;
+      box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+    }
+
+    /* テーブルスタイルの改善 */
+    .compact-table .MuiTableCell-root {
+      padding: 8px;
+    }
+
+    .compact-table .MuiTableCell-head {
+      background-color: #f5f5f5;
+      font-weight: bold;
+    }
+
+    /* Adjust the width of specific columns for better readability */
+    .col-checkbox {
+      width: 50px;
+    }
+
+    .col-move {
+      width: 80px;
+    }
+
+    .col-name {
+      width: 150px;
+    }
+
+    .col-address {
+      width: 200px;
+    }
+
+    .col-coord {
+      width: 100px;
+    }
+
+    .col-date {
+      width: 120px;
+    }
+
+    .col-number {
+      width: 100px;
+    }
+
+    .col-radius {
+      width: 150px;
+    }
+
+    .col-action {
+      width: 80px;
     }
   </style>
 </head>
@@ -94,7 +125,12 @@ const {
   TableRow,
   IconButton,
   Paper,
-  Checkbox
+  Checkbox,
+  TablePagination,
+  Dialog,
+  DialogTitle,
+  DialogContent,
+  Divider,
 } = MaterialUI;
 
 /**
@@ -110,8 +146,41 @@ const {
  *  - ポリゴンタブ(町丁目データ)もインポート/エクスポート、地図に反映(例)
  */
 function App() {
-  // MUIデフォルトテーマ
-  const theme = createTheme();
+  const theme = createTheme({
+    palette: {
+      primary: {
+        main: '#1976d2',
+      },
+      secondary: {
+        main: '#9c27b0',
+      },
+      background: {
+        default: '#f5f5f5',
+      },
+    },
+    components: {
+      MuiButton: {
+        styleOverrides: {
+          root: {
+            textTransform: 'none',
+          },
+        },
+      },
+      MuiTextField: {
+        defaultProps: {
+          size: 'small',
+          variant: 'outlined',
+        },
+      },
+      MuiTableCell: {
+        styleOverrides: {
+          root: {
+            padding: '8px',
+          },
+        },
+      },
+    },
+  });
 
   // --------- 検索関連state ---------
   const [searchType, setSearchType] = React.useState('address');
@@ -166,6 +235,86 @@ function App() {
 
   // Overpass API キャッシュ
   const overpassCache = React.useRef(new Map());
+
+  const [isCollapsed, setIsCollapsed] = React.useState(false);
+  const [plotsPageSize, setPlotsPageSize] = React.useState(20);
+  const [plotsPage, setPlotsPage] = React.useState(0);
+  const [polygonsPageSize, setPolygonsPageSize] = React.useState(20);
+  const [polygonsPage, setPolygonsPage] = React.useState(0);
+
+  // ページ変更ハンドラー
+  const handlePlotsPageChange = (event, newPage) => {
+    setPlotsPage(newPage);
+  };
+
+  const handlePlotsPageSizeChange = (event) => {
+    setPlotsPageSize(parseInt(event.target.value, 10));
+    setPlotsPage(0);
+  };
+
+  const handlePolygonsPageChange = (event, newPage) => {
+    setPolygonsPage(newPage);
+  };
+
+  const handlePolygonsPageSizeChange = (event) => {
+    setPolygonsPageSize(parseInt(event.target.value, 10));
+    setPolygonsPage(0);
+  };
+
+  // 検索コントロールのドラッグ&ドロップ用state
+  const [controlPosition, setControlPosition] = React.useState({ x: 16, y: 16 });
+  const [isDragging, setIsDragging] = React.useState(false);
+  const dragStartPos = React.useRef({ x: 0, y: 0 });
+  const dragOffset = React.useRef({ x: 0, y: 0 });
+
+  // ドラッグ処理ハンドラー
+  const handleDragStart = (e) => {
+    setIsDragging(true);
+    const rect = e.currentTarget.getBoundingClientRect();
+    dragOffset.current = {
+      x: e.clientX - rect.left,
+      y: e.clientY - rect.top
+    };
+  };
+
+  const handleDrag = (e) => {
+    if (!isDragging) return;
+    
+    const x = e.clientX - dragOffset.current.x;
+    const y = e.clientY - dragOffset.current.y;
+    
+    // 画面範囲内に制限
+    const maxX = window.innerWidth - 280; // コントロールの幅を考慮
+    const maxY = window.innerHeight - 100; // 適当なマージン
+    
+    setControlPosition({
+      x: Math.min(Math.max(0, x), maxX),
+      y: Math.min(Math.max(0, y), maxY)
+    });
+  };
+
+  const handleDragEnd = () => {
+    setIsDragging(false);
+  };
+
+  // ドラッグ中のイベントリスナー
+  React.useEffect(() => {
+    if (isDragging) {
+      document.addEventListener('mousemove', handleDrag);
+      document.addEventListener('mouseup', handleDragEnd);
+    }
+    return () => {
+      document.removeEventListener('mousemove', handleDrag);
+      document.removeEventListener('mouseup', handleDragEnd);
+    };
+  }, [isDragging]);
+
+  // モーダル制御用のstate
+  const [modalOpen, setModalOpen] = React.useState(false);
+
+  // モーダルの開閉ハンドラ
+  const handleModalOpen = () => setModalOpen(true);
+  const handleModalClose = () => setModalOpen(false);
 
   // =====================================
   // 1. 地図初期化 (渋谷駅を中心)
@@ -578,66 +727,81 @@ out skel qt;`;
     const ws = XLSX.utils.json_to_sheet(data);
     const wb = XLSX.utils.book_new();
     XLSX.utils.book_append_sheet(wb, ws, 'Data');
-    const buffer = XLSX.write(wb,{bookType:'xlsx',type:'array'});
-    const blob = new Blob([buffer],{type:'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'});
+    const buffer = XLSX.write(wb, {bookType:'xlsx', type:'array'});
+    const blob = new Blob([buffer], {
+      type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+    });
     const url = URL.createObjectURL(blob);
     const link = document.createElement('a');
     link.href = url;
     link.download = `${type}_data.xlsx`;
     link.click();
-  }
-
-  function importData(file, type) {
-    const reader = new FileReader();
-    reader.onload = (e) => {
-      if (file.name.endsWith('.csv')) {
-        Papa.parse(file,{
-          header:true,
-          complete:(results)=>{
-            processImportedData(results.data, type);
-          }
-        });
-      } else {
-        // Excel
-        const data = new Uint8Array(e.target.result);
-        const wb = XLSX.read(data,{type:'array'});
-        const firstSheet = wb.Sheets[wb.SheetNames[0]];
-        const jsonData = XLSX.utils.sheet_to_json(firstSheet);
-        processImportedData(jsonData, type);
-      }
-    };
-    reader.readAsArrayBuffer(file);
+    URL.revokeObjectURL(url);
   }
 
   function processImportedData(jsonData, type) {
-    if (type==='plots') {
-      const rows = jsonData.map(item=>({
+    if (type === 'plots') {
+      const rows = jsonData.map(item => ({
         selected: false,
-        name: item.name||'',
-        address: item.address||'',
-        lat: item.lat||'',
-        lon: item.lon||'',
-        startDate: item.startDate||'',
-        endDate: item.endDate||'',
-        sales: item.sales||'',
-        customers: item.customers||'',
-        area: item.area||'',
-        radius1: item.radius1||500,
-        color1: item.color1||'#1976d2',
-        radius2: item.radius2||1000,
-        color2: item.color2||'#9c27b0',
-        radius3: item.radius3||1500,
-        color3: item.color3||'#ff9800'
+        name: item.name || '',
+        address: item.address || '',
+        lat: item.lat || '',
+        lon: item.lon || '',
+        startDate: item.startDate || '',
+        endDate: item.endDate || '',
+        sales: item.sales || '',
+        customers: item.customers || '',
+        area: item.area || '',
+        radius1: item.radius1 || 500,
+        color1: item.color1 || '#1976d2',
+        radius2: item.radius2 || 1000,
+        color2: item.color2 || '#9c27b0',
+        radius3: item.radius3 || 1500,
+        color3: item.color3 || '#ff9800'
       }));
       setPlotsData(prev => [...prev, ...rows]);
     } else {
       // polygons
-      const rows = jsonData.map(item=>({
-        name: item.name||'',
-        polygonData: item.polygonData||'',
-        color: item.color||'#1976d2'
+      const rows = jsonData.map(item => ({
+        name: item.name || '',
+        polygonData: item.polygonData || '',
+        color: item.color || '#1976d2'
       }));
       setPolygonsData(prev => [...prev, ...rows]);
+    }
+  }
+
+  // =====================================
+  // Map Centering Function
+  // =====================================
+  function handleMoveToMarker(lat, lon) {
+    if (mapInstance) {
+      mapInstance.setView([lat, lon], 16); // Zoom level can be adjusted
+    }
+  }
+
+  // =====================================
+  // Import Data Function
+  // =====================================
+  function importData(file, type) {
+    const reader = new FileReader();
+    reader.onload = (e) => {
+      const content = e.target.result;
+      let jsonData = [];
+      if (file.name.endsWith('.csv')) {
+        jsonData = Papa.parse(content, { header: true }).data;
+      } else {
+        const workbook = XLSX.read(content, { type: 'binary' });
+        const sheetName = workbook.SheetNames[0];
+        jsonData = XLSX.utils.sheet_to_json(workbook.Sheets[sheetName]);
+      }
+      processImportedData(jsonData, type);
+      showSuccess('インポート完了');
+    };
+    if (file.name.endsWith('.csv')) {
+      reader.readAsText(file);
+    } else {
+      reader.readAsBinaryString(file);
     }
   }
 
@@ -647,34 +811,397 @@ out skel qt;`;
   return (
     <ThemeProvider theme={theme}>
       <CssBaseline />
+      
+      <Box sx={{ display: 'flex', flexDirection: 'column', minHeight: '100vh' }}>
+        {/* AppBar with Search & Settings Button */}
+        <AppBar position="static" elevation={0}>
+          <Toolbar>
+            <Typography variant="h6" sx={{ flexGrow: 1 }}>
+              All Features: React + Leaflet + MUI
+            </Typography>
+            {/* Search & Settings Button */}
+            <Button 
+              color="inherit" 
+              onClick={handleModalOpen}
+              startIcon={<span>🔍</span>}
+            >
+              検索＆設定
+            </Button>
+          </Toolbar>
+        </AppBar>
 
-      <AppBar position="static">
-        <Toolbar>
-          <Typography variant="h6" sx={{ flexGrow:1 }}>
-            All Features: React + Leaflet + MUI
+        {/* メインコンテンツ */}
+        <Box sx={{ flex: 1, display: 'flex', flexDirection: 'column', gap: 2, p: 2 }}>
+          {/* マップセクション */}
+          <Paper elevation={1} sx={{ height: '60vh', position: 'relative' }}>
+            <div id="map" ref={mapRef} style={{ height: '100%' }}></div>
+          </Paper>
+
+          {/* タブセクション */}
+          <Paper elevation={1}>
+            <Tabs 
+              value={tabValue} 
+              onChange={handleTabChange}
+              sx={{ borderBottom: 1, borderColor: 'divider' }}
+            >
+              <Tab label="プロット地点" />
+              <Tab label="町丁目ポリゴン" />
+            </Tabs>
+            
+            {/* タブパネル内容は既存コードを維持 */}
+            {tabValue===0 && (
+              <Box sx={{ p:2, overflow:'auto' }}>
+                <Box sx={{ display:'flex', gap:1, mb:2 }}>
+                  <Button variant="contained" onClick={()=>exportData('plots',plotsData)}>
+                    エクスポート
+                  </Button>
+                  <input
+                    id="importPlotsFile"
+                    type="file"
+                    accept=".csv,.xlsx"
+                    style={{ display:'none' }}
+                    onChange={(e)=>{
+                      if(e.target.files?.[0]) importData(e.target.files[0],'plots');
+                    }}
+                  />
+                  <Button variant="contained" onClick={()=>document.getElementById('importPlotsFile').click()}>
+                    インポート
+                  </Button>
+                </Box>
+                <TableContainer 
+                  component={Paper} 
+                  sx={{ 
+                    maxHeight: 'calc(100vh - 300px)',
+                    '& .MuiTable-root': {
+                      borderCollapse: 'collapse',
+                      width: 'max-content',
+                      minWidth: '100%'
+                    }
+                  }}
+                >
+                  <Table className="compact-table" size="small" stickyHeader>
+                    <TableHead>
+                      <TableRow>
+                        <TableCell className="col-checkbox" padding="checkbox"></TableCell>
+                        {/* New Move Column Header */}
+                        <TableCell className="col-move">移動</TableCell>
+                        <TableCell className="col-name">名称</TableCell>
+                        <TableCell className="col-address">住所</TableCell>
+                        <TableCell className="col-coord">緯度</TableCell>
+                        <TableCell className="col-coord">経度</TableCell>
+                        <TableCell className="col-date">開始日</TableCell>
+                        <TableCell className="col-date">終了日</TableCell>
+                        <TableCell className="col-number">売上</TableCell>
+                        <TableCell className="col-number">客数</TableCell>
+                        <TableCell className="col-number">面積</TableCell>
+                        <TableCell className="col-radius">半径1&色</TableCell>
+                        <TableCell className="col-radius">半径2&色</TableCell>
+                        <TableCell className="col-radius">半径3&色</TableCell>
+                        <TableCell className="col-action">操作</TableCell>
+                      </TableRow>
+                    </TableHead>
+                    <TableBody>
+                      {plotsData
+                        .slice(plotsPage * plotsPageSize, plotsPage * plotsPageSize + plotsPageSize)
+                        .map((row, i) => (
+                        <TableRow key={i}>
+                          <TableCell padding="checkbox">
+                            <Checkbox
+                              checked={row.selected||false}
+                              onChange={(e)=>
+                                handlePlotsFieldChange(i,'selected',e.target.checked)
+                              }
+                            />
+                          </TableCell>
+                          {/* New Move Button Column */}
+                          <TableCell>
+                            <Button 
+                              variant="outlined" 
+                              size="small"
+                              onClick={() => handleMoveToMarker(row.lat, row.lon)}
+                            >
+                              移動
+                            </Button>
+                          </TableCell>
+                          <TableCell>
+                            <TextField
+                              variant="outlined" size="small"
+                              value={row.name||''}
+                              onChange={(e)=>handlePlotsFieldChange(i,'name',e.target.value)}
+                            />
+                          </TableCell>
+                          <TableCell>
+                            <TextField
+                              variant="outlined" size="small"
+                              value={row.address||''}
+                              onChange={(e)=>handlePlotsFieldChange(i,'address',e.target.value)}
+                            />
+                          </TableCell>
+                          <TableCell>
+                            <TextField
+                              type="number" variant="outlined" size="small"
+                              value={row.lat||''}
+                              onChange={(e)=>handlePlotsFieldChange(i,'lat',e.target.value)}
+                            />
+                          </TableCell>
+                          <TableCell>
+                            <TextField
+                              type="number" variant="outlined" size="small"
+                              value={row.lon||''}
+                              onChange={(e)=>handlePlotsFieldChange(i,'lon',e.target.value)}
+                            />
+                          </TableCell>
+                          <TableCell>
+                            <TextField
+                              type="date" variant="outlined" size="small"
+                              value={row.startDate||''}
+                              onChange={(e)=>handlePlotsFieldChange(i,'startDate',e.target.value)}
+                            />
+                          </TableCell>
+                          <TableCell>
+                            <TextField
+                              type="date" variant="outlined" size="small"
+                              value={row.endDate||''}
+                              onChange={(e)=>handlePlotsFieldChange(i,'endDate',e.target.value)}
+                            />
+                          </TableCell>
+                          <TableCell>
+                            <TextField
+                              type="number" variant="outlined" size="small"
+                              value={row.sales||''}
+                              onChange={(e)=>handlePlotsFieldChange(i,'sales',e.target.value)}
+                            />
+                          </TableCell>
+                          <TableCell>
+                            <TextField
+                              type="number" variant="outlined" size="small"
+                              value={row.customers||''}
+                              onChange={(e)=>handlePlotsFieldChange(i,'customers',e.target.value)}
+                            />
+                          </TableCell>
+                          <TableCell>
+                            <TextField
+                              type="number" variant="outlined" size="small"
+                              value={row.area||''}
+                              onChange={(e)=>handlePlotsFieldChange(i,'area',e.target.value)}
+                            />
+                          </TableCell>
+                          <TableCell>
+                            <Box sx={{ display:'flex', gap:1, alignItems:'center' }}>
+                              <TextField
+                                type="number" variant="outlined" size="small"
+                                sx={{ width:60 }}
+                                value={row.radius1||500}
+                                onChange={(e)=>handlePlotsFieldChange(i,'radius1',e.target.value)}
+                              />
+                              <input
+                                type="color"
+                                value={row.color1||'#1976d2'}
+                                onChange={(e)=>handlePlotsFieldChange(i,'color1',e.target.value)}
+                                style={{ width:'40px', height:'30px', border:'none' }}
+                              />
+                            </Box>
+                          </TableCell>
+                          <TableCell>
+                            <Box sx={{ display:'flex', gap:1, alignItems:'center' }}>
+                              <TextField
+                                type="number" variant="outlined" size="small"
+                                sx={{ width:60 }}
+                                value={row.radius2||1000}
+                                onChange={(e)=>handlePlotsFieldChange(i,'radius2',e.target.value)}
+                              />
+                              <input
+                                type="color"
+                                value={row.color2||'#9c27b0'}
+                                onChange={(e)=>handlePlotsFieldChange(i,'color2',e.target.value)}
+                                style={{ width:'40px', height:'30px', border:'none' }}
+                              />
+                            </Box>
+                          </TableCell>
+                          <TableCell>
+                            <Box sx={{ display:'flex', gap:1, alignItems:'center' }}>
+                              <TextField
+                                type="number" variant="outlined" size="small"
+                                sx={{ width:60 }}
+                                value={row.radius3||1500}
+                                onChange={(e)=>handlePlotsFieldChange(i,'radius3',e.target.value)}
+                              />
+                              <input
+                                type="color"
+                                value={row.color3||'#ff9800'}
+                                onChange={(e)=>handlePlotsFieldChange(i,'color3',e.target.value)}
+                                style={{ width:'40px', height:'30px', border:'none' }}
+                              />
+                            </Box>
+                          </TableCell>
+                          <TableCell>
+                            <IconButton size="small" onClick={()=>handleDeletePlotRow(i)}>
+                              🗑️
+                            </IconButton>
+                          </TableCell>
+                        </TableRow>
+                      ))}
+                    </TableBody>
+                  </Table>
+                </TableContainer>
+                <Box sx={{ display: 'flex', alignItems: 'center', gap: 2, mt: 2 }}>
+                  <TablePagination
+                    component="div"
+                    count={plotsData.length}
+                    page={plotsPage}
+                    onPageChange={handlePlotsPageChange}
+                    rowsPerPage={plotsPageSize}
+                    onRowsPerPageChange={handlePlotsPageSizeChange}
+                    rowsPerPageOptions={[10, 20, 30, { label: '全て', value: -1 }]}
+                    labelRowsPerPage="表示件数:"
+                  />
+                </Box>
+              </Box>
+            )}
+
+            {/* ポリゴンタブ */}
+            {tabValue===1 && (
+              <Box sx={{ p:2, overflowX:'auto' }}>
+                <Box sx={{ display:'flex', gap:1, mb:2 }}>
+                  <Button variant="contained" onClick={handleAddPolygonRow}>
+                    新規追加
+                  </Button>
+                  <Button variant="contained" onClick={applyPolygonsToMap}>
+                    地図に反映
+                  </Button>
+                  <Button variant="contained" onClick={()=>exportData('polygons', polygonsData)}>
+                    エクスポート
+                  </Button>
+                  <input
+                    id="importPolygonsFile"
+                    type="file"
+                    accept=".csv,.xlsx"
+                    style={{ display:'none' }}
+                    onChange={(e)=>{
+                      if(e.target.files?.[0]) importData(e.target.files[0], 'polygons');
+                    }}
+                  />
+                  <Button variant="contained" onClick={()=>document.getElementById('importPolygonsFile').click()}>
+                    インポート
+                  </Button>
+                </Box>
+
+                <TableContainer component={Paper} sx={{ maxHeight: 'calc(100vh - 350px)' }}>
+                  <Table className="compact-table" size="small" stickyHeader>
+                    <TableHead>
+                      <TableRow>
+                        <TableCell>町丁目名</TableCell>
+                        <TableCell>ポリゴンデータ(JSON)</TableCell>
+                        <TableCell>色</TableCell>
+                        <TableCell>操作</TableCell>
+                      </TableRow>
+                    </TableHead>
+                    <TableBody>
+                      {polygonsData
+                        .slice(polygonsPage * polygonsPageSize, polygonsPage * polygonsPageSize + polygonsPageSize)
+                        .map((row, i) => (
+                        <TableRow key={i}>
+                          <TableCell>
+                            <TextField
+                              variant="outlined" size="small"
+                              value={row.name||''}
+                              onChange={(e)=>handlePolygonFieldChange(i,'name',e.target.value)}
+                            />
+                          </TableCell>
+                          <TableCell>
+                            <TextField
+                              variant="outlined" size="small" fullWidth
+                              placeholder='{"type":"Feature","geometry":{...}}'
+                              value={row.polygonData||''}
+                              onChange={(e)=>handlePolygonFieldChange(i,'polygonData',e.target.value)}
+                            />
+                          </TableCell>
+                          <TableCell>
+                            <input
+                              type="color"
+                              value={row.color||'#1976d2'}
+                              onChange={(e)=>handlePolygonFieldChange(i,'color',e.target.value)}
+                              style={{ width:'40px', height:'30px', border:'none' }}
+                            />
+                          </TableCell>
+                          <TableCell>
+                            <IconButton size="small" onClick={()=>handleDeletePolygonRow(i)}>
+                              🗑️
+                            </IconButton>
+                          </TableCell>
+                        </TableRow>
+                      ))}
+                    </TableBody>
+                  </Table>
+                </TableContainer>
+                <Box sx={{ display: 'flex', alignItems: 'center', gap: 2, mt: 2 }}>
+                  <TablePagination
+                    component="div"
+                    count={polygonsData.length}
+                    page={polygonsPage}
+                    onPageChange={handlePolygonsPageChange}
+                    rowsPerPage={polygonsPageSize}
+                    onRowsPerPageChange={handlePolygonsPageSizeChange}
+                    rowsPerPageOptions={[10, 20, 30, { label: '全て', value: -1 }]}
+                    labelRowsPerPage="表示件数:"
+                  />
+                </Box>
+              </Box>
+            )}
+          </Paper>
+        </Box>
+
+        {/* フッター */}
+        <Box component="footer" sx={{ 
+          py: 2, 
+          px: 3, 
+          mt: 'auto', 
+          backgroundColor: 'background.paper',
+          borderTop: 1,
+          borderColor: 'divider'
+        }}>
+          <Typography variant="body2" color="text.secondary" align="center">
+            © 2023 Map Application
           </Typography>
-        </Toolbar>
-      </AppBar>
+        </Box>
+      </Box>
 
-      <Box sx={{ flex:1, display:'flex', flexDirection:'column' }}>
-        {/* マップ */}
-        <Box className="map-container">
-          <div id="map" ref={mapRef}></div>
-          <div id="statsContainer"></div>
-
-          {/* 検索コントロール */}
-          <Box sx={{
-            position:'absolute', top:16, left:16, p:2,
-            borderRadius:2, boxShadow:2, bgcolor:'background.paper',
-            maxWidth:300, zIndex:1000
-          }}>
+      {/* モーダルダイアログ */}
+      <Dialog 
+        open={modalOpen} 
+        onClose={handleModalClose}
+        maxWidth="sm"
+        fullWidth
+        PaperProps={{
+          elevation: 2,
+          sx: { borderRadius: 2 }
+        }}
+      >
+        <DialogTitle>
+          <Box className="modal-header" sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+            検索＆設定
+            <IconButton 
+              className="close-button"
+              onClick={handleModalClose}
+            >
+              ✖
+            </IconButton>
+          </Box>
+        </DialogTitle>
+        <DialogContent className="modal-content">
+          {/* 検索セクション */}
+          <Box className="modal-section" sx={{ mb: 4 }}>
+            <Typography variant="subtitle1" className="modal-section-title">
+              🔍 地点検索
+            </Typography>
             <FormControl>
               <RadioGroup row value={searchType} onChange={(e)=>setSearchType(e.target.value)}>
                 <FormControlLabel value="address" control={<Radio/>} label="住所検索"/>
                 <FormControlLabel value="coords" control={<Radio/>} label="座標検索"/>
               </RadioGroup>
             </FormControl>
-            {searchType==='address'?(
+            
+            {searchType==='address' ? (
               <TextField
                 label="住所"
                 variant="outlined"
@@ -684,12 +1211,13 @@ out skel qt;`;
                 onChange={(e)=>setAddress(e.target.value)}
                 sx={{ mt:1 }}
               />
-            ):(
+            ) : (
               <Box sx={{ display:'flex', gap:1, mt:1 }}>
                 <TextField
                   label="緯度"
                   variant="outlined"
                   size="small"
+                  fullWidth
                   value={latInput}
                   onChange={(e)=>setLatInput(e.target.value)}
                 />
@@ -697,333 +1225,109 @@ out skel qt;`;
                   label="経度"
                   variant="outlined"
                   size="small"
+                  fullWidth
                   value={lonInput}
                   onChange={(e)=>setLonInput(e.target.value)}
                 />
               </Box>
             )}
-            <Button variant="contained" onClick={handleSearch} sx={{ mt:1 }}>
-              検索
-            </Button>
-            {message && <Box>{message}</Box>}
-
-            {/* 半径一括適用 */}
-            <Typography variant="subtitle2" sx={{ mt:2 }}>
-              選択行に一括適用
-            </Typography>
-            <Box sx={{ display:'flex', gap:1, mt:1 }}>
-              <TextField
-                label="半径1"
-                type="number"
-                size="small"
-                value={globalRadius1}
-                onChange={(e)=>setGlobalRadius1(e.target.value)}
-                sx={{ width:80 }}
-              />
-              <input
-                type="color"
-                value={globalColor1}
-                onChange={(e)=>setGlobalColor1(e.target.value)}
-                style={{ width:'40px', height:'30px', border:'none' }}
-              />
+            <Box className="modal-actions" sx={{ mt:2 }}>
+              <Button 
+                variant="contained" 
+                onClick={() => {
+                  handleSearch();
+                  handleModalClose();
+                }}
+                startIcon={<span>🔍</span>}
+              >
+                検索して追加
+              </Button>
             </Box>
-            <Box sx={{ display:'flex', gap:1, mt:1 }}>
-              <TextField
-                label="半径2"
-                type="number"
-                size="small"
-                value={globalRadius2}
-                onChange={(e)=>setGlobalRadius2(e.target.value)}
-                sx={{ width:80 }}
-              />
-              <input
-                type="color"
-                value={globalColor2}
-                onChange={(e)=>setGlobalColor2(e.target.value)}
-                style={{ width:'40px', height:'30px', border:'none' }}
-              />
-            </Box>
-            <Box sx={{ display:'flex', gap:1, mt:1 }}>
-              <TextField
-                label="半径3"
-                type="number"
-                size="small"
-                value={globalRadius3}
-                onChange={(e)=>setGlobalRadius3(e.target.value)}
-                sx={{ width:80 }}
-              />
-              <input
-                type="color"
-                value={globalColor3}
-                onChange={(e)=>setGlobalColor3(e.target.value)}
-                style={{ width:'40px', height:'30px', border:'none' }}
-              />
-            </Box>
-            <Button variant="contained" sx={{ mt:1 }} onClick={handleApplyGlobalRadius}>
-              一括適用
-            </Button>
+            {message && <Box sx={{mt:2}}>{message}</Box>}
           </Box>
-        </Box>
 
-        {/* タブエリア */}
-        <Box sx={{ flex:1, display:'flex', flexDirection:'column' }}>
-          <Tabs value={tabValue} onChange={handleTabChange} sx={{ borderBottom:1, borderColor:'divider' }}>
-            <Tab label="プロット地点"/>
-            <Tab label="町丁目ポリゴン"/>
-          </Tabs>
-
-          {/* プロット地点タブ */}
-          {tabValue===0 && (
-            <Box sx={{ p:2, overflowX:'auto' }}>
-              <Box sx={{ display:'flex', gap:1, mb:2 }}>
-                <Button variant="contained" onClick={()=>exportData('plots',plotsData)}>
-                  エクスポート
-                </Button>
-                <input
-                  id="importPlotsFile"
-                  type="file"
-                  accept=".csv,.xlsx"
-                  style={{ display:'none' }}
-                  onChange={(e)=>{
-                    if(e.target.files?.[0]) importData(e.target.files[0],'plots');
-                  }}
+          {/* 半径設定セクション */}
+          <Box className="modal-section">
+            <Typography variant="subtitle1" className="modal-section-title">
+              ⭕ 半径設定の一括適用
+            </Typography>
+            <Box sx={{ display:'flex', flexDirection:'column', gap:2, mt:1 }}>
+              <Box sx={{ display:'flex', gap:1, alignItems:'center' }}>
+                <TextField
+                  label="半径1"
+                  type="number"
+                  size="small"
+                  value={globalRadius1}
+                  onChange={(e)=>setGlobalRadius1(e.target.value)}
+                  sx={{ width:120 }}
                 />
-                <Button variant="contained" onClick={()=>document.getElementById('importPlotsFile').click()}>
-                  インポート
-                </Button>
-              </Box>
-              <TableContainer component={Paper}>
-                <Table size="small" sx={{ minWidth:1300 }}>
-                  <TableHead>
-                    <TableRow>
-                      <TableCell padding="checkbox"></TableCell>
-                      <TableCell>名称</TableCell>
-                      <TableCell>住所</TableCell>
-                      <TableCell>緯度</TableCell>
-                      <TableCell>経度</TableCell>
-                      <TableCell>開始日</TableCell>
-                      <TableCell>終了日</TableCell>
-                      <TableCell>売上</TableCell>
-                      <TableCell>客数</TableCell>
-                      <TableCell>面積</TableCell>
-                      <TableCell>半径1&色</TableCell>
-                      <TableCell>半径2&色</TableCell>
-                      <TableCell>半径3&色</TableCell>
-                      <TableCell>操作</TableCell>
-                    </TableRow>
-                  </TableHead>
-                  <TableBody>
-                    {plotsData.map((row,i)=>(
-                      <TableRow key={i}>
-                        <TableCell padding="checkbox">
-                          <Checkbox
-                            checked={row.selected||false}
-                            onChange={(e)=>
-                              handlePlotsFieldChange(i,'selected',e.target.checked)
-                            }
-                          />
-                        </TableCell>
-                        <TableCell>
-                          <TextField
-                            variant="outlined" size="small"
-                            value={row.name||''}
-                            onChange={(e)=>handlePlotsFieldChange(i,'name',e.target.value)}
-                          />
-                        </TableCell>
-                        <TableCell>
-                          <TextField
-                            variant="outlined" size="small"
-                            value={row.address||''}
-                            onChange={(e)=>handlePlotsFieldChange(i,'address',e.target.value)}
-                          />
-                        </TableCell>
-                        <TableCell>
-                          <TextField
-                            type="number" variant="outlined" size="small"
-                            value={row.lat||''}
-                            onChange={(e)=>handlePlotsFieldChange(i,'lat',e.target.value)}
-                          />
-                        </TableCell>
-                        <TableCell>
-                          <TextField
-                            type="number" variant="outlined" size="small"
-                            value={row.lon||''}
-                            onChange={(e)=>handlePlotsFieldChange(i,'lon',e.target.value)}
-                          />
-                        </TableCell>
-                        <TableCell>
-                          <TextField
-                            type="date" variant="outlined" size="small"
-                            value={row.startDate||''}
-                            onChange={(e)=>handlePlotsFieldChange(i,'startDate',e.target.value)}
-                          />
-                        </TableCell>
-                        <TableCell>
-                          <TextField
-                            type="date" variant="outlined" size="small"
-                            value={row.endDate||''}
-                            onChange={(e)=>handlePlotsFieldChange(i,'endDate',e.target.value)}
-                          />
-                        </TableCell>
-                        <TableCell>
-                          <TextField
-                            type="number" variant="outlined" size="small"
-                            value={row.sales||''}
-                            onChange={(e)=>handlePlotsFieldChange(i,'sales',e.target.value)}
-                          />
-                        </TableCell>
-                        <TableCell>
-                          <TextField
-                            type="number" variant="outlined" size="small"
-                            value={row.customers||''}
-                            onChange={(e)=>handlePlotsFieldChange(i,'customers',e.target.value)}
-                          />
-                        </TableCell>
-                        <TableCell>
-                          <TextField
-                            type="number" variant="outlined" size="small"
-                            value={row.area||''}
-                            onChange={(e)=>handlePlotsFieldChange(i,'area',e.target.value)}
-                          />
-                        </TableCell>
-                        <TableCell>
-                          <Box sx={{ display:'flex', gap:1, alignItems:'center' }}>
-                            <TextField
-                              type="number" variant="outlined" size="small"
-                              sx={{ width:60 }}
-                              value={row.radius1||500}
-                              onChange={(e)=>handlePlotsFieldChange(i,'radius1',e.target.value)}
-                            />
-                            <input
-                              type="color"
-                              value={row.color1||'#1976d2'}
-                              onChange={(e)=>handlePlotsFieldChange(i,'color1',e.target.value)}
-                              style={{ width:'40px', height:'30px', border:'none' }}
-                            />
-                          </Box>
-                        </TableCell>
-                        <TableCell>
-                          <Box sx={{ display:'flex', gap:1, alignItems:'center' }}>
-                            <TextField
-                              type="number" variant="outlined" size="small"
-                              sx={{ width:60 }}
-                              value={row.radius2||1000}
-                              onChange={(e)=>handlePlotsFieldChange(i,'radius2',e.target.value)}
-                            />
-                            <input
-                              type="color"
-                              value={row.color2||'#9c27b0'}
-                              onChange={(e)=>handlePlotsFieldChange(i,'color2',e.target.value)}
-                              style={{ width:'40px', height:'30px', border:'none' }}
-                            />
-                          </Box>
-                        </TableCell>
-                        <TableCell>
-                          <Box sx={{ display:'flex', gap:1, alignItems:'center' }}>
-                            <TextField
-                              type="number" variant="outlined" size="small"
-                              sx={{ width:60 }}
-                              value={row.radius3||1500}
-                              onChange={(e)=>handlePlotsFieldChange(i,'radius3',e.target.value)}
-                            />
-                            <input
-                              type="color"
-                              value={row.color3||'#ff9800'}
-                              onChange={(e)=>handlePlotsFieldChange(i,'color3',e.target.value)}
-                              style={{ width:'40px', height:'30px', border:'none' }}
-                            />
-                          </Box>
-                        </TableCell>
-                        <TableCell>
-                          <IconButton size="small" onClick={()=>handleDeletePlotRow(i)}>
-                            🗑️
-                          </IconButton>
-                        </TableCell>
-                      </TableRow>
-                    ))}
-                  </TableBody>
-                </Table>
-              </TableContainer>
-            </Box>
-          )}
-
-          {/* ポリゴンタブ */}
-          {tabValue===1 && (
-            <Box sx={{ p:2, overflowX:'auto' }}>
-              <Box sx={{ display:'flex', gap:1, mb:2 }}>
-                <Button variant="contained" onClick={handleAddPolygonRow}>
-                  新規追加
-                </Button>
-                <Button variant="contained" onClick={applyPolygonsToMap}>
-                  地図に反映
-                </Button>
-                <Button variant="contained" onClick={()=>exportData('polygons', polygonsData)}>
-                  エクスポート
-                </Button>
                 <input
-                  id="importPolygonsFile"
-                  type="file"
-                  accept=".csv,.xlsx"
-                  style={{ display:'none' }}
-                  onChange={(e)=>{
-                    if(e.target.files?.[0]) importData(e.target.files[0], 'polygons');
-                  }}
+                  type="color"
+                  value={globalColor1}
+                  onChange={(e)=>setGlobalColor1(e.target.value)}
+                  style={{ width:'40px', height:'30px', border:'none' }}
                 />
-                <Button variant="contained" onClick={()=>document.getElementById('importPolygonsFile').click()}>
-                  インポート
-                </Button>
+                <Typography variant="body2" color="text.secondary">m</Typography>
               </Box>
-
-              <TableContainer component={Paper}>
-                <Table size="small" sx={{ minWidth:600 }}>
-                  <TableHead>
-                    <TableRow>
-                      <TableCell>町丁目名</TableCell>
-                      <TableCell>ポリゴンデータ(JSON)</TableCell>
-                      <TableCell>色</TableCell>
-                      <TableCell>操作</TableCell>
-                    </TableRow>
-                  </TableHead>
-                  <TableBody>
-                    {polygonsData.map((row, i)=>(
-                      <TableRow key={i}>
-                        <TableCell>
-                          <TextField
-                            variant="outlined" size="small"
-                            value={row.name||''}
-                            onChange={(e)=>handlePolygonFieldChange(i,'name',e.target.value)}
-                          />
-                        </TableCell>
-                        <TableCell>
-                          <TextField
-                            variant="outlined" size="small" fullWidth
-                            placeholder='{"type":"Feature","geometry":{...}}'
-                            value={row.polygonData||''}
-                            onChange={(e)=>handlePolygonFieldChange(i,'polygonData',e.target.value)}
-                          />
-                        </TableCell>
-                        <TableCell>
-                          <input
-                            type="color"
-                            value={row.color||'#1976d2'}
-                            onChange={(e)=>handlePolygonFieldChange(i,'color',e.target.value)}
-                            style={{ width:'40px', height:'30px', border:'none' }}
-                          />
-                        </TableCell>
-                        <TableCell>
-                          <IconButton size="small" onClick={()=>handleDeletePolygonRow(i)}>
-                            🗑️
-                          </IconButton>
-                        </TableCell>
-                      </TableRow>
-                    ))}
-                  </TableBody>
-                </Table>
-              </TableContainer>
+              <Box sx={{ display:'flex', gap:1, alignItems:'center' }}>
+                <TextField
+                  label="半径2"
+                  type="number"
+                  size="small"
+                  value={globalRadius2}
+                  onChange={(e)=>setGlobalRadius2(e.target.value)}
+                  sx={{ width:120 }}
+                />
+                <input
+                  type="color"
+                  value={globalColor2}
+                  onChange={(e)=>setGlobalColor2(e.target.value)}
+                  style={{ width:'40px', height:'30px', border:'none' }}
+                />
+                <Typography variant="body2" color="text.secondary">m</Typography>
+              </Box>
+              <Box sx={{ display:'flex', gap:1, alignItems:'center' }}>
+                <TextField
+                  label="半径3"
+                  type="number"
+                  size="small"
+                  value={globalRadius3}
+                  onChange={(e)=>setGlobalRadius3(e.target.value)}
+                  sx={{ width:120 }}
+                />
+                <input
+                  type="color"
+                  value={globalColor3}
+                  onChange={(e)=>setGlobalColor3(e.target.value)}
+                  style={{ width:'40px', height:'30px', border:'none' }}
+                />
+                <Typography variant="body2" color="text.secondary">m</Typography>
+              </Box>
             </Box>
-          )}
-        </Box>
-      </Box>
+            <Box className="modal-actions" sx={{ display:'flex', justifyContent: 'flex-end', gap:1, mt:2 }}>
+              <Button 
+                variant="outlined" 
+                onClick={handleModalClose}
+                startIcon={<span>✖</span>}
+              >
+                キャンセル
+              </Button>
+              <Button 
+                variant="contained" 
+                color="primary"
+                onClick={() => {
+                  handleApplyGlobalRadius();
+                  handleModalClose();
+                }}
+                startIcon={<span>✓</span>}
+              >
+                選択項目に適用
+              </Button>
+            </Box>
+          </Box>
+        </DialogContent>
+      </Dialog>
+
     </ThemeProvider>
   );
 }

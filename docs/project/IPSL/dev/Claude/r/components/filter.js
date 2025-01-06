@@ -12,7 +12,7 @@ const Filter = () => {
     const months = ["選択しない", "1月", "2月", "3月", "4月", "5月", "6月", "7月", "8月", "9月", "10月", "11月", "12月"];
     const weeks = ["選択しない", ...Array.from({ length: 52 }).map((_, i) => `${i + 1}`)];
     const locations = ["全社", "東京本店", "大阪支店", "名古屋支店", "福岡支店"];
-    const departments = ["全部門", "営業部", "企画部", "開発部", "総務部"];
+    const departments = ["全部門", "部門1", "部門2", "部門3", "部門4"];
     const [year, setYear] = useState(new Date().getFullYear());
     const [month, setMonth] = useState("選択しない");
     const [weekNumber, setWeekNumber] = useState("選択しない");
