@@ -23,6 +23,8 @@ function OTBMatrix(props) {
     const [viewMode, setViewMode] = React.useState('weekly'); // 'daily', 'weekly', 'monthly'
     const [classificationUnit, setClassificationUnit] = React.useState('department'); // デフォルトは部門
     const [timeUnit, setTimeUnit] = React.useState('weekly'); // 'daily', 'weekly', 'monthly'
+    const [isDragging, setIsDragging] = React.useState(false);
+    const fileInputRef = React.useRef(null);
 
     // タブラベルと対応するデータキー
     const classificationOptions = [
@@ -292,6 +294,59 @@ function OTBMatrix(props) {
         document.body.removeChild(link);
     };
 
+    // ファイルインポート処理
+    const handleFileImport = async (file) => {
+        try {
+            const reader = new FileReader();
+            reader.onload = (e) => {
+                const data = new Uint8Array(e.target.result);
+                const workbook = XLSX.read(data, { type: 'array' });
+                const sheetName = workbook.SheetNames[0];
+                const worksheet = workbook.Sheets[sheetName];
+                const jsonData = XLSX.utils.sheet_to_json(worksheet);
+                
+                // データを親コンポーネントに渡す
+                if (props.onDataImport) {
+                    props.onDataImport(jsonData);
+                }
+            };
+            reader.readAsArrayBuffer(file);
+        } catch (error) {
+            console.error('ファイルの読み込みエラー:', error);
+            alert('ファイルの読み込みに失敗しました。');
+        }
+    };
+
+    // ドラッグ&ドロップハンドラー
+    const handleDragOver = (e) => {
+        e.preventDefault();
+        setIsDragging(true);
+    };
+
+    const handleDragLeave = (e) => {
+        e.preventDefault();
+        setIsDragging(false);
+    };
+
+    const handleDrop = (e) => {
+        e.preventDefault();
+        setIsDragging(false);
+        const file = e.dataTransfer.files[0];
+        if (file && file.type === "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet") {
+            handleFileImport(file);
+        } else {
+            alert('Excelファイル(.xlsx)のみ対応しています。');
+        }
+    };
+
+    // ファイル選択ハンドラー
+    const handleFileSelect = (e) => {
+        const file = e.target.files[0];
+        if (file) {
+            handleFileImport(file);
+        }
+    };
+
     // 分類単位タブの切り替えハンドラ
     const handleClassificationTabChange = (event, newValue) => {
         setClassificationUnit(newValue);
@@ -341,7 +396,39 @@ function OTBMatrix(props) {
                 </Tabs>
             </Box>
 
-            <Box sx={{ display: 'flex', gap: 2, mt: 2, mb: 2, alignItems: 'center' }}>
+            <Box sx={{ display: 'flex', gap: 2, mt: 2, mb: 2, alignItems: 'center', flexWrap: 'wrap' }}>
+                <input
+                    type="file"
+                    ref={fileInputRef}
+                    style={{ display: 'none' }}
+                    accept=".xlsx"
+                    onChange={handleFileSelect}
+                />
+                
+                {/* ドラッグ&ドロップエリア */}
+                <Box
+                    sx={{
+                        flex: 1,
+                        minHeight: '60px',
+                        border: '2px dashed',
+                        borderColor: isDragging ? 'primary.main' : 'grey.300',
+                        borderRadius: 1,
+                        display: 'flex',
+                        alignItems: 'center',
+                        justifyContent: 'center',
+                        bgcolor: isDragging ? 'action.hover' : 'background.paper',
+                        cursor: 'pointer',
+                    }}
+                    onDragOver={handleDragOver}
+                    onDragLeave={handleDragLeave}
+                    onDrop={handleDrop}
+                    onClick={() => fileInputRef.current?.click()}
+                >
+                    <Typography color="textSecondary">
+                        Excelファイルをドラッグ&ドロップするか、クリックして選択してください
+                    </Typography>
+                </Box>
+
                 {/* 列の単位選択 */}
                 <FormControl variant="outlined" size="small">
                     <InputLabel id="time-unit-label">期間単位</InputLabel>
@@ -410,7 +497,7 @@ function OTBMatrix(props) {
                             itemLabels.map((itemLabel, itemIndex) => (
                                 <TableRow key={`${rowIndex}-${itemIndex}`} sx={itemLabel === '期末在庫' ? { backgroundColor: '#f5f5f5' } : {}}>
                                     {itemIndex === 0 ? (
-                                        <TableCell rowSpan={itemLabels.length} sx={{ padding: '4px 8px', border: '1px solid #ddd' }}>
+                                        <TableCell rowSpan={itemLabels.length} sx={{ padding: '2px 4px', border: '1px solid #ddd' }}>
                                             {row.classification}
                                         </TableCell>
                                     ) : null}
