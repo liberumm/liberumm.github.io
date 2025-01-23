@@ -1,4 +1,5 @@
 // components/OTBMatrix.js
+
 function OTBMatrix(props) {
     const {
         Box,
@@ -17,16 +18,31 @@ function OTBMatrix(props) {
         Button,
         Tabs,
         Tab,
-        Grid
-    } = MaterialUI;
+        Grid,
+        FormControlLabel,
+        Switch
+    } = MaterialUI; // Material-UIをグローバル変数として想定
 
-    const [viewMode, setViewMode] = React.useState('weekly'); // 'daily', 'weekly', 'monthly'
-    const [classificationUnit, setClassificationUnit] = React.useState('department'); // デフォルトは部門
-    const [timeUnit, setTimeUnit] = React.useState('weekly'); // 'daily', 'weekly', 'monthly'
+    // ================================
+    // 1) 既存ステート + 追加ステート
+    // ================================
+    const [viewMode, setViewMode] = React.useState('weekly');
+    const [classificationUnit, setClassificationUnit] = React.useState('department');
+    const [timeUnit, setTimeUnit] = React.useState('weekly');
     const [isDragging, setIsDragging] = React.useState(false);
-    const fileInputRef = React.useRef(null);
 
-    // タブラベルと対応するデータキー
+    // 追加: 計画 / 当年 / 前年 / 分類マスタ を保持
+    const [PlanData, setPlanData] = React.useState([]);
+    const [currentYearData, setCurrentYearData] = React.useState([]);
+    const [lastYearData, setLastYearData] = React.useState([]);
+    const [classificationMasterData, setClassificationMasterData] = React.useState([]);
+
+    const [showMasterImportControls, setShowMasterImportControls] = React.useState(false);
+    const [showByStore, setShowByStore] = React.useState(false); // 店舗別表示の切り替え用
+
+    // ================================
+    // 2) 分類オプション & 表示項目 (既存)
+    // ================================
     const classificationOptions = [
         { label: '全社', value: 'all' },
         { label: '部門', value: 'department' },
@@ -36,11 +52,11 @@ function OTBMatrix(props) {
         { label: 'アイテム', value: 'item' },
         { label: 'SKU', value: 'SKU' },
     ];
-
-    // 各項目ラベル
     const itemLabels = ['期初在庫', '売上', '売価変更', '仕入', '期末在庫'];
 
-    // 期間ごとのデータを作成する関数
+    // ================================
+    // 3) 期間生成ロジック (既存)
+    // ================================
     const createDailyPeriods = (year) => {
         const periods = [];
         for (let month = 0; month < 12; month++) {
@@ -51,7 +67,7 @@ function OTBMatrix(props) {
                     period: `${month + 1}月${day}日`,
                     start: formatDateToJST(date),
                     end: formatDateToJST(date),
-                    businessDays: 1 // 営業日を全ての日とするため1
+                    businessDays: 1
                 });
             }
         }
@@ -73,8 +89,10 @@ function OTBMatrix(props) {
                 periodEnd = new Date(lastDayOfYear);
             }
 
-            // 営業日を全ての日とするため、businessDaysは7
-            const businessDays = Math.min(7, Math.ceil((periodEnd - periodStart) / (1000 * 60 * 60 * 24)) + 1);
+            const businessDays = Math.min(
+                7, 
+                Math.ceil((periodEnd - periodStart) / (1000 * 60 * 60 * 24)) + 1
+            );
 
             periods.push({
                 period: `第${periods.length + 1}週`,
@@ -93,8 +111,8 @@ function OTBMatrix(props) {
         const periods = [];
         for (let month = 0; month < 12; month++) {
             const start = new Date(year, month, 1);
-            const end = new Date(year, month + 1, 0); // 月の最終日
-            const businessDays = Math.ceil((end - start) / (1000 * 60 * 60 * 24)) + 1; // 全日数
+            const end = new Date(year, month + 1, 0);
+            const businessDays = Math.ceil((end - start) / (1000 * 60 * 60 * 24)) + 1;
             periods.push({
                 period: `${month + 1}月`,
                 start: formatDateToJST(start),
@@ -105,24 +123,6 @@ function OTBMatrix(props) {
         return periods;
     };
 
-    // 営業日を計算する関数（全ての日を営業日とする）
-    const calculateBusinessDays = (start, end) => {
-        return Math.ceil((end - start) / (1000 * 60 * 60 * 24)) + 1; // 全日数
-    };
-
-    // 分類単位のリストを取得する関数を分離
-    const getClassifications = React.useCallback((data, unit) => {
-        if (unit === 'all') {
-            return ['全社'];
-        }
-        const unique = new Set();
-        data.forEach(item => {
-            unique.add(item[unit] || '未設定');
-        });
-        return Array.from(unique);
-    }, []);
-
-    // 日付をJST形式にフォーマットする関数
     const formatDateToJST = (date) => {
         const options = {
             timeZone: 'Asia/Tokyo',
@@ -133,35 +133,83 @@ function OTBMatrix(props) {
         return new Intl.DateTimeFormat('ja-JP', options).format(date);
     };
 
-    // 月曜日を取得する関数
     const getMonday = (date) => {
         const day = date.getDay();
-        const diff = day === 0 ? -6 : 1 - day; // Sunday=0 => -6, Monday=1 => 0, etc.
+        const diff = day === 0 ? -6 : 1 - day;
         const monday = new Date(date);
         monday.setDate(monday.getDate() + diff);
         return monday;
     };
 
-    // 営業日判定関数（全ての日を営業日とするため不要）
-    // const isBusinessDay = (date) => {
-    //     const day = date.getDay();
-    //     return day !== 0 && day !== 6;
-    // };
+    // ================================
+    // 4) 分類抽出 / 集計
+    // ================================
+    const getClassifications = React.useCallback((data, unit) => {
+        if (unit === 'all') {
+            return ['全社'];
+        }
+        const unique = new Set();
+        data.forEach(item => {
+            if (showByStore) {
+                // 店舗別表示の場合は「店舗-分類」の形式で保持
+                const store = item.store || '未設定店舗';
+                const classification = item[unit] || '未設定';
+                unique.add(`${store}-${classification}`);
+            } else {
+                // 店舗合計の場合は従来通り
+                unique.add(item[unit] || '未設定');
+            }
+        });
+        return Array.from(unique);
+    }, [showByStore]); // showByStore依存を追加
 
-    // データの集計ロジック
     const aggregatedData = React.useMemo(() => {
-        if (!props.data || props.data.length === 0) return { periods: [], matrix: [] };
+        // a) インポートしていない場合 (分類マスタ含め全て空) → props.data のみ
+        const noPlan  = PlanData.length === 0;
+        const noCurr  = currentYearData.length === 0;
+        const noLast  = lastYearData.length === 0;
+        const noClass = classificationMasterData.length === 0;
 
-        // データの日付範囲を取得
-        const dates = props.data.map(item => new Date(item.expectedDate)).filter(date => !isNaN(date));
-        if (dates.length === 0) return { periods: [], matrix: [] };
+        const isAllEmpty = (noPlan && noCurr && noLast && noClass);
+
+        // b) インポートが何かあれば props.data + 各種インポート
+        //    さらに、分類マスタがあれば「カテゴリ→部門/コーナー/ライン/…」を補完
+        let mergedData = [];
+        if (isAllEmpty) {
+            // 従来どおり
+            mergedData = [...props.data];
+        } else {
+            // plan/currentYear/lastYear データ合体
+            mergedData = [
+                ...props.data,
+                ...PlanData,
+                ...currentYearData,
+                ...lastYearData
+            ];
+            // 分類マスタがあるなら、カテゴリ 等をキーに突き合わせ
+            if (classificationMasterData.length > 0) {
+                mergedData = mergedData.map((row) => mergeClassificationFromMaster(row));
+            }
+        }
+
+        if (!mergedData || mergedData.length === 0) {
+            return { periods: [], matrix: [] };
+        }
+
+        // 日付抽出
+        const dates = mergedData
+            .map(item => new Date(item.expectedDate))
+            .filter(date => !isNaN(date));
+
+        if (dates.length === 0) {
+            return { periods: [], matrix: [] };
+        }
 
         const minDate = new Date(Math.min(...dates));
-        const maxDate = new Date(Math.max(...dates));
-
         const currentYear = minDate.getFullYear();
         const previousYear = currentYear - 1;
 
+        // timeUnitに応じて期間を生成
         let periods = [];
         if (timeUnit === 'daily') {
             periods = createDailyPeriods(currentYear);
@@ -171,10 +219,10 @@ function OTBMatrix(props) {
             periods = createMonthlyPeriods(currentYear);
         }
 
-        // 分類単位のリストを取得
-        const classifications = getClassifications(props.data, classificationUnit);
-        
-        // 期末在庫の履歴を保持するオブジェクト
+        // 分類単位
+        const classifications = getClassifications(mergedData, classificationUnit);
+
+        // 在庫履歴
         const inventoryHistory = {};
         classifications.forEach(classItem => {
             inventoryHistory[classItem] = {};
@@ -183,75 +231,148 @@ function OTBMatrix(props) {
         // 集計
         const matrix = classifications.map(classItem => {
             const row = { classification: classItem };
-            
+
             periods.forEach((period, periodIndex) => {
-                // 当年の期間内のデータをフィルタリング
-                const currentPeriodData = props.data.filter(item => {
+                // 当年期間
+                const currentPeriodData = mergedData.filter(item => {
                     const itemDate = new Date(item.expectedDate);
-                    return !isNaN(itemDate) && 
-                           itemDate >= new Date(period.start) && 
-                           itemDate <= new Date(period.end) &&
-                           (classificationUnit === 'all' || item[classificationUnit] === classItem);
+                    if (isNaN(itemDate)) return false;
+
+                    const dateMatch = itemDate >= new Date(period.start) && 
+                                    itemDate <= new Date(period.end);
+
+                    if (showByStore) {
+                        // 店舗別表示の場合は「店舗-分類」で比較
+                        const itemClassKey = `${item.store || '未設定店舗'}-${item[classificationUnit] || '未設定'}`;
+                        return dateMatch && (classificationUnit === 'all' || itemClassKey === classItem);
+                    } else {
+                        // 店舗合計の場合は従来通り
+                        return dateMatch && (classificationUnit === 'all' || item[classificationUnit] === classItem);
+                    }
                 });
 
-                // 前年の同期間のデータをフィルタリング
+                // 前年期間
                 const previousPeriodStart = new Date(new Date(period.start).setFullYear(previousYear));
                 const previousPeriodEnd = new Date(new Date(period.end).setFullYear(previousYear));
-                const previousPeriodData = props.data.filter(item => {
+                const previousPeriodData = mergedData.filter(item => {
                     const itemDate = new Date(item.expectedDate);
-                    return !isNaN(itemDate) && 
-                           itemDate >= previousPeriodStart && 
-                           itemDate <= previousPeriodEnd &&
-                           (classificationUnit === 'all' || item[classificationUnit] === classItem);
+                    if (isNaN(itemDate)) return false;
+
+                    const dateMatch = itemDate >= previousPeriodStart && 
+                                    itemDate <= previousPeriodEnd;
+
+                    if (showByStore) {
+                        const itemClassKey = `${item.store || '未設定店舗'}-${item[classificationUnit] || '未設定'}`;
+                        return dateMatch && (classificationUnit === 'all' || itemClassKey === classItem);
+                    } else {
+                        return dateMatch && (classificationUnit === 'all' || item[classificationUnit] === classItem);
+                    }
                 });
 
-                // 期初在庫の計算
-                const previousEndingInventory = periodIndex === 0 ? 0 : 
-                    inventoryHistory[classItem][`期末在庫_${period.period}`] || 0;
-                row[`期初在庫_${period.period}`] = previousEndingInventory;
+                // 計画
+                const beginningInventoryPlan = currentPeriodData.reduce(
+                    (sum, d) => sum + (Number(d['期初在庫計画']) || 0),
+                    0
+                );
+                const salesPlan = currentPeriodData.reduce(
+                    (sum, d) => sum + (Number(d['売上計画']) || 0),
+                    0
+                );
+                const priceChangesPlan = currentPeriodData.reduce(
+                    (sum, d) => sum + (Number(d['売価変更計画']) || 0),
+                    0
+                );
+                const purchasesPlan = currentPeriodData.reduce(
+                    (sum, d) => sum + (Number(d['仕入計画']) || 0),
+                    0
+                );
+                const endingInventoryPlan = beginningInventoryPlan - salesPlan - priceChangesPlan + purchasesPlan;
+                row[`計画_期初在庫_${period.period}`] = beginningInventoryPlan;
+                row[`計画_売上_${period.period}`] = salesPlan;
+                row[`計画_売価変更_${period.period}`] = priceChangesPlan;
+                row[`計画_仕入_${period.period}`] = purchasesPlan;
+                row[`計画_期末在庫_${period.period}`] = Math.max(endingInventoryPlan, 0);
 
-                // 各値の計算 (当年)
-                const sales = currentPeriodData.reduce((sum, item) => sum + (Number(item.sales) || 0), 0);
-                const priceChanges = currentPeriodData.reduce((sum, item) => sum + (Number(item.priceChanges) || 0), 0);
-                const purchases = currentPeriodData.reduce((sum, item) => sum + (Number(item.purchases) || 0), 0);
-                const endingInventory = previousEndingInventory - sales - priceChanges + purchases;
+                // 当年
+                const prevEndingInv = (periodIndex === 0)
+                    ? 0
+                    : inventoryHistory[classItem][`期末在庫_${period.period}`] || 0;
+                row[`当年_期初在庫_${period.period}`] = prevEndingInv;
 
-                row[`売上_${period.period}`] = sales;
-                row[`売価変更_${period.period}`] = priceChanges;
-                row[`仕入_${period.period}`] = purchases;
-                row[`期末在庫_${period.period}`] = endingInventory >= 0 ? endingInventory : 0;
+                const sales = currentPeriodData.reduce((s, d) => s + (Number(d.sales) || 0), 0);
+                const priceChanges = currentPeriodData.reduce((s, d) => s + (Number(d.priceChanges) || 0), 0);
+                const purchases = currentPeriodData.reduce((s, d) => s + (Number(d.purchases) || 0), 0);
+                const endingInventory = prevEndingInv - sales - priceChanges + purchases;
+                row[`当年_売上_${period.period}`] = sales;
+                row[`当年_売価変更_${period.period}`] = priceChanges;
+                row[`当年_仕入_${period.period}`] = purchases;
+                row[`当年_期末在庫_${period.period}`] = Math.max(endingInventory, 0);
 
-                // 前年の値の計算
-                const prevSales = previousPeriodData.reduce((sum, item) => sum + (Number(item.sales) || 0), 0);
-                const prevPriceChanges = previousPeriodData.reduce((sum, item) => sum + (Number(item.priceChanges) || 0), 0);
-                const prevPurchases = previousPeriodData.reduce((sum, item) => sum + (Number(item.purchases) || 0), 0);
-                const prevEndingInventory = previousPeriodData.length > 0 
-                    ? prevPurchases - prevSales - prevPriceChanges 
-                    : 0;
+                // inventoryHistory記憶
+                inventoryHistory[classItem][`期末在庫_${period.period}`] = Math.max(endingInventory, 0);
 
-                // 前年の期末在庫
-                const prevPeriodEndingInventory = prevEndingInventory >= 0 ? prevEndingInventory : 0;
-                row[`期末在庫_prev_${period.period}`] = prevPeriodEndingInventory;
-
-                // 前年比と差異額の計算
-                const yoy = prevEndingInventory !== 0 ? ((endingInventory - prevEndingInventory) / Math.abs(prevEndingInventory)) * 100 : 0;
-                const difference = endingInventory - prevEndingInventory;
-
-                row[`前年比_${period.period}`] = yoy.toFixed(2) + '%';
-                row[`差異額_${period.period}`] = difference;
-                
-                // 期末在庫の履歴を保存
-                inventoryHistory[classItem][`期末在庫_${period.period}`] = endingInventory >= 0 ? endingInventory : 0;
+                // 前年
+                const prevSales = previousPeriodData.reduce((s, d) => s + (Number(d.sales) || 0), 0);
+                const prevPriceChanges = previousPeriodData.reduce((s, d) => s + (Number(d.priceChanges) || 0), 0);
+                const prevPurchases = previousPeriodData.reduce((s, d) => s + (Number(d.purchases) || 0), 0);
+                const prevEndInv = 0 - prevSales - prevPriceChanges + prevPurchases;
+                row[`前年_期初在庫_${period.period}`] = 0;
+                row[`前年_売上_${period.period}`] = prevSales;
+                row[`前年_売価変更_${period.period}`] = prevPriceChanges;
+                row[`前年_仕入_${period.period}`] = prevPurchases;
+                row[`前年_期末在庫_${period.period}`] = Math.max(prevEndInv, 0);
             });
 
             return row;
         });
 
         return { periods, matrix };
-    }, [props.data, viewMode, classificationUnit, timeUnit, getClassifications]);
+    }, [
+        props.data,
+        PlanData,
+        currentYearData,
+        lastYearData,
+        classificationMasterData,
+        timeUnit,
+        classificationUnit,
+        showByStore, // showByStore依存を追加
+        getClassifications
+    ]);
 
-    // 早期リターン
-    if (!aggregatedData || !aggregatedData.periods || !aggregatedData.matrix) {
+    // -------------------------------------------------
+    // (A) 分類マスタを使って row の部門/コーナー/ライン/... を補完
+    // -------------------------------------------------
+    const mergeClassificationFromMaster = (row) => {
+        if (!row.category) {
+            return row;
+        }
+        const found = classificationMasterData.find(m => m.category === row.category);
+        if (!found) {
+            return row;
+        }
+        const newRow = { ...row };
+        if (found.department) newRow.department = found.department;
+        if (found.corner)     newRow.corner     = found.corner;
+        if (found.line)       newRow.line       = found.line;
+        if (found.category)   newRow.category   = found.category;
+        if (found.item)       newRow.item       = found.item;
+        if (found.SKU)        newRow.SKU        = found.SKU;
+        return newRow;
+    };
+
+    const splitClassification = (classification) => {
+        if (!showByStore) return { store: '', classification };
+        const [store, ...rest] = classification.split('-');
+        return {
+            store: store || '未設定店舗',
+            classification: rest.join('-') || '未設定'
+        };
+    };
+
+    // ================================
+    // 5) 表示が無い場合の処理
+    // ================================
+    if (!aggregatedData.periods?.length || !aggregatedData.matrix?.length) {
         return (
             <Box component={Paper} sx={{ p: 2 }}>
                 <Typography variant="h6">データが存在しません</Typography>
@@ -259,23 +380,32 @@ function OTBMatrix(props) {
         );
     }
 
-    // Excelエクスポート機能
+    // ================================
+    // 6) エクスポート & テンプレ
+    // ================================
     const handleExportExcel = () => {
-        // カスタムヘッダーを含めるため、データを加工
         const exportData = [];
-        aggregatedData.matrix.forEach(row => {
-            aggregatedData.periods.forEach(period => {
-                exportData.push({
-                    '分類単位': row.classification,
-                    '期間': period.period,
-                    '当年期初在庫': row[`期初在庫_${period.period}`],
-                    '当年売上': row[`売上_${period.period}`],
-                    '当年売価変更': row[`売価変更_${period.period}`],
-                    '当年仕入': row[`仕入_${period.period}`],
-                    '当年期末在庫': row[`期末在庫_${period.period}`],
-                    '前年期末在庫': row[`期末在庫_prev_${period.period}`],
-                    '前年比': row[`前年比_${period.period}`],
-                    '差異額': row[`差異額_${period.period}`],
+        const { periods, matrix } = aggregatedData;
+        matrix.forEach(row => {
+            periods.forEach(period => {
+                itemLabels.forEach(itemLabel => {
+                    exportData.push({
+                        '分類単位': row.classification,
+                        '期間': period.period,
+                        '項目': itemLabel,
+                        '計画': row[`計画_${itemLabel}_${period.period}`] || 0,
+                        '当年': row[`当年_${itemLabel}_${period.period}`] || 0,
+                        '前年': row[`前年_${itemLabel}_${period.period}`] || 0,
+                        '前年比': (() => {
+                            const thisYearVal = row[`当年_${itemLabel}_${period.period}`] || 0;
+                            const lastYearVal = row[`前年_${itemLabel}_${period.period}`] || 0;
+                            return lastYearVal
+                                ? ((thisYearVal - lastYearVal) / Math.abs(lastYearVal) * 100).toFixed(2) + '%'
+                                : '0%';
+                        })(),
+                        '差異額': (row[`当年_${itemLabel}_${period.period}`] || 0)
+                                  - (row[`前年_${itemLabel}_${period.period}`] || 0)
+                    });
                 });
             });
         });
@@ -294,20 +424,165 @@ function OTBMatrix(props) {
         document.body.removeChild(link);
     };
 
-    // ファイルインポート処理
-    const handleFileImport = async (file) => {
+    const handleDownloadTemplate = () => {
+        // テンプレートに新しい列構成を反映
+        const templateData = [{
+            '日付': 'YYYY/MM/DD',
+            '時間': 'HH:MM',
+            'カテゴリ': '',
+            'アイテム': '',
+            'SKU': '',
+            '店舗': '',
+            '期初在庫': 0,
+            '期初在庫（数量）': 0,
+            '売上': 0,
+            '売上（数量）': 0,
+            '売価変更': 0,
+            '売価変更（数量）': 0,
+            '仕入': 0,
+            '仕入（数量）': 0,
+            '期末在庫': 0,
+            '期末在庫（数量）': 0
+        }];
+        const worksheet = XLSX.utils.json_to_sheet(templateData);
+        const workbook = { Sheets: { 'Template': worksheet }, SheetNames: ['Template'] };
+        const excelBuffer = XLSX.write(workbook, { bookType: 'xlsx', type: 'array' });
+        const blob = new Blob([excelBuffer], { type: 'application/octet-stream' });
+        const link = document.createElement("a");
+        const url = URL.createObjectURL(blob);
+        link.setAttribute("href", url);
+        link.setAttribute("download", "ImportTemplate.xlsx");
+        link.style.visibility = 'hidden';
+        document.body.appendChild(link);
+        link.click();
+        document.body.removeChild(link);
+    };
+
+    // ================================
+    // 7) インポート用パーサ (計画/当年/前年/分類マスタ)
+    // ================================
+    const parsePlanRow = (row) => {
+        const parseNum = (v) => isNaN(Number(v)) ? 0 : Number(v);
+        const dateString = row['日付'] || '';
+        const timeString = row['時間'] || '';
+        const d = new Date(dateString + ' ' + timeString);
+        const newRow = {};
+        if (!isNaN(d)) newRow.expectedDate = d;
+        newRow.category = row['カテゴリ'] || '';
+        newRow.item     = row['アイテム'] || '';
+        newRow.SKU      = row['SKU'] || '';
+        newRow.store    = row['店舗'] || '';
+        newRow['期初在庫計画']        = parseNum(row['期初在庫']);
+        newRow['期初在庫数量計画']    = parseNum(row['期初在庫（数量）']);
+        newRow['売上計画']            = parseNum(row['売上']);
+        newRow['売上数量計画']        = parseNum(row['売上（数量）']);
+        newRow['売価変更計画']        = parseNum(row['売価変更']);
+        newRow['売価変更数量計画']    = parseNum(row['売価変更（数量）']);
+        newRow['仕入計画']            = parseNum(row['仕入']);
+        newRow['仕入数量計画']        = parseNum(row['仕入（数量）']);
+        newRow['期末在庫計画']        = parseNum(row['期末在庫']);
+        newRow['期末在庫数量計画']    = parseNum(row['期末在庫（数量）']);
+        return newRow;
+    };
+
+    const parseCurrentYearRow = (row) => {
+        const parseNum = (v) => isNaN(Number(v)) ? 0 : Number(v);
+        const dateString = row['日付'] || '';
+        const timeString = row['時間'] || '';
+        const d = new Date(dateString + ' ' + timeString);
+        
+        const newRow = {};
+        if (!isNaN(d)) newRow.expectedDate = d;
+
+        newRow.category = row['カテゴリ'] || '';
+        newRow.item     = row['アイテム'] || '';
+        newRow.SKU      = row['SKU'] || '';
+        newRow.store    = row['店舗'] || '';
+
+        newRow.sales              = parseNum(row['売上']);
+        newRow.sales数量          = parseNum(row['売上（数量）']);
+        newRow.priceChanges       = parseNum(row['売価変更']);
+        newRow.priceChanges数量   = parseNum(row['売価変更（数量）']);
+        newRow.purchases          = parseNum(row['仕入']);
+        newRow.purchases数量      = parseNum(row['仕入（数量）']);
+
+        newRow['期初在庫']        = parseNum(row['期初在庫']);
+        newRow['期初在庫数量']    = parseNum(row['期初在庫（数量）']);
+        newRow['期末在庫']        = parseNum(row['期末在庫']);
+        newRow['期末在庫数量']    = parseNum(row['期末在庫（数量）']);
+
+        return newRow;
+    };
+
+    const parseLastYearRow = (row) => {
+        const parseNum = (v) => isNaN(Number(v)) ? 0 : Number(v);
+        const dateString = row['日付'] || '';
+        const timeString = row['時間'] || '';
+        const d = new Date(dateString + ' ' + timeString);
+        
+        const newRow = {};
+        if (!isNaN(d)) newRow.expectedDate = d;
+
+        newRow.category = row['カテゴリ'] || '';
+        newRow.item     = row['アイテム'] || '';
+        newRow.SKU      = row['SKU'] || '';
+        newRow.store    = row['店舗'] || '';
+
+        newRow.sales              = parseNum(row['売上']);
+        newRow.sales数量          = parseNum(row['売上（数量）']);
+        newRow.priceChanges       = parseNum(row['売価変更']);
+        newRow.priceChanges数量   = parseNum(row['売価変更（数量）']);
+        newRow.purchases          = parseNum(row['仕入']);
+        newRow.purchases数量      = parseNum(row['仕入（数量）']);
+
+        newRow['期初在庫']        = parseNum(row['期初在庫']);
+        newRow['期初在庫数量']    = parseNum(row['期初在庫（数量）']);
+        newRow['期末在庫']        = parseNum(row['期末在庫']);
+        newRow['期末在庫数量']    = parseNum(row['期末在庫（数量）']);
+
+        return newRow;
+    };
+
+    const parseClassificationMasterRow = (row) => {
+        return {
+            department: row['部門'] || '',
+            corner:     row['コーナー'] || '',
+            line:       row['ライン'] || '',
+            category:   row['カテゴリ'] || '',
+            item:       row['アイテム'] || '',
+            SKU:        row['SKU'] || ''
+        };
+    };
+
+    // ================================
+    // 8) handleFileImport: 計画/当年/前年/分類マスタを識別
+    // ================================
+    const handleFileImport = (e, importType) => {
         try {
+            const file = e.target.files[0];
+            if (!file) return;
+
             const reader = new FileReader();
-            reader.onload = (e) => {
-                const data = new Uint8Array(e.target.result);
+            reader.onload = (ev) => {
+                const data = new Uint8Array(ev.target.result);
                 const workbook = XLSX.read(data, { type: 'array' });
                 const sheetName = workbook.SheetNames[0];
                 const worksheet = workbook.Sheets[sheetName];
                 const jsonData = XLSX.utils.sheet_to_json(worksheet);
-                
-                // データを親コンポーネントに渡す
-                if (props.onDataImport) {
-                    props.onDataImport(jsonData);
+
+                let mappedRows = [];
+                if (importType === 'plan') {
+                    mappedRows = jsonData.map(parsePlanRow);
+                    setPlanData(mappedRows);
+                } else if (importType === 'currentYear') {
+                    mappedRows = jsonData.map(parseCurrentYearRow);
+                    setCurrentYearData(mappedRows);
+                } else if (importType === 'lastYear') {
+                    mappedRows = jsonData.map(parseLastYearRow);
+                    setLastYearData(mappedRows);
+                } else if (importType === 'classificationMaster') {
+                    mappedRows = jsonData.map(parseClassificationMasterRow);
+                    setClassificationMasterData(mappedRows);
                 }
             };
             reader.readAsArrayBuffer(file);
@@ -317,78 +592,120 @@ function OTBMatrix(props) {
         }
     };
 
-    // ドラッグ&ドロップハンドラー
+    const handleFileDrop = (e, importType) => {
+        e.preventDefault();
+        setIsDragging(false);
+
+        const file = e.dataTransfer.files[0];
+        if (!file) return;
+
+        if (file.type !== "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+         && file.type !== "application/vnd.ms-excel") {
+            alert('Excelファイル(.xlsx, .xls)のみ対応しています。');
+            return;
+        }
+
+        const reader = new FileReader();
+        reader.onload = (ev) => {
+            const data = new Uint8Array(ev.target.result);
+            const workbook = XLSX.read(data, { type: 'array' });
+            const sheetName = workbook.SheetNames[0];
+            const worksheet = workbook.Sheets[sheetName];
+            const jsonData = XLSX.utils.sheet_to_json(worksheet);
+
+            let mappedRows = [];
+            if (importType === 'plan') {
+                mappedRows = jsonData.map(parsePlanRow);
+                setPlanData(mappedRows);
+            } else if (importType === 'currentYear') {
+                mappedRows = jsonData.map(parseCurrentYearRow);
+                setCurrentYearData(mappedRows);
+            } else if (importType === 'lastYear') {
+                mappedRows = jsonData.map(parseLastYearRow);
+                setLastYearData(mappedRows);
+            } else if (importType === 'classificationMaster') {
+                mappedRows = jsonData.map(parseClassificationMasterRow);
+                setClassificationMasterData(mappedRows);
+            }
+        };
+        reader.readAsArrayBuffer(file);
+    };
+
+    // ================================
+    // 9) DnD UI用ドラッグ中ハンドラ等
+    // ================================
     const handleDragOver = (e) => {
         e.preventDefault();
         setIsDragging(true);
     };
-
     const handleDragLeave = (e) => {
         e.preventDefault();
         setIsDragging(false);
     };
 
-    const handleDrop = (e) => {
-        e.preventDefault();
-        setIsDragging(false);
-        const file = e.dataTransfer.files[0];
-        if (file && file.type === "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet") {
-            handleFileImport(file);
-        } else {
-            alert('Excelファイル(.xlsx)のみ対応しています。');
-        }
-    };
-
-    // ファイル選択ハンドラー
-    const handleFileSelect = (e) => {
-        const file = e.target.files[0];
-        if (file) {
-            handleFileImport(file);
-        }
-    };
-
-    // 分類単位タブの切り替えハンドラ
+    // ================================
+    // 10) イベントハンドラ (タブ類)
+    // ================================
     const handleClassificationTabChange = (event, newValue) => {
         setClassificationUnit(newValue);
     };
-
-    // ビューモードタブの切り替えハンドラ
     const handleViewModeTabChange = (event, newValue) => {
         setViewMode(newValue);
     };
-
-    // 列の単位切り替えハンドラ
     const handleTimeUnitChange = (event) => {
         setTimeUnit(event.target.value);
     };
 
+    // ================================
+    // 11) レンダリング
+    // ================================
     return (
         <Box component={Paper} sx={{ p: 2, width: '100%' }}>
             <Typography variant="h6" gutterBottom>
                 OTB計画マトリックス
             </Typography>
 
-            {/* 二行タブの実装 */}
+            {/* 分類単位タブ */}
             <Box sx={{ borderBottom: 1, borderColor: 'divider' }}>
-                {/* 1行目: 分類単位 */}
-                <Tabs
-                    value={classificationUnit}
-                    onChange={handleClassificationTabChange}
-                    aria-label="Classification Unit Tabs"
-                    variant="scrollable"
-                    scrollButtons="auto"
-                >
-                    {classificationOptions.map(option => (
-                        <Tab key={option.value} label={option.label} value={option.value} />
-                    ))}
-                </Tabs>
-                {/* 2行目: ビューモード */}
+                <Box sx={{ display: 'flex', alignItems: 'center', mb: 1 }}>
+                    <Tabs
+                        value={classificationUnit}
+                        onChange={handleClassificationTabChange}
+                        aria-label="Classification Unit Tabs"
+                        variant="scrollable"
+                        scrollButtons="auto"
+                        sx={{ flexGrow: 1 }}
+                    >
+                        {classificationOptions.map(option => (
+                            <Tab key={option.value} label={option.label} value={option.value} />
+                        ))}
+                    </Tabs>
+
+                    {/* 店舗別表示切り替えスイッチを追加 */}
+                    <FormControlLabel
+                        control={
+                            <Switch
+                                checked={showByStore}
+                                onChange={(e) => setShowByStore(e.target.checked)}
+                                color="primary"
+                            />
+                        }
+                        label={
+                            <Typography variant="body2" color="textSecondary">
+                                店舗別表示
+                            </Typography>
+                        }
+                        sx={{ ml: 2, mr: 2 }}
+                    />
+                </Box>
+
+                {/* ビューモードタブ */}
                 <Tabs
                     value={viewMode}
                     onChange={handleViewModeTabChange}
                     aria-label="View Mode Tabs"
                     variant="fullWidth"
-                    sx={{ borderTop: 1, borderColor: 'divider', backgroundColor: '#f0f0f0' }} // 背景色を追加
+                    sx={{ borderTop: 1, borderColor: 'divider', backgroundColor: '#f0f0f0' }}
                 >
                     <Tab value="annual" label="年間ビュー" />
                     <Tab value="monthly" label="月度ビュー" />
@@ -396,40 +713,8 @@ function OTBMatrix(props) {
                 </Tabs>
             </Box>
 
-            <Box sx={{ display: 'flex', gap: 2, mt: 2, mb: 2, alignItems: 'center', flexWrap: 'wrap' }}>
-                <input
-                    type="file"
-                    ref={fileInputRef}
-                    style={{ display: 'none' }}
-                    accept=".xlsx"
-                    onChange={handleFileSelect}
-                />
-                
-                {/* ドラッグ&ドロップエリア */}
-                <Box
-                    sx={{
-                        flex: 1,
-                        minHeight: '60px',
-                        border: '2px dashed',
-                        borderColor: isDragging ? 'primary.main' : 'grey.300',
-                        borderRadius: 1,
-                        display: 'flex',
-                        alignItems: 'center',
-                        justifyContent: 'center',
-                        bgcolor: isDragging ? 'action.hover' : 'background.paper',
-                        cursor: 'pointer',
-                    }}
-                    onDragOver={handleDragOver}
-                    onDragLeave={handleDragLeave}
-                    onDrop={handleDrop}
-                    onClick={() => fileInputRef.current?.click()}
-                >
-                    <Typography color="textSecondary">
-                        Excelファイルをドラッグ&ドロップするか、クリックして選択してください
-                    </Typography>
-                </Box>
-
-                {/* 列の単位選択 */}
+            {/* 期間セレクト & エクスポート */}
+            <Box sx={{ mt: 2, mb: 2, display: 'flex', gap: 2, alignItems: 'center', flexWrap: 'wrap' }}>
                 <FormControl variant="outlined" size="small">
                     <InputLabel id="time-unit-label">期間単位</InputLabel>
                     <Select
@@ -444,19 +729,143 @@ function OTBMatrix(props) {
                     </Select>
                 </FormControl>
 
-                {/* エクスポートボタン */}
-                <Button variant="contained" color="primary" onClick={handleExportExcel}>
+                <Button 
+                    variant="contained" 
+                    color="primary" 
+                    onClick={handleExportExcel}
+                >
                     Excelとしてエクスポート
                 </Button>
             </Box>
 
-            {/* マトリックス表示 */}
+            {/* ===================== インポートセクション (例) ===================== */}
+            <Box mt={2}>
+                <Paper variant="outlined" sx={{ p: 2, mb: 2 }}>
+                    {/* ヘッダー部分 */}
+                    <Grid container spacing={2} alignItems="center" sx={{ mb: 2 }}>
+                        <Grid item xs>
+                            <Typography variant="subtitle1" component="h2">
+                                <span className="material-icons" style={{ verticalAlign: 'middle', marginRight: '8px' }}>
+                                    upload_file
+                                </span>
+                                データ取込
+                            </Typography>
+                        </Grid>
+                        <Grid item>
+                            <Button
+                                size="small"
+                                variant="outlined"
+                                onClick={() => setShowMasterImportControls(!showMasterImportControls)}
+                                startIcon={<span className="material-icons">
+                                    {showMasterImportControls ? 'expand_less' : 'expand_more'}
+                                </span>}
+                            >
+                                {showMasterImportControls ? "閉じる" : "開く"}
+                            </Button>
+                        </Grid>
+                    </Grid>
+
+                    {/* インポートコントロール */}
+                    {showMasterImportControls && (
+                        <Grid container spacing={2}>
+                            {[
+                                { title: "計画ファイル",              type: 'plan',                 icon: 'analytics' },
+                                { title: "当年ファイル",              type: 'currentYear',          icon: 'event' },
+                                { title: "前年ファイル",              type: 'lastYear',             icon: 'history' },
+                                { title: "分類マスタ",               type: 'classificationMaster', icon: 'account_tree' }
+                            ].map((item) => (
+                                <Grid item xs={12} md={3} key={item.type}>
+                                    <Paper
+                                        elevation={0}
+                                        variant="outlined"
+                                        sx={{
+                                            p: 2,
+                                            backgroundColor: '#f8f9fa',
+                                            '&:hover': { backgroundColor: '#f5f5f5' }
+                                        }}
+                                    >
+                                        <Typography variant="subtitle2" sx={{ display: 'flex', alignItems: 'center', mb: 2 }}>
+                                            <span className="material-icons" style={{ marginRight: '8px' }}>
+                                                {item.icon}
+                                            </span>
+                                            {item.title}
+                                        </Typography>
+
+                                        {/* ドロップエリアとファイル選択を統合 */}
+                                        <Box
+                                            component="label"
+                                            sx={{
+                                                display: 'block',
+                                                border: '1px dashed #bdbdbd',
+                                                borderRadius: 1,
+                                                p: 3,
+                                                textAlign: 'center',
+                                                backgroundColor: '#ffffff',
+                                                cursor: 'pointer',
+                                                mb: 2,
+                                                '&:hover': {
+                                                    borderColor: 'primary.main',
+                                                    backgroundColor: '#f5f5f5'
+                                                }
+                                            }}
+                                            onDrop={(e) => handleFileDrop(e, item.type)}
+                                            onDragOver={(e) => e.preventDefault()}
+                                            onClick={() => document.getElementById(`file-input-${item.type}`).click()}
+                                        >
+                                            <input
+                                                id={`file-input-${item.type}`}
+                                                type="file"
+                                                accept=".xlsx, .xls"
+                                                hidden
+                                                onChange={(e) => handleFileImport(e, item.type)}
+                                            />
+                                            <span className="material-icons" style={{ fontSize: '48px', color: '#757575', marginBottom: '8px' }}>
+                                                upload_file
+                                            </span>
+                                            <Typography variant="body2" color="textSecondary" gutterBottom>
+                                                ファイルをドラッグ＆ドロップ
+                                            </Typography>
+                                            <Typography variant="body2" color="primary">
+                                                またはクリックして選択
+                                            </Typography>
+                                        </Box>
+
+                                        {/* テンプレートダウンロードボタン */}
+                                        <Button
+                                            fullWidth
+                                            variant="outlined"
+                                            onClick={handleDownloadTemplate}
+                                            startIcon={<span className="material-icons">download</span>}
+                                            size="small"
+                                        >
+                                            テンプレートをダウンロード
+                                        </Button>
+                                    </Paper>
+                                </Grid>
+                            ))}
+                        </Grid>
+                    )}
+                </Paper>
+            </Box>
+            {/* =========================================================== */}
+
+            {/* ===================== 集計マトリックステーブル (既存) ===================== */}
             <TableContainer sx={{ overflowX: 'auto', width: '100%' }}>
-                <Table size="small" stickyHeader sx={{ whiteSpace: 'nowrap', borderCollapse: 'collapse', width: '100%' }}>
+                <Table size="small" stickyHeader sx={{ whiteSpace: 'nowrap', width: '100%' }}>
                     <TableHead>
                         <TableRow>
-                            <TableCell rowSpan={2} sx={{ padding: '4px 8px', border: '1px solid #ddd' }}>分類単位</TableCell>
-                            <TableCell rowSpan={2} sx={{ padding: '4px 8px', border: '1px solid #ddd' }}>項目</TableCell>
+                            {/* 店舗列を追加 */}
+                            {showByStore && (
+                                <TableCell rowSpan={2} sx={{ padding: '4px 8px', border: '1px solid #ddd' }}>
+                                    店舗
+                                </TableCell>
+                            )}
+                            <TableCell rowSpan={2} sx={{ padding: '4px 8px', border: '1px solid #ddd' }}>
+                                分類単位
+                            </TableCell>
+                            <TableCell rowSpan={2} sx={{ padding: '4px 8px', border: '1px solid #ddd' }}>
+                                項目
+                            </TableCell>
                             <TableCell colSpan={5} align="center" sx={{ padding: '4px 8px', border: '1px solid #ddd' }}>
                                 <Typography variant="caption">期間合計</Typography>
                             </TableCell>
@@ -473,83 +882,162 @@ function OTBMatrix(props) {
                             ))}
                         </TableRow>
                         <TableRow>
-                            {/* 期間合計の列 */}
-                            <TableCell sx={{ padding: '4px 8px', border: '1px solid #ddd', backgroundColor: '#f5f5f5' }}>計画</TableCell>
-                            <TableCell sx={{ padding: '4px 8px', border: '1px solid #ddd' }}>当年</TableCell>
-                            <TableCell sx={{ padding: '4px 8px', border: '1px solid #ddd' }}>前年</TableCell>
-                            <TableCell sx={{ padding: '4px 8px', border: '1px solid #ddd' }}>前年比</TableCell>
-                            <TableCell sx={{ padding: '4px 8px', border: '1px solid #ddd' }}>差異額</TableCell>
-                            {/* 各期間の列 */}
+                            <TableCell sx={{ padding: '4px 8px', border: '1px solid #ddd', backgroundColor: '#f5f5f5' }}>
+                                計画
+                            </TableCell>
+                            <TableCell sx={{ padding: '4px 8px', border: '1px solid #ddd' }}>
+                                当年
+                            </TableCell>
+                            <TableCell sx={{ padding: '4px 8px', border: '1px solid #ddd' }}>
+                                前年
+                            </TableCell>
+                            <TableCell sx={{ padding: '4px 8px', border: '1px solid #ddd' }}>
+                                前年比
+                            </TableCell>
+                            <TableCell sx={{ padding: '4px 8px', border: '1px solid #ddd' }}>
+                                差異額
+                            </TableCell>
                             {aggregatedData.periods.map((period, index) => (
                                 <React.Fragment key={index}>
-                                    <TableCell sx={{ padding: '4px 8px', border: '1px solid #ddd', backgroundColor: '#f5f5f5' }}>計画</TableCell>
-                                    <TableCell sx={{ padding: '4px 8px', border: '1px solid #ddd' }}>当年</TableCell>
-                                    <TableCell sx={{ padding: '4px 8px', border: '1px solid #ddd' }}>前年</TableCell>
-                                    <TableCell sx={{ padding: '4px 8px', border: '1px solid #ddd' }}>前年比</TableCell>
-                                    <TableCell sx={{ padding: '4px 8px', border: '1px solid #ddd' }}>差異額</TableCell>
+                                    <TableCell sx={{ padding: '4px 8px', border: '1px solid #ddd', backgroundColor: '#f5f5f5' }}>
+                                        計画
+                                    </TableCell>
+                                    <TableCell sx={{ padding: '4px 8px', border: '1px solid #ddd' }}>
+                                        当年
+                                    </TableCell>
+                                    <TableCell sx={{ padding: '4px 8px', border: '1px solid #ddd' }}>
+                                        前年
+                                    </TableCell>
+                                    <TableCell sx={{ padding: '4px 8px', border: '1px solid #ddd' }}>
+                                        前年比
+                                    </TableCell>
+                                    <TableCell sx={{ padding: '4px 8px', border: '1px solid #ddd' }}>
+                                        差異額
+                                    </TableCell>
                                 </React.Fragment>
                             ))}
                         </TableRow>
                     </TableHead>
                     <TableBody>
-                        {/* 期間合計のデータ表示を追加 */}
                         {aggregatedData.matrix.map((row, rowIndex) => (
-                            itemLabels.map((itemLabel, itemIndex) => (
-                                <TableRow key={`${rowIndex}-${itemIndex}`} sx={itemLabel === '期末在庫' ? { backgroundColor: '#f5f5f5' } : {}}>
-                                    {itemIndex === 0 ? (
-                                        <TableCell rowSpan={itemLabels.length} sx={{ padding: '2px 4px', border: '1px solid #ddd' }}>
-                                            {row.classification}
+                            itemLabels.map((itemLabel, itemIndex) => {
+                                const { store, classification } = splitClassification(row.classification);
+                                
+                                return (
+                                    <TableRow 
+                                        key={`${rowIndex}-${itemIndex}`} 
+                                        sx={itemLabel === '期末在庫' ? { backgroundColor: '#f5f5f5' } : {}}
+                                    >
+                                        {itemIndex === 0 && (
+                                            <>
+                                                {/* 店舗列を追加 */}
+                                                {showByStore && (
+                                                    <TableCell 
+                                                        rowSpan={itemLabels.length} 
+                                                        sx={{ padding: '2px 4px', border: '1px solid #ddd' }}
+                                                    >
+                                                        {store}
+                                                    </TableCell>
+                                                )}
+                                                <TableCell 
+                                                    rowSpan={itemLabels.length} 
+                                                    sx={{ padding: '2px 4px', border: '1px solid #ddd' }}
+                                                >
+                                                    {classification}
+                                                </TableCell>
+                                            </>
+                                        )}
+                                        <TableCell sx={{ padding: '4px 8px', border: '1px solid #ddd' }}>
+                                            {itemLabel}
                                         </TableCell>
-                                    ) : null}
-                                    <TableCell sx={{ padding: '4px 8px', border: '1px solid #ddd' }}>{itemLabel}</TableCell>
-                                    {/* 期間合計のセル */}
-                                    <TableCell align="right" sx={{ padding: '4px 8px', border: '1px solid #ddd', backgroundColor: '#f5f5f5' }}>
-                                        {row[`計画合計_${itemLabel}`] || 0}
-                                    </TableCell>
-                                    <TableCell align="right" sx={{ padding: '4px 8px', border: '1px solid #ddd' }}>
-                                        {row[`当年合計_${itemLabel}`] || 0}
-                                    </TableCell>
-                                    <TableCell align="right" sx={{ padding: '4px 8px', border: '1px solid #ddd' }}>
-                                        {row[`前年合計_${itemLabel}`] || 0}
-                                    </TableCell>
-                                    <TableCell align="right" sx={{ padding: '4px 8px', border: '1px solid #ddd' }}>
-                                        {row[`前年比合計_${itemLabel}`] || '0%'}
-                                    </TableCell>
-                                    <TableCell align="right" sx={{ padding: '4px 8px', border: '1px solid #ddd' }}>
-                                        {row[`差異額合計_${itemLabel}`] || 0}
-                                    </TableCell>
-                                    {/* 各期間のデータ */}
-                                    {aggregatedData.periods.map((period, periodIndex) => (
-                                        <React.Fragment key={periodIndex}>
-                                            <TableCell align="right" sx={{ 
-                                                padding: '4px 8px', 
-                                                border: '1px solid #ddd',
-                                                backgroundColor: '#f5f5f5'
-                                            }}>
-                                                {row[`計画_${period.period}`] || 0}
-                                            </TableCell>
-                                            <TableCell align="right" sx={{ padding: '4px 8px', border: '1px solid #ddd' }}>
-                                                {row[`${itemLabel}_${period.period}`]}
-                                            </TableCell>
-                                            <TableCell align="right" sx={{ padding: '4px 8px', border: '1px solid #ddd' }}>
-                                                {row[`${itemLabel}_prev_${period.period}`]}
-                                            </TableCell>
-                                            <TableCell align="right" sx={{ padding: '4px 8px', border: '1px solid #ddd' }}>
-                                                {row[`前年比_${period.period}`]}
-                                            </TableCell>
-                                            <TableCell align="right" sx={{ padding: '4px 8px', border: '1px solid #ddd' }}>
-                                                {row[`差異額_${period.period}`]}
-                                            </TableCell>
-                                        </React.Fragment>
-                                    ))}
-                                </TableRow>
-                            ))
+
+                                        {/* 期間合計（ダミーセル） */}
+                                        <TableCell
+                                            align="right"
+                                            sx={{ padding: '4px 8px', border: '1px solid #ddd', backgroundColor: '#f5f5f5' }}
+                                        >
+                                            0
+                                        </TableCell>
+                                        <TableCell
+                                            align="right"
+                                            sx={{ padding: '4px 8px', border: '1px solid #ddd' }}
+                                        >
+                                            0
+                                        </TableCell>
+                                        <TableCell
+                                            align="right"
+                                            sx={{ padding: '4px 8px', border: '1px solid #ddd' }}
+                                        >
+                                            0
+                                        </TableCell>
+                                        <TableCell
+                                            align="right"
+                                            sx={{ padding: '4px 8px', border: '1px solid #ddd' }}
+                                        >
+                                            0%
+                                        </TableCell>
+                                        <TableCell
+                                            align="right"
+                                            sx={{ padding: '4px 8px', border: '1px solid #ddd' }}
+                                        >
+                                            0
+                                        </TableCell>
+
+                                        {/* 各期間のデータ */}
+                                        {aggregatedData.periods.map((period, periodIndex) => {
+                                            const planVal = row[`計画_${itemLabel}_${period.period}`] || 0;
+                                            const thisYearVal = row[`当年_${itemLabel}_${period.period}`] || 0;
+                                            const lastYearVal = row[`前年_${itemLabel}_${period.period}`] || 0;
+                                            const yoy = lastYearVal
+                                                ? ((thisYearVal - lastYearVal) / Math.abs(lastYearVal) * 100).toFixed(2) + '%'
+                                                : '0%';
+                                            const diff = thisYearVal - lastYearVal;
+
+                                            return (
+                                                <React.Fragment key={periodIndex}>
+                                                    <TableCell
+                                                        align="right"
+                                                        sx={{ padding: '4px 8px', border: '1px solid #ddd', backgroundColor: '#f5f5f5' }}
+                                                    >
+                                                        {planVal}
+                                                    </TableCell>
+                                                    <TableCell
+                                                        align="right"
+                                                        sx={{ padding: '4px 8px', border: '1px solid #ddd' }}
+                                                    >
+                                                        {thisYearVal}
+                                                    </TableCell>
+                                                    <TableCell
+                                                        align="right"
+                                                        sx={{ padding: '4px 8px', border: '1px solid #ddd' }}
+                                                    >
+                                                        {lastYearVal}
+                                                    </TableCell>
+                                                    <TableCell
+                                                        align="right"
+                                                        sx={{ padding: '4px 8px', border: '1px solid #ddd' }}
+                                                    >
+                                                        {yoy}
+                                                    </TableCell>
+                                                    <TableCell
+                                                        align="right"
+                                                        sx={{ padding: '4px 8px', border: '1px solid #ddd' }}
+                                                    >
+                                                        {diff}
+                                                    </TableCell>
+                                                </React.Fragment>
+                                            );
+                                        })}
+                                    </TableRow>
+                                );
+                            })
                         ))}
                     </TableBody>
                 </Table>
             </TableContainer>
         </Box>
     );
-
-    window.OTBMatrix = OTBMatrix;
 }
+
+// 必要に応じてグローバルへ
+window.OTBMatrix = OTBMatrix;
