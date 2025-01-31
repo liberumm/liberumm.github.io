@@ -534,7 +534,7 @@ function Header() {
                 <Container maxWidth={false} sx={{ padding: 0 }}>
                     <Toolbar disableGutters>
                         <Typography variant="h6" noWrap sx={{ flexGrow: 1, textAlign: { xs: 'center', sm: 'left' } }}>
-                            商品管理アシスト - Product Management Assist
+                            業務支援 - Assist
                         </Typography>
 
                         <Box sx={{ display: { xs: 'block', md: 'none' } }}>

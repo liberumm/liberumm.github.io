@@ -1,7 +1,7 @@
 const {
     Box, Container, Paper, Grid, Button, Typography, FormControl, Select, MenuItem, TablePagination,
     Dialog, DialogTitle, DialogContent, DialogActions, TextField, Snackbar, Alert,
-    InputAdornment
+    InputAdornment, Tabs, Tab
 } = MaterialUI;
 
 // Material Iconsコンポーネントの定義を削除し、IconButtonを追加
@@ -42,6 +42,9 @@ function MainContent() {
         registrant: ''
     });
     const [snackbar, setSnackbar] = React.useState({ open: false, message: '', severity: 'success' });
+    const [tabValue, setTabValue] = React.useState(0);
+    const [editDialogOpen, setEditDialogOpen] = React.useState(false);
+    const [editingMeter, setEditingMeter] = React.useState(null);
 
     // フィルター適用後のメーター
     const filteredMeters = React.useMemo(() => {
@@ -59,9 +62,17 @@ function MainContent() {
                 return meterValue.includes(value.toLowerCase());
             });
 
-            return matchesSearch && matchesColumnFilters;
+            // タブフィルター
+            const isInputted = meter.currentValue && meter.confirmationDate;
+            if (tabValue === 1) { // 未入力タブ
+                return !isInputted && matchesSearch && matchesColumnFilters;
+            } else if (tabValue === 2) { // 入力済タブ
+                return isInputted && matchesSearch && matchesColumnFilters;
+            }
+            
+            return matchesSearch && matchesColumnFilters; // 全てタブ
         });
-    }, [meters, filterCriteria, columnFilters]);
+    }, [meters, filterCriteria, columnFilters, tabValue]);
 
     // イベントハンドラー
     const handleSelectAllClick = (event) => {
@@ -250,6 +261,27 @@ function MainContent() {
         link.click();
     };
 
+    const handleTabChange = (event, newValue) => {
+        setTabValue(newValue);
+        setPage(0); // タブ切替時にページをリセット
+    };
+
+    const handleEditClick = (meter) => {
+        setEditingMeter({ ...meter });
+        setEditDialogOpen(true);
+    };
+
+    const handleEditSave = () => {
+        if (!editingMeter) return;
+
+        setMeters(meters.map(meter => 
+            meter.id === editingMeter.id ? { ...meter, ...editingMeter } : meter
+        ));
+        setEditDialogOpen(false);
+        setEditingMeter(null);
+        setSnackbar({ open: true, message: '設備情報を更新しました', severity: 'success' });
+    };
+
     React.useEffect(() => {
         console.log("Current meters:", meters);
     }, [meters]);
@@ -259,93 +291,119 @@ function MainContent() {
             <Box sx={{ my: 4 }}>
                 {/* ヘッダー部分 */}
                 <Paper elevation={2} sx={{ p: 2, mb: 3 }}>
-                    <Box sx={{ 
-                        display: 'flex', 
-                        justifyContent: 'space-between', 
-                        alignItems: 'center',
-                        mb: 2 
-                    }}>
+                <Box
+                    sx={{
+                        display: 'flex',
+                        justifyContent: 'space-between',
+                        alignItems: 'center', // 縦方向中央揃え
+                        height: '100%' // 高さを確保
+                    }}
+                >
+                    {/* タイトル（中央揃えのため flex を適用） */}
+                    <Box sx={{ display: 'flex', alignItems: 'center' }}>
                         <Typography variant="h5" component="h1">
                             設備管理
                         </Typography>
-                        <Box sx={{ display: 'flex', gap: 1 }}>
-                            <Button 
-                                variant="contained" 
-                                color="primary" 
-                                startIcon={<IconWrapper>add</IconWrapper>}
-                                onClick={() => setOpenDialog(true)}
-                            >
-                                設備追加
-                            </Button>
-                            <Button 
-                                variant="outlined"
-                                startIcon={<IconWrapper>download</IconWrapper>}
-                                onClick={handleDownloadTemplate}
-                            >
-                                テンプレート
-                            </Button>
-                            <input
+                    </Box>
+
+                    {/* ボタン群（中央揃えのため flex を適用） */}
+                    <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+                        <Button 
+                            variant="contained" 
+                            color="primary" 
+                            startIcon={<IconWrapper>add</IconWrapper>}
+                            onClick={() => setOpenDialog(true)}
+                        >
+                            設備追加
+                        </Button>
+                        <Button 
+                            variant="outlined"
+                            startIcon={<IconWrapper>download</IconWrapper>}
+                            onClick={handleDownloadTemplate}
+                        >
+                            テンプレート
+                        </Button>
+                        <input
                             accept=".csv"
                             style={{ display: 'none' }}
                             id="csv-file-input"
                             type="file"
                             onChange={handleImport}
-                            />
-                            <label htmlFor="csv-file-input">
-                                <Button 
-                                    variant="contained" 
-                                    color="success" 
-                                    component="span"
-                                    startIcon={<IconWrapper>file_upload</IconWrapper>}
-                                >
-                                    インポート
-                                </Button>
-                            </label>
-                        </Box>
+                        />
+                        <label htmlFor="csv-file-input">
+                            <Button 
+                                variant="contained" 
+                                color="success" 
+                                component="span"
+                                startIcon={<IconWrapper>file_upload</IconWrapper>}
+                            >
+                                インポート
+                            </Button>
+                        </label>
                     </Box>
-
-                    <Box sx={{ 
-                        display: 'flex', 
-                        gap: 1,
-                        flexWrap: 'wrap'
-                    }}>
-                        <Button 
-                            variant="contained" 
-                            color="secondary" 
-                            startIcon={<IconWrapper>file_download</IconWrapper>}
-                            onClick={handleExport}
-                        >
-                            エクスポート
-                        </Button>
-                    </Box>
-                </Paper>
+                </Box>
+            </Paper>
 
                 {/* メインコンテンツ */}
                 <Paper elevation={3} sx={{ p: 2 }}>
+                    {/* タイトルとタブ */}
+                    <Box sx={{ mb: 2, borderBottom: 1, borderColor: 'divider'}}>
+                        <Box sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', mb: 2 }}>
+                            <Typography variant="h5" component="h1">
+                                設備情報入力
+                            </Typography>
+                        </Box>
+                        <Tabs value={tabValue} onChange={handleTabChange}>
+                            <Tab label={`全て (${meters.length})`} />
+                            <Tab label={`未入力 (${meters.filter(m => !(m.currentValue && m.confirmationDate)).length})`} />
+                            <Tab label={`入力済 (${meters.filter(m => m.currentValue && m.confirmationDate).length})`} />
+                        </Tabs>
+                    </Box>
+
                     {/* フィルター部分 */}
-                    <Box sx={{ mb: 2 }}>
-                        <Grid container spacing={2} alignItems="center">
-                            <Grid item xs={12} sm={6} md={3}>
-                                <TextField
-                                    fullWidth
-                                    variant="outlined"
-                                    size="small"
-                                    placeholder="検索..."
-                                    InputProps={{
-                                        startAdornment: (
-                                            <InputAdornment position="start">
-                                                <IconWrapper>search</IconWrapper>
-                                            </InputAdornment>
-                                        )
-                                    }}
-                                    value={filterCriteria.searchTerm}
-                                    onChange={(e) => handleFilterChange({
-                                        ...filterCriteria,
-                                        searchTerm: e.target.value
-                                    })}
-                                />
-                            </Grid>
+                    <Box
+                    sx={{
+                        mb: 2,
+                        display: 'flex',
+                        alignItems: 'center',
+                        justifyContent: 'space-between',
+                    }}
+                    >
+                    {/* 左側：検索フィールド */}
+                    <Grid container spacing={2} alignItems="center" sx={{ flex: 1 }}>
+                        <Grid item xs={12} sm={6} md={3}>
+                        <TextField
+                            fullWidth
+                            variant="outlined"
+                            size="small"
+                            placeholder="検索..."
+                            InputProps={{
+                            startAdornment: (
+                                <InputAdornment position="start">
+                                <IconWrapper>search</IconWrapper>
+                                </InputAdornment>
+                            ),
+                            }}
+                            value={filterCriteria.searchTerm}
+                            onChange={(e) =>
+                            handleFilterChange({
+                                ...filterCriteria,
+                                searchTerm: e.target.value,
+                            })
+                            }
+                        />
                         </Grid>
+                    </Grid>
+
+                    {/* 右側：エクスポートボタン */}
+                    <Button
+                        variant="contained"
+                        color="secondary"
+                        startIcon={<IconWrapper>file_download</IconWrapper>}
+                        onClick={handleExport}
+                    >
+                        エクスポート
+                    </Button>
                     </Box>
 
                     {/* テーブル */}
@@ -359,6 +417,7 @@ function MainContent() {
                         handleRowClick={handleRowClick}
                         handleCellValueChange={handleCellValueChange}
                         handleColumnFilterChange={handleColumnFilterChange}
+                        onEditClick={handleEditClick}  // onEditClickプロパティを追加
                     />
 
                     {/* ページネーション */}
@@ -432,6 +491,53 @@ function MainContent() {
                     <DialogActions>
                         <Button onClick={() => setOpenDialog(false)}>キャンセル</Button>
                         <Button onClick={handleAddEquipment} variant="contained">追加</Button>
+                    </DialogActions>
+                </Dialog>
+
+                {/* 編集ダイアログ */}
+                <Dialog open={editDialogOpen} onClose={() => setEditDialogOpen(false)} maxWidth="sm" fullWidth>
+                    <DialogTitle>設備情報編集</DialogTitle>
+                    <DialogContent>
+                        <Box sx={{ display: 'grid', gap: 2, pt: 2 }}>
+                            <TextField
+                                label="設備ID"
+                                required
+                                value={editingMeter?.equipmentId || ''}
+                                onChange={(e) => setEditingMeter({...editingMeter, equipmentId: e.target.value})}
+                            />
+                            <TextField
+                                label="設備名"
+                                required
+                                value={editingMeter?.equipmentName || ''}
+                                onChange={(e) => setEditingMeter({...editingMeter, equipmentName: e.target.value})}
+                            />
+                            <TextField
+                                label="設備タイプ"
+                                value={editingMeter?.equipmentType || ''}
+                                onChange={(e) => setEditingMeter({...editingMeter, equipmentType: e.target.value})}
+                            />
+                            <TextField
+                                label="設置場所"
+                                value={editingMeter?.installationPlace || ''}
+                                onChange={(e) => setEditingMeter({...editingMeter, installationPlace: e.target.value})}
+                            />
+                            <TextField
+                                label="拠点名"
+                                value={editingMeter?.locationName || ''}
+                                onChange={(e) => setEditingMeter({...editingMeter, locationName: e.target.value})}
+                            />
+                            <TextField
+                                label="管理者"
+                                value={editingMeter?.manager || ''}
+                                onChange={(e) => setEditingMeter({...editingMeter, manager: e.target.value})}
+                            />
+                        </Box>
+                    </DialogContent>
+                    <DialogActions>
+                        <Button onClick={() => setEditDialogOpen(false)}>キャンセル</Button>
+                        <Button onClick={handleEditSave} variant="contained" color="primary">
+                            保存
+                        </Button>
                     </DialogActions>
                 </Dialog>
 
