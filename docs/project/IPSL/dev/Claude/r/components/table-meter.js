@@ -180,7 +180,8 @@ function TableMeter({
     handleMenuClick = () => {},
     handleChangePage = () => {},
     handleChangeRowsPerPage = () => {},
-    handleColumnFilterChange = () => {}  // 列フィルター用のハンドラーを追加
+    handleColumnFilterChange = () => {},  // 列フィルター用のハンドラーを追加
+    onEditClick = () => {}  // onEditClickを追加
 }) {
     const [columnFilters, setColumnFilters] = React.useState({
         equipmentId: '',
@@ -346,7 +347,10 @@ function TableMeter({
 
                                 {/* Action cell */}
                                 <TableCell>
-                                    <IconButton onClick={(e) => { e.stopPropagation(); handleEditMeter(meter); }}>
+                                    <IconButton onClick={(e) => { 
+                                        e.stopPropagation(); 
+                                        onEditClick(meter);  // handleEditMeterをonEditClickに変更
+                                    }}>
                                         <span className="material-icons">edit</span>
                                     </IconButton>
                                     <IconButton onClick={(e) => { e.stopPropagation(); handleMenuClick(e, meter); }}>
