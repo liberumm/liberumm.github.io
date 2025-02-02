@@ -1,146 +1,6 @@
-(function() {
-  // HTMLコンテンツを文字列として定義
-  const htmlContent = `
-<!DOCTYPE html>
-<html lang="ja">
-<head>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
-  <title>React Leaflet with GSI Tiles</title>
-  <!-- React and ReactDOM -->
-  <script src="https://cdn.jsdelivr.net/npm/react@18/umd/react.production.min.js"></script>
-  <script src="https://cdn.jsdelivr.net/npm/react-dom@18/umd/react-dom.production.min.js"></script>
-  <!-- MUI (Material-UI) -->
-  <script src="https://cdn.jsdelivr.net/npm/@mui/material@5.11.15/umd/material-ui.production.min.js"></script>
-  <!-- Babel for JSX -->
-  <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.21.0/babel.min.js"></script>
-  <!-- Emotion ライブラリ -->
-  <script src="https://cdn.jsdelivr.net/npm/@emotion/react@11.11.0/dist/emotion-react.umd.min.js"></script>
-  <script src="https://cdn.jsdelivr.net/npm/@emotion/styled@11.11.0/dist/emotion-styled.umd.min.js"></script>
-  <!-- PapaParse -->
-  <script src="https://cdnjs.cloudflare.com/ajax/libs/PapaParse/5.4.1/papaparse.min.js"></script>
-  <!-- Material-UI Styles -->
-  <link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Roboto:300,400,500,700&display=swap" />
-  <link rel="stylesheet" href="https://fonts.googleapis.com/icon?family=Material+Icons" />
-
-  <!-- Leaflet CSS -->
-  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
-  <style>
-    #root {
-      display: flex;
-      flex-direction: column;
-      min-height: 100vh;
-      background-color: #f5f5f5;
-    }
-    .section-card {
-      margin: 16px;
-      padding: 16px;
-      border-radius: 8px;
-      box-shadow: 0 2px 4px rgba(0,0,0,0.1);
-      background-color: white;
-    }
-    .map-container {
-      height: 70vh;
-      border-radius: 4px;
-      overflow: hidden;
-    }
-    .control-panel {
-      display: flex;
-      gap: 16px;
-      flex-wrap: wrap;
-      align-items: center;
-    }
-    .settings-grid {
-      display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
-      gap: 16px;
-      margin-top: 16px;
-    }
-    footer {
-      margin-top: auto;
-      padding: 16px;
-      text-align: center;
-      background-color: #1976d2;
-      color: white;
-    }
-    .drop-zone {
-      border: 2px dashed #1976d2;
-      border-radius: 8px;
-      padding: 24px;
-      text-align: center;
-      background-color: #f8f9fa;
-      transition: all 0.3s ease;
-    }
-    .drop-zone:hover {
-      background-color: #e3f2fd;
-      border-color: #2196f3;
-    }
-    .drop-zone.dragover {
-      background-color: #bbdefb;
-      border-color: #1565c0;
-    }
-    /* テーブルセル内で折り畳まないように */
-    td, th {
-      white-space: nowrap;
-    }
-  </style>
-</head>
-<body>
-  <div id="root"></div>
-  <!-- Leaflet JS -->
-  <script
-    src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
-    crossorigin=""
-  ></script>
-</body>
-</html>
-  `;
-
-  // HTMLをドキュメントに書き込む
-  document.open();
-  document.write(htmlContent);
-  document.close();
-
-  // スクリプトの実行を保証するために遅延させる
-  window.addEventListener('load', () => {
+function MapSite() {
     const {
-      AppBar,
-      Toolbar,
-      Typography,
-      CssBaseline,
-      Box,
-      Table,
-      TableBody,
-      TableCell,
-      TableContainer,
-      TableHead,
-      TableRow,
-      TablePagination,
-      Paper,
-      TextField,
-      Button,
-      Collapse,
-      Checkbox,
-      FormGroup,
-      FormControlLabel,
-      FormControl,
-      FormLabel,
-      Select,
-      MenuItem,
-      InputLabel,
-      Typography: MuiTypography,
-      Dialog,
-      DialogTitle,
-      DialogContent,
-      DialogContentText,
-      DialogActions,
-      IconButton,
-      TableSortLabel,
-      RadioGroup,
-      Radio,
-      FormHelperText,
-      Card,
-      Icon,
+      AppBar, Toolbar, Typography, CssBaseline, Box, Table, TableBody, TableCell, TableContainer, TableHead, TableRow, TablePagination, Paper, TextField, Button, Collapse, Checkbox, FormGroup, FormControlLabel, FormControl, FormLabel, Select, MenuItem, InputLabel, Typography: MuiTypography, Dialog, DialogTitle, DialogContent, DialogContentText, DialogActions, IconButton, TableSortLabel, RadioGroup, Radio, FormHelperText, Card, Icon, Tooltip, // 追加
     } = MaterialUI;
 
     // アイコンの定義
@@ -368,8 +228,39 @@ S11,札幌時計台（北海道）,0.00,0.00,2024-01-01,2024-12-31,365,北海道
       const [orderBy, setOrderBy] = React.useState('');
 
       // 定数: テーブル行の高さとヘッダーの高さ（px単位）
-      const ROW_HEIGHT = 53; // テーブル行の高さ
-      const HEADER_HEIGHT = 56 * 4; // テーブルヘッダーの高さ（2行分）
+      const ROW_HEIGHT = 40; // テーブル行の高さを縮小
+      const HEADER_HEIGHT = 48 * 2; // ヘッダーの高さも縮小
+
+      // 各セクションの余白を縮小
+      const sectionStyles = {
+        mt: 1,  // marginTopを2から1に縮小
+        '& .MuiCardContent-root': {
+            p: 1,  // paddingを縮小
+        },
+        '& .MuiCollapse-root': {
+            '& > div': {
+                p: 1,  // Collapseの内部余白を縮小
+            },
+        },
+      };
+
+      // テーブルスタイルの更新
+      const tableStyles = {
+        '& .MuiTableCell-root': {
+            padding: '2px 4px',  // セルの余白を縮小
+            whiteSpace: 'nowrap',
+            overflow: 'hidden',
+            textOverflow: 'ellipsis',
+            maxWidth: '150px',  // セル幅を縮小
+            borderBottom: '1px solid rgba(224, 224, 224, 0.5)',
+            fontSize: '0.875rem',  // フォントサイズを小さく
+        },
+        '& .MuiTableCell-head': {
+            backgroundColor: '#f5f5f5',
+            fontWeight: 'bold',
+            padding: '4px 4px',  // ヘッダーセルの余白
+        },
+      };
 
       React.useEffect(() => {
         if (!mapRef.current) {
@@ -488,45 +379,42 @@ S11,札幌時計台（北海道）,0.00,0.00,2024-01-01,2024-12-31,365,北海道
         };
       }, [stores]);
 
-      // フィルタリング関数を修正
+      // フィルタリング関数の改善
       const applyFilters = () => {
         let filtered = stores.filter((store) => {
-          // 全体フィルター判定
-          const globalMatch = globalFilterText
-            ? Object.values(store).some((value) =>
-                String(value).toLowerCase().includes(globalFilterText.toLowerCase())
-              )
-            : true;
+          // グローバルフィルターの改善：複数のキーワードに対応
+          const globalMatch = !globalFilterText || globalFilterText.toLowerCase().split(/\s+/).every(keyword =>
+            Object.values(store).some(value => 
+              String(value).toLowerCase().includes(keyword)
+            )
+          );
 
-          // 列フィルター判定（修正部分）
+          // 列フィルターの処理
           const columnMatch = Object.entries(columnFilters).every(([col, val]) => {
             if (!val) return true;
-            
             const storeValue = String(store[col]).toLowerCase();
             const filterValue = val.toLowerCase();
             const mode = filterModes[col];
 
-            // 数値型の列の場合
+            // 数値型とそれ以外で処理を分ける
             if (['sales', 'budget', 'days', 'lat', 'lng'].includes(col)) {
-              if (mode === 'exact') {
-                return parseFloat(storeValue) === parseFloat(filterValue);
-              } else {
-                return storeValue.includes(filterValue);
-              }
+              const numericStoreValue = parseFloat(storeValue);
+              const numericFilterValue = parseFloat(filterValue);
+              if (isNaN(numericFilterValue)) return true;
+              return mode === 'exact' 
+                ? numericStoreValue === numericFilterValue
+                : String(numericStoreValue).includes(filterValue);
             }
             
-            // 文字列型の列の場合
-            if (mode === 'exact') {
-              return storeValue === filterValue;
-            } else {
-              return storeValue.includes(filterValue);
-            }
+            return mode === 'exact' 
+              ? storeValue === filterValue 
+              : storeValue.includes(filterValue);
           });
 
           return globalMatch && columnMatch;
         });
 
-        // 並び替えを適用
+        // 並び替えの適用
         if (orderBy) {
           filtered = stableSort(filtered, getComparator(order, orderBy));
         }
@@ -910,500 +798,566 @@ S11,札幌時計台（北海道）,0.00,0.00,2024-01-01,2024-12-31,365,北海道
 
       // 並び替え用の関数を修正
       const descendingComparator = (a, b, orderBy) => {
-        if (b[orderBy] < a[orderBy]) {
-          return -1;
+        // 値が存在しない場合のチェックを追加
+        const aValue = (a[orderBy] ?? '').toString();
+        const bValue = (b[orderBy] ?? '').toString();
+
+        if (bValue < aValue) {
+            return -1;
         }
-        if (b[orderBy] > a[orderBy]) {
-          return 1;
+        if (bValue > aValue) {
+            return 1;
         }
         return 0;
-      };
+    };
 
-      const getComparator = (order, orderBy) => {
+    const getComparator = (order, orderBy) => {
         return order === 'desc'
-          ? (a, b) => descendingComparator(a, b, orderBy)
-          : (a, b) => -descendingComparator(a, b, orderBy);
-      };
+            ? (a, b) => descendingComparator(a, b, orderBy)
+            : (a, b) => -descendingComparator(a, b, orderBy);
+    };
 
-      const stableSort = (array, comparator) => {
+    const stableSort = (array, comparator) => {
         const stabilizedThis = array.map((el, index) => [el, index]);
         stabilizedThis.sort((a, b) => {
-          const order = comparator(a[0], b[0]);
-          if (order !== 0) return order;
-          return a[1] - b[1];
+            const order = comparator(a[0], b[0]);
+            if (order !== 0) return order;
+            return a[1] - b[1];
         });
         return stabilizedThis.map((el) => el[0]);
-      };
+    };
 
       return (
-        <MaterialUI.ThemeProvider theme={theme}>
-          <Box id="root">
-            <AppBar position="static" elevation={0}>
-              <Toolbar>
-                <Typography variant="h6" component="div" sx={{ flexGrow: 1 }}>
-                  Site Locator
-                </Typography>
-                <Button color="inherit">ヘルプ</Button>
-              </Toolbar>
-            </AppBar>
-
-            {/* 地図セクション */}
-            <Card className="section-card">
-              <SectionHeader 
-                title="地図表示"
-                expanded={expandedMap}
-                onToggle={toggleMap}
-              />
-              <Collapse in={expandedMap}>
-                <Box className="map-container" id="map" />
-              </Collapse>
-            </Card>
-
-            {/* サークルモードセクション */}
-            <Card className="section-card">
-              <SectionHeader 
-                title="サークルモード設定"
-                expanded={expandedCircle}
-                onToggle={toggleCircle}
-              />
-              <Collapse in={expandedCircle}>
-                <FormControl component="fieldset" sx={{ marginTop: 1 }}>
-                  <FormLabel component="legend">サークルモード</FormLabel>
-                  <FormGroup row>
-                    <FormControlLabel
-                      control={
-                        <Checkbox
-                          checked={circleModes.trade1}
-                          onChange={handleCircleModeChange}
-                          name="trade1"
+            <Box sx={{ gap: 1 }}>  {/* 全体の余白を縮小 */}
+                {/* 地図セクション */}
+                <Card sx={sectionStyles}>
+                    <SectionHeader 
+                        title="地図表示"
+                        expanded={expandedMap}
+                        onToggle={toggleMap}
+                    />
+                    <Collapse in={expandedMap}>
+                        <Box 
+                            id="map" 
+                            sx={{
+                                width: '100%',
+                                height: '60vh',
+                                margin: '0px 0'
+                            }}
                         />
-                      }
-                      label="1次商圏"
-                    />
-                    <FormControlLabel
-                      control={
-                        <Checkbox
-                          checked={circleModes.trade2}
-                          onChange={handleCircleModeChange}
-                          name="trade2"
-                        />
-                      }
-                      label="2次商圏"
-                    />
-                    <FormControlLabel
-                      control={
-                        <Checkbox
-                          checked={circleModes.trade3}
-                          onChange={handleCircleModeChange}
-                          name="trade3"
-                        />
-                      }
-                      label="3次商圏"
-                    />
-                    <FormControlLabel
-                      control={
-                        <Checkbox
-                          checked={circleModes.sales}
-                          onChange={handleCircleModeChange}
-                          name="sales"
-                        />
-                      }
-                      label="売上"
-                    />
-                    <FormControlLabel
-                      control={
-                        <Checkbox
-                          checked={circleModes.budget}
-                          onChange={handleCircleModeChange}
-                          name="budget"
-                        />
-                      }
-                      label="予算"
-                    />
-                    <FormControlLabel
-                      control={
-                        <Checkbox
-                          checked={circleModes.area}
-                          onChange={handleCircleModeChange}
-                          name="area"
-                        />
-                      }
-                      label="面積"
-                    />
-                  </FormGroup>
-                </FormControl>
-                {/* Circle Settings */}
-                <Box sx={{ display: "flex", gap: 4, flexWrap: 'wrap', marginTop: 2 }}>
-                  {/* 1次商圏設定 */}
-                  {circleModes.trade1 && (
-                    <Box sx={{ display: "flex", flexDirection: "column", gap: 1 }}>
-                      <MuiTypography variant="subtitle1">1次商圏設定</MuiTypography>
-                      <TextField
-                        label="半径(m)"
-                        type="number"
-                        variant="outlined"
-                        size="small"
-                        value={tradeSettings.trade1.radius}
-                        onChange={handleTradeSettingChange('trade1', 'radius')}
-                        inputProps={{ min: "0", step: "100" }}
-                      />
-                      <input
-                        type="color"
-                        value={tradeSettings.trade1.color}
-                        onChange={handleTradeSettingChange('trade1', 'color')}
-                        style={{ width: '40px', height: '40px', border: 'none', padding: '0' }}
-                      />
-                    </Box>
-                  )}
-                  {/* 2次商圏設定 */}
-                  {circleModes.trade2 && (
-                    <Box sx={{ display: "flex", flexDirection: "column", gap: 1 }}>
-                      <MuiTypography variant="subtitle1">2次商圏設定</MuiTypography>
-                      <TextField
-                        label="半径(m)"
-                        type="number"
-                        variant="outlined"
-                        size="small"
-                        value={tradeSettings.trade2.radius}
-                        onChange={handleTradeSettingChange('trade2', 'radius')}
-                        inputProps={{ min: "0", step: "100" }}
-                      />
-                      <input
-                        type="color"
-                        value={tradeSettings.trade2.color}
-                        onChange={handleTradeSettingChange('trade2', 'color')}
-                        style={{ width: '40px', height: '40px', border: 'none', padding: '0' }}
-                      />
-                    </Box>
-                  )}
-                  {/* 3次商圏設定 */}
-                  {circleModes.trade3 && (
-                    <Box sx={{ display: "flex", flexDirection: "column", gap: 1 }}>
-                      <MuiTypography variant="subtitle1">3次商圏設定</MuiTypography>
-                      <TextField
-                        label="半径(m)"
-                        type="number"
-                        variant="outlined"
-                        size="small"
-                        value={tradeSettings.trade3.radius}
-                        onChange={handleTradeSettingChange('trade3', 'radius')}
-                        inputProps={{ min: "0", step: "100" }}
-                      />
-                      <input
-                        type="color"
-                        value={tradeSettings.trade3.color}
-                        onChange={handleTradeSettingChange('trade3', 'color')}
-                        style={{ width: '40px', height: '40px', border: 'none', padding: '0' }}
-                      />
-                    </Box>
-                  )}
-                  {/* 売上設定 */}
-                  {circleModes.sales && (
-                    <Box sx={{ display: "flex", flexDirection: "column", gap: 1 }}>
-                      <MuiTypography variant="subtitle1">売上設定</MuiTypography>
-                      <TextField
-                        label="スケール"
-                        type="number"
-                        variant="outlined"
-                        size="small"
-                        value={circleSettings.sales.scale}
-                        onChange={handleCircleSettingChange('sales', 'scale')}
-                        inputProps={{ min: "0", step: "0.01" }}
-                      />
-                      <input
-                        type="color"
-                        value={circleSettings.sales.color}
-                        onChange={handleCircleSettingChange('sales', 'color')}
-                        style={{ width: '40px', height: '40px', border: 'none', padding: '0' }}
-                      />
-                    </Box>
-                  )}
-                  {/* 予算設定 */}
-                  {circleModes.budget && (
-                    <Box sx={{ display: "flex", flexDirection: "column", gap: 1 }}>
-                      <MuiTypography variant="subtitle1">予算設定</MuiTypography>
-                      <TextField
-                        label="スケール"
-                        type="number"
-                        variant="outlined"
-                        size="small"
-                        value={circleSettings.budget.scale}
-                        onChange={handleCircleSettingChange('budget', 'scale')}
-                        inputProps={{ min: "0", step: "0.01" }}
-                      />
-                      <input
-                        type="color"
-                        value={circleSettings.budget.color}
-                        onChange={handleCircleSettingChange('budget', 'color')}
-                        style={{ width: '40px', height: '40px', border: 'none', padding: '0' }}
-                      />
-                    </Box>
-                  )}
-                  {/* 面積設定 */}
-                  {circleModes.area && (
-                    <Box sx={{ display: "flex", flexDirection: "column", gap: 1 }}>
-                      <MuiTypography variant="subtitle1">面積設定</MuiTypography>
-                      <TextField
-                        label="スケール"
-                        type="number"
-                        variant="outlined"
-                        size="small"
-                        value={circleSettings.area.scale}
-                        onChange={handleCircleSettingChange('area', 'scale')}
-                        inputProps={{ min: "0", step: "0.1" }}
-                      />
-                      <input
-                        type="color"
-                        value={circleSettings.area.color}
-                        onChange={handleCircleSettingChange('area', 'color')}
-                        style={{ width: '40px', height: '40px', border: 'none', padding: '0' }}
-                      />
-                    </Box>
-                  )}
-                </Box>
-              </Collapse>
-            </Card>
-
-            {/* CSVアップロードセクション */}
-            <Card className="section-card">
-              <SectionHeader 
-                title="データ管理"
-                expanded={expandedCSV}
-                onToggle={() => setExpandedCSV(!expandedCSV)}
-              />
-              <Collapse in={expandedCSV}>
-                <Box sx={{ display: "flex", flexDirection: "column", gap: 2, marginTop: 1 }}>
-                  {/* エンコード選択 */}
-                  <FormControl component="fieldset">
-                    <FormLabel component="legend">ファイルエンコード</FormLabel>
-                    <RadioGroup
-                      row
-                      value={selectedEncoding}
-                      onChange={(e) => setSelectedEncoding(e.target.value)}
-                    >
-                      <FormControlLabel value="UTF-8" control={<Radio />} label="UTF-8" />
-                      <FormControlLabel value="Shift_JIS" control={<Radio />} label="Shift_JIS" />
-                    </RadioGroup>
-                  </FormControl>
-
-                  {/* アップロード方法選択 */}
-                  <FormControl component="fieldset">
-                    <FormLabel component="legend">アップロード方法</FormLabel>
-                    <RadioGroup
-                      row
-                      value={selectedUploadMethod}
-                      onChange={(e) => setSelectedUploadMethod(e.target.value)}
-                    >
-                      <FormControlLabel value="new" control={<Radio />} label="新規アップロード" />
-                      <FormControlLabel value="append" control={<Radio />} label="追加アップロード" />
-                    </RadioGroup>
-                  </FormControl>
-
-                  {/* ドロップゾーン */}
-                  <Box
-                    className={`drop-zone ${isDragOver ? 'dragover' : ''}`}
-                    onDrop={handleDrop}
-                    onDragOver={handleDragOver}
-                    onDragLeave={handleDragLeave}
-                    onClick={handleDropZoneClick}
-                  >
-                    <input
-                      type="file"
-                      accept=".csv"
-                      ref={fileInputRef}
-                      onChange={(e) => handleCSVUpload(e.target.files[0], selectedEncoding, selectedUploadMethod)}
-                      style={{ display: "none" }}
-                    />
-                    Drag and drop a CSV file here or click to select a file
-                  </Box>
-                  <Box sx={{ display: "flex", gap: 2, alignItems: "center" }}>
-                    <Button
-                      variant="contained"
-                      color="primary"
-                      onClick={handleDownloadTemplate}
-                    >
-                      Download Template
-                    </Button>
-                  </Box>
-                </Box>
-              </Collapse>
-            </Card>
-
-            {/* テーブルセクション */}
-            <Card className="section-card">
-              <SectionHeader 
-                title="データ一覧"
-                expanded={expandedTable}
-                onToggle={() => setExpandedTable(!expandedTable)}
-              />
-              <Collapse in={expandedTable}>
-            {/* 全体フィルター */}
-            <Box sx={{ padding: 1, display: "flex", gap: 1, alignItems: "center" }}>
-              <TextField
-                label="Global Filter"
-                variant="outlined"
-                size="small"
-                value={globalFilterText}
-                onChange={handleFilterChange}
-                fullWidth
-              />
-              <Button variant="contained" color="primary" onClick={handleFilterApply}>
-                Apply Filter
-              </Button>
-              <Button variant="outlined" color="secondary" onClick={handleFilterClear}>
-                Clear Filter
-              </Button>
-            </Box>
-                <TableContainer
-                  component={Paper}
-                  sx={{
-                    marginTop: 1,
-                    height: rowsPerPage === -1 ? 'auto' : `${rowsPerPage * ROW_HEIGHT + HEADER_HEIGHT}px`,
-                  }}
-                >
-                  <Table size="small" stickyHeader>
-                    <TableHead>
-                      <TableRow>
-                        {/* 全選択チェックボックス */}
-                        <TableCell padding="checkbox">
-                          <Checkbox
-                            indeterminate={isIndeterminate}
-                            checked={isAllSelected}
-                            onChange={handleSelectAll}
-                            inputProps={{ 'aria-label': 'select all stores' }}
-                          />
-                        </TableCell>
-                        {columns.map((col) => (
-                          <TableCell key={col.key}>
-                            <TableSortLabel
-                              active={orderBy === col.key}
-                              direction={orderBy === col.key ? order : 'asc'}
-                              onClick={handleRequestSort(col.key)}
-                            >
-                              {col.label}
-                              {orderBy === col.key ? (
-                                <Box component="span" sx={{ visuallyHidden: true }}>
-                                  {order === 'desc' ? 'sorted descending' : 'sorted ascending'}
+                        {/* サークルモード設定を地図セクション内に移動 */}
+                        <Box sx={{ mt: 2 ,p:2 }}>
+                            <SectionHeader 
+                                title="サークルモード設定"
+                                expanded={expandedCircle}
+                                onToggle={toggleCircle}
+                            />
+                            <Collapse in={expandedCircle}>
+                                <FormControl component="fieldset" sx={{ marginTop: 1 }}>
+                                    <FormLabel component="legend">サークルモード</FormLabel>
+                                    <FormGroup row>
+                                        <FormControlLabel
+                                            control={
+                                                <Checkbox
+                                                    checked={circleModes.trade1}
+                                                    onChange={handleCircleModeChange}
+                                                    name="trade1"
+                                                />
+                                            }
+                                            label="1次商圏"
+                                        />
+                                        <FormControlLabel
+                                            control={
+                                                <Checkbox
+                                                    checked={circleModes.trade2}
+                                                    onChange={handleCircleModeChange}
+                                                    name="trade2"
+                                                />
+                                            }
+                                            label="2次商圏"
+                                        />
+                                        <FormControlLabel
+                                            control={
+                                                <Checkbox
+                                                    checked={circleModes.trade3}
+                                                    onChange={handleCircleModeChange}
+                                                    name="trade3"
+                                                />
+                                            }
+                                            label="3次商圏"
+                                        />
+                                        <FormControlLabel
+                                            control={
+                                                <Checkbox
+                                                    checked={circleModes.sales}
+                                                    onChange={handleCircleModeChange}
+                                                    name="sales"
+                                                />
+                                            }
+                                            label="売上"
+                                        />
+                                        <FormControlLabel
+                                            control={
+                                                <Checkbox
+                                                    checked={circleModes.budget}
+                                                    onChange={handleCircleModeChange}
+                                                    name="budget"
+                                                />
+                                            }
+                                            label="予算"
+                                        />
+                                        <FormControlLabel
+                                            control={
+                                                <Checkbox
+                                                    checked={circleModes.area}
+                                                    onChange={handleCircleModeChange}
+                                                    name="area"
+                                                />
+                                            }
+                                            label="面積"
+                                        />
+                                    </FormGroup>
+                                </FormControl>
+                                {/* Circle Settings */}
+                                <Box sx={{ display: "flex", gap: 4, flexWrap: 'wrap', marginTop: 2 }}>
+                                    {/* 1次商圏設定 */}
+                                    {circleModes.trade1 && (
+                                        <Box sx={{ display: "flex", flexDirection: "column", gap: 1 }}>
+                                            <MuiTypography variant="subtitle1">1次商圏設定</MuiTypography>
+                                            <TextField
+                                                label="半径(m)"
+                                                type="number"
+                                                variant="outlined"
+                                                size="small"
+                                                value={tradeSettings.trade1.radius}
+                                                onChange={handleTradeSettingChange('trade1', 'radius')}
+                                                inputProps={{ min: "0", step: "100" }}
+                                            />
+                                            <input
+                                                type="color"
+                                                value={tradeSettings.trade1.color}
+                                                onChange={handleTradeSettingChange('trade1', 'color')}
+                                                style={{ width: '40px', height: '40px', border: 'none', padding: '0' }}
+                                            />
+                                        </Box>
+                                    )}
+                                    {/* 2次商圏設定 */}
+                                    {circleModes.trade2 && (
+                                        <Box sx={{ display: "flex", flexDirection: "column", gap: 1 }}>
+                                            <MuiTypography variant="subtitle1">2次商圏設定</MuiTypography>
+                                            <TextField
+                                                label="半径(m)"
+                                                type="number"
+                                                variant="outlined"
+                                                size="small"
+                                                value={tradeSettings.trade2.radius}
+                                                onChange={handleTradeSettingChange('trade2', 'radius')}
+                                                inputProps={{ min: "0", step: "100" }}
+                                            />
+                                            <input
+                                                type="color"
+                                                value={tradeSettings.trade2.color}
+                                                onChange={handleTradeSettingChange('trade2', 'color')}
+                                                style={{ width: '40px', height: '40px', border: 'none', padding: '0' }}
+                                            />
+                                        </Box>
+                                    )}
+                                    {/* 3次商圏設定 */}
+                                    {circleModes.trade3 && (
+                                        <Box sx={{ display: "flex", flexDirection: "column", gap: 1 }}>
+                                            <MuiTypography variant="subtitle1">3次商圏設定</MuiTypography>
+                                            <TextField
+                                                label="半径(m)"
+                                                type="number"
+                                                variant="outlined"
+                                                size="small"
+                                                value={tradeSettings.trade3.radius}
+                                                onChange={handleTradeSettingChange('trade3', 'radius')}
+                                                inputProps={{ min: "0", step: "100" }}
+                                            />
+                                            <input
+                                                type="color"
+                                                value={tradeSettings.trade3.color}
+                                                onChange={handleTradeSettingChange('trade3', 'color')}
+                                                style={{ width: '40px', height: '40px', border: 'none', padding: '0' }}
+                                            />
+                                        </Box>
+                                    )}
+                                    {/* 売上設定 */}
+                                    {circleModes.sales && (
+                                        <Box sx={{ display: "flex", flexDirection: "column", gap: 1 }}>
+                                            <MuiTypography variant="subtitle1">売上設定</MuiTypography>
+                                            <TextField
+                                                label="スケール"
+                                                type="number"
+                                                variant="outlined"
+                                                size="small"
+                                                value={circleSettings.sales.scale}
+                                                onChange={handleCircleSettingChange('sales', 'scale')}
+                                                inputProps={{ min: "0", step: "0.01" }}
+                                            />
+                                            <input
+                                                type="color"
+                                                value={circleSettings.sales.color}
+                                                onChange={handleCircleSettingChange('sales', 'color')}
+                                                style={{ width: '40px', height: '40px', border: 'none', padding: '0' }}
+                                            />
+                                        </Box>
+                                    )}
+                                    {/* 予算設定 */}
+                                    {circleModes.budget && (
+                                        <Box sx={{ display: "flex", flexDirection: "column", gap: 1 }}>
+                                            <MuiTypography variant="subtitle1">予算設定</MuiTypography>
+                                            <TextField
+                                                label="スケール"
+                                                type="number"
+                                                variant="outlined"
+                                                size="small"
+                                                value={circleSettings.budget.scale}
+                                                onChange={handleCircleSettingChange('budget', 'scale')}
+                                                inputProps={{ min: "0", step: "0.01" }}
+                                            />
+                                            <input
+                                                type="color"
+                                                value={circleSettings.budget.color}
+                                                onChange={handleCircleSettingChange('budget', 'color')}
+                                                style={{ width: '40px', height: '40px', border: 'none', padding: '0' }}
+                                            />
+                                        </Box>
+                                    )}
+                                    {/* 面積設定 */}
+                                    {circleModes.area && (
+                                        <Box sx={{ display: "flex", flexDirection: "column", gap: 1 }}>
+                                            <MuiTypography variant="subtitle1">面積設定</MuiTypography>
+                                            <TextField
+                                                label="スケール"
+                                                type="number"
+                                                variant="outlined"
+                                                size="small"
+                                                value={circleSettings.area.scale}
+                                                onChange={handleCircleSettingChange('area', 'scale')}
+                                                inputProps={{ min: "0", step: "0.1" }}
+                                            />
+                                            <input
+                                                type="color"
+                                                value={circleSettings.area.color}
+                                                onChange={handleCircleSettingChange('area', 'color')}
+                                                style={{ width: '40px', height: '40px', border: 'none', padding: '0' }}
+                                            />
+                                        </Box>
+                                    )}
                                 </Box>
-                              ) : null}
-                            </TableSortLabel>
-                          </TableCell>
-                        ))}
-                      </TableRow>
-                      <TableRow>
-                        {/* 空のセル（チェックボックス列） */}
-                        <TableCell />
-                        {columns.map((col) => (
-                          <TableCell key={col.key}>
-                            <Box sx={{ display: "flex", flexDirection: "column" }}>
-                              <FormControl variant="standard" size="small" sx={{ minWidth: 80 }}>
-                                <Select
-                                  value={filterModes[col.key]}
-                                  onChange={handleFilterModeChange(col.key)}
-                                  sx={{ '& .MuiSelect-select': { py: 0.5 } }}
-                                  disableUnderline
-                                >
-                                  <MenuItem value="partial">部分一致</MenuItem>
-                                  <MenuItem value="exact">完全一致</MenuItem>
-                                </Select>
-                              </FormControl>
-                              <TextField
-                                variant="outlined"
-                                size="small"
-                                value={columnFilters[col.key]}
-                                onChange={(e) => setColumnFilters(prev => ({ ...prev, [col.key]: e.target.value }))}
-                                onKeyDown={(e) => {
-                                  if (e.key === 'Enter') {
-                                    handleColumnFilterChange(col.key)(e);
-                                  }
-                                }}
-                                onBlur={handleColumnFilterChange(col.key)}
-                                placeholder={`${col.label}でフィルター`}
-                                sx={{ mt: 1 }}
-                              />
-                            </Box>
-                          </TableCell>
-                        ))}
-                      </TableRow>
-                    </TableHead>
-                    <TableBody>
-                      {stableSort(filteredStores, getComparator(order, orderBy))
-                        .slice(
-                          rowsPerPage === -1 ? 0 : page * rowsPerPage,
-                          rowsPerPage === -1 ? filteredStores.length : page * rowsPerPage + rowsPerPage
-                        )
-                        .map((store) => (
-                          <TableRow key={store.storeCode} hover style={{ cursor: 'pointer', height: `${ROW_HEIGHT}px` }}>
-                            <TableCell padding="checkbox">
-                              <Checkbox
-                                checked={selectedStores.has(store.storeCode)}
-                                onChange={handleSelectStore(store.storeCode)}
-                                inputProps={{ 'aria-labelledby': `checkbox-${store.storeCode}` }}
-                              />
-                            </TableCell>
-                            {columns.map((col) => (
-                              <TableCell key={col.key} onClick={() => handleRowClick(store)}>
-                                {store[col.key]}
-                              </TableCell>
-                            ))}
-                          </TableRow>
-                        ))}
-                    </TableBody>
-                  </Table>
-                  <TablePagination
-                    component="div"
-                    count={filteredStores.length}
-                    rowsPerPage={rowsPerPage}
-                    page={page}
-                    onPageChange={(event, newPage) => setPage(newPage)}
-                    onRowsPerPageChange={(event) => {
-                      const value = parseInt(event.target.value, 10);
-                      setRowsPerPage(value === -1 ? filteredStores.length : value);
-                      setPage(0);
-                    }}
-                    rowsPerPageOptions={[
-                      { label: '10', value: 10 },
-                      { label: '15', value: 20 },
-                      { label: '30', value: 30 },
-                      { label: '50', value: 50 },
-                      { label: '全て', value: -1 },
-                    ]}
+                            </Collapse>
+                        </Box>
+                    </Collapse>
+                </Card>
+
+                {/* CSVアップロードセクション */}
+                <Card sx={sectionStyles}>
+                  <SectionHeader
+                    title="データ管理"
+                    expanded={expandedCSV}
+                    onToggle={() => setExpandedCSV(!expandedCSV)}
                   />
-                </TableContainer>
-              </Collapse>
-            </Card>
+                  <Collapse in={expandedCSV}>
+                    <Box sx={{ p: 1 }}>
+                    <Grid container spacing={2} alignItems="center">
+                    {/* エンコード選択 */}
+                    <Grid item xs={12} sm={4}>
+                      <FormControl fullWidth component="fieldset">
+                        <FormLabel component="legend">ファイルエンコード</FormLabel>
+                        <RadioGroup
+                          row
+                          value={selectedEncoding}
+                          onChange={(e) => setSelectedEncoding(e.target.value)}
+                        >
+                          <FormControlLabel value="UTF-8" control={<Radio />} label="UTF-8" />
+                          <FormControlLabel value="Shift_JIS" control={<Radio />} label="Shift_JIS" />
+                        </RadioGroup>
+                      </FormControl>
+                    </Grid>
 
-            {/* 詳細ダイアログ */}
-            <Dialog
-              open={openDetailDialog}
-              onClose={() => setOpenDetailDialog(false)}
-            >
-              <DialogTitle>店舗詳細</DialogTitle>
-              <DialogContent>
-                {selectedStore && (
-                  <>
-                    <DialogContentText><strong>店舗コード:</strong> {selectedStore.storeCode}</DialogContentText>
-                    <DialogContentText><strong>店舗名:</strong> {selectedStore.name}</DialogContentText>
-                    <DialogContentText><strong>住所:</strong> {selectedStore.address}</DialogContentText>
-                    {/* 追加の詳細情報があればここに追加 */}
-                  </>
-                )}
-              </DialogContent>
-              <DialogActions>
-                <Button onClick={() => setOpenDetailDialog(false)} color="primary">
-                  Close
-                </Button>
-              </DialogActions>
-            </Dialog>
+                    {/* アップロード方法選択 */}
+                    <Grid item xs={12} sm={4}>
+                      <FormControl fullWidth component="fieldset">
+                        <FormLabel component="legend">アップロード方法</FormLabel>
+                        <RadioGroup
+                          row
+                          value={selectedUploadMethod}
+                          onChange={(e) => setSelectedUploadMethod(e.target.value)}
+                        >
+                          <FormControlLabel value="new" control={<Radio />} label="新規アップロード" />
+                          <FormControlLabel value="append" control={<Radio />} label="追加アップロード" />
+                        </RadioGroup>
+                      </FormControl>
+                    </Grid>
 
-            <footer>
-              &copy; 2024 Site Locator Inc. All Rights Reserved.
-            </footer>
+                    {/* ボタン */}
+                    <Grid item xs={12} sm={4} container justifyContent="flex-end">
+                      <Button variant="contained" color="primary" onClick={handleDownloadTemplate}>
+                        Download Template
+                      </Button>
+                    </Grid>
+
+                        {/* ドロップゾーン */}
+                        <Grid item xs={12}>
+                          <Box
+                            className={`drop-zone ${isDragOver ? 'dragover' : ''}`}
+                            onDrop={handleDrop}
+                            onDragOver={handleDragOver}
+                            onDragLeave={handleDragLeave}
+                            onClick={handleDropZoneClick}
+                            sx={{
+                              p: 2,
+                              border: '2px dashed #ccc',
+                              borderRadius: 1,
+                              textAlign: 'center',
+                              cursor: 'pointer'
+                            }}
+                          >
+                            <input
+                              type="file"
+                              accept=".csv"
+                              ref={fileInputRef}
+                              onChange={(e) =>
+                                handleCSVUpload(e.target.files[0], selectedEncoding, selectedUploadMethod)
+                              }
+                              style={{ display: "none" }}
+                            />
+                            Drag and drop a CSV file here or click to select a file
+                          </Box>
+                        </Grid>
+                      </Grid>
+                    </Box>
+                  </Collapse>
+                </Card>
+
+
+                {/* テーブルセクション */}
+                <Card sx={sectionStyles}>
+                    <SectionHeader 
+                        title="データ一覧"
+                        expanded={expandedTable}
+                        onToggle={() => setExpandedTable(!expandedTable)}
+                    />
+                    <Collapse in={expandedTable}>
+                {/* 全体フィルター */}
+                <Box sx={{ padding: 1, display: "flex", gap: 1, alignItems: "center", flexWrap: "flex" }}>
+                  <TextField
+                    label="キーワード検索 (スペース区切りで複数指定可)"
+                    variant="outlined"
+                    size="small"
+                    value={globalFilterText}
+                    onChange={handleFilterChange}
+                    fullWidth
+                  />
+                  <Button 
+                    variant="contained" 
+                    color="primary" 
+                    onClick={handleFilterApply}
+                    sx={{ minWidth: 100 }}
+                  >
+                    検索
+                  </Button>
+                  <Button 
+                    variant="outlined" 
+                    color="secondary" 
+                    onClick={handleFilterClear}
+                    sx={{ minWidth: 100 }}
+                  >
+                    リセット
+                  </Button>
+                </Box>
+                    <TableContainer
+                      component={Paper}
+                      sx={{
+                        marginTop: 1,
+                        height: rowsPerPage === -1 
+                          ? 'auto' 
+                          : `${Math.min(rowsPerPage * ROW_HEIGHT + HEADER_HEIGHT, window.innerHeight * 0.6)}px`,
+                        maxHeight: `${window.innerHeight * 0.6}px`,
+                        '& .MuiTable-root': tableStyles
+                      }}
+                    >
+                        <Table 
+                            size="small" 
+                        >
+                            <TableHead>
+                                {/* 1行目: フィルター行 */}
+                                <TableRow>
+                                    <TableCell padding="checkbox" />
+                                    {columns.map((col) => (
+                                        <TableCell key={col.key}>
+                                            <Box sx={{ display: "flex", flexDirection: "column" }}>
+                                                <FormControl variant="standard" size="small" sx={{ minWidth: 80 }}>
+                                                    <Select
+                                                        value={filterModes[col.key]}
+                                                        onChange={handleFilterModeChange(col.key)}
+                                                        sx={{ '& .MuiSelect-select': { py: 0.5 } }}
+                                                        disableUnderline
+                                                    >
+                                                        <MenuItem value="partial">部分一致</MenuItem>
+                                                        <MenuItem value="exact">完全一致</MenuItem>
+                                                    </Select>
+                                                </FormControl>
+                                                <TextField
+                                                    variant="outlined"
+                                                    size="small"
+                                                    value={columnFilters[col.key]}
+                                                    onChange={(e) => setColumnFilters(prev => ({ ...prev, [col.key]: e.target.value }))}
+                                                    onKeyDown={(e) => {
+                                                        if (e.key === 'Enter') {
+                                                            handleColumnFilterChange(col.key)(e);
+                                                        }
+                                                    }}
+                                                    onBlur={handleColumnFilterChange(col.key)}
+                                                    placeholder={`${col.label}でフィルター`}
+                                                    sx={{ mt: 1 }}
+                                                />
+                                            </Box>
+                                        </TableCell>
+                                    ))}
+                                </TableRow>
+                                {/* 2行目: ヘッダーラベル行 */}
+                                <TableRow
+                                  sx={{
+                                    // 子要素のTableCellに対して一括でスタイルを適用
+                                    '& > th, & > td': {
+                                      position: 'sticky',
+                                      top: 0, // 固定位置。1行目がある場合は、1行目の高さ分だけオフセットする例: top: '56px'
+                                      backgroundColor: 'background.paper',
+                                      zIndex: 1,
+                                    },
+                                  }}
+                                >
+                                    <TableCell padding="checkbox">
+                                        <Checkbox
+                                            indeterminate={isIndeterminate}
+                                            checked={isAllSelected}
+                                            onChange={handleSelectAll}
+                                            inputProps={{ 'aria-label': 'select all stores' }}
+                                        />
+                                    </TableCell>
+                                    {columns.map((col) => (
+                                        <TableCell key={col.key}>
+                                            <TableSortLabel
+                                                active={orderBy === col.key}
+                                                direction={orderBy === col.key ? order : 'asc'}
+                                                onClick={handleRequestSort(col.key)}
+                                            >
+                                                {col.label}
+                                                {orderBy === col.key ? (
+                                                    <Box component="span" sx={{ visuallyHidden: true }}>
+                                                        {order === 'desc' ? '>降順' : '>昇順'}
+                                                    </Box>
+                                                ) : null}
+                                            </TableSortLabel>
+                                        </TableCell>
+                                    ))}
+                                </TableRow>
+                            </TableHead>
+                            <TableBody>
+                              {stableSort(filteredStores, getComparator(order, orderBy))
+                                .slice(
+                                  rowsPerPage === -1 ? 0 : page * rowsPerPage,
+                                  rowsPerPage === -1 ? filteredStores.length : page * rowsPerPage + rowsPerPage
+                                )
+                                .map((store) => (
+                                  <TableRow 
+                                    key={store.storeCode} 
+                                    hover 
+                                    sx={{ 
+                                        height: `${ROW_HEIGHT}px`,
+                                        cursor: 'pointer',
+                                        '& td': { 
+                                            borderBottom: '1px solid rgba(224, 224, 224, 0.5)',
+                                        }
+                                    }}
+                                  >
+                                    <TableCell padding="checkbox">
+                                      <Checkbox
+                                        checked={selectedStores.has(store.storeCode)}
+                                        onChange={handleSelectStore(store.storeCode)}
+                                        inputProps={{ 'aria-labelledby': `checkbox-${store.storeCode}` }}
+                                        size="small"
+                                      />
+                                    </TableCell>
+                                    {columns.map((col) => (
+                                      <Tooltip 
+                                        key={col.key} 
+                                        title={store[col.key]}
+                                        enterDelay={500}
+                                      >
+                                        <TableCell 
+                                            onClick={() => handleRowClick(store)}
+                                        >
+                                            {store[col.key]}
+                                        </TableCell>
+                                      </Tooltip>
+                                    ))}
+                                  </TableRow>
+                                ))}
+                            </TableBody>
+                        </Table>
+                        <TablePagination
+                          component="div"
+                          count={filteredStores.length}
+                          rowsPerPage={rowsPerPage}
+                          page={page}
+                          onPageChange={(event, newPage) => setPage(newPage)}
+                          onRowsPerPageChange={(event) => {
+                            const value = parseInt(event.target.value, 10);
+                            setRowsPerPage(value === -1 ? filteredStores.length : value);
+                            setPage(0);
+                          }}
+                          rowsPerPageOptions={[
+                            { label: '10', value: 10 },
+                            { label: '15', value: 20 },
+                            { label: '30', value: 30 },
+                            { label: '50', value: 50 },
+                            { label: '全て', value: -1 },
+                          ]}
+                          sx={{
+                            '.MuiTablePagination-toolbar': {
+                                minHeight: '40px',  // 高さを縮小
+                                pl: 1,
+                            },
+                            '.MuiTablePagination-select': {
+                                py: 0,
+                            }
+                          }}
+                        />
+                    </TableContainer>
+                  </Collapse>
+                </Card>
+
+                {/* 詳細ダイアログ */}
+                <Dialog
+                  open={openDetailDialog}
+                  onClose={() => setOpenDetailDialog(false)}
+                >
+                  <DialogTitle>店舗詳細</DialogTitle>
+                  <DialogContent>
+                    {selectedStore && (
+                      <>
+                        <DialogContentText><strong>店舗コード:</strong> {selectedStore.storeCode}</DialogContentText>
+                        <DialogContentText><strong>店舗名:</strong> {selectedStore.name}</DialogContentText>
+                        <DialogContentText><strong>住所:</strong> {selectedStore.address}</DialogContentText>
+                        {/* 追加の詳細情報があればここに追加 */}
+                      </>
+                    )}
+                  </DialogContent>
+                  <DialogActions>
+                    <Button onClick={() => setOpenDetailDialog(false)} color="primary">
+                      Close
+                    </Button>
+                  </DialogActions>
+                </Dialog>
+
           </Box>
-        </MaterialUI.ThemeProvider>
-      );
-    }
+      )
+    };
 
-    ReactDOM.createRoot(document.getElementById("root")).render(<App />);
-  });
-})();
+    return <App />;
+}
+
