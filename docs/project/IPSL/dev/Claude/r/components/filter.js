@@ -224,7 +224,7 @@ const Filter = () => {
           }}
         >
           <span className="material-icons">filter_alt</span>
-          検索条件
+          条件
         </Typography>
 
         <Box display="flex" gap={1}>
