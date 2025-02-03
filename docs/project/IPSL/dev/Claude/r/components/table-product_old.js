@@ -44,6 +44,7 @@ function ProductTable() {
       totalPrice: 100000,
       confirmationDate: '2023-08-25',
       supplier: 'Supplier A',
+      allocationDate: '2023-08-29',
     },
     {
       id: 2,
@@ -64,6 +65,7 @@ function ProductTable() {
       totalPrice: 120000,
       confirmationDate: '2023-08-26',
       supplier: 'Supplier B',
+      allocationDate: '2023-08-30',
     },
     {
       id: 3,
@@ -84,6 +86,7 @@ function ProductTable() {
       totalPrice: 120000,
       confirmationDate: '2023-08-27',
       supplier: 'Supplier C',
+      allocationDate: '2023-08-31',
     },
     {
       id: 4,
@@ -104,6 +107,7 @@ function ProductTable() {
       totalPrice: 120000,
       confirmationDate: '2023-08-28',
       supplier: 'Supplier D',
+      allocationDate: '2023-09-01',
     },
     {
       id: 5,
@@ -124,6 +128,7 @@ function ProductTable() {
       totalPrice: 80000,
       confirmationDate: '2023-08-29',
       supplier: 'Supplier E',
+      allocationDate: '2023-09-02',
     },
     {
       id: 6,
@@ -144,6 +149,7 @@ function ProductTable() {
       totalPrice: 60000,
       confirmationDate: '2023-08-30',
       supplier: 'Supplier F',
+      allocationDate: '2023-09-03',
     },
     {
       id: 7,
@@ -164,6 +170,7 @@ function ProductTable() {
       totalPrice: 105000,
       confirmationDate: '2023-08-31',
       supplier: 'Supplier G',
+      allocationDate: '2023-09-04',
     },
     {
       id: 8,
@@ -184,6 +191,7 @@ function ProductTable() {
       totalPrice: 90000,
       confirmationDate: '2023-09-01',
       supplier: 'Supplier H',
+      allocationDate: '2023-09-05',
     },
     {
       id: 9,
@@ -204,6 +212,7 @@ function ProductTable() {
       totalPrice: 125000,
       confirmationDate: '2023-09-02',
       supplier: 'Supplier I',
+      allocationDate: '2023-09-06',
     },
     {
       id: 10,
@@ -224,6 +233,7 @@ function ProductTable() {
       totalPrice: 105000,
       confirmationDate: '2023-09-03',
       supplier: 'Supplier J',
+      allocationDate: '2023-09-07',
     },
   ]);
 
@@ -248,6 +258,7 @@ function ProductTable() {
     totalPrice: '',
     confirmationDate: '',
     supplier: '',
+    allocationDate: '',
   });
 
   // ----------------------------
@@ -312,7 +323,8 @@ function ProductTable() {
       row.totalCost.toString().includes(filters.totalCost) &&
       row.totalPrice.toString().includes(filters.totalPrice) &&
       row.confirmationDate.includes(filters.confirmationDate) &&
-      row.supplier.toLowerCase().includes(filters.supplier.toLowerCase())
+      row.supplier.toLowerCase().includes(filters.supplier.toLowerCase()) &&
+      row.allocationDate.includes(filters.allocationDate)
     );
   });
 
@@ -367,24 +379,44 @@ function ProductTable() {
   // ----------------------------
   const allPrimaryActions = [
     {
-      label: "依頼作成　社内",
-      onClick: () => console.log("依頼作成　社内 clicked"),
+      label: "依頼作成",
+      onClick: () => console.log("依頼作成 clicked"),
       activeTabs: [1],
     },
     {
-      label: "提案作成　取引先",
-      onClick: () => console.log("提案作成　取引先 clicked"),
+      label: "提案作成",
+      onClick: () => console.log("提案作成 clicked"),
       activeTabs: [1],
     },
     {
-      label: "依頼確定　社内",
-      onClick: () => console.log("依頼確定　社内 clicked"),
+      label: "提案変更",
+      onClick: () => console.log("提案作成 clicked"),
       activeTabs: [2],
     },
     {
-      label: "発注　社内",
-      onClick: () => console.log("発注　社内 clicked"),
+      label: "提案確定",
+      onClick: () => console.log("提案確定 clicked"),
+      activeTabs: [2],
+    },
+    {
+      label: "マスタ登録",
+      onClick: () => console.log("配荷 clicked"),
+      activeTabs: [3],
+    },
+    {
+      label: "配荷",
+      onClick: () => console.log("配荷 clicked"),
       activeTabs: [3, 4],
+    },
+    {
+      label: "発注",
+      onClick: () => console.log("発注 clicked"),
+      activeTabs: [3, 4],
+    },
+    {
+      label: "追加発注",
+      onClick: () => console.log("発注 clicked"),
+      activeTabs: [5,6],
     },
     {
       label: "履歴確認",
@@ -396,7 +428,7 @@ function ProductTable() {
   // ----------------------------
   // サマリーカード用表示ステータス
   // ----------------------------
-  const summaryStatus = ['提案中', '確定済', '発注済', '納品済', '差し戻し'];
+  const summaryStatus = ['依頼中', '提案中', '確定済', '発注残', '発注済', '納品済', '差し戻し', '削除予定'];
 
   return (
     <Grid container spacing={2}>
@@ -421,7 +453,7 @@ function ProductTable() {
                 ? (statusData.reduce((acc, item) => acc + item.price, 0) / statusData.length).toFixed(2)
                 : 0;
             return (
-              <Grid item xs={12} sm={6} md={4} key={status}>
+              <Grid item xs={6} sm={4} md={3} key={status}>
                 <Paper sx={{ p: 2, backgroundColor: '#e8f5e9' }}>
                   <Typography variant="subtitle2">ステータス: {status}</Typography>
                   <Typography variant="body2">数量: {totalQuantity}</Typography>
@@ -438,34 +470,41 @@ function ProductTable() {
 
       {/* プライマリーアクションボタン群（常時表示、条件により活性化／非活性） */}
       <Grid item xs={12} sx={{ backgroundColor: '#fff3e0', p: 1 }}>
-        <Box sx={{ display: 'flex', justifyContent: 'center', mb: 2 }}>
-          <ButtonGroup variant="contained">
-            {allPrimaryActions.map((action, index) => (
-              <Button
-                key={index}
-                onClick={action.onClick}
-                disabled={!action.activeTabs.includes(selectedTab)}
-              >
-                {action.label}
-              </Button>
-            ))}
-          </ButtonGroup>
+        <Box sx={{ display: 'flex', gap: 1, flexWrap: 'wrap', justifyContent: 'center', mb: 2 }}>
+          {allPrimaryActions.map((action, index) => (
+            <Button
+              key={index}
+              variant="contained"
+              onClick={action.onClick}
+              disabled={!action.activeTabs.includes(selectedTab)}
+            >
+              {action.label}
+            </Button>
+          ))}
         </Box>
       </Grid>
 
       {/* ステータス選択タブ */}
       <Grid item xs={12} sx={{ backgroundColor: '#f3e5f5', p: 1 }}>
-        <Tabs value={selectedTab} onChange={handleTabChange} centered>
-          <Tab label="全て" />
-          <Tab label="依頼中" />
-          <Tab label="提案中" />
-          <Tab label="確定済" />
-          <Tab label="発注残" />
-          <Tab label="発注済" />
-          <Tab label="納品済" />
-          <Tab label="差し戻し" />
-          <Tab label="削除予定" />
-        </Tabs>
+        <Box sx={{ maxWidth: '100%', overflow: 'auto' }}>
+          <Tabs 
+            value={selectedTab} 
+            onChange={handleTabChange} 
+            variant="scrollable"
+            scrollButtons="auto"
+            allowScrollButtonsMobile
+          >
+            <Tab label="全て" />
+            <Tab label="依頼中" />
+            <Tab label="提案中" />
+            <Tab label="確定済" />
+            <Tab label="発注残" />
+            <Tab label="発注済" />
+            <Tab label="納品済" />
+            <Tab label="差し戻し" />
+            <Tab label="削除予定" />
+          </Tabs>
+        </Box>
       </Grid>
 
       {/* テーブルおよびグローバルアクション */}
@@ -473,14 +512,14 @@ function ProductTable() {
         <Paper sx={{ p: 2, backgroundColor: '#f1f8e9' }}>
           {/* グローバルアクション */}
           <Grid item xs={12}>
-            <Box sx={{ display: 'flex', justifyContent: 'flex-end', mb: 2, backgroundColor: '#ffebee', p: 1 }}>
-              <ButtonGroup variant="outlined">
-                <Button color="error">削除</Button>
-                <Button>Import</Button>
-                <Button>Download Template</Button>
-                <Button>Export CSV</Button>
-                <Button>Export Excel</Button>
-              </ButtonGroup>
+            <Box sx={{ display: 'flex', gap: 1, flexWrap: 'wrap', justifyContent: 'flex-end', mb: 2, backgroundColor: '#ffebee', p: 1 }}>
+              <Button variant="outlined" color="success">RPA出力</Button>
+              <Button variant="outlined">情報変更</Button>
+              <Button variant="outlined">取り込み</Button>
+              <Button variant="outlined">テンプレート</Button>
+              <Button variant="outlined">CSV出力</Button>
+              <Button variant="outlined">Excel出力</Button>
+              <Button variant="outlined" color="error">削除</Button>
             </Box>
           </Grid>
 
@@ -488,29 +527,6 @@ function ProductTable() {
           <TableContainer component={Paper} sx={{ maxHeight: 400 }}>
             <Table stickyHeader size="small" aria-label="compact table">
               <TableHead>
-                <TableRow>
-                  <TableCell padding="checkbox">
-                    <Checkbox color="primary" size="small" />
-                  </TableCell>
-                  <TableCell sx={{ whiteSpace: 'nowrap' }}>No</TableCell>
-                  <TableCell sx={{ whiteSpace: 'nowrap' }}>ステータス</TableCell>
-                  <TableCell sx={{ whiteSpace: 'nowrap' }}>納期可能日</TableCell>
-                  <TableCell sx={{ whiteSpace: 'nowrap' }}>注文日</TableCell>
-                  <TableCell sx={{ whiteSpace: 'nowrap' }}>納品日</TableCell>
-                  <TableCell sx={{ whiteSpace: 'nowrap' }}>商品名</TableCell>
-                  <TableCell sx={{ whiteSpace: 'nowrap' }}>コーナー</TableCell>
-                  <TableCell sx={{ whiteSpace: 'nowrap' }}>ライン</TableCell>
-                  <TableCell sx={{ whiteSpace: 'nowrap' }}>カテゴリ</TableCell>
-                  <TableCell sx={{ whiteSpace: 'nowrap' }}>商品コード</TableCell>
-                  <TableCell sx={{ whiteSpace: 'nowrap' }}>コスト</TableCell>
-                  <TableCell sx={{ whiteSpace: 'nowrap' }}>価格</TableCell>
-                  <TableCell sx={{ whiteSpace: 'nowrap' }}>マークアップ</TableCell>
-                  <TableCell sx={{ whiteSpace: 'nowrap' }}>数量</TableCell>
-                  <TableCell sx={{ whiteSpace: 'nowrap' }}>合計コスト</TableCell>
-                  <TableCell sx={{ whiteSpace: 'nowrap' }}>合計価格</TableCell>
-                  <TableCell sx={{ whiteSpace: 'nowrap' }}>確認日</TableCell>
-                  <TableCell sx={{ whiteSpace: 'nowrap' }}>サプライヤー</TableCell>
-                </TableRow>
                 <TableRow>
                   <TableCell padding="checkbox">
                     <Checkbox color="primary" size="small" />
@@ -534,6 +550,7 @@ function ProductTable() {
                     'totalPrice',
                     'confirmationDate',
                     'supplier',
+                    'allocationDate',
                   ].map((key) => (
                     <TableCell key={key} sx={{ p: 1 }}>
                       <TextField
@@ -547,6 +564,30 @@ function ProductTable() {
                     </TableCell>
                   ))}
                 </TableRow>
+                <TableRow>
+                  <TableCell padding="checkbox">
+                    <Checkbox color="primary" size="small" />
+                  </TableCell>
+                  <TableCell sx={{ whiteSpace: 'nowrap' }}>No</TableCell>
+                  <TableCell sx={{ whiteSpace: 'nowrap' }}>ステータス</TableCell>
+                  <TableCell sx={{ whiteSpace: 'nowrap' }}>納期可能日</TableCell>
+                  <TableCell sx={{ whiteSpace: 'nowrap' }}>配荷日</TableCell>
+                  <TableCell sx={{ whiteSpace: 'nowrap' }}>発注日</TableCell>
+                  <TableCell sx={{ whiteSpace: 'nowrap' }}>納品日</TableCell>
+                  <TableCell sx={{ whiteSpace: 'nowrap' }}>商品名</TableCell>
+                  <TableCell sx={{ whiteSpace: 'nowrap' }}>コーナー</TableCell>
+                  <TableCell sx={{ whiteSpace: 'nowrap' }}>ライン</TableCell>
+                  <TableCell sx={{ whiteSpace: 'nowrap' }}>カテゴリ</TableCell>
+                  <TableCell sx={{ whiteSpace: 'nowrap' }}>商品コード</TableCell>
+                  <TableCell sx={{ whiteSpace: 'nowrap' }}>原価</TableCell>
+                  <TableCell sx={{ whiteSpace: 'nowrap' }}>価格</TableCell>
+                  <TableCell sx={{ whiteSpace: 'nowrap' }}>値入</TableCell>
+                  <TableCell sx={{ whiteSpace: 'nowrap' }}>数量</TableCell>
+                  <TableCell sx={{ whiteSpace: 'nowrap' }}>原価計</TableCell>
+                  <TableCell sx={{ whiteSpace: 'nowrap' }}>合計計</TableCell>
+                  <TableCell sx={{ whiteSpace: 'nowrap' }}>確定日</TableCell>
+                  <TableCell sx={{ whiteSpace: 'nowrap' }}>取引先</TableCell>
+                </TableRow>
               </TableHead>
               <TableBody>
                 {displayedData.map((row, index) => (
@@ -557,6 +598,7 @@ function ProductTable() {
                     <TableCell sx={{ p: 1 }}>{renderCell(page * rowsPerPage + index + 1)}</TableCell>
                     <TableCell sx={{ p: 1 }}>{renderCell(row.status)}</TableCell>
                     <TableCell sx={{ p: 1 }}>{renderCell(row.availableDeliveryDate)}</TableCell>
+                    <TableCell sx={{ p: 1 }}>{renderCell(row.allocationDate)}</TableCell>
                     <TableCell sx={{ p: 1 }}>{renderCell(row.orderDate)}</TableCell>
                     <TableCell sx={{ p: 1 }}>{renderCell(row.deliveryDate)}</TableCell>
                     <TableCell sx={{ p: 1 }}>{renderCell(row.productName)}</TableCell>
