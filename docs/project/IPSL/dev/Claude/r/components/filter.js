@@ -329,7 +329,7 @@ const Filter = () => {
         </Grid>
 
         {/* 店舗/部署 */}
-        <Grid item xs={12} sm={6} md={2}>
+        <Grid item xs={6} sm={6} md={2}>
           <TextField
             select
             label="店舗/部署"
@@ -347,7 +347,7 @@ const Filter = () => {
         </Grid>
 
         {/* 部門 */}
-        <Grid item xs={12} sm={6} md={2}>
+        <Grid item xs={6} sm={6} md={2}>
           <TextField
             select
             label="部門"
