@@ -45,6 +45,7 @@ function ProductTable() {
       confirmationDate: '2023-08-25',
       supplier: 'Supplier A',
       allocationDate: '2023-08-29',
+      operationHistory: '', // '', '差戻', '削除予定' のいずれか
     },
     {
       id: 2,
@@ -66,6 +67,7 @@ function ProductTable() {
       confirmationDate: '2023-08-26',
       supplier: 'Supplier B',
       allocationDate: '2023-08-30',
+      operationHistory: '', // '', '差戻', '削除予定' のいずれか
     },
     {
       id: 3,
@@ -87,6 +89,7 @@ function ProductTable() {
       confirmationDate: '2023-08-27',
       supplier: 'Supplier C',
       allocationDate: '2023-08-31',
+      operationHistory: '', // '', '差戻', '削除予定' のいずれか
     },
     {
       id: 4,
@@ -108,6 +111,7 @@ function ProductTable() {
       confirmationDate: '2023-08-28',
       supplier: 'Supplier D',
       allocationDate: '2023-09-01',
+      operationHistory: '', // '', '差戻', '削除予定' のいずれか
     },
     {
       id: 5,
@@ -129,6 +133,7 @@ function ProductTable() {
       confirmationDate: '2023-08-29',
       supplier: 'Supplier E',
       allocationDate: '2023-09-02',
+      operationHistory: '', // '', '差戻', '削除予定' のいずれか
     },
     {
       id: 6,
@@ -150,6 +155,7 @@ function ProductTable() {
       confirmationDate: '2023-08-30',
       supplier: 'Supplier F',
       allocationDate: '2023-09-03',
+      operationHistory: '', // '', '差戻', '削除予定' のいずれか
     },
     {
       id: 7,
@@ -171,6 +177,7 @@ function ProductTable() {
       confirmationDate: '2023-08-31',
       supplier: 'Supplier G',
       allocationDate: '2023-09-04',
+      operationHistory: '', // '', '差戻', '削除予定' のいずれか
     },
     {
       id: 8,
@@ -192,6 +199,7 @@ function ProductTable() {
       confirmationDate: '2023-09-01',
       supplier: 'Supplier H',
       allocationDate: '2023-09-05',
+      operationHistory: '', // '', '差戻', '削除予定' のいずれか
     },
     {
       id: 9,
@@ -213,6 +221,7 @@ function ProductTable() {
       confirmationDate: '2023-09-02',
       supplier: 'Supplier I',
       allocationDate: '2023-09-06',
+      operationHistory: '', // '', '差戻', '削除予定' のいずれか
     },
     {
       id: 10,
@@ -234,6 +243,7 @@ function ProductTable() {
       confirmationDate: '2023-09-03',
       supplier: 'Supplier J',
       allocationDate: '2023-09-07',
+      operationHistory: '', // '', '差戻', '削除予定' のいずれか
     },
   ]);
 
@@ -259,6 +269,7 @@ function ProductTable() {
     confirmationDate: '',
     supplier: '',
     allocationDate: '',
+    operationHistory: '',
   });
 
   // ----------------------------
@@ -324,7 +335,8 @@ function ProductTable() {
       row.totalPrice.toString().includes(filters.totalPrice) &&
       row.confirmationDate.includes(filters.confirmationDate) &&
       row.supplier.toLowerCase().includes(filters.supplier.toLowerCase()) &&
-      row.allocationDate.includes(filters.allocationDate)
+      row.allocationDate.includes(filters.allocationDate) &&
+      row.operationHistory.toLowerCase().includes(filters.operationHistory.toLowerCase())
     );
   });
 
@@ -425,49 +437,8 @@ function ProductTable() {
     },
   ];
 
-  // ----------------------------
-  // サマリーカード用表示ステータス
-  // ----------------------------
-  const summaryStatus = ['依頼中', '提案中', '確定済', '発注残', '発注済', '納品済', '差し戻し', '削除予定'];
-
   return (
-    <Grid container spacing={2}>
-      {/* ヘッダー */}
-      <Grid item xs={12} sx={{ backgroundColor: '#e3f2fd', p: 1 }}>
-        <Typography variant="h4" align="center" gutterBottom>
-          商品管理システム
-        </Typography>
-      </Grid>
-
-      {/* サマリーカード */}
-      <Grid item xs={12}>
-        <Grid container spacing={2} sx={{ mb: 2 }}>
-          {summaryStatus.map((status) => {
-            const statusData = filteredData.filter((item) => item.status === status);
-            const totalQuantity = statusData.reduce((acc, item) => acc + item.quantity, 0);
-            const totalCost = statusData.reduce((acc, item) => acc + item.totalCost, 0);
-            const totalPrice = statusData.reduce((acc, item) => acc + item.totalPrice, 0);
-            const totalMarkup = statusData.reduce((acc, item) => acc + (item.price - item.cost), 0);
-            const avgPrice =
-              statusData.length > 0
-                ? (statusData.reduce((acc, item) => acc + item.price, 0) / statusData.length).toFixed(2)
-                : 0;
-            return (
-              <Grid item xs={6} sm={4} md={3} key={status}>
-                <Paper sx={{ p: 2, backgroundColor: '#e8f5e9' }}>
-                  <Typography variant="subtitle2">ステータス: {status}</Typography>
-                  <Typography variant="body2">数量: {totalQuantity}</Typography>
-                  <Typography variant="body2">原価計: {totalCost}</Typography>
-                  <Typography variant="body2">売価計: {totalPrice}</Typography>
-                  <Typography variant="body2">値入: {totalMarkup}</Typography>
-                  <Typography variant="body2">平均売価: {avgPrice}</Typography>
-                </Paper>
-              </Grid>
-            );
-          })}
-        </Grid>
-      </Grid>
-
+    <Grid container spacing={2} mt={2}>
       {/* プライマリーアクションボタン群（常時表示、条件により活性化／非活性） */}
       <Grid item xs={12} sx={{ backgroundColor: '#fff3e0', p: 1 }}>
         <Box sx={{ display: 'flex', gap: 1, flexWrap: 'wrap', justifyContent: 'center', mb: 2 }}>
@@ -551,6 +522,7 @@ function ProductTable() {
                     'confirmationDate',
                     'supplier',
                     'allocationDate',
+                    'operationHistory',
                   ].map((key) => (
                     <TableCell key={key} sx={{ p: 1 }}>
                       <TextField
@@ -587,6 +559,7 @@ function ProductTable() {
                   <TableCell sx={{ whiteSpace: 'nowrap' }}>合計計</TableCell>
                   <TableCell sx={{ whiteSpace: 'nowrap' }}>確定日</TableCell>
                   <TableCell sx={{ whiteSpace: 'nowrap' }}>取引先</TableCell>
+                  <TableCell sx={{ whiteSpace: 'nowrap' }}>操作履歴</TableCell>
                 </TableRow>
               </TableHead>
               <TableBody>
@@ -614,6 +587,7 @@ function ProductTable() {
                     <TableCell sx={{ p: 1 }}>{renderCell(row.totalPrice)}</TableCell>
                     <TableCell sx={{ p: 1 }}>{renderCell(row.confirmationDate)}</TableCell>
                     <TableCell sx={{ p: 1 }}>{renderCell(row.supplier)}</TableCell>
+                    <TableCell sx={{ p: 1 }}>{renderCell(row.operationHistory)}</TableCell>
                   </TableRow>
                 ))}
               </TableBody>
