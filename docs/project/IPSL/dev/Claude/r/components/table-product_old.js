@@ -433,7 +433,7 @@ function ProductTable() {
     {
       label: "履歴確認",
       onClick: () => console.log("履歴確認 clicked"),
-      activeTabs: [5, 6],
+      activeTabs: [ 0, 1, 2, 3, 4, 5, 6, 7, 8],
     },
   ];
 
