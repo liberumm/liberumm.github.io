@@ -195,7 +195,9 @@ function TableMeter({
     onEditClick = () => {},
     showEditableFields = true, // 編集可能モードのデフォルトをtrueに設定
     isEquipmentList = false, // 設備一覧表示モード判定用
-    isRecordList = false    // 設備メーター履歴表示モード判定用
+    isRecordList = false,    // 設備メーター履歴表示モード判定用
+    recordDisplayMode = 'actual', // actual: メーター実数, usage: 利用量
+    periodUnit = 'month'     // year: 年度, month: 月度, week: 週, day: 日
 }) {
     const [columnFilters, setColumnFilters] = React.useState({
         equipmentId: '',
@@ -223,19 +225,46 @@ function TableMeter({
 
     const isSelected = (id) => selectedMeterIds.includes(id);
 
-    // 月度の期間を生成（3月始まり14カ月）
+    // 期間の生成（単位に応じて）
     const periods = React.useMemo(() => {
-        const months = [];
         const today = new Date();
-        const startYear = today.getMonth() < 2 ? today.getFullYear() - 1 : today.getFullYear();
-        
-        for (let i = 0; i < 14; i++) {
-            const month = (i + 2) % 12 + 1; // 3月から開始
-            const year = startYear + Math.floor((i + 2) / 12);
-            months.push(`${year}年${month}月`);
+        const periods = [];
+
+        switch(periodUnit) {
+            case 'year':
+                // 過去5年分
+                for(let i = 4; i >= 0; i--) {
+                    periods.push(`${today.getFullYear() - i}年度`);
+                }
+                break;
+            case 'month':
+                // 3月始まり14カ月
+                const startYear = today.getMonth() < 2 ? today.getFullYear() - 1 : today.getFullYear();
+                for (let i = 0; i < 14; i++) {
+                    const month = (i + 2) % 12 + 1;
+                    const year = startYear + Math.floor((i + 2) / 12);
+                    periods.push(`${year}年${month}月`);
+                }
+                break;
+            case 'week':
+                // 過去12週
+                for(let i = 11; i >= 0; i--) {
+                    const d = new Date();
+                    d.setDate(d.getDate() - (i * 7));
+                    periods.push(`${d.getFullYear()}年${d.getMonth()+1}月第${Math.ceil(d.getDate()/7)}週`);
+                }
+                break;
+            case 'day':
+                // 過去31日
+                for(let i = 30; i >= 0; i--) {
+                    const d = new Date();
+                    d.setDate(d.getDate() - i);
+                    periods.push(`${d.getMonth()+1}/${d.getDate()}`);
+                }
+                break;
         }
-        return months;
-    }, []);
+        return periods;
+    }, [periodUnit]);
 
     return (
         <TableContainer component={Paper}>
@@ -444,7 +473,9 @@ function TableMeter({
                                         <TableCell sx={{ whiteSpace: 'nowrap' }}>{meter.manager}</TableCell>
                                         {periods.map(period => (
                                             <TableCell key={`${meter.id}-${period}`}>
-                                                {meter.records?.[period] || ''}
+                                                {recordDisplayMode === 'actual' ? 
+                                                    meter.records?.[period]?.value || '' :
+                                                    meter.records?.[period]?.usage || ''}
                                             </TableCell>
                                         ))}
                                     </>
@@ -582,7 +613,9 @@ function MainContent() {
     const [tabValue, setTabValue] = React.useState(0);
     const [editDialogOpen, setEditDialogOpen] = React.useState(false);
     const [editingMeter, setEditingMeter] = React.useState(null);
-    const [mainTabValue, setMainTabValue] = React.useState(0); // メインタブの状態管理を追加
+    const [mainTabValue, setMainTabValue] = React.useState(2); // 設備情報入力を初期タブに
+    const [recordDisplayMode, setRecordDisplayMode] = React.useState('actual');
+    const [periodUnit, setPeriodUnit] = React.useState('month');
 
     // フィルター適用後のメーター
     const filteredMeters = React.useMemo(() => {
@@ -883,14 +916,14 @@ function MainContent() {
                     onChange={(event, newValue) => setMainTabValue(newValue)}
                     sx={{ borderBottom: 1, borderColor: 'divider', mb: 2 }}
                 >
+                    <Tab label="設備情報" />
                     <Tab label="設備一覧" />
                     <Tab label="設備情報入力" />
-                    <Tab label="設備情報" />
                     <Tab label="設備メーター履歴" />
                 </Tabs>
 
                 {/* 設備一覧タブ */}
-                {mainTabValue === 0 && (
+                {mainTabValue === 1 && (
                     <Box>
                         <Typography variant="h6" sx={{ mb: 2 }}>設備一覧</Typography>
                         {/* フィルター部分 */}
@@ -935,7 +968,7 @@ function MainContent() {
                 )}
 
                 {/* 設備情報入力タブ */}
-                {mainTabValue === 1 && (
+                {mainTabValue === 2 && (
                     <Box>
                         <Typography variant="h6" sx={{ mb: 2 }}>設備情報入力</Typography>
                         {/* フィルター部分 */}
@@ -985,7 +1018,7 @@ function MainContent() {
                 )}
 
                 {/* 設備情報タブ */}
-                {mainTabValue === 2 && (
+                {mainTabValue === 0 && (
                     <Box>
                         <Typography variant="h6" sx={{ mb: 2 }}>設備情報</Typography>
                         {/* 設備情報編集用のフォーム */}
@@ -1027,8 +1060,28 @@ function MainContent() {
                 {mainTabValue === 3 && (
                     <Box>
                         <Typography variant="h6" sx={{ mb: 2 }}>設備メーター履歴</Typography>
-                        {/* フィルター部分 */}
-                        <Box sx={{ mb: 2, display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                        {/* 表示オプション */}
+                        <Box sx={{ mb: 2, display: 'flex', gap: 2, alignItems: 'center' }}>
+                            <FormControl size="small">
+                                <Select
+                                    value={recordDisplayMode}
+                                    onChange={(e) => setRecordDisplayMode(e.target.value)}
+                                >
+                                    <MenuItem value="actual">メーター実数</MenuItem>
+                                    <MenuItem value="usage">利用量</MenuItem>
+                                </Select>
+                            </FormControl>
+                            <FormControl size="small">
+                                <Select
+                                    value={periodUnit}
+                                    onChange={(e) => setPeriodUnit(e.target.value)}
+                                >
+                                    <MenuItem value="year">年度</MenuItem>
+                                    <MenuItem value="month">月度</MenuItem>
+                                    <MenuItem value="week">週</MenuItem>
+                                    <MenuItem value="day">日</MenuItem>
+                                </Select>
+                            </FormControl>
                             <TextField
                                 size="small"
                                 placeholder="検索..."
@@ -1064,6 +1117,8 @@ function MainContent() {
                             onEditClick={handleEditClick}
                             showEditableFields={true}
                             isRecordList={true}
+                            recordDisplayMode={recordDisplayMode}
+                            periodUnit={periodUnit}
                         />
                     </Box>
                 )}
