@@ -911,10 +911,12 @@ function MainContent() {
 
             {/* メインタブ */}
             <Paper elevation={3} sx={{ p: 2 }}>
+
                 <Tabs
                     value={mainTabValue}
                     onChange={(event, newValue) => setMainTabValue(newValue)}
                     sx={{ borderBottom: 1, borderColor: 'divider', mb: 2 }}
+                    
                 >
                     <Tab label="設備情報" />
                     <Tab label="設備一覧" />
