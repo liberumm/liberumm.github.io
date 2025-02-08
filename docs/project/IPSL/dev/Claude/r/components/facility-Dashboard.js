@@ -141,7 +141,7 @@ function CalendarArea() {
   );
 }
 
-// TODOリストコンポーネント（対応が必要な項目）
+// TODOリストコンポーネント（対応が必要な項目：常にエリアを表示）
 function TodoList({ histories }) {
   // 「オープン」状態の履歴項目のみ抽出
   const openItems = histories.filter(item => item.status === 'open');
@@ -160,38 +160,38 @@ function TodoList({ histories }) {
     }
   };
 
-  if (openItems.length === 0) {
-    return null;
-  }
-
   return (
     <Paper sx={{ p: 1, m: 1, backgroundColor: '#ffebee' }}>
       <Typography variant="h6" sx={{ mb: 1 }}>TODO リスト</Typography>
-      <TableContainer>
-        <Table size="small">
-          <TableHead>
-            <TableRow>
-              <TableCell>対応内容</TableCell>
-              <TableCell>対応期限</TableCell>
-              <TableCell>優先度</TableCell>
-            </TableRow>
-          </TableHead>
-          <TableBody>
-            {openItems.map((item, index) => {
-              const urgency = computeUrgency(item.dueDate);
-              return (
-                <TableRow key={index}>
-                  <TableCell>{item.title || '未定義'}</TableCell>
-                  <TableCell>{item.dueDate}</TableCell>
-                  <TableCell>
-                    <Chip label={urgency.level} color={urgency.color} size="small" />
-                  </TableCell>
-                </TableRow>
-              );
-            })}
-          </TableBody>
-        </Table>
-      </TableContainer>
+      {openItems.length === 0 ? (
+        <Typography variant="body2">TODO 項目はありません</Typography>
+      ) : (
+        <TableContainer>
+          <Table size="small">
+            <TableHead>
+              <TableRow>
+                <TableCell>対応内容</TableCell>
+                <TableCell>対応期限</TableCell>
+                <TableCell>優先度</TableCell>
+              </TableRow>
+            </TableHead>
+            <TableBody>
+              {openItems.map((item, index) => {
+                const urgency = computeUrgency(item.dueDate);
+                return (
+                  <TableRow key={index}>
+                    <TableCell>{item.title || '未定義'}</TableCell>
+                    <TableCell>{item.dueDate}</TableCell>
+                    <TableCell>
+                      <Chip label={urgency.level} color={urgency.color} size="small" />
+                    </TableCell>
+                  </TableRow>
+                );
+              })}
+            </TableBody>
+          </Table>
+        </TableContainer>
+      )}
     </Paper>
   );
 }
@@ -228,7 +228,7 @@ function EventList({ events }) {
   );
 }
 
-// ダッシュボード概要コンポーネント（概要エリア：各情報の合計値と内訳を表示）  
+// ダッシュボード概要コンポーネント（概要エリア：各情報の合計値と内訳を表示）
 function DashboardSummary({ stores, contracts, tenants, facilities, vendors, sales, competitors, histories, selectedStore }) {
   // 選択店舗でフィルタリングするヘルパー
   const filterByStore = (items) =>
@@ -251,7 +251,7 @@ function DashboardSummary({ stores, contracts, tenants, facilities, vendors, sal
   };
 
   // 内訳（※各データは、店舗は businessType、契約は status、テナントは genre、設備は status、業者は type、競合は type、履歴は status として集計）
-  const storeCountsByType     = groupBy(filteredStores,    'businessType');
+  const storeCountsByType     = groupBy(filteredStores,    'business_type');
   const contractsByStatus     = groupBy(filteredContracts, 'status');
   const tenantsByGenre        = groupBy(filteredTenants,   'genre');
   const facilitiesByStatus    = groupBy(filteredFacilities,'status');
@@ -658,14 +658,14 @@ function Dashboard() {
   // サンプルデータ（実際のデータに置き換えてください）
   const [stores, setStores] = useState([
     // サンプル店舗データ例
-    { store_id: 1, store_name: '店舗A', business_type: 'スーパー', building_category: 'ショッピングモール', floor_area: '150㎡', built_year: '2010' },
-    { store_id: 2, store_name: '店舗B', business_type: 'ファッション', building_category: 'ショッピングモール', floor_area: '150㎡', built_year: '2010' },
-    { store_id: 3, store_name: '店舗C', business_type: '飲食', building_category: 'ビル', floor_area: '100㎡', built_year: '2015' }
+    { store_id: 1, store_name: '店舗A', business_type: 'SM', building_category: 'ショッピングモール', floor_area: '150㎡', built_year: '2010' },
+    { store_id: 2, store_name: '店舗B', business_type: '衣料', building_category: 'ビル', floor_area: '100㎡', built_year: '2015' }
   ]);
   const [contracts, setContracts] = useState([
     // サンプル契約データ例
     { contract_id: 1, contract_name: '契約A', contract_type: '賃貸', contract_period: '2023-2028', status: '契約中', store_id: 1 },
-    { contract_id: 2, contract_name: '契約B', contract_type: 'リース', contract_period: '2022-2027', status: '更新中', store_id: 2 }
+    { contract_id: 2, contract_name: '契約B', contract_type: 'リース', contract_period: '2022-2027', status: '更新中', store_id: 2 },
+    { contract_id: 3, contract_name: '契約C', contract_type: 'リース', contract_period: '2022-2027', status: '契約中', store_id: 2 }
   ]);
   const [tenants, setTenants] = useState([
     // サンプルテナントデータ例
@@ -675,16 +675,14 @@ function Dashboard() {
   const [facilities, setFacilities] = useState([
     // サンプル設備データ例
     { facility_id: 1, facility_name: 'エレベーター', status: '正常', installation_place: '正面', store_id: 1 },
-    { facility_id: 2, facility_name: '空調', status: '要修理', installation_place: '裏', store_id: 2 },
-    { facility_id: 3, facility_name: '冷房', status: '要修理', installation_place: '裏', store_id: 2 }
+    { facility_id: 2, facility_name: '空調', status: '故障中', installation_place: '裏', store_id: 2 }
   ]);
   
   // 履歴データ（TODOリスト用）
   const [histories, setHistories] = useState([
-    { history_id: 1, title: '契約更新確認', dueDate: '2025-02-10', status: '対応中' },
-    { history_id: 2, title: '設備点検', dueDate: '2025-02-08', status: '対応中' },
-    { history_id: 2, title: '設備点検', dueDate: '2025-02-08', status: '対応中' },
-    { history_id: 3, title: 'テナント対応', dueDate: '2025-02-20', status: '対応済' }
+    { history_id: 1, title: '契約更新確認', dueDate: '2025-02-10', status: 'open' },
+    { history_id: 2, title: '設備点検', dueDate: '2025-02-08', status: 'open' },
+    { history_id: 3, title: 'テナント対応', dueDate: '2025-02-20', status: 'close' }
   ]);
   
   // EVENT リスト用のサンプルデータ
