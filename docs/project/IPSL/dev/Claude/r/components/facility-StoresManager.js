@@ -58,23 +58,23 @@ function StoresManager() {
         <Table size="small">
           <TableHead>
             <TableRow>
-              <TableCell>ID</TableCell>
-              <TableCell>店舗コード</TableCell>
-              <TableCell>店舗名</TableCell>
-              <TableCell>建物区分</TableCell>
-              <TableCell>作成日</TableCell>
-              <TableCell>操作</TableCell>
+              <TableCell sx={{ whiteSpace: 'nowrap' }}>ID</TableCell>
+              <TableCell sx={{ whiteSpace: 'nowrap' }}>店舗コード</TableCell>
+              <TableCell sx={{ whiteSpace: 'nowrap' }}>店舗名</TableCell>
+              <TableCell sx={{ whiteSpace: 'nowrap' }}>建物区分</TableCell>
+              <TableCell sx={{ whiteSpace: 'nowrap' }}>作成日</TableCell>
+              <TableCell sx={{ whiteSpace: 'nowrap' }}>操作</TableCell>
             </TableRow>
           </TableHead>
           <TableBody>
             {stores.map((store) => (
               <TableRow key={store.store_id}>
-                <TableCell>{store.store_id}</TableCell>
-                <TableCell>{store.store_code}</TableCell>
-                <TableCell>{store.store_name}</TableCell>
-                <TableCell>{store.building_type}</TableCell>
-                <TableCell>{store.created_at}</TableCell>
-                <TableCell>
+                <TableCell sx={{ whiteSpace: 'nowrap' }}>{store.store_id}</TableCell>
+                <TableCell sx={{ whiteSpace: 'nowrap' }}>{store.store_code}</TableCell>
+                <TableCell sx={{ whiteSpace: 'nowrap' }}>{store.store_name}</TableCell>
+                <TableCell sx={{ whiteSpace: 'nowrap' }}>{store.building_type}</TableCell>
+                <TableCell sx={{ whiteSpace: 'nowrap' }}>{store.created_at}</TableCell>
+                <TableCell sx={{ whiteSpace: 'nowrap' }}>
                   <Button
                     size="small"
                     color="secondary"

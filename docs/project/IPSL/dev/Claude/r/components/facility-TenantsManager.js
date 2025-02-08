@@ -90,29 +90,29 @@ function TenantsManager() {
         <Table size="small">
           <TableHead>
             <TableRow>
-              <TableCell>ID</TableCell>
-              <TableCell>店舗ID</TableCell>
-              <TableCell>テナント名</TableCell>
-              <TableCell>業種</TableCell>
-              <TableCell>賃料</TableCell>
-              <TableCell>開始日</TableCell>
-              <TableCell>終了日</TableCell>
-              <TableCell>作成日</TableCell>
-              <TableCell>操作</TableCell>
+              <TableCell sx={{ whiteSpace: 'nowrap' }}>ID</TableCell>
+              <TableCell sx={{ whiteSpace: 'nowrap' }}>店舗ID</TableCell>
+              <TableCell sx={{ whiteSpace: 'nowrap' }}>テナント名</TableCell>
+              <TableCell sx={{ whiteSpace: 'nowrap' }}>業種</TableCell>
+              <TableCell sx={{ whiteSpace: 'nowrap' }}>賃料</TableCell>
+              <TableCell sx={{ whiteSpace: 'nowrap' }}>開始日</TableCell>
+              <TableCell sx={{ whiteSpace: 'nowrap' }}>終了日</TableCell>
+              <TableCell sx={{ whiteSpace: 'nowrap' }}>作成日</TableCell>
+              <TableCell sx={{ whiteSpace: 'nowrap' }}>操作</TableCell>
             </TableRow>
           </TableHead>
           <TableBody>
             {tenants.map((tenant) => (
               <TableRow key={tenant.tenant_id}>
-                <TableCell>{tenant.tenant_id}</TableCell>
-                <TableCell>{tenant.store_id}</TableCell>
-                <TableCell>{tenant.tenant_name}</TableCell>
-                <TableCell>{tenant.tenant_industry}</TableCell>
-                <TableCell>{tenant.tenant_rent}</TableCell>
-                <TableCell>{tenant.contract_start_date}</TableCell>
-                <TableCell>{tenant.contract_end_date}</TableCell>
-                <TableCell>{tenant.created_at}</TableCell>
-                <TableCell>
+                <TableCell sx={{ whiteSpace: 'nowrap' }}>{tenant.tenant_id}</TableCell>
+                <TableCell sx={{ whiteSpace: 'nowrap' }}>{tenant.store_id}</TableCell>
+                <TableCell sx={{ whiteSpace: 'nowrap' }}>{tenant.tenant_name}</TableCell>
+                <TableCell sx={{ whiteSpace: 'nowrap' }}>{tenant.tenant_industry}</TableCell>
+                <TableCell sx={{ whiteSpace: 'nowrap' }}>{tenant.tenant_rent}</TableCell>
+                <TableCell sx={{ whiteSpace: 'nowrap' }}>{tenant.contract_start_date}</TableCell>
+                <TableCell sx={{ whiteSpace: 'nowrap' }}>{tenant.contract_end_date}</TableCell>
+                <TableCell sx={{ whiteSpace: 'nowrap' }}>{tenant.created_at}</TableCell>
+                <TableCell sx={{ whiteSpace: 'nowrap' }}>
                   <Button
                     size="small"
                     color="secondary"

@@ -80,29 +80,29 @@ function FacilitiesManager() {
         <Table size="small">
           <TableHead>
             <TableRow>
-              <TableCell>ID</TableCell>
-              <TableCell>店舗ID</TableCell>
-              <TableCell>設備種別</TableCell>
-              <TableCell>設備名</TableCell>
-              <TableCell>設置場所</TableCell>
-              <TableCell>容量/サイズ</TableCell>
-              <TableCell>備考</TableCell>
-              <TableCell>作成日</TableCell>
-              <TableCell>操作</TableCell>
+              <TableCell sx={{ whiteSpace: 'nowrap' }}>ID</TableCell>
+              <TableCell sx={{ whiteSpace: 'nowrap' }}>店舗ID</TableCell>
+              <TableCell sx={{ whiteSpace: 'nowrap' }}>設備種別</TableCell>
+              <TableCell sx={{ whiteSpace: 'nowrap' }}>設備名</TableCell>
+              <TableCell sx={{ whiteSpace: 'nowrap' }}>設置場所</TableCell>
+              <TableCell sx={{ whiteSpace: 'nowrap' }}>容量/サイズ</TableCell>
+              <TableCell sx={{ whiteSpace: 'nowrap' }}>備考</TableCell>
+              <TableCell sx={{ whiteSpace: 'nowrap' }}>作成日</TableCell>
+              <TableCell sx={{ whiteSpace: 'nowrap' }}>操作</TableCell>
             </TableRow>
           </TableHead>
           <TableBody>
             {facilities.map((facility) => (
               <TableRow key={facility.facility_id}>
-                <TableCell>{facility.facility_id}</TableCell>
-                <TableCell>{facility.store_id}</TableCell>
-                <TableCell>{facility.facility_type}</TableCell>
-                <TableCell>{facility.facility_name}</TableCell>
-                <TableCell>{facility.location_info}</TableCell>
-                <TableCell>{facility.capacity_or_size}</TableCell>
-                <TableCell>{facility.details}</TableCell>
-                <TableCell>{facility.created_at}</TableCell>
-                <TableCell>
+                <TableCell sx={{ whiteSpace: 'nowrap' }}>{facility.facility_id}</TableCell>
+                <TableCell sx={{ whiteSpace: 'nowrap' }}>{facility.store_id}</TableCell>
+                <TableCell sx={{ whiteSpace: 'nowrap' }}>{facility.facility_type}</TableCell>
+                <TableCell sx={{ whiteSpace: 'nowrap' }}>{facility.facility_name}</TableCell>
+                <TableCell sx={{ whiteSpace: 'nowrap' }}>{facility.location_info}</TableCell>
+                <TableCell sx={{ whiteSpace: 'nowrap' }}>{facility.capacity_or_size}</TableCell>
+                <TableCell sx={{ whiteSpace: 'nowrap' }}>{facility.details}</TableCell>
+                <TableCell sx={{ whiteSpace: 'nowrap' }}>{facility.created_at}</TableCell>
+                <TableCell sx={{ whiteSpace: 'nowrap' }}>
                   <Button
                     size="small"
                     color="secondary"
