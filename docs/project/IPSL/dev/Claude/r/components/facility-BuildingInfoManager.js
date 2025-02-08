@@ -101,33 +101,33 @@ function BuildingInfoManager() {
         <Table size="small">
           <TableHead>
             <TableRow>
-              <TableCell>ID</TableCell>
-              <TableCell>店舗ID</TableCell>
-              <TableCell>地上階数</TableCell>
-              <TableCell>地下階数</TableCell>
-              <TableCell>入居フロア</TableCell>
-              <TableCell>敷地面積</TableCell>
-              <TableCell>建築面積</TableCell>
-              <TableCell>延床面積</TableCell>
-              <TableCell>売場面積</TableCell>
-              <TableCell>バックヤード面積</TableCell>
-              <TableCell>操作</TableCell>
+              <TableCell sx={{ whiteSpace: 'nowrap' }}>ID</TableCell>
+              <TableCell sx={{ whiteSpace: 'nowrap' }}>店舗ID</TableCell>
+              <TableCell sx={{ whiteSpace: 'nowrap' }}>地上階数</TableCell>
+              <TableCell sx={{ whiteSpace: 'nowrap' }}>地下階数</TableCell>
+              <TableCell sx={{ whiteSpace: 'nowrap' }}>入居フロア</TableCell>
+              <TableCell sx={{ whiteSpace: 'nowrap' }}>敷地面積</TableCell>
+              <TableCell sx={{ whiteSpace: 'nowrap' }}>建築面積</TableCell>
+              <TableCell sx={{ whiteSpace: 'nowrap' }}>延床面積</TableCell>
+              <TableCell sx={{ whiteSpace: 'nowrap' }}>売場面積</TableCell>
+              <TableCell sx={{ whiteSpace: 'nowrap' }}>バックヤード面積</TableCell>
+              <TableCell sx={{ whiteSpace: 'nowrap' }}>操作</TableCell>
             </TableRow>
           </TableHead>
           <TableBody>
             {infos.map((info) => (
               <TableRow key={info.building_info_id}>
-                <TableCell>{info.building_info_id}</TableCell>
-                <TableCell>{info.store_id}</TableCell>
-                <TableCell>{info.floors_above}</TableCell>
-                <TableCell>{info.floors_below}</TableCell>
-                <TableCell>{info.occupied_floors}</TableCell>
-                <TableCell>{info.site_area}</TableCell>
-                <TableCell>{info.building_area}</TableCell>
-                <TableCell>{info.total_floor_area}</TableCell>
-                <TableCell>{info.sales_area}</TableCell>
-                <TableCell>{info.backyard_area}</TableCell>
-                <TableCell>
+                <TableCell sx={{ whiteSpace: 'nowrap' }}>{info.building_info_id}</TableCell>
+                <TableCell sx={{ whiteSpace: 'nowrap' }}>{info.store_id}</TableCell>
+                <TableCell sx={{ whiteSpace: 'nowrap' }}>{info.floors_above}</TableCell>
+                <TableCell sx={{ whiteSpace: 'nowrap' }}>{info.floors_below}</TableCell>
+                <TableCell sx={{ whiteSpace: 'nowrap' }}>{info.occupied_floors}</TableCell>
+                <TableCell sx={{ whiteSpace: 'nowrap' }}>{info.site_area}</TableCell>
+                <TableCell sx={{ whiteSpace: 'nowrap' }}>{info.building_area}</TableCell>
+                <TableCell sx={{ whiteSpace: 'nowrap' }}>{info.total_floor_area}</TableCell>
+                <TableCell sx={{ whiteSpace: 'nowrap' }}>{info.sales_area}</TableCell>
+                <TableCell sx={{ whiteSpace: 'nowrap' }}>{info.backyard_area}</TableCell>
+                <TableCell sx={{ whiteSpace: 'nowrap' }}>
                   <Button
                     size="small"
                     color="secondary"

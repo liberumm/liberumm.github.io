@@ -57,25 +57,25 @@ function CompetitorsManager() {
         <Table size="small">
           <TableHead>
             <TableRow>
-              <TableCell>ID</TableCell>
-              <TableCell>店舗ID</TableCell>
-              <TableCell>競合店名</TableCell>
-              <TableCell>順位</TableCell>
-              <TableCell>備考</TableCell>
-              <TableCell>作成日</TableCell>
-              <TableCell>操作</TableCell>
+              <TableCell sx={{ whiteSpace: 'nowrap' }}>ID</TableCell>
+              <TableCell sx={{ whiteSpace: 'nowrap' }}>店舗ID</TableCell>
+              <TableCell sx={{ whiteSpace: 'nowrap' }}>競合店名</TableCell>
+              <TableCell sx={{ whiteSpace: 'nowrap' }}>順位</TableCell>
+              <TableCell sx={{ whiteSpace: 'nowrap' }}>備考</TableCell>
+              <TableCell sx={{ whiteSpace: 'nowrap' }}>作成日</TableCell>
+              <TableCell sx={{ whiteSpace: 'nowrap' }}>操作</TableCell>
             </TableRow>
           </TableHead>
           <TableBody>
             {competitors.map((c) => (
               <TableRow key={c.competitor_id}>
-                <TableCell>{c.competitor_id}</TableCell>
-                <TableCell>{c.store_id}</TableCell>
-                <TableCell>{c.competitor_name}</TableCell>
-                <TableCell>{c.competitor_rank}</TableCell>
-                <TableCell>{c.notes}</TableCell>
-                <TableCell>{c.created_at}</TableCell>
-                <TableCell>
+                <TableCell sx={{ whiteSpace: 'nowrap' }}>{c.competitor_id}</TableCell>
+                <TableCell sx={{ whiteSpace: 'nowrap' }}>{c.store_id}</TableCell>
+                <TableCell sx={{ whiteSpace: 'nowrap' }}>{c.competitor_name}</TableCell>
+                <TableCell sx={{ whiteSpace: 'nowrap' }}>{c.competitor_rank}</TableCell>
+                <TableCell sx={{ whiteSpace: 'nowrap' }}>{c.notes}</TableCell>
+                <TableCell sx={{ whiteSpace: 'nowrap' }}>{c.created_at}</TableCell>
+                <TableCell sx={{ whiteSpace: 'nowrap' }}>
                   <Button
                     size="small"
                     color="secondary"

@@ -56,25 +56,25 @@ function VendorsManager() {
         <Table size="small">
           <TableHead>
             <TableRow>
-              <TableCell>ID</TableCell>
-              <TableCell>業者名</TableCell>
-              <TableCell>業者種別</TableCell>
-              <TableCell>連絡先</TableCell>
-              <TableCell>備考</TableCell>
-              <TableCell>作成日</TableCell>
-              <TableCell>操作</TableCell>
+              <TableCell sx={{ whiteSpace: 'nowrap' }}>ID</TableCell>
+              <TableCell sx={{ whiteSpace: 'nowrap' }}>業者名</TableCell>
+              <TableCell sx={{ whiteSpace: 'nowrap' }}>業者種別</TableCell>
+              <TableCell sx={{ whiteSpace: 'nowrap' }}>連絡先</TableCell>
+              <TableCell sx={{ whiteSpace: 'nowrap' }}>備考</TableCell>
+              <TableCell sx={{ whiteSpace: 'nowrap' }}>作成日</TableCell>
+              <TableCell sx={{ whiteSpace: 'nowrap' }}>操作</TableCell>
             </TableRow>
           </TableHead>
           <TableBody>
             {vendors.map((vendor) => (
               <TableRow key={vendor.vendor_id}>
-                <TableCell>{vendor.vendor_id}</TableCell>
-                <TableCell>{vendor.vendor_name}</TableCell>
-                <TableCell>{vendor.vendor_type}</TableCell>
-                <TableCell>{vendor.contact_info}</TableCell>
-                <TableCell>{vendor.notes}</TableCell>
-                <TableCell>{vendor.created_at}</TableCell>
-                <TableCell>
+                <TableCell sx={{ whiteSpace: 'nowrap' }}>{vendor.vendor_id}</TableCell>
+                <TableCell sx={{ whiteSpace: 'nowrap' }}>{vendor.vendor_name}</TableCell>
+                <TableCell sx={{ whiteSpace: 'nowrap' }}>{vendor.vendor_type}</TableCell>
+                <TableCell sx={{ whiteSpace: 'nowrap' }}>{vendor.contact_info}</TableCell>
+                <TableCell sx={{ whiteSpace: 'nowrap' }}>{vendor.notes}</TableCell>
+                <TableCell sx={{ whiteSpace: 'nowrap' }}>{vendor.created_at}</TableCell>
+                <TableCell sx={{ whiteSpace: 'nowrap' }}>
                   <Button
                     size="small"
                     color="secondary"

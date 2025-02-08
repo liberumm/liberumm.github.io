@@ -2,7 +2,7 @@ const { Box, Typography, Container, Grid, Link } = MaterialUI;
 
 function Footer() {
     return (
-        <Box component="footer" sx={{ bgcolor: 'primary.dark', color: 'white', py: 1 }}>
+        <Box component="footer" sx={{ bgcolor: 'primary.main', color: 'white', py: 1 }}>
             <Container maxWidth="md">
                 <Box mt={0} textAlign="center">
                     <Typography variant="body2">

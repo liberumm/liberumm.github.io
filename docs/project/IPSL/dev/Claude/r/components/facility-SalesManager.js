@@ -57,23 +57,23 @@ function SalesManager() {
         <Table size="small">
           <TableHead>
             <TableRow>
-              <TableCell>ID</TableCell>
-              <TableCell>店舗ID</TableCell>
-              <TableCell>年度</TableCell>
-              <TableCell>年間売上</TableCell>
-              <TableCell>作成日</TableCell>
-              <TableCell>操作</TableCell>
+              <TableCell sx={{ whiteSpace: 'nowrap' }}>ID</TableCell>
+              <TableCell sx={{ whiteSpace: 'nowrap' }}>店舗ID</TableCell>
+              <TableCell sx={{ whiteSpace: 'nowrap' }}>年度</TableCell>
+              <TableCell sx={{ whiteSpace: 'nowrap' }}>年間売上</TableCell>
+              <TableCell sx={{ whiteSpace: 'nowrap' }}>作成日</TableCell>
+              <TableCell sx={{ whiteSpace: 'nowrap' }}>操作</TableCell>
             </TableRow>
           </TableHead>
           <TableBody>
             {sales.map((sale) => (
               <TableRow key={sale.sales_id}>
-                <TableCell>{sale.sales_id}</TableCell>
-                <TableCell>{sale.store_id}</TableCell>
-                <TableCell>{sale.year}</TableCell>
-                <TableCell>{sale.annual_sales}</TableCell>
-                <TableCell>{sale.created_at}</TableCell>
-                <TableCell>
+                <TableCell sx={{ whiteSpace: 'nowrap' }}>{sale.sales_id}</TableCell>
+                <TableCell sx={{ whiteSpace: 'nowrap' }}>{sale.store_id}</TableCell>
+                <TableCell sx={{ whiteSpace: 'nowrap' }}>{sale.year}</TableCell>
+                <TableCell sx={{ whiteSpace: 'nowrap' }}>{sale.annual_sales}</TableCell>
+                <TableCell sx={{ whiteSpace: 'nowrap' }}>{sale.created_at}</TableCell>
+                <TableCell sx={{ whiteSpace: 'nowrap' }}>
                   <Button
                     size="small"
                     color="secondary"
