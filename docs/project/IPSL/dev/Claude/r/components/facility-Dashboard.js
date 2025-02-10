@@ -681,10 +681,10 @@ function Dashboard() {
   
   // 履歴データ（TODOリスト用）
   const [histories, setHistories] = useState([
-    { history_id: 1, title: '契約更新確認', dueDate: '2025-02-10', status: '対応中' },
-    { history_id: 2, title: '設備点検', dueDate: '2025-02-08', status: '対応中' },
-    { history_id: 2, title: '設備点検', dueDate: '2025-02-08', status: '対応中' },
-    { history_id: 3, title: 'テナント対応', dueDate: '2025-02-20', status: '対応済' }
+    { history_id: 1, title: '契約更新確認', dueDate: '2025-02-10', status: 'open' },
+    { history_id: 2, title: '設備点検', dueDate: '2025-02-08', status: 'open' },
+    { history_id: 2, title: '設備点検', dueDate: '2025-02-08', status: 'close' },
+    { history_id: 3, title: 'テナント対応', dueDate: '2025-02-20', status: 'open' }
   ]);
   
   // EVENT リスト用のサンプルデータ
