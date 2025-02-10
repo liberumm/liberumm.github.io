@@ -251,7 +251,7 @@ function DashboardSummary({ stores, contracts, tenants, facilities, vendors, sal
   };
 
   // 内訳（※各データは、店舗は businessType、契約は status、テナントは genre、設備は status、業者は type、競合は type、履歴は status として集計）
-  const storeCountsByType     = groupBy(filteredStores,    'businessType');
+  const storeCountsByType     = groupBy(filteredStores,    'business_type');
   const contractsByStatus     = groupBy(filteredContracts, 'status');
   const tenantsByGenre        = groupBy(filteredTenants,   'genre');
   const facilitiesByStatus    = groupBy(filteredFacilities,'status');
@@ -365,7 +365,7 @@ function DashboardSummary({ stores, contracts, tenants, facilities, vendors, sal
       {/* 上段：各カード */}
       <Grid container spacing={1}>
         {cardData.map((item, idx) => (
-          <Grid item xs={12} sm={6} md={3} key={idx}>
+          <Grid item xs={6} sm={3} md={3} key={idx}>
             <Card
               elevation={1}
               sx={{
@@ -401,6 +401,7 @@ function DashboardSummary({ stores, contracts, tenants, facilities, vendors, sal
       </Grid>
 
       {/* 下段：既存のテーブル表示セクション */}
+      {/*
       <Grid container spacing={1} sx={{ mt: 1 }}>
         {sections.map((section, idx) => (
           <Grid item xs={12} md={6} key={idx}>
@@ -434,6 +435,7 @@ function DashboardSummary({ stores, contracts, tenants, facilities, vendors, sal
           </Grid>
         ))}
       </Grid>
+      */}
     </Box>
   );
 }
@@ -658,9 +660,9 @@ function Dashboard() {
   // サンプルデータ（実際のデータに置き換えてください）
   const [stores, setStores] = useState([
     // サンプル店舗データ例
-    { store_id: 1, store_name: '店舗A', business_type: 'スーパー', building_category: 'ショッピングモール', floor_area: '150㎡', built_year: '2010' },
-    { store_id: 2, store_name: '店舗B', business_type: 'ファッション', building_category: 'ショッピングモール', floor_area: '150㎡', built_year: '2010' },
-    { store_id: 3, store_name: '店舗C', business_type: '飲食', building_category: 'ビル', floor_area: '100㎡', built_year: '2015' }
+    { store_id: 1, store_name: '店舗A', business_type: 'SM', building_category: 'ショッピングモール', floor_area: '150㎡', built_year: '2010' },
+    { store_id: 2, store_name: '店舗B', business_type: '衣料', building_category: 'ショッピングモール', floor_area: '150㎡', built_year: '2010' },
+    { store_id: 3, store_name: '店舗C', business_type: 'SM', building_category: 'ビル', floor_area: '100㎡', built_year: '2015' }
   ]);
   const [contracts, setContracts] = useState([
     // サンプル契約データ例
