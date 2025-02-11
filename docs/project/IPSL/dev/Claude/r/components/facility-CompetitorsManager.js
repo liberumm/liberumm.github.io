@@ -261,16 +261,16 @@ function CompetitorsManager() {
                   setOpenEditDialog(true);
                 }}
               >
-                <TableCell>{c.competitor_id}</TableCell>
-                <TableCell>{c.store_id}</TableCell>
-                <TableCell>{c.competitor_name}</TableCell>
-                <TableCell>{c.competitor_rank}</TableCell>
-                <TableCell>{c.notes}</TableCell>
-                <TableCell>{c.created_at}</TableCell>
-                <TableCell>{c.updated_at}</TableCell>
-                <TableCell>{c.created_by}</TableCell>
-                <TableCell>{c.updated_by}</TableCell>
-                <TableCell>
+                <TableCell sx={{ whiteSpace: "nowrap" }}>{c.competitor_id}</TableCell>
+                <TableCell sx={{ whiteSpace: "nowrap" }}>{c.store_id}</TableCell>
+                <TableCell sx={{ whiteSpace: "nowrap" }}>{c.competitor_name}</TableCell>
+                <TableCell sx={{ whiteSpace: "nowrap" }}>{c.competitor_rank}</TableCell>
+                <TableCell sx={{ whiteSpace: "nowrap" }}>{c.notes}</TableCell>
+                <TableCell sx={{ whiteSpace: "nowrap" }}>{c.created_at}</TableCell>
+                <TableCell sx={{ whiteSpace: "nowrap" }}>{c.updated_at}</TableCell>
+                <TableCell sx={{ whiteSpace: "nowrap" }}>{c.created_by}</TableCell>
+                <TableCell sx={{ whiteSpace: "nowrap" }}>{c.updated_by}</TableCell>
+                <TableCell sx={{ whiteSpace: "nowrap" }}>
                   <Button
                     size="small"
                     color="secondary"

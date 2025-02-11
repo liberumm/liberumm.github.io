@@ -584,7 +584,7 @@ function Dashboard() {
     { label: '一覧', icon: 'dashboard' },
     { label: '店舗管理', icon: 'store' },
     { label: '店舗営業管理', icon: 'info' },
-    { label: '店舗概要', icon: 'dataset' },
+    { label: '施設概要', icon: 'dataset' },  // "店舗概要"から変更
     { label: '契約管理', icon: 'assignment' },
     { label: 'テナント管理', icon: 'people' },
     { label: '建物情報管理', icon: 'domain' },
@@ -673,6 +673,9 @@ function Dashboard() {
       }
     }
   });
+
+  // 施設選択用の状態を追加
+  const [selectedFacility, setSelectedFacility] = useState('');
 
   // DashboardSummary 内の各カードをクリックしたときの処理
   // カードタイトルに応じたタブインデックスのマッピング
@@ -846,7 +849,7 @@ function Dashboard() {
           <SalesConditionManager data={storeOverviewData} />
         </TabPanel>
         <TabPanel value={tabValue} index={3}>
-          <StoreOverview data={storeOverviewData} />
+          <FacilityOverview data={{ ...storeOverviewData, stores: stores }} />
         </TabPanel>
         <TabPanel value={tabValue} index={4}>
           <ContractsManager />
@@ -874,6 +877,186 @@ function Dashboard() {
         </TabPanel>
       </Box>
     </Paper>
+  );
+}
+
+// StoreOverviewをFacilityOverviewに変更
+function FacilityOverview({ data = {} }) {
+  const [open, setOpen] = useState(false);
+  const [editData, setEditData] = useState(data);
+  // selectedFacility の状態を追加
+  const [selectedFacility, setSelectedFacility] = useState('');
+
+  const handleOpen = () => setOpen(true);
+  const handleClose = () => setOpen(false);
+  
+  const handleChange = (event) => {
+    const { name, value, checked, type } = event.target;
+    if (name.includes('_')) {
+      const [parent, child, prop] = name.split('_');
+      setEditData(prev => ({
+        ...prev,
+        [parent]: {
+          ...prev[parent],
+          [child]: {
+            ...prev[parent][child],
+            [prop]: type === 'checkbox' ? checked : value
+          }
+        }
+      }));
+    } else {
+      setEditData(prev => ({
+        ...prev,
+        [name]: type === 'checkbox' ? checked : value
+      }));
+    }
+  };
+
+  const handleSave = () => {
+    console.log('保存されたデータ:', editData);
+    handleClose();
+  };
+
+  // 施設選択用セレクトボックスを追加
+  return (
+    <Box>
+      <Box mb={3}>
+        <FormControl fullWidth>
+          <InputLabel>施設を選択</InputLabel>
+          <Select
+            value={selectedFacility}
+            onChange={(e) => setSelectedFacility(e.target.value)}
+          >
+            <MenuItem value="">
+              <em>選択してください</em>
+            </MenuItem>
+            {/* stores は props として渡す必要があります */}
+            {(data.stores || []).map((store) => (
+              <MenuItem key={store.store_id} value={store.store_id}>
+                {store.store_name}
+              </MenuItem>
+            ))}
+          </Select>
+        </FormControl>
+      </Box>
+
+      {selectedFacility ? (
+        <>
+          {/* 選択された施設の基本情報 */}
+          <Paper sx={{ p: 2, mb: 2 }}>
+            <Typography variant="h6" gutterBottom>基本情報</Typography>
+            <Grid container spacing={2}>
+              <Grid item xs={12} md={6}>
+                {/* 既存の店舗情報テーブル */}
+                <TableContainer component={Paper} sx={{ mb: 2 }}>
+                  <Table size="small">
+                    <TableHead>
+                      <TableRow>
+                        <TableCell sx={{ fontWeight: 'bold', width: '30%' }}>項目</TableCell>
+                        <TableCell sx={{ fontWeight: 'bold' }}>内容</TableCell>
+                      </TableRow>
+                    </TableHead>
+                    <TableBody>
+                      <TableRow>
+                        <TableCell>開店年月</TableCell>
+                        <TableCell>{data.openDate}</TableCell>
+                      </TableRow>
+                      <TableRow>
+                        <TableCell>改装年月</TableCell>
+                        <TableCell>{data.renovationDate}</TableCell>
+                      </TableRow>
+                      <TableRow>
+                        <TableCell>提出日</TableCell>
+                        <TableCell>{data.submissionDate}</TableCell>
+                      </TableRow>
+                      <TableRow>
+                        <TableCell>営業時間</TableCell>
+                        <TableCell>{data.businessHours}</TableCell>
+                      </TableRow>
+                      <TableRow>
+                        <TableCell>駐車場必要台数</TableCell>
+                        <TableCell>{data.parkingRequired} 台</TableCell>
+                      </TableRow>
+                      <TableRow>
+                        <TableCell>駐車場届出台数</TableCell>
+                        <TableCell>{data.parkingSubmitted} 台</TableCell>
+                      </TableRow>
+                      <TableRow>
+                        <TableCell>駐輪場必要台数</TableCell>
+                        <TableCell>{data.bicycleParkingRequired} 台</TableCell>
+                      </TableRow>
+                      <TableRow>
+                        <TableCell>駐輪場届出台数</TableCell>
+                        <TableCell>{data.bicycleParkingSubmitted} 台</TableCell>
+                      </TableRow>
+                      <TableRow>
+                        <TableCell>納品可能時間</TableCell>
+                        <TableCell>{data.deliveryAvailableTime}</TableCell>
+                      </TableRow>
+                      <TableRow>
+                        <TableCell>用途地域</TableCell>
+                        <TableCell>
+                          {data.zoningArea?.map((area, index) => (
+                            <Typography key={index}>
+                              {area} {data.zoningApproved[index] ? '⭕' : '❌'}
+                            </Typography>
+                          ))}
+                        </TableCell>
+                      </TableRow>
+                      <TableRow>
+                        <TableCell>階数</TableCell>
+                        <TableCell>
+                          地上: {data.floorInfo?.aboveGround} 階<br />
+                          地下: {data.floorInfo?.underground} 階<br />
+                          入居階: {data.floorInfo?.occupiedFloors}<br />
+                          天井高: {data.floorInfo?.ceilingHeight}
+                        </TableCell>
+                      </TableRow>
+                      <TableRow>
+                        <TableCell>駐車場（敷地内）</TableCell>
+                        <TableCell>
+                          台数: {data.parkingDetails?.onSite?.total} 台<br />
+                          身障者用台数: {data.parkingDetails?.onSite?.handicap} 台<br />
+                          有料／無料: {data.parkingDetails?.onSite?.paid ? '有料' : '無料'}<br />
+                          精算機: {data.parkingDetails?.onSite?.paymentMachine ? 'あり' : 'なし'}<br />
+                          提携駐車場: {data.parkingDetails?.onSite?.partnerParking} 
+                          ({data.parkingDetails?.onSite?.partnerParkingCount} 台)<br />
+                          バイク台数: {data.parkingDetails?.onSite?.motorcycleCount} 台<br />
+                          管理: {data.parkingDetails?.onSite?.management}<br />
+                          利用条件: {data.parkingDetails?.onSite?.usageConditions}<br />
+                          超過料金: {data.parkingDetails?.onSite?.excessFee}
+                        </TableCell>
+                      </TableRow>
+                    </TableBody>
+                  </Table>
+                </TableContainer>
+              </Grid>
+            </Grid>
+          </Paper>
+
+          {/* 関連情報のサマリー */}
+          <Grid container spacing={2}>
+            {/* テナント情報 */}
+            <Grid item xs={12} md={6}>
+              <Paper sx={{ p: 2 }}>
+                <Typography variant="subtitle1">テナント情報</Typography>
+                {/* テナント数や状況のサマリー表示 */}
+              </Paper>
+            </Grid>
+            {/* 設備情報 */}
+            <Grid item xs={12} md={6}>
+              <Paper sx={{ p: 2 }}>
+                <Typography variant="subtitle1">設備情報</Typography>
+                {/* 設備数や状況のサマリー表示 */}
+              </Paper>
+            </Grid>
+            {/* その他の関連情報 */}
+          </Grid>
+        </>
+      ) : (
+        <Typography>施設を選択してください</Typography>
+      )}
+    </Box>
   );
 }
 
