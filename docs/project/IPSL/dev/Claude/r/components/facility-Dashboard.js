@@ -229,7 +229,12 @@ function EventList({ events }) {
 }
 
 // ダッシュボード概要コンポーネント（概要エリア：各情報の合計値と内訳を表示）
+<<<<<<< HEAD
 function DashboardSummary({ stores, contracts, tenants, facilities, vendors, sales, competitors, histories, selectedStore }) {
+=======
+// ※ onCardClick プロパティを受け取り、各カードクリック時に対応するタブへ遷移できるようにします。
+function DashboardSummary({ stores, contracts, tenants, facilities, vendors, sales, competitors, histories, selectedStore, onCardClick }) {
+>>>>>>> 528b81afcf9e00ebe37c9c1b206da5cf103d611c
   // 選択店舗でフィルタリングするヘルパー
   const filterByStore = (items) =>
     selectedStore ? items?.filter(item => item.store_id === selectedStore) : items;
@@ -250,7 +255,11 @@ function DashboardSummary({ stores, contracts, tenants, facilities, vendors, sal
     }, {});
   };
 
+<<<<<<< HEAD
   // 内訳（※各データは、店舗は businessType、契約は status、テナントは genre、設備は status、業者は type、競合は type、履歴は status として集計）
+=======
+  // 内訳
+>>>>>>> 528b81afcf9e00ebe37c9c1b206da5cf103d611c
   const storeCountsByType     = groupBy(filteredStores,    'business_type');
   const contractsByStatus     = groupBy(filteredContracts, 'status');
   const tenantsByGenre        = groupBy(filteredTenants,   'genre');
@@ -267,14 +276,14 @@ function DashboardSummary({ stores, contracts, tenants, facilities, vendors, sal
     return acc;
   }, {});
 
-  // 売上の合計と比率の算出（各売上オブジェクトに annual_sales, planned_sales, previous_year_sales がある前提）
+  // 売上の合計と比率の算出
   const totalSales         = (sales || []).reduce((sum, sale) => sum + (sale.annual_sales || 0), 0);
   const totalPlannedSales  = (sales || []).reduce((sum, sale) => sum + (sale.planned_sales || 0), 0);
   const totalPreviousSales = (sales || []).reduce((sum, sale) => sum + (sale.previous_year_sales || 0), 0);
   const plannedRatio       = totalPlannedSales > 0  ? (totalSales / totalPlannedSales * 100).toFixed(1) : '-';
   const previousRatio      = totalPreviousSales > 0 ? (totalSales / totalPreviousSales * 100).toFixed(1) : '-';
 
-  // カード用のデータ定義（各カテゴリ：合計値と内訳）
+  // カード用のデータ定義
   const cardData = [
     {
       title: '店舗情報',
@@ -332,47 +341,21 @@ function DashboardSummary({ stores, contracts, tenants, facilities, vendors, sal
   // カード表示用の配色例
   const cardColors = ['#bbdefb', '#c8e6c9', '#ffe0b2', '#d1c4e9', '#b2dfdb', '#ffcc80', '#b2ebf2', '#eeeeee'];
 
-  // 既存の表セクション（必要に応じてこちらも更新可能）
-  const sections = [
-    {
-      title: '店舗・建物情報',
-      data: filterByStore(stores),
-      columns: ['店舗名', '建物区分', '延床面積', '築年数'],
-      rowKey: 'store_id'
-    },
-    {
-      title: '契約情報',
-      data: filterByStore(contracts),
-      columns: ['契約名', '契約種別', '契約期間', '状態'],
-      rowKey: 'contract_id'
-    },
-    {
-      title: 'テナント情報',
-      data: filterByStore(tenants),
-      columns: ['テナント名', '業種', '契約状態', '区画'],
-      rowKey: 'tenant_id'
-    },
-    {
-      title: '設備情報',
-      data: filterByStore(facilities),
-      columns: ['設備名', '種別', '設置場所', '状態'],
-      rowKey: 'facility_id'
-    }
-  ];
-
   return (
     <Box sx={{ p: 1 }}>
-      {/* 上段：各カード */}
       <Grid container spacing={1}>
         {cardData.map((item, idx) => (
-          <Grid item xs={12} sm={6} md={3} key={idx}>
+          <Grid item xs={6} sm={3} md={3} key={idx}>
             <Card
+              // カードをクリックしたとき、内部でイベント伝播を止めてから onCardClick を呼び出す
+              onClick={(e) => { e.stopPropagation(); onCardClick(item.title); }}
               elevation={1}
               sx={{
                 transition: 'transform 0.2s',
                 '&:hover': { transform: 'scale(1.01)' },
                 bgcolor: cardColors[idx],
-                p: 1
+                p: 1,
+                cursor: 'pointer'
               }}
             >
               <CardContent sx={{ p: 1 }}>
@@ -396,41 +379,6 @@ function DashboardSummary({ stores, contracts, tenants, facilities, vendors, sal
                 </Box>
               </CardContent>
             </Card>
-          </Grid>
-        ))}
-      </Grid>
-
-      {/* 下段：既存のテーブル表示セクション */}
-      <Grid container spacing={1} sx={{ mt: 1 }}>
-        {sections.map((section, idx) => (
-          <Grid item xs={12} md={6} key={idx}>
-            <Paper elevation={1} sx={{ p: 1, borderRadius: 1 }}>
-              <Typography variant="subtitle1" sx={{ mb: 1, fontWeight: 'bold' }}>
-                {section.title}
-              </Typography>
-              <TableContainer sx={{ maxHeight: 250 }}>
-                <Table size="small" stickyHeader>
-                  <TableHead>
-                    <TableRow>
-                      {section.columns.map((column, colIdx) => (
-                        <TableCell key={colIdx} sx={{ px: 1, py: 0.5 }}>{column}</TableCell>
-                      ))}
-                    </TableRow>
-                  </TableHead>
-                  <TableBody>
-                    {section.data?.map(item => (
-                      <TableRow key={item[section.rowKey]} hover>
-                        {section.columns.map((column, colIdx) => (
-                          <TableCell key={colIdx} sx={{ px: 1, py: 0.5 }}>
-                            {item[column.toLowerCase().replace(/\s+/g, '_')] || '-'}
-                          </TableCell>
-                        ))}
-                      </TableRow>
-                    ))}
-                  </TableBody>
-                </Table>
-              </TableContainer>
-            </Paper>
           </Grid>
         ))}
       </Grid>
@@ -588,7 +536,7 @@ function StoreOverview({ data = {} }) {
                 size="small"
               />
             </Grid>
-            {/* 他の編集フィールドも同様に実装 */}
+            {/* 他の編集フィールドも必要に応じて追加 */}
           </Grid>
         </DialogContent>
         <DialogActions>
@@ -634,17 +582,17 @@ function SalesConditionManager({ data }) {
   return <Typography sx={{ p: 2 }}>店舗営業管理のコンテンツ：データ {JSON.stringify(data)}</Typography>;
 }
 
-// ダッシュボードコンポーネント（タブエリアと Chips エリアの両方を表示）
+// ダッシュボードコンポーネント
 function Dashboard() {
   const [tabValue, setTabValue] = useState(0);
-  const [calendarExpanded, setCalendarExpanded] = useState(false); // 初期は折りたたみ
-  const [summaryExpanded, setSummaryExpanded] = useState(true);      // 初期は展開
+  const [calendarExpanded, setCalendarExpanded] = useState(false);
+  const [summaryExpanded, setSummaryExpanded] = useState(true);
 
   const tabItems = [
     { label: '一覧', icon: 'dashboard' },
     { label: '店舗管理', icon: 'store' },
     { label: '店舗営業管理', icon: 'info' },
-    { label: '店舗概要', icon: 'dataset' },
+    { label: '施設概要', icon: 'dataset' },  // "店舗概要"から変更
     { label: '契約管理', icon: 'assignment' },
     { label: 'テナント管理', icon: 'people' },
     { label: '建物情報管理', icon: 'domain' },
@@ -657,52 +605,52 @@ function Dashboard() {
 
   // サンプルデータ（実際のデータに置き換えてください）
   const [stores, setStores] = useState([
+<<<<<<< HEAD
     // サンプル店舗データ例
     { store_id: 1, store_name: '店舗A', business_type: 'SM', building_category: 'ショッピングモール', floor_area: '150㎡', built_year: '2010' },
     { store_id: 2, store_name: '店舗B', business_type: '衣料', building_category: 'ビル', floor_area: '100㎡', built_year: '2015' }
+=======
+    { store_id: 1, store_name: '店舗A', business_type: 'SM', building_category: 'ショッピングモール', floor_area: '150㎡', built_year: '2010' },
+    { store_id: 2, store_name: '店舗B', business_type: '衣料', building_category: 'ショッピングモール', floor_area: '150㎡', built_year: '2010' },
+    { store_id: 3, store_name: '店舗C', business_type: 'SM', building_category: 'ビル', floor_area: '100㎡', built_year: '2015' }
+>>>>>>> 528b81afcf9e00ebe37c9c1b206da5cf103d611c
   ]);
   const [contracts, setContracts] = useState([
-    // サンプル契約データ例
     { contract_id: 1, contract_name: '契約A', contract_type: '賃貸', contract_period: '2023-2028', status: '契約中', store_id: 1 },
     { contract_id: 2, contract_name: '契約B', contract_type: 'リース', contract_period: '2022-2027', status: '更新中', store_id: 2 },
     { contract_id: 3, contract_name: '契約C', contract_type: 'リース', contract_period: '2022-2027', status: '契約中', store_id: 2 }
   ]);
   const [tenants, setTenants] = useState([
-    // サンプルテナントデータ例
     { tenant_id: 1, tenant_name: 'テナントA', genre: 'アパレル', contract_status: 'occupied', section: '1F', store_id: 1 },
     { tenant_id: 2, tenant_name: 'テナントB', genre: 'カフェ', contract_status: 'occupied', section: '2F', store_id: 2 }
   ]);
   const [facilities, setFacilities] = useState([
-    // サンプル設備データ例
     { facility_id: 1, facility_name: 'エレベーター', status: '正常', installation_place: '正面', store_id: 1 },
     { facility_id: 2, facility_name: '空調', status: '故障中', installation_place: '裏', store_id: 2 }
   ]);
-  
-  // 履歴データ（TODOリスト用）
   const [histories, setHistories] = useState([
     { history_id: 1, title: '契約更新確認', dueDate: '2025-02-10', status: 'open' },
     { history_id: 2, title: '設備点検', dueDate: '2025-02-08', status: 'open' },
+<<<<<<< HEAD
     { history_id: 3, title: 'テナント対応', dueDate: '2025-02-20', status: 'close' }
+=======
+    { history_id: 2, title: '設備点検', dueDate: '2025-02-08', status: 'close' },
+    { history_id: 3, title: 'テナント対応', dueDate: '2025-02-20', status: 'open' }
+>>>>>>> 528b81afcf9e00ebe37c9c1b206da5cf103d611c
   ]);
-  
-  // EVENT リスト用のサンプルデータ
   const [events, setEvents] = useState([
     { event_id: 1, title: 'システムメンテナンス', eventDate: '2025-02-15', description: '定期メンテナンスのお知らせ' },
     { event_id: 2, title: '新機能リリース', eventDate: '2025-03-01', description: '新機能のご案内' }
   ]);
-  
   const [vendors, setVendors] = useState([
-    // サンプル業者データ例
     { store_id: 1, vendor_id: 1, vendor_name: '業者A', type: '設備' },
     { store_id: 2, vendor_id: 2, vendor_name: '業者B', type: '建築' }
   ]);
   const [sales, setSales] = useState([
-    // サンプル売上データ例
     { sale_id: 1, annual_sales: 5000000, planned_sales: 6000000, previous_year_sales: 5500000, store_id: 1 },
     { sale_id: 2, annual_sales: 3000000, planned_sales: 3500000, previous_year_sales: 3200000, store_id: 2 }
   ]);
   const [competitors, setCompetitors] = useState([
-    // サンプル競合データ例
     { competitor_id: 1, title: '競合A', type: '飲食', store_id: 1 },
     { competitor_id: 2, title: '競合B', type: '小売', store_id: 2 }
   ]);
@@ -739,10 +687,32 @@ function Dashboard() {
         excessFee: '100円/30分'
       },
       offSite: {
-        // ...similar structure as onSite
+        // ...必要に応じた構造
       }
     }
   });
+
+  // 施設選択用の状態を追加
+  const [selectedFacility, setSelectedFacility] = useState('');
+
+  // DashboardSummary 内の各カードをクリックしたときの処理
+  // カードタイトルに応じたタブインデックスのマッピング
+  const handleCardClick = (cardTitle) => {
+    const mapping = {
+      '店舗情報': 1,
+      '契約状況': 4,
+      'テナント': 5,
+      '設備': 7,
+      '業者': 8,
+      '売上': 9,
+      '競合': 10,
+      '履歴': 11
+    };
+    const tabIndex = mapping[cardTitle];
+    if (tabIndex !== undefined) {
+      setTabValue(tabIndex);
+    }
+  };
 
   return (
     <Paper
@@ -754,7 +724,7 @@ function Dashboard() {
         flexDirection: 'column'
       }}
     >
-      {/* カレンダー表示エリア（TODOエリアの上、初期は折りたたみ） */}
+      {/* カレンダー表示エリア */}
       <Box sx={{ p: 1 }}>
         <Box
           sx={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', cursor: 'pointer' }}
@@ -772,13 +742,13 @@ function Dashboard() {
         </Collapse>
       </Box>
 
-      {/* TODOリストエリア：対応が必要な項目 */}
+      {/* TODOリストエリア */}
       <TodoList histories={histories} />
-  
-      {/* EVENTリストエリア：対応は不要だが知っておくべき項目 */}
+
+      {/* EVENTリストエリア */}
       <EventList events={events} />
 
-      {/* 概要エリア（折りたたみ可能） */}
+      {/* 概要エリア（Collapse 内の外側 Paper をクリックすると店舗概要タブへ） */}
       <Box sx={{ p: 1 }}>
         <Box
           sx={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', cursor: 'pointer' }}
@@ -792,20 +762,25 @@ function Dashboard() {
           </IconButton>
         </Box>
         <Collapse in={summaryExpanded}>
-          <DashboardSummary
-            stores={stores}
-            contracts={contracts}
-            tenants={tenants}
-            facilities={facilities}
-            vendors={vendors}
-            sales={sales}
-            competitors={competitors}
-            histories={histories}
-            selectedStore={selectedStore}
-          />
+          {/* 外側 Paper（クリック時は店舗概要タブ：タブインデックス 3 へ遷移） */}
+          <Paper sx={{ cursor: 'pointer', p: 1 }} onClick={() => setTabValue(3)}>
+            <DashboardSummary
+              stores={stores}
+              contracts={contracts}
+              tenants={tenants}
+              facilities={facilities}
+              vendors={vendors}
+              sales={sales}
+              competitors={competitors}
+              histories={histories}
+              selectedStore={selectedStore}
+              onCardClick={handleCardClick}
+            />
+          </Paper>
         </Collapse>
       </Box>
-      {/* タブエリア（AppBar 内の Tabs） */}
+
+      {/* タブエリア */}
       <AppBar
         position="static"
         sx={{
@@ -839,7 +814,7 @@ function Dashboard() {
         </Tabs>
       </AppBar>
 
-      {/* Chips エリア（タブ選択を補助するエリア） */}
+      {/* Chips エリア */}
       <Box sx={{ p: 1, display: 'flex', flexWrap: 'wrap', gap: 1 }}>
         {tabItems.map((item, idx) => (
           <Chip
@@ -856,31 +831,32 @@ function Dashboard() {
       {/* コンテンツ部分 */}
       <Box sx={{ flexGrow: 1, overflowY: 'auto', p: 1 }}>
         <TabPanel value={tabValue} index={0}>
-          <Paper sx={{ p: 1, mb: 2 }}>
+          {/* 「一覧」タブ内の各 Paper をクリックすると、対応する管理タブへ遷移 */}
+          <Paper sx={{ p: 1, mb: 2, cursor: 'pointer' }} onClick={() => setTabValue(1)}>
             <StoresManager setStores={setStores} stores={stores} />
           </Paper>
-          <Paper sx={{ p: 1, mb: 2 }}>
+          <Paper sx={{ p: 1, mb: 2, cursor: 'pointer' }} onClick={() => setTabValue(4)}>
             <ContractsManager />
           </Paper>
-          <Paper sx={{ p: 1, mb: 2 }}>
+          <Paper sx={{ p: 1, mb: 2, cursor: 'pointer' }} onClick={() => setTabValue(5)}>
             <TenantsManager />
           </Paper>
-          <Paper sx={{ p: 1, mb: 2 }}>
+          <Paper sx={{ p: 1, mb: 2, cursor: 'pointer' }} onClick={() => setTabValue(6)}>
             <BuildingInfoManager />
           </Paper>
-          <Paper sx={{ p: 1, mb: 2 }}>
+          <Paper sx={{ p: 1, mb: 2, cursor: 'pointer' }} onClick={() => setTabValue(7)}>
             <FacilitiesManager />
           </Paper>
-          <Paper sx={{ p: 1, mb: 2 }}>
+          <Paper sx={{ p: 1, mb: 2, cursor: 'pointer' }} onClick={() => setTabValue(8)}>
             <VendorsManager />
           </Paper>
-          <Paper sx={{ p: 1, mb: 2 }}>
+          <Paper sx={{ p: 1, mb: 2, cursor: 'pointer' }} onClick={() => setTabValue(9)}>
             <SalesManager />
           </Paper>
-          <Paper sx={{ p: 1, mb: 2 }}>
+          <Paper sx={{ p: 1, mb: 2, cursor: 'pointer' }} onClick={() => setTabValue(10)}>
             <CompetitorsManager />
           </Paper>
-          <Paper sx={{ p: 1, mb: 2 }}>
+          <Paper sx={{ p: 1, mb: 2, cursor: 'pointer' }} onClick={() => setTabValue(11)}>
             <HistoryManager />
           </Paper>
         </TabPanel>
@@ -891,7 +867,7 @@ function Dashboard() {
           <SalesConditionManager data={storeOverviewData} />
         </TabPanel>
         <TabPanel value={tabValue} index={3}>
-          <StoreOverview data={storeOverviewData} />
+          <FacilityOverview data={{ ...storeOverviewData, stores: stores }} />
         </TabPanel>
         <TabPanel value={tabValue} index={4}>
           <ContractsManager />
@@ -919,6 +895,186 @@ function Dashboard() {
         </TabPanel>
       </Box>
     </Paper>
+  );
+}
+
+// StoreOverviewをFacilityOverviewに変更
+function FacilityOverview({ data = {} }) {
+  const [open, setOpen] = useState(false);
+  const [editData, setEditData] = useState(data);
+  // selectedFacility の状態を追加
+  const [selectedFacility, setSelectedFacility] = useState('');
+
+  const handleOpen = () => setOpen(true);
+  const handleClose = () => setOpen(false);
+  
+  const handleChange = (event) => {
+    const { name, value, checked, type } = event.target;
+    if (name.includes('_')) {
+      const [parent, child, prop] = name.split('_');
+      setEditData(prev => ({
+        ...prev,
+        [parent]: {
+          ...prev[parent],
+          [child]: {
+            ...prev[parent][child],
+            [prop]: type === 'checkbox' ? checked : value
+          }
+        }
+      }));
+    } else {
+      setEditData(prev => ({
+        ...prev,
+        [name]: type === 'checkbox' ? checked : value
+      }));
+    }
+  };
+
+  const handleSave = () => {
+    console.log('保存されたデータ:', editData);
+    handleClose();
+  };
+
+  // 施設選択用セレクトボックスを追加
+  return (
+    <Box>
+      <Box mb={3}>
+        <FormControl fullWidth>
+          <InputLabel>施設を選択</InputLabel>
+          <Select
+            value={selectedFacility}
+            onChange={(e) => setSelectedFacility(e.target.value)}
+          >
+            <MenuItem value="">
+              <em>選択してください</em>
+            </MenuItem>
+            {/* stores は props として渡す必要があります */}
+            {(data.stores || []).map((store) => (
+              <MenuItem key={store.store_id} value={store.store_id}>
+                {store.store_name}
+              </MenuItem>
+            ))}
+          </Select>
+        </FormControl>
+      </Box>
+
+      {selectedFacility ? (
+        <>
+          {/* 選択された施設の基本情報 */}
+          <Paper sx={{ p: 2, mb: 2 }}>
+            <Typography variant="h6" gutterBottom>基本情報</Typography>
+            <Grid container spacing={2}>
+              <Grid item xs={12} md={6}>
+                {/* 既存の店舗情報テーブル */}
+                <TableContainer component={Paper} sx={{ mb: 2 }}>
+                  <Table size="small">
+                    <TableHead>
+                      <TableRow>
+                        <TableCell sx={{ fontWeight: 'bold', width: '30%' }}>項目</TableCell>
+                        <TableCell sx={{ fontWeight: 'bold' }}>内容</TableCell>
+                      </TableRow>
+                    </TableHead>
+                    <TableBody>
+                      <TableRow>
+                        <TableCell>開店年月</TableCell>
+                        <TableCell>{data.openDate}</TableCell>
+                      </TableRow>
+                      <TableRow>
+                        <TableCell>改装年月</TableCell>
+                        <TableCell>{data.renovationDate}</TableCell>
+                      </TableRow>
+                      <TableRow>
+                        <TableCell>提出日</TableCell>
+                        <TableCell>{data.submissionDate}</TableCell>
+                      </TableRow>
+                      <TableRow>
+                        <TableCell>営業時間</TableCell>
+                        <TableCell>{data.businessHours}</TableCell>
+                      </TableRow>
+                      <TableRow>
+                        <TableCell>駐車場必要台数</TableCell>
+                        <TableCell>{data.parkingRequired} 台</TableCell>
+                      </TableRow>
+                      <TableRow>
+                        <TableCell>駐車場届出台数</TableCell>
+                        <TableCell>{data.parkingSubmitted} 台</TableCell>
+                      </TableRow>
+                      <TableRow>
+                        <TableCell>駐輪場必要台数</TableCell>
+                        <TableCell>{data.bicycleParkingRequired} 台</TableCell>
+                      </TableRow>
+                      <TableRow>
+                        <TableCell>駐輪場届出台数</TableCell>
+                        <TableCell>{data.bicycleParkingSubmitted} 台</TableCell>
+                      </TableRow>
+                      <TableRow>
+                        <TableCell>納品可能時間</TableCell>
+                        <TableCell>{data.deliveryAvailableTime}</TableCell>
+                      </TableRow>
+                      <TableRow>
+                        <TableCell>用途地域</TableCell>
+                        <TableCell>
+                          {data.zoningArea?.map((area, index) => (
+                            <Typography key={index}>
+                              {area} {data.zoningApproved[index] ? '⭕' : '❌'}
+                            </Typography>
+                          ))}
+                        </TableCell>
+                      </TableRow>
+                      <TableRow>
+                        <TableCell>階数</TableCell>
+                        <TableCell>
+                          地上: {data.floorInfo?.aboveGround} 階<br />
+                          地下: {data.floorInfo?.underground} 階<br />
+                          入居階: {data.floorInfo?.occupiedFloors}<br />
+                          天井高: {data.floorInfo?.ceilingHeight}
+                        </TableCell>
+                      </TableRow>
+                      <TableRow>
+                        <TableCell>駐車場（敷地内）</TableCell>
+                        <TableCell>
+                          台数: {data.parkingDetails?.onSite?.total} 台<br />
+                          身障者用台数: {data.parkingDetails?.onSite?.handicap} 台<br />
+                          有料／無料: {data.parkingDetails?.onSite?.paid ? '有料' : '無料'}<br />
+                          精算機: {data.parkingDetails?.onSite?.paymentMachine ? 'あり' : 'なし'}<br />
+                          提携駐車場: {data.parkingDetails?.onSite?.partnerParking} 
+                          ({data.parkingDetails?.onSite?.partnerParkingCount} 台)<br />
+                          バイク台数: {data.parkingDetails?.onSite?.motorcycleCount} 台<br />
+                          管理: {data.parkingDetails?.onSite?.management}<br />
+                          利用条件: {data.parkingDetails?.onSite?.usageConditions}<br />
+                          超過料金: {data.parkingDetails?.onSite?.excessFee}
+                        </TableCell>
+                      </TableRow>
+                    </TableBody>
+                  </Table>
+                </TableContainer>
+              </Grid>
+            </Grid>
+          </Paper>
+
+          {/* 関連情報のサマリー */}
+          <Grid container spacing={2}>
+            {/* テナント情報 */}
+            <Grid item xs={12} md={6}>
+              <Paper sx={{ p: 2 }}>
+                <Typography variant="subtitle1">テナント情報</Typography>
+                {/* テナント数や状況のサマリー表示 */}
+              </Paper>
+            </Grid>
+            {/* 設備情報 */}
+            <Grid item xs={12} md={6}>
+              <Paper sx={{ p: 2 }}>
+                <Typography variant="subtitle1">設備情報</Typography>
+                {/* 設備数や状況のサマリー表示 */}
+              </Paper>
+            </Grid>
+            {/* その他の関連情報 */}
+          </Grid>
+        </>
+      ) : (
+        <Typography>施設を選択してください</Typography>
+      )}
+    </Box>
   );
 }
 
