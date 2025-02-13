@@ -15,8 +15,7 @@ const {
   DialogActions,
   TextField,
   Typography,
-  Tabs,
-  Tab,
+  Chip,
   Select,
   MenuItem,
   FormControl,
@@ -26,7 +25,7 @@ const {
 const { useState } = React;
 
 function ContractsManager() {
-  // サンプルデータ（テーブル構造に対応）
+  // サンプルデータ（全10件）
   const [contracts, setContracts] = useState([
     {
       contract_id: 1,
@@ -35,12 +34,12 @@ function ContractsManager() {
       contract_start_date: "2020-01-01",
       contract_end_date: "2025-12-31",
       cancellation_date: "", // 有効
-      monthly_rent: 500000.00,
-      rent_per_tsubo: 15000.00,
-      common_service_fee: 10000.00,
-      deposit: 1000000.00,
-      construction_support: 50000.00,
-      penalty_fee: 20000.00,
+      monthly_rent: 500000.0,
+      rent_per_tsubo: 15000.0,
+      common_service_fee: 10000.0,
+      deposit: 1000000.0,
+      construction_support: 50000.0,
+      penalty_fee: 20000.0,
       renewal_conditions: "自動更新",
       notes: "備考なし",
       created_at: "2020-01-01 10:00:00",
@@ -55,12 +54,12 @@ function ContractsManager() {
       contract_start_date: "2021-03-01",
       contract_end_date: "2026-02-28",
       cancellation_date: "2023-04-30", // 解約済
-      monthly_rent: 600000.00,
-      rent_per_tsubo: 18000.00,
-      common_service_fee: 12000.00,
-      deposit: 1200000.00,
-      construction_support: 60000.00,
-      penalty_fee: 25000.00,
+      monthly_rent: 600000.0,
+      rent_per_tsubo: 18000.0,
+      common_service_fee: 12000.0,
+      deposit: 1200000.0,
+      construction_support: 60000.0,
+      penalty_fee: 25000.0,
       renewal_conditions: "条件変更",
       notes: "早期解約",
       created_at: "2021-03-01 11:00:00",
@@ -75,18 +74,158 @@ function ContractsManager() {
       contract_start_date: "2022-06-01",
       contract_end_date: "2030-05-31",
       cancellation_date: "", // 有効
-      monthly_rent: 800000.00,
-      rent_per_tsubo: 20000.00,
-      common_service_fee: 15000.00,
-      deposit: 1500000.00,
-      construction_support: 70000.00,
-      penalty_fee: 30000.00,
+      monthly_rent: 800000.0,
+      rent_per_tsubo: 20000.0,
+      common_service_fee: 15000.0,
+      deposit: 1500000.0,
+      construction_support: 70000.0,
+      penalty_fee: 30000.0,
       renewal_conditions: "再交渉",
       notes: "新規契約",
       created_at: "2022-06-01 09:30:00",
       updated_at: "2022-06-01 09:30:00",
       created_by: 3,
       updated_by: 3,
+    },
+    {
+      contract_id: 4,
+      store_id: 4,
+      contract_type: "普通借家",
+      contract_start_date: "2019-05-01",
+      contract_end_date: "2024-04-30",
+      cancellation_date: "",
+      monthly_rent: 550000.0,
+      rent_per_tsubo: 15500.0,
+      common_service_fee: 11000.0,
+      deposit: 1100000.0,
+      construction_support: 52000.0,
+      penalty_fee: 21000.0,
+      renewal_conditions: "自動更新",
+      notes: "備考なし",
+      created_at: "2019-05-01 09:00:00",
+      updated_at: "2019-05-01 09:00:00",
+      created_by: 4,
+      updated_by: 4,
+    },
+    {
+      contract_id: 5,
+      store_id: 5,
+      contract_type: "定期借家",
+      contract_start_date: "2018-07-01",
+      contract_end_date: "2023-06-30",
+      cancellation_date: "2022-12-31",
+      monthly_rent: 620000.0,
+      rent_per_tsubo: 18500.0,
+      common_service_fee: 12500.0,
+      deposit: 1300000.0,
+      construction_support: 65000.0,
+      penalty_fee: 26000.0,
+      renewal_conditions: "条件変更",
+      notes: "早期解約",
+      created_at: "2018-07-01 10:15:00",
+      updated_at: "2022-12-31 11:00:00",
+      created_by: 5,
+      updated_by: 5,
+    },
+    {
+      contract_id: 6,
+      store_id: 6,
+      contract_type: "事業用定期借地",
+      contract_start_date: "2023-01-01",
+      contract_end_date: "2031-12-31",
+      cancellation_date: "",
+      monthly_rent: 900000.0,
+      rent_per_tsubo: 21000.0,
+      common_service_fee: 16000.0,
+      deposit: 1600000.0,
+      construction_support: 75000.0,
+      penalty_fee: 32000.0,
+      renewal_conditions: "再交渉",
+      notes: "新規契約",
+      created_at: "2023-01-01 08:45:00",
+      updated_at: "2023-01-01 08:45:00",
+      created_by: 6,
+      updated_by: 6,
+    },
+    {
+      contract_id: 7,
+      store_id: 7,
+      contract_type: "普通借家",
+      contract_start_date: "2017-02-01",
+      contract_end_date: "2022-01-31",
+      cancellation_date: "2021-12-31",
+      monthly_rent: 480000.0,
+      rent_per_tsubo: 14000.0,
+      common_service_fee: 9000.0,
+      deposit: 950000.0,
+      construction_support: 45000.0,
+      penalty_fee: 19000.0,
+      renewal_conditions: "自動更新",
+      notes: "早期解約",
+      created_at: "2017-02-01 09:30:00",
+      updated_at: "2021-12-31 10:00:00",
+      created_by: 7,
+      updated_by: 7,
+    },
+    {
+      contract_id: 8,
+      store_id: 8,
+      contract_type: "定期借家",
+      contract_start_date: "2020-11-01",
+      contract_end_date: "2025-10-31",
+      cancellation_date: "",
+      monthly_rent: 580000.0,
+      rent_per_tsubo: 17000.0,
+      common_service_fee: 11500.0,
+      deposit: 1150000.0,
+      construction_support: 54000.0,
+      penalty_fee: 23000.0,
+      renewal_conditions: "条件変更",
+      notes: "備考あり",
+      created_at: "2020-11-01 10:30:00",
+      updated_at: "2020-11-01 10:30:00",
+      created_by: 8,
+      updated_by: 8,
+    },
+    {
+      contract_id: 9,
+      store_id: 9,
+      contract_type: "事業用定期借地",
+      contract_start_date: "2021-08-01",
+      contract_end_date: "2029-07-31",
+      cancellation_date: "",
+      monthly_rent: 750000.0,
+      rent_per_tsubo: 19500.0,
+      common_service_fee: 13500.0,
+      deposit: 1400000.0,
+      construction_support: 68000.0,
+      penalty_fee: 28000.0,
+      renewal_conditions: "再交渉",
+      notes: "備考なし",
+      created_at: "2021-08-01 09:00:00",
+      updated_at: "2021-08-01 09:00:00",
+      created_by: 9,
+      updated_by: 9,
+    },
+    {
+      contract_id: 10,
+      store_id: 10,
+      contract_type: "普通借家",
+      contract_start_date: "2022-12-01",
+      contract_end_date: "2027-11-30",
+      cancellation_date: "2023-06-30",
+      monthly_rent: 530000.0,
+      rent_per_tsubo: 15200.0,
+      common_service_fee: 10500.0,
+      deposit: 1020000.0,
+      construction_support: 51000.0,
+      penalty_fee: 20500.0,
+      renewal_conditions: "自動更新",
+      notes: "早期解約",
+      created_at: "2022-12-01 10:00:00",
+      updated_at: "2023-06-30 11:00:00",
+      created_by: 10,
+      updated_by: 10,
     },
   ]);
 
@@ -114,12 +253,12 @@ function ContractsManager() {
   // フィルター用状態
   const [filterContractType, setFilterContractType] = useState("すべて");
   const [filterStatus, setFilterStatus] = useState("すべて");
-  // 契約種別選択肢（タブ用）
+  // 契約種別選択肢
   const contractTypes = ["普通借家", "定期借家", "事業用定期借地"];
 
   // ページネーション用状態
   const [currentPage, setCurrentPage] = useState(0);
-  // デフォルトは20件表示。-1の場合は「全て」
+  // デフォルトは20件表示。-1の場合は「全件」
   const [rowsPerPage, setRowsPerPage] = useState(20);
   // カスタム件数入力用
   const [customRows, setCustomRows] = useState("");
@@ -276,41 +415,42 @@ function ContractsManager() {
         </Button>
       </Box>
 
-      {/* フィルター用タブ：契約種別 */}
+      {/* フィルター（契約種別＝カテゴリフィルター） */}
       <Box mb={2}>
         <Typography variant="subtitle1">契約種別フィルター</Typography>
-        <Tabs
-          value={filterContractType}
-          onChange={(e, newValue) => {
-            setFilterContractType(newValue);
-            setCurrentPage(0);
-          }}
-          indicatorColor="primary"
-          textColor="primary"
-        >
-          <Tab label="すべて" value="すべて" />
-          {contractTypes.map((type) => (
-            <Tab key={type} label={type} value={type} />
+        <Box mt={1} display="flex" flexWrap="wrap" gap={1}>
+          {["すべて", ...contractTypes].map((type) => (
+            <Chip
+              key={type}
+              label={type}
+              clickable
+              color={filterContractType === type ? "primary" : "default"}
+              onClick={() => {
+                setFilterContractType(type);
+                setCurrentPage(0);
+              }}
+            />
           ))}
-        </Tabs>
+        </Box>
       </Box>
 
-      {/* フィルター用タブ：ステータス */}
+      {/* フィルター（ステータス） */}
       <Box mb={2}>
         <Typography variant="subtitle1">ステータスフィルター</Typography>
-        <Tabs
-          value={filterStatus}
-          onChange={(e, newValue) => {
-            setFilterStatus(newValue);
-            setCurrentPage(0);
-          }}
-          indicatorColor="primary"
-          textColor="primary"
-        >
-          <Tab label="すべて" value="すべて" />
-          <Tab label="有効" value="有効" />
-          <Tab label="解約済" value="解約済" />
-        </Tabs>
+        <Box mt={1} display="flex" flexWrap="wrap" gap={1}>
+          {["すべて", "有効", "解約済"].map((status) => (
+            <Chip
+              key={status}
+              label={status}
+              clickable
+              color={filterStatus === status ? "primary" : "default"}
+              onClick={() => {
+                setFilterStatus(status);
+                setCurrentPage(0);
+              }}
+            />
+          ))}
+        </Box>
       </Box>
 
       {/* テーブル */}
@@ -318,60 +458,110 @@ function ContractsManager() {
         <Table size="small">
           <TableHead>
             <TableRow>
-              <TableCell sx={{ whiteSpace: 'nowrap' }}>ID</TableCell>
-              <TableCell sx={{ whiteSpace: 'nowrap' }}>店舗ID</TableCell>
-              <TableCell sx={{ whiteSpace: 'nowrap' }}>契約種別</TableCell>
-              <TableCell sx={{ whiteSpace: 'nowrap' }}>開始日</TableCell>
-              <TableCell sx={{ whiteSpace: 'nowrap' }}>終了日</TableCell>
-              <TableCell sx={{ whiteSpace: 'nowrap' }}>解約日</TableCell>
-              <TableCell sx={{ whiteSpace: 'nowrap' }}>月額賃料</TableCell>
-              <TableCell sx={{ whiteSpace: 'nowrap' }}>坪単価</TableCell>
-              <TableCell sx={{ whiteSpace: 'nowrap' }}>共益費</TableCell>
-              <TableCell sx={{ whiteSpace: 'nowrap' }}>保証金</TableCell>
-              <TableCell sx={{ whiteSpace: 'nowrap' }}>建設協力金</TableCell>
-              <TableCell sx={{ whiteSpace: 'nowrap' }}>違約金</TableCell>
-              <TableCell sx={{ whiteSpace: 'nowrap' }}>更新条件</TableCell>
-              <TableCell sx={{ whiteSpace: 'nowrap' }}>備考</TableCell>
-              <TableCell sx={{ whiteSpace: 'nowrap' }}>作成日時</TableCell>
-              <TableCell sx={{ whiteSpace: 'nowrap' }}>更新日時</TableCell>
-              <TableCell sx={{ whiteSpace: 'nowrap' }}>登録者</TableCell>
-              <TableCell sx={{ whiteSpace: 'nowrap' }}>更新者</TableCell>
-              <TableCell sx={{ whiteSpace: 'nowrap' }}>操作</TableCell>
+              <TableCell sx={{ whiteSpace: "nowrap" }}>ID</TableCell>
+              <TableCell sx={{ whiteSpace: "nowrap" }}>店舗ID</TableCell>
+              <TableCell sx={{ whiteSpace: "nowrap" }}>契約種別</TableCell>
+              <TableCell sx={{ whiteSpace: "nowrap" }}>開始日</TableCell>
+              <TableCell sx={{ whiteSpace: "nowrap" }}>終了日</TableCell>
+              <TableCell sx={{ whiteSpace: "nowrap" }}>解約日</TableCell>
+              <TableCell sx={{ whiteSpace: "nowrap" }}>月額賃料</TableCell>
+              <TableCell sx={{ whiteSpace: "nowrap" }}>坪単価</TableCell>
+              <TableCell sx={{ whiteSpace: "nowrap" }}>共益費</TableCell>
+              <TableCell sx={{ whiteSpace: "nowrap" }}>保証金</TableCell>
+              <TableCell sx={{ whiteSpace: "nowrap" }}>建設協力金</TableCell>
+              <TableCell sx={{ whiteSpace: "nowrap" }}>違約金</TableCell>
+              <TableCell sx={{ whiteSpace: "nowrap" }}>更新条件</TableCell>
+              <TableCell sx={{ whiteSpace: "nowrap" }}>備考</TableCell>
+              <TableCell sx={{ whiteSpace: "nowrap" }}>作成日時</TableCell>
+              <TableCell sx={{ whiteSpace: "nowrap" }}>更新日時</TableCell>
+              <TableCell sx={{ whiteSpace: "nowrap" }}>登録者</TableCell>
+              <TableCell sx={{ whiteSpace: "nowrap" }}>更新者</TableCell>
+              <TableCell sx={{ whiteSpace: "nowrap" }}>操作</TableCell>
             </TableRow>
           </TableHead>
           <TableBody>
             {displayedContracts.map((contract) => (
-              <TableRow key={contract.contract_id}>
-                <TableCell sx={{ whiteSpace: 'nowrap' }}>{contract.contract_id}</TableCell>
-                <TableCell sx={{ whiteSpace: 'nowrap' }}>{contract.store_id}</TableCell>
-                <TableCell sx={{ whiteSpace: 'nowrap' }}>{contract.contract_type}</TableCell>
-                <TableCell sx={{ whiteSpace: 'nowrap' }}>{contract.contract_start_date}</TableCell>
-                <TableCell sx={{ whiteSpace: 'nowrap' }}>{contract.contract_end_date}</TableCell>
-                <TableCell sx={{ whiteSpace: 'nowrap' }}>{contract.cancellation_date || "－"}</TableCell>
-                <TableCell sx={{ whiteSpace: 'nowrap' }}>{contract.monthly_rent}</TableCell>
-                <TableCell sx={{ whiteSpace: 'nowrap' }}>{contract.rent_per_tsubo}</TableCell>
-                <TableCell sx={{ whiteSpace: 'nowrap' }}>{contract.common_service_fee}</TableCell>
-                <TableCell sx={{ whiteSpace: 'nowrap' }}>{contract.deposit}</TableCell>
-                <TableCell sx={{ whiteSpace: 'nowrap' }}>{contract.construction_support}</TableCell>
-                <TableCell sx={{ whiteSpace: 'nowrap' }}>{contract.penalty_fee}</TableCell>
-                <TableCell sx={{ whiteSpace: 'nowrap' }}>{contract.renewal_conditions}</TableCell>
-                <TableCell sx={{ whiteSpace: 'nowrap' }}>{contract.notes}</TableCell>
-                <TableCell sx={{ whiteSpace: 'nowrap' }}>{contract.created_at}</TableCell>
-                <TableCell sx={{ whiteSpace: 'nowrap' }}>{contract.updated_at}</TableCell>
-                <TableCell sx={{ whiteSpace: 'nowrap' }}>{contract.created_by}</TableCell>
-                <TableCell sx={{ whiteSpace: 'nowrap' }}>{contract.updated_by}</TableCell>
-                <TableCell sx={{ whiteSpace: 'nowrap' }}>
+              <TableRow
+                key={contract.contract_id}
+                onClick={() => handleEdit(contract)}
+                sx={{
+                  cursor: "pointer",
+                  "&:hover": { backgroundColor: "rgba(0, 0, 0, 0.08)" },
+                }}
+              >
+                <TableCell sx={{ whiteSpace: "nowrap" }}>
+                  {contract.contract_id}
+                </TableCell>
+                <TableCell sx={{ whiteSpace: "nowrap" }}>
+                  {contract.store_id}
+                </TableCell>
+                <TableCell sx={{ whiteSpace: "nowrap" }}>
+                  {contract.contract_type}
+                </TableCell>
+                <TableCell sx={{ whiteSpace: "nowrap" }}>
+                  {contract.contract_start_date}
+                </TableCell>
+                <TableCell sx={{ whiteSpace: "nowrap" }}>
+                  {contract.contract_end_date}
+                </TableCell>
+                <TableCell sx={{ whiteSpace: "nowrap" }}>
+                  {contract.cancellation_date || "－"}
+                </TableCell>
+                <TableCell sx={{ whiteSpace: "nowrap" }}>
+                  {contract.monthly_rent}
+                </TableCell>
+                <TableCell sx={{ whiteSpace: "nowrap" }}>
+                  {contract.rent_per_tsubo}
+                </TableCell>
+                <TableCell sx={{ whiteSpace: "nowrap" }}>
+                  {contract.common_service_fee}
+                </TableCell>
+                <TableCell sx={{ whiteSpace: "nowrap" }}>
+                  {contract.deposit}
+                </TableCell>
+                <TableCell sx={{ whiteSpace: "nowrap" }}>
+                  {contract.construction_support}
+                </TableCell>
+                <TableCell sx={{ whiteSpace: "nowrap" }}>
+                  {contract.penalty_fee}
+                </TableCell>
+                <TableCell sx={{ whiteSpace: "nowrap" }}>
+                  {contract.renewal_conditions}
+                </TableCell>
+                <TableCell sx={{ whiteSpace: "nowrap" }}>
+                  {contract.notes}
+                </TableCell>
+                <TableCell sx={{ whiteSpace: "nowrap" }}>
+                  {contract.created_at}
+                </TableCell>
+                <TableCell sx={{ whiteSpace: "nowrap" }}>
+                  {contract.updated_at}
+                </TableCell>
+                <TableCell sx={{ whiteSpace: "nowrap" }}>
+                  {contract.created_by}
+                </TableCell>
+                <TableCell sx={{ whiteSpace: "nowrap" }}>
+                  {contract.updated_by}
+                </TableCell>
+                <TableCell sx={{ whiteSpace: "nowrap" }}>
+                  {/* 編集ボタン（行クリックでも編集可能。ここではイベント伝播を止める） */}
                   <Button
                     size="small"
                     color="primary"
-                    onClick={() => handleEdit(contract)}
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      handleEdit(contract);
+                    }}
                   >
                     編集
                   </Button>
                   <Button
                     size="small"
                     color="secondary"
-                    onClick={() => handleDelete(contract.contract_id)}
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      handleDelete(contract.contract_id);
+                    }}
                   >
                     削除
                   </Button>
@@ -380,15 +570,7 @@ function ContractsManager() {
             ))}
           </TableBody>
         </Table>
-      </TableContainer>
-
-      {/* ページネーション */}
-      <Box
-        display="flex"
-        justifyContent="space-between"
-        alignItems="center"
-        mt={2}
-      >
+        {/* ページネーション */}
         <TablePagination
           component="div"
           count={filteredContracts.length}
@@ -398,19 +580,7 @@ function ContractsManager() {
           onRowsPerPageChange={handleRowsPerPageChange}
           rowsPerPageOptions={[10, 20, 30, { label: "全て", value: -1 }]}
         />
-        <Box display="flex" alignItems="center">
-          <TextField
-            label="カスタム表示件数"
-            value={customRows}
-            onChange={handleCustomRowsChange}
-            type="number"
-            style={{ width: 150, marginRight: 8 }}
-          />
-          <Button variant="outlined" onClick={applyCustomRows}>
-            適用
-          </Button>
-        </Box>
-      </Box>
+      </TableContainer>
 
       {/* 新規／編集ダイアログ */}
       <Dialog open={openDialog} onClose={handleDialogClose} maxWidth="sm" fullWidth>
