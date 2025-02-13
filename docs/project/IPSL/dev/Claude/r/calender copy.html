@@ -2,7 +2,7 @@
 <html lang="ja">
   <head>
     <meta charset="UTF-8" />
-    <title>スケジュールカレンダー - CRUD/詳細表示＆固定高さカレンダー</title>
+    <title>スケジュールカレンダー - Swiperカレンダー</title>
     <!-- FullCalendar の CSS -->
     <link
       href="https://cdn.jsdelivr.net/npm/fullcalendar@6.1.8/index.global.min.css"
@@ -18,19 +18,39 @@
       rel="stylesheet"
       href="https://fonts.googleapis.com/icon?family=Material+Icons"
     />
+    <!-- Swiper の CSS -->
+    <link
+      rel="stylesheet"
+      href="https://unpkg.com/swiper/swiper-bundle.min.css"
+    />
     <style>
       body {
         background-color: #f0f2f5;
+        margin: 0;
+        padding: 0;
       }
-      /* FullCalendar 表示領域 */
-      #calendar {
-        max-width: 1000px;
-        margin: 0 auto;
+      /* Swiperコンテナは画面幅いっぱいにレスポンシブ */
+      .swiper {
+        width: 100%;
+        /* 画面内に収めるため必要に応じて高さを調整（ここでは例として60vh） */
+        height: auto;
+      }
+      /* 各スライドは中央を目立たせるため、中央は80%、左右は縮小して部分表示 */
+      .swiper-slide {
+        width: 80%;
+        opacity: 0.5;
+        transition: opacity 0.3s, transform 0.3s;
+      }
+      .swiper-slide.swiper-slide-active {
+        opacity: 1;
+        transform: scale(1);
+      }
+      .swiper-slide:not(.swiper-slide-active) {
+        transform: scale(0.9);
       }
     </style>
   </head>
   <body>
-    <!-- React 描画用 -->
     <div id="root"></div>
 
     <!-- FullCalendar のJS -->
@@ -63,6 +83,8 @@
       src="https://cdn.jsdelivr.net/npm/@emotion/styled@11.11.0/dist/emotion-styled.umd.min.js"
       crossorigin="anonymous"
     ></script>
+    <!-- Swiper のJS -->
+    <script src="https://unpkg.com/swiper/swiper-bundle.min.js"></script>
 
     <script type="text/babel">
       const { useState, useEffect, useRef } = React;
@@ -91,6 +113,144 @@
         ThemeProvider,
         createTheme,
       } = MaterialUI;
+
+      // FullCalendar を利用した各月のカレンダー表示コンポーネント
+      function CalendarView({ initialDate, events, onEventClick }) {
+        const calendarEl = useRef(null);
+        useEffect(() => {
+          const calendar = new FullCalendar.Calendar(calendarEl.current, {
+            locale: "ja",
+            initialDate: initialDate,
+            initialView: "dayGridMonth",
+            // ヘッダーのナビゲーションボタンは非表示、タイトルのみ表示
+            headerToolbar: {
+              left: "",
+              center: "title",
+              right: ""
+            },
+            events: events,
+            // ここではレスポンシブな高さとして "auto" を指定
+            height: "auto",
+            eventClick: function (info) {
+              info.jsEvent.preventDefault();
+              if (onEventClick) {
+                onEventClick(info.event);
+              }
+            },
+          });
+          calendar.render();
+          return () => {
+            calendar.destroy();
+          };
+        }, [initialDate, events, onEventClick]);
+        return <div ref={calendarEl}></div>;
+      }
+
+      // カレンダーエリアをSwiperで表示するコンポーネント
+      // 初期状態は前後2か月（合計5か月）を生成し、中央（当月）を初期表示
+      // ユーザー操作で先頭に近づいた場合は過去2か月分、末尾に近づいた場合は未来2か月分のスライドを追加
+      function CalendarCarousel({ events, onEventClick }) {
+        const swiperContainerRef = useRef(null);
+        const swiperRef = useRef(null);
+        // 現在の日時を基準にする
+        const currentDate = new Date();
+        const initialRange = 2; // 前後2か月＝計5か月分（-2, -1, 0, +1, +2）
+        const initialDates = [];
+        for (let i = -initialRange; i <= initialRange; i++) {
+          const d = new Date(currentDate);
+          d.setMonth(d.getMonth() + i);
+          initialDates.push(new Date(d));
+        }
+        const [dates, setDates] = useState(initialDates);
+
+        // 初回の slideChange イベントをスキップするためのフラグ
+        const firstChangeRef = useRef(true);
+
+        // Swiper の初期化（マウント時）
+        useEffect(() => {
+          swiperRef.current = new Swiper(swiperContainerRef.current, {
+            // 中央の当月スライド（インデックス＝initialRange）を初期表示
+            initialSlide: initialRange,
+            centeredSlides: true,
+            slidesPerView: "auto",
+            loop: false,
+            navigation: {
+              nextEl: ".swiper-button-next",
+              prevEl: ".swiper-button-prev",
+            },
+            pagination: {
+              el: ".swiper-pagination",
+              clickable: true,
+            },
+            on: {
+              slideChange: function () {
+                const swiper = this;
+                // 初回イベントはスキップ
+                if (firstChangeRef.current) {
+                  firstChangeRef.current = false;
+                  return;
+                }
+                setDates((prevDates) => {
+                  let newDates = prevDates;
+                  // 先頭付近の場合：過去2か月分を追加
+                  if (swiper.activeIndex <= 1) {
+                    const firstDate = prevDates[0];
+                    const additional = [];
+                    for (let i = 2; i > 0; i--) {
+                      let d = new Date(firstDate);
+                      d.setMonth(d.getMonth() - i);
+                      additional.push(d);
+                    }
+                    newDates = [...additional, ...prevDates];
+                    // スライド位置の補正
+                    swiper.slideTo(swiper.activeIndex + additional.length, 0);
+                  }
+                  // 末尾付近の場合：未来2か月分を追加
+                  else if (swiper.activeIndex >= prevDates.length - 2) {
+                    const lastDate = prevDates[prevDates.length - 1];
+                    const additional = [];
+                    for (let i = 1; i <= 2; i++) {
+                      let d = new Date(lastDate);
+                      d.setMonth(d.getMonth() + i);
+                      additional.push(d);
+                    }
+                    newDates = [...prevDates, ...additional];
+                  }
+                  return newDates;
+                });
+                // FullCalendar のレイアウト再計算のためにリサイズイベントを発火
+                window.dispatchEvent(new Event("resize"));
+              },
+            },
+          });
+        }, []);
+
+        // 日付リストが更新されたら Swiper を更新
+        useEffect(() => {
+          if (swiperRef.current) {
+            swiperRef.current.update();
+          }
+        }, [dates]);
+
+        return (
+          <div className="swiper" ref={swiperContainerRef}>
+            <div className="swiper-wrapper">
+              {dates.map((d, i) => (
+                <div className="swiper-slide" key={i}>
+                  <CalendarView
+                    initialDate={d.toISOString().substring(0, 10)}
+                    events={events}
+                    onEventClick={onEventClick}
+                  />
+                </div>
+              ))}
+            </div>
+            <div className="swiper-pagination"></div>
+            <div className="swiper-button-prev"></div>
+            <div className="swiper-button-next"></div>
+          </div>
+        );
+      }
 
       function SpreadsheetLists() {
         // ---------------------------
@@ -351,7 +511,7 @@
         const eventRowsPerPage = 5;
 
         // ---------------------------
-        // 編集/追加用ダイアログ状態
+        // 編集／追加用ダイアログ状態（TODO）
         // ---------------------------
         const [openTodoDialog, setOpenTodoDialog] = useState(false);
         const [currentTodo, setCurrentTodo] = useState({
@@ -364,6 +524,9 @@
         });
         const [isTodoEditMode, setIsTodoEditMode] = useState(false);
 
+        // ---------------------------
+        // 編集／追加用ダイアログ状態（EVENT）
+        // ---------------------------
         const [openEventDialog, setOpenEventDialog] = useState(false);
         const [currentEvent, setCurrentEvent] = useState({
           title: "",
@@ -383,57 +546,20 @@
         const [detailData, setDetailData] = useState(null);
 
         // ---------------------------
-        // FullCalendar 初期化（高さ700px指定）
+        // EVENT詳細表示用コールバック
         // ---------------------------
-        const calendarRef = useRef(null);
-        const calendarInstance = useRef(null);
-        useEffect(() => {
-          if (calendarRef.current && !calendarInstance.current) {
-            calendarInstance.current = new FullCalendar.Calendar(calendarRef.current, {
-              locale: "ja",
-              initialView: "dayGridMonth",
-              headerToolbar: {
-                left: "prev,next today",
-                center: "title",
-                right: "dayGridMonth,timeGridWeek,timeGridDay",
-              },
-              buttonText: {
-                today: "今日",
-                month: "月",
-                week: "週",
-                day: "日",
-              },
-              events: eventItems,
-              // 高さ700pxで固定し、スクロールせずに表示
-              height: 600,
-              eventClick: function (info) {
-                info.jsEvent.preventDefault();
-                // EVENT行クリックの場合、詳細表示ダイアログを表示
-                setDetailType("event");
-                setDetailData({
-                  title: info.event.title,
-                  start: info.event.start ? info.event.start.toLocaleString() : "",
-                  location: info.event.extendedProps.location,
-                  organizer: info.event.extendedProps.organizer,
-                  description: info.event.extendedProps.description,
-                  color: info.event.backgroundColor || "#1976d2",
-                });
-                setOpenDetailDialog(true);
-              },
-            });
-            calendarInstance.current.render();
-          }
-        }, []);
-
-        // EVENTリストが更新されたらカレンダーに反映
-        useEffect(() => {
-          if (calendarInstance.current) {
-            calendarInstance.current.removeAllEvents();
-            eventItems.forEach((ev) => {
-              calendarInstance.current.addEvent(ev);
-            });
-          }
-        }, [eventItems]);
+        const handleOpenDetailEvent = (ev) => {
+          setDetailType("event");
+          setDetailData({
+            title: ev.title,
+            start: ev.start ? new Date(ev.start).toLocaleString() : "",
+            location: ev.extendedProps.location,
+            organizer: ev.extendedProps.organizer,
+            description: ev.extendedProps.description,
+            color: ev.backgroundColor || "#1976d2",
+          });
+          setOpenDetailDialog(true);
+        };
 
         // ---------------------------
         // 表示するデータスライス（TablePagination 用）
@@ -571,34 +697,21 @@
           setDetailData(item);
           setOpenDetailDialog(true);
         };
-        const handleOpenDetailEvent = (ev) => {
-          setDetailType("event");
-          setDetailData({
-            title: ev.title,
-            start: new Date(ev.start).toLocaleString(),
-            location: ev.extendedProps.location,
-            organizer: ev.extendedProps.organizer,
-            description: ev.extendedProps.description,
-            color: ev.color,
-          });
-          setOpenDetailDialog(true);
-        };
 
         return (
           <Box>
             {/* ヘッダー */}
             <AppBar position="static">
               <Toolbar>
-                <Typography variant="h6">スケジュールカレンダー</Typography>
+                <Typography variant="h7">スケジュールカレンダー</Typography>
               </Toolbar>
             </AppBar>
+            {/* カレンダーエリア（Swiper採用・動的に月スライドが追加される） */}
+            <Paper elevation={3} sx={{ p: 2, mb: 4 }}>
+              <CalendarCarousel events={eventItems} onEventClick={handleOpenDetailEvent} />
+            </Paper>
 
             <Container maxWidth="lg" sx={{ mt: 4, mb: 4 }}>
-              {/* カレンダー */}
-              <Paper elevation={3} sx={{ p: 2, mb: 4 }}>
-                <div id="calendar" ref={calendarRef}></div>
-              </Paper>
-
               {/* TODOリスト（テーブル形式・CRUD＆詳細表示付き） */}
               <Paper elevation={3} sx={{ p: 2, mb: 4 }}>
                 <Box
@@ -632,7 +745,9 @@
                         <TableRow
                           key={item.id}
                           hover
-                          sx={{ "&:hover": { backgroundColor: "action.hover", cursor: "pointer" } }}
+                          sx={{
+                            "&:hover": { backgroundColor: "action.hover", cursor: "pointer" },
+                          }}
                           onClick={() => handleOpenDetailTodo(item)}
                         >
                           <TableCell>{item.id}</TableCell>
@@ -644,10 +759,7 @@
                             <Checkbox checked={item.completed} disabled size="small" />
                           </TableCell>
                           <TableCell align="center">
-                            <Button
-                              size="small"
-                              onClick={(e) => handleOpenEditTodo(item, e)}
-                            >
+                            <Button size="small" onClick={(e) => handleOpenEditTodo(item, e)}>
                               編集
                             </Button>
                             <Button
@@ -705,7 +817,9 @@
                         <TableRow
                           key={index}
                           hover
-                          sx={{ "&:hover": { backgroundColor: "action.hover", cursor: "pointer" } }}
+                          sx={{
+                            "&:hover": { backgroundColor: "action.hover", cursor: "pointer" },
+                          }}
                           onClick={() => handleOpenDetailEvent(ev)}
                         >
                           <TableCell>{ev.title}</TableCell>
@@ -714,10 +828,7 @@
                           <TableCell>{ev.extendedProps.organizer}</TableCell>
                           <TableCell>{ev.extendedProps.description}</TableCell>
                           <TableCell align="center">
-                            <Button
-                              size="small"
-                              onClick={(e) => handleOpenEditEvent(ev, e)}
-                            >
+                            <Button size="small" onClick={(e) => handleOpenEditEvent(ev, e)}>
                               編集
                             </Button>
                             <Button
@@ -755,21 +866,20 @@
               }}
             >
               <Typography variant="body2">
-                © 2025 My Company. All rights reserved.
+                © {new Date().getFullYear()} My Company. All rights reserved.
               </Typography>
             </Box>
 
-            {/* ==============================
-                【詳細表示用ダイアログ】
-                行クリックで開き、ヘッダーに背景色を付与
-            ============================== */}
+            {/* 詳細表示用ダイアログ */}
             <Dialog
               open={openDetailDialog}
               onClose={() => setOpenDetailDialog(false)}
               fullWidth
               maxWidth="sm"
             >
-              <DialogTitle sx={{ backgroundColor: "primary.dark", color: "white" }}>
+              <DialogTitle
+                sx={{ backgroundColor: "primary.dark", color: "white" }}
+              >
                 {detailType === "todo"
                   ? "TODO詳細"
                   : detailType === "event"
@@ -817,15 +927,17 @@
                 )}
               </DialogContent>
               <DialogActions>
-                <Button onClick={() => setOpenDetailDialog(false)} variant="contained" color="primary">
+                <Button
+                  onClick={() => setOpenDetailDialog(false)}
+                  variant="contained"
+                  color="primary"
+                >
                   閉じる
                 </Button>
               </DialogActions>
             </Dialog>
 
-            {/* ---------------------------
-                【編集／追加用ダイアログ（TODO）】
-            --------------------------- */}
+            {/* 編集／追加用ダイアログ（TODO） */}
             <Dialog
               open={openTodoDialog}
               onClose={() => setOpenTodoDialog(false)}
@@ -898,15 +1010,17 @@
               </DialogContent>
               <DialogActions>
                 <Button onClick={() => setOpenTodoDialog(false)}>キャンセル</Button>
-                <Button onClick={handleSaveTodo} variant="contained" color="primary">
+                <Button
+                  onClick={handleSaveTodo}
+                  variant="contained"
+                  color="primary"
+                >
                   保存
                 </Button>
               </DialogActions>
             </Dialog>
 
-            {/* ---------------------------
-                【編集／追加用ダイアログ（EVENT）】
-            --------------------------- */}
+            {/* 編集／追加用ダイアログ（EVENT） */}
             <Dialog
               open={openEventDialog}
               onClose={() => setOpenEventDialog(false)}
@@ -989,7 +1103,11 @@
               </DialogContent>
               <DialogActions>
                 <Button onClick={() => setOpenEventDialog(false)}>キャンセル</Button>
-                <Button onClick={handleSaveEvent} variant="contained" color="primary">
+                <Button
+                  onClick={handleSaveEvent}
+                  variant="contained"
+                  color="primary"
+                >
                   保存
                 </Button>
               </DialogActions>
