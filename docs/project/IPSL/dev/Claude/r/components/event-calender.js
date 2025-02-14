@@ -552,12 +552,6 @@ function CalendarApp() {
 
   return (
     <Box>
-      <AppBar position="static">
-        <Toolbar>
-          <Typography variant="h7">スケジュールカレンダー</Typography>
-        </Toolbar>
-      </AppBar>
-
       {/* Swiper（カレンダー） */}
       <Paper elevation={3} sx={{ p: 2, mb: 4 }}>
         <CalendarCarousel events={eventItems} onEventClick={handleOpenDetailEvent} />
