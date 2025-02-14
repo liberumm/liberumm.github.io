@@ -254,6 +254,89 @@ const sampleEventItems = [
       organizer: "全体統括",
     },
   },
+  {
+    title: "定期保守: グリストラップ清掃",
+    start: "2025-02-20T08:00:00",
+    color: "#27ae60",
+    extendedProps: {
+      description: "定期保守の一環として、グリストラップ清掃を実施します。",
+      location: "施設エリア",
+      organizer: "保守担当",
+    },
+  },
+  {
+    title: "定期保守: グリストラップ清掃",
+    start: "2025-03-20T08:00:00",
+    color: "#27ae60",
+    extendedProps: {
+      description: "定期保守の一環として、グリストラップ清掃を実施します。",
+      location: "施設エリア",
+      organizer: "保守担当",
+    },
+  },
+  // 定期保守：設備巡回点検
+  {
+    title: "定期保守: 設備巡回点検",
+    start: "2025-02-25T10:00:00",
+    color: "#2980b9",
+    extendedProps: {
+      description: "定期保守の一環として、設備巡回点検を実施します。",
+      location: "全施設",
+      organizer: "点検担当",
+    },
+  },
+  {
+    title: "定期保守: 設備巡回点検",
+    start: "2025-03-25T10:00:00",
+    color: "#2980b9",
+    extendedProps: {
+      description: "定期保守の一環として、設備巡回点検を実施します。",
+      location: "全施設",
+      organizer: "点検担当",
+    },
+  },
+  // 修繕依頼工事：焼鳥屋機器修理
+  {
+    title: "修繕工事: 焼鳥屋機器修理",
+    start: "2025-02-28T09:00:00",
+    color: "#c0392b",
+    extendedProps: {
+      description: "都度発生する修繕依頼工事として、焼鳥屋の機器修理を実施します。",
+      location: "焼鳥屋",
+      organizer: "修繕担当",
+    },
+  },
+  {
+    title: "修繕工事: 焼鳥屋機器修理",
+    start: "2025-03-28T09:00:00",
+    color: "#c0392b",
+    extendedProps: {
+      description: "都度発生する修繕依頼工事として、焼鳥屋の機器修理を実施します。",
+      location: "焼鳥屋",
+      organizer: "修繕担当",
+    },
+  },
+  // 修繕工事：駐車場補修
+  {
+    title: "修繕工事: 駐車場補修",
+    start: "2025-03-02T11:00:00",
+    color: "#8e44ad",
+    extendedProps: {
+      description: "都度発生する修繕依頼工事として、駐車場補修を実施します。",
+      location: "駐車場",
+      organizer: "補修担当",
+    },
+  },
+  {
+    title: "修繕工事: 駐車場補修",
+    start: "2025-03-15T11:00:00",
+    color: "#8e44ad",
+    extendedProps: {
+      description: "都度発生する修繕依頼工事として、駐車場補修を実施します。",
+      location: "駐車場",
+      organizer: "補修担当",
+  },
+}
 ];
 
 // ----------------------------------------------------
