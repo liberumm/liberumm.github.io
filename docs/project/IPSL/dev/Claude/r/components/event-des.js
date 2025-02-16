@@ -1,4 +1,4 @@
-export function EventDetailsModal({ open, onClose, eventData }) {
+export function EventDetailsModal({ open, onClose, eventData, projects }) {
   // MaterialUI のコンポーネント（※実際は個別 import 推奨）
   const {
     Container,
@@ -31,30 +31,25 @@ export function EventDetailsModal({ open, onClose, eventData }) {
     attachments: true,
   });
 
-  // 案件タスクの状態（初期データ）
-  const [tasks, setTasks] = React.useState([
-    { 
-      id: 1,
-      dueDate: '2024-02-01',
-      type: 'ヒアリング',
-      task: 'ヒアリングシート作成',
-      priority: '高',
-      requester: '店舗開発部',
-      createdAt: '2024-01-15',
-      project: '店舗改装',
-      currentStep: 1
-    },
-    { id: 2,
-      dueDate: '2024-02-01',
-      type: 'ヒアリング',
-      task: 'ヒアリングシート作成',
-      priority: '高',
-      requester: '店舗開発部',
-      createdAt: '2024-01-15',
-      project: '店舗改装',
-      currentStep: 1
-    },
-  ]);
+  // タスクの初期データを event-calender.js の構造に合わせる
+  const [tasks, setTasks] = React.useState(() => {
+    if (!eventData?.extendedProps?.project_id) return [];
+
+    return [{
+      id: Date.now(),
+      project_id: eventData.extendedProps.project_id,
+      task: eventData.title,
+      dueDate: new Date(eventData.start).toISOString().split('T')[0],
+      priority: eventData.extendedProps?.priority || 'Medium',
+      description: eventData.extendedProps?.description || '',
+      completed: false,
+      assignee: eventData.extendedProps?.organizer || '未設定',
+      type: eventData.extendedProps?.type || 'タスク',
+      requester: eventData.extendedProps?.organizer || '未設定',
+      createdAt: new Date().toISOString().split('T')[0],
+      project: eventData.extendedProps?.project_name || '未設定'
+    }];
+  });
 
   // タスクの進捗ステップ（タスク一覧表示用）
   const steps = ["受付", "審査中", "承認待ち", "完了"];
@@ -92,29 +87,88 @@ export function EventDetailsModal({ open, onClose, eventData }) {
     本部: { 承認: false, 支払: false, 完了: false },
   });
 
-  // 自分のTODOデータ（実際はAPIから取得）
-  const [myTodos] = React.useState([
-    {
-      dueDate: '2024-02-01',
-      type: '依頼',
-      task: '設備改善依頼',
-      priority: '高',
-      requester: '店舗開発部',
-      createdAt: '2024-01-15',
-      project: '店舗改装',
-      action: '依頼実施'
-    },
-    {
-      dueDate: '2024-02-05',
-      type: '承認',
-      task: '見積書承認',
-      priority: '中',
-      requester: '東都ビル',
-      createdAt: '2024-01-16',
-      project: '店舗改装',
-      action: '見積書承認'
+  // 現在のユーザー定義を追加
+  const currentUser = "佐藤花子"; // event-calender.js と同じ値を使用
+
+  // 自分のTODOデータを修正
+  const [myTodos] = React.useState(() => {
+    if (!eventData) return [];
+
+    // イベントデータからTODOを生成
+    const todo = {
+      id: Date.now(),
+      project_id: eventData.extendedProps?.project_id || '',
+      task: eventData.title,
+      dueDate: eventData.start ? new Date(eventData.start).toISOString().split('T')[0] : '',
+      priority: eventData.extendedProps?.priority || 'Medium',
+      description: eventData.extendedProps?.description || '',
+      completed: false,
+      assignee: currentUser,
+      type: eventData.extendedProps?.type || 'タスク',
+      requester: eventData.extendedProps?.organizer || '未設定',
+      createdAt: new Date().toISOString().split('T')[0],
+      project: eventData.extendedProps?.project_name || '未設定',
+      action: eventData.extendedProps?.type === 'タスク' ? 'タスク実行' : 'イベント参加'
+    };
+
+    // 案件に関連する他のTODOも追加（オプション）
+    const projectTodos = [];
+    if (eventData.extendedProps?.project_id) {
+      // 関連案件の他のタスクも表示する場合はここに追加
     }
-  ]);
+
+    return [todo, ...projectTodos];
+  });
+
+  // 案件管理モーダル用のstate
+  const [projectModalOpen, setProjectModalOpen] = React.useState(false);
+  const [editingProject, setEditingProject] = React.useState(null);
+
+  // 案件情報を取得
+  const projectInfo = React.useMemo(() => {
+    if (!eventData?.extendedProps?.project_id) return null;
+    const project = projects?.find(p => p.id === eventData.extendedProps.project_id);
+
+    return project || {
+      id: eventData.extendedProps.project_id,
+      name: eventData.extendedProps?.project_name || '未設定',
+      start: new Date(eventData.start).toISOString().split('T')[0],
+      end: eventData.end ? new Date(eventData.end).toISOString().split('T')[0] : '未設定',
+      status: '進行中',
+      manager: eventData.extendedProps?.organizer || '未設定',
+      department: eventData.extendedProps?.department || '未設定',
+      budget: 0,
+      description: eventData.extendedProps?.description || '未設定',
+      type: eventData.extendedProps?.type || '未設定'
+    };
+  }, [eventData, projects]);
+
+  // ★ 案件に関連するイベント（ダミーデータ） ★
+  const projectEvents = React.useMemo(() => {
+    if (!projectInfo) return [];
+    return [
+      {
+        id: 1,
+        title: projectInfo.name + " Kickoff",
+        start: projectInfo.start,
+        end: projectInfo.start,
+        extendedProps: {
+          type: "ミーティング",
+          organizer: projectInfo.manager,
+        },
+      },
+      {
+        id: 2,
+        title: projectInfo.name + " Review",
+        start: new Date(new Date(projectInfo.start).getTime() + 86400000).toISOString(), // +1日
+        end: new Date(new Date(projectInfo.start).getTime() + 86400000).toISOString(),
+        extendedProps: {
+          type: "レビュー",
+          organizer: projectInfo.manager,
+        },
+      },
+    ];
+  }, [projectInfo]);
 
   // --- モーダル表示前の eventData チェック ---
   if (!eventData) return null;
@@ -164,17 +218,7 @@ export function EventDetailsModal({ open, onClose, eventData }) {
       <Stepper alternativeLabel>
         {phases.map((phase, index) => (
           <Step key={phase} completed={overallStatus[index]}>
-            <StepLabel>
-              
-              {/*overallStatus[index] ? (
-                <Icon color="primary">check_circle</Icon>
-              ) : (
-                <Icon color="secondary">access_time</Icon>
-              )*/} 
-              
-              {phase}
-              
-            </StepLabel>
+            <StepLabel>{phase}</StepLabel>
           </Step>
         ))}
       </Stepper>
@@ -227,17 +271,28 @@ export function EventDetailsModal({ open, onClose, eventData }) {
     const [currentStep, setCurrentStep] = React.useState(
       task ? task.currentStep : 0
     );
+    const [projectId, setProjectId] = React.useState(task ? task.project_id : "");
 
     // タスク内容が変更された場合にフォーム状態を更新
     React.useEffect(() => {
       setName(task ? task.name : "");
       setCurrentStep(task ? task.currentStep : 0);
+      setProjectId(task ? task.project_id : "");
     }, [task]);
 
     return (
       <Dialog open={open} onClose={onClose}>
         <DialogTitle>{task ? "タスク編集" : "タスク作成"}</DialogTitle>
         <DialogContent>
+          <TextField
+            margin="dense"
+            label="案件ID"
+            fullWidth
+            variant="standard"
+            value={projectId}
+            onChange={(e) => setProjectId(e.target.value)}
+            required
+          />
           <TextField
             autoFocus
             margin="dense"
@@ -261,7 +316,12 @@ export function EventDetailsModal({ open, onClose, eventData }) {
           <Button onClick={onClose}>キャンセル</Button>
           <Button
             onClick={() =>
-              onSave({ id: task ? task.id : Date.now(), name, currentStep })
+              onSave({
+                id: task ? task.id : Date.now(),
+                project_id: projectId,
+                name,
+                currentStep
+              })
             }
           >
             保存
@@ -271,86 +331,284 @@ export function EventDetailsModal({ open, onClose, eventData }) {
     );
   }
 
+  // 案件管理用のモーダルコンポーネント
+  function ProjectModal({ open, onClose, project }) {
+    const [formData, setFormData] = React.useState({
+      name: project?.name || '',
+      start: project?.start || '',
+      end: project?.end || '',
+      manager: project?.manager || '',
+      department: project?.department || '',
+      budget: project?.budget || '',
+      description: project?.description || '',
+      type: project?.type || ''
+    });
+
+    return (
+      <Dialog open={open} onClose={onClose} maxWidth="md" fullWidth>
+        <DialogTitle>{project ? '案件編集' : '新規案件作成'}</DialogTitle>
+        <DialogContent>
+          <Grid container spacing={2} sx={{ mt: 1 }}>
+            <Grid item xs={12}>
+              <TextField
+                fullWidth
+                label="案件名"
+                value={formData.name}
+                onChange={(e) => setFormData({ ...formData, name: e.target.value })}
+              />
+            </Grid>
+            <Grid item xs={6}>
+              <TextField
+                fullWidth
+                label="開始日"
+                type="date"
+                value={formData.start}
+                onChange={(e) => setFormData({ ...formData, start: e.target.value })}
+                InputLabelProps={{ shrink: true }}
+              />
+            </Grid>
+            <Grid item xs={6}>
+              <TextField
+                fullWidth
+                label="終了日"
+                type="date"
+                value={formData.end}
+                onChange={(e) => setFormData({ ...formData, end: e.target.value })}
+                InputLabelProps={{ shrink: true }}
+              />
+            </Grid>
+            {/* 残りのフィールド */}
+            {/* ...existing code... */}
+          </Grid>
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={onClose}>キャンセル</Button>
+          <Button variant="contained" onClick={() => { /* 保存処理 */ }}>
+            保存
+          </Button>
+        </DialogActions>
+      </Dialog>
+    );
+  }
+
+  // 案件情報表示セクションを更新
+  const renderProjectInfo = () => (
+    <Box sx={{ p: 2 }}>
+      <Grid container spacing={2}>
+        <Grid item xs={12} sm={6} md={4}>
+          <Typography variant="body1">
+            案件ID: {projectInfo.id}
+          </Typography>
+          <Typography variant="body1">
+            案件名: {projectInfo.name}
+          </Typography>
+          <Typography variant="body1">
+            開始日: {projectInfo.start}
+          </Typography>
+          <Typography variant="body1">
+            終了日: {projectInfo.end}
+          </Typography>
+        </Grid>
+        <Grid item xs={12} sm={12} md={12}>
+          <Typography variant="body1">
+            担当部署: {projectInfo.department}
+          </Typography>
+          <Typography variant="body1">
+            案件マネージャー: {projectInfo.manager}
+          </Typography>
+          <Typography variant="body1">
+            予算: ¥{projectInfo.budget.toLocaleString()}
+          </Typography>
+          <Typography variant="body1">
+            種別: {projectInfo.type}
+          </Typography>
+          <Typography variant="body1">
+            ステータス: {projectInfo.status}
+          </Typography>
+        </Grid>
+        <Grid item xs={12}>
+          <Typography variant="body1">
+            案件概要: {projectInfo.description}
+          </Typography>
+        </Grid>
+      </Grid>
+    </Box>
+  );
+
+  // 共通のヘッダー用スタイル
+  const headerSx = { p: 2, backgroundColor: '#C0C0C0', color: 'white' };
+
   // --- メインレンダリング ---
   return (
     <>
       <Dialog open={open} onClose={onClose} fullWidth maxWidth="lg">
-        <DialogTitle>案件詳細情報</DialogTitle>
+        <DialogTitle>
+          {eventData?.title || "案件詳細情報"} - {projectInfo?.name}
+        </DialogTitle>
         <DialogContent>
           <Container>
-            {/* あなたのTODO */}
-            <Paper sx={{ p: 2, mt: 2, mb: 2 }}>
-              <Typography variant="h6" gutterBottom>
-                自分のTODO
-              </Typography>
-              <Table size="small">
-                <TableHead>
-                  <TableRow>
-                    <TableCell>完了期限</TableCell>
-                    <TableCell>種類</TableCell>
-                    <TableCell>タスク</TableCell>
-                    <TableCell>優先度</TableCell>
-                    <TableCell>依頼者</TableCell>
-                    <TableCell>登録日</TableCell>
-                    <TableCell>案件</TableCell>
-                    <TableCell>アクション</TableCell>
-                  </TableRow>
-                </TableHead>
-                <TableBody>
-                  {myTodos.map((todo, index) => (
-                    <TableRow key={index}>
-                      <TableCell>{todo.dueDate}</TableCell>
-                      <TableCell>{todo.type}</TableCell>
-                      <TableCell>{todo.task}</TableCell>
-                      <TableCell>{todo.priority}</TableCell>
-                      <TableCell>{todo.requester}</TableCell>
-                      <TableCell>{todo.createdAt}</TableCell>
-                      <TableCell>{todo.project}</TableCell>
-                      <TableCell>
-                        <Button
-                          variant="contained"
-                          size="small"
-                          startIcon={<Icon>
-                            {todo.type === 'ヒアリング' ? 'record_voice_over' : 'description'}
-                          </Icon>}
-                        >
-                          {todo.action}
-                        </Button>
-                      </TableCell>
+            {/* 自分のタスク */}
+            <Paper sx={{ mt: 2, mb: 2 }}>
+              <Box sx={headerSx}>
+                <Typography variant="h6">
+                  自分のタスク ({currentUser})
+                </Typography>
+              </Box>
+              <Box sx={{ p: 2 }}>
+                <Table size="small">
+                  <TableHead>
+                    <TableRow>
+                      <TableCell>完了期限</TableCell>
+                      <TableCell>種類</TableCell>
+                      <TableCell>タスク</TableCell>
+                      <TableCell>優先度</TableCell>
+                      <TableCell>依頼者</TableCell>
+                      <TableCell>登録日</TableCell>
+                      <TableCell>案件</TableCell>
+                      <TableCell>アクション</TableCell>
                     </TableRow>
-                  ))}
-                </TableBody>
-              </Table>
+                  </TableHead>
+                  <TableBody>
+                    {myTodos.length > 0 ? (
+                      myTodos.map((todo, index) => (
+                        <TableRow key={index}>
+                          <TableCell>{todo.dueDate}</TableCell>
+                          <TableCell>{todo.type}</TableCell>
+                          <TableCell>{todo.task}</TableCell>
+                          <TableCell>{todo.priority}</TableCell>
+                          <TableCell>{todo.requester}</TableCell>
+                          <TableCell>{todo.createdAt}</TableCell>
+                          <TableCell>{todo.project}</TableCell>
+                          <TableCell>
+                            <Button
+                              variant="contained"
+                              size="small"
+                              startIcon={
+                                <Icon>
+                                  {todo.type === 'タスク' ? 'assignment' : 'event'}
+                                </Icon>
+                              }
+                            >
+                              {todo.action}
+                            </Button>
+                          </TableCell>
+                        </TableRow>
+                      ))
+                    ) : (
+                      <TableRow>
+                        <TableCell colSpan={8} align="center">
+                          表示するタスクはありません
+                        </TableCell>
+                      </TableRow>
+                    )}
+                  </TableBody>
+                </Table>
+              </Box>
             </Paper>
 
-            {/* 全体フェーズ進捗ステッパー（統合版） */}
-            <Paper sx={{ p: 2, mt: 2, mb: 2 }}>
-              <Typography variant="h6" gutterBottom>
-                全体フェーズ進捗
-              </Typography>
-              <Box sx={{ mt: 2 }}>
+            {/* イベントデータ */}
+            <Paper sx={{ mt: 2, mb: 2 }}>
+              <Box sx={headerSx}>
+                <Typography variant="h6">イベントデータ</Typography>
+              </Box>
+              <Box sx={{ p: 2 }}>
+                <Grid container spacing={2}>
+                  <Grid item xs={12} sm={6}>
+                    <Typography variant="body1">
+                      タイトル: {eventData.title}
+                    </Typography>
+                    <Typography variant="body1">
+                      開始日時: {new Date(eventData.start).toLocaleString()}
+                    </Typography>
+                    {eventData.end && (
+                      <Typography variant="body1">
+                        終了日時: {new Date(eventData.end).toLocaleString()}
+                      </Typography>
+                    )}
+                  </Grid>
+                  <Grid item xs={12} sm={6}>
+                    {eventData.extendedProps && (
+                      <>
+                        <Typography variant="body1">
+                          種別: {eventData.extendedProps.type || '未設定'}
+                        </Typography>
+                        <Typography variant="body1">
+                          オーガナイザー: {eventData.extendedProps.organizer || '未設定'}
+                        </Typography>
+                        <Typography variant="body1">
+                          案件: {eventData.extendedProps.project_name || '未設定'}
+                        </Typography>
+                        <Typography variant="body1">
+                          優先度: {eventData.extendedProps.priority || 'Medium'}
+                        </Typography>
+                      </>
+                    )}
+                  </Grid>
+                </Grid>
+              </Box>
+            </Paper>
+
+            {/* 全体フェーズ進捗ステッパー */}
+            <Paper sx={{ mt: 2, mb: 2 }}>
+              <Box sx={headerSx}>
+                <Typography variant="h6">全体進捗</Typography>
+              </Box>
+              <Box sx={{ p: 2 }}>
                 <OverallProgressStepper />
               </Box>
             </Paper>
 
             {/* 担当フェーズ進捗テーブル */}
-            <Paper sx={{ p: 2, mt: 2, mb: 2 }}>
-              <Typography variant="h6" gutterBottom>
-                担当フェーズ進捗
-              </Typography>
-              <Box sx={{ mt: 2 }}>
+            <Paper sx={{ mt: 2, mb: 2 }}>
+              <Box sx={headerSx}>
+                <Typography variant="h6">担当進捗</Typography>
+              </Box>
+              <Box sx={{ p: 2 }}>
                 <RoleProgressTable />
               </Box>
             </Paper>
 
-            {/* 案件タスク一覧 */}
-            <Paper sx={{ p: 2, mt: 2, mb: 2 }}>
+            {/* 案件基本情報 */}
+            <Paper sx={{ mb: 2 }}>
               <Box
                 sx={{
+                  ...headerSx,
+                  cursor: "pointer",
                   display: "flex",
                   justifyContent: "space-between",
                   alignItems: "center",
-                  mb: 2,
+                }}
+                onClick={() => setExpanded((prev) => ({ ...prev, basic: !prev.basic }))}
+              >
+                <Typography variant="h6">案件基本情報</Typography>
+                <Box sx={{ display: 'flex', gap: 1, alignItems: 'center' }}>
+                  <Button
+                    variant="contained"
+                    size="small"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      setEditingProject(projectInfo);
+                      setProjectModalOpen(true);
+                    }}
+                  >
+                    編集
+                  </Button>
+                  <Icon sx={{ color: 'white' }}>
+                    {expanded.basic ? "expand_less" : "expand_more"}
+                  </Icon>
+                </Box>
+              </Box>
+              {expanded.basic && renderProjectInfo()}
+            </Paper>
+
+            {/* 案件タスク一覧 */}
+            <Paper sx={{ mt: 2, mb: 2 }}>
+              <Box
+                sx={{
+                  ...headerSx,
+                  display: "flex",
+                  justifyContent: "space-between",
+                  alignItems: "center",
                 }}
               >
                 <Typography variant="h6">案件タスク一覧</Typography>
@@ -362,123 +620,102 @@ export function EventDetailsModal({ open, onClose, eventData }) {
                   タスク作成
                 </Button>
               </Box>
-              <Table size="small">
-                <TableHead>
-                  <TableRow>
-                    <TableCell>完了期限</TableCell>
-                    <TableCell>種類</TableCell>
-                    <TableCell>タスク</TableCell>
-                    <TableCell>優先度</TableCell>
-                    <TableCell>依頼者</TableCell>
-                    <TableCell>登録日</TableCell>
-                    <TableCell>案件</TableCell>
-                    <TableCell>アクション</TableCell>
-                  </TableRow>
-                </TableHead>
-                <TableBody>
-                  {tasks.map((task) => (
-                    <TableRow key={task.id}>
-                      <TableCell>{task.dueDate}</TableCell>
-                      <TableCell>{task.type}</TableCell>
-                      <TableCell>{task.task}</TableCell>
-                      <TableCell>{task.priority}</TableCell>
-                      <TableCell>{task.requester}</TableCell>
-                      <TableCell>{task.createdAt}</TableCell>
-                      <TableCell>{task.project}</TableCell>
-                      <TableCell>
-                        <Button
-                          variant="outlined"
-                          size="small"
-                          onClick={() => handleEditTask(task)}
-                        >
-                          編集
-                        </Button>
-                      </TableCell>
+              <Box sx={{ p: 2 }}>
+                <Table size="small">
+                  <TableHead>
+                    <TableRow>
+                      <TableCell>完了期限</TableCell>
+                      <TableCell>種類</TableCell>
+                      <TableCell>タスク</TableCell>
+                      <TableCell>優先度</TableCell>
+                      <TableCell>依頼者</TableCell>
+                      <TableCell>登録日</TableCell>
+                      <TableCell>案件</TableCell>
+                      <TableCell>アクション</TableCell>
                     </TableRow>
-                  ))}
-                </TableBody>
-              </Table>
+                  </TableHead>
+                  <TableBody>
+                    {tasks.map((task) => (
+                      <TableRow key={task.id}>
+                        <TableCell>{task.dueDate}</TableCell>
+                        <TableCell>{task.type}</TableCell>
+                        <TableCell>{task.task}</TableCell>
+                        <TableCell>{task.priority}</TableCell>
+                        <TableCell>{task.requester}</TableCell>
+                        <TableCell>{task.createdAt}</TableCell>
+                        <TableCell>{task.project}</TableCell>
+                        <TableCell>
+                          <Button
+                            variant="outlined"
+                            size="small"
+                            onClick={() => handleEditTask(task)}
+                          >
+                            編集
+                          </Button>
+                        </TableCell>
+                      </TableRow>
+                    ))}
+                  </TableBody>
+                </Table>
+              </Box>
             </Paper>
 
-            {/* 案件基本情報 */}
-            <Paper sx={{ mb: 2 }}>
+            {/* ★ 案件イベント一覧 ★ */}
+            <Paper sx={{ mt: 2, mb: 2 }}>
               <Box
                 sx={{
-                  p: 2,
-                  cursor: "pointer",
+                  ...headerSx,
                   display: "flex",
                   justifyContent: "space-between",
                   alignItems: "center",
-                  backgroundColor: "grey.200",
                 }}
-                onClick={() =>
-                  setExpanded((prev) => ({ ...prev, basic: !prev.basic }))
-                }
               >
-                <Typography variant="h6">案件基本情報</Typography>
-                <Icon>{expanded.basic ? "expand_less" : "expand_more"}</Icon>
+                <Typography variant="h6">案件イベント一覧</Typography>
+                {/* 必要に応じてイベント追加ボタン等を配置 */}
               </Box>
-              {expanded.basic && (
-                <Box sx={{ p: 2 }}>
-                  <Grid container spacing={2}>
-                    <Grid item xs={12} sm={6} md={4}>
-                      <Typography variant="body1">
-                        タイトル: {eventData.title}
-                      </Typography>
-                      <Typography variant="body1">
-                        開始日時: {new Date(eventData.start).toLocaleString()}
-                      </Typography>
-                      <Typography variant="body1">
-                        場所: {eventData.extendedProps?.location}
-                      </Typography>
-                      <Typography variant="body1">
-                        担当者: {eventData.extendedProps?.organizer}
-                      </Typography>
-                    </Grid>
-                    <Grid item xs={12} sm={6} md={4}>
-                      <Typography variant="body1">
-                        ステータス: 受付中
-                      </Typography>
-                      <Typography variant="body1">優先度: 高</Typography>
-                      <Typography variant="body1">
-                        詳細: {eventData.extendedProps?.description}
-                      </Typography>
-                    </Grid>
-                    <Grid
-                      item
-                      xs={12}
-                      sm={12}
-                      md={4}
-                      sx={{ display: "flex", alignItems: "center", gap: 1 }}
-                    >
-                      <Button
-                        variant="contained"
-                        startIcon={<Icon>record_voice_over</Icon>}
-                      >
-                        案件詳細
-                      </Button>
-                      <Button
-                        variant="outlined"
-                        startIcon={<Icon>download</Icon>}
-                      >
-                        ダウンロード
-                      </Button>
-                    </Grid>
-                  </Grid>
-                </Box>
-              )}
+              <Box sx={{ p: 2 }}>
+                <Table size="small">
+                  <TableHead>
+                    <TableRow>
+                      <TableCell>タイトル</TableCell>
+                      <TableCell>開始日時</TableCell>
+                      <TableCell>終了日時</TableCell>
+                      <TableCell>種別</TableCell>
+                      <TableCell>オーガナイザー</TableCell>
+                    </TableRow>
+                  </TableHead>
+                  <TableBody>
+                    {projectEvents.length > 0 ? (
+                      projectEvents.map((evt) => (
+                        <TableRow key={evt.id}>
+                          <TableCell>{evt.title}</TableCell>
+                          <TableCell>{new Date(evt.start).toLocaleString()}</TableCell>
+                          <TableCell>{evt.end ? new Date(evt.end).toLocaleString() : '-'}</TableCell>
+                          <TableCell>{evt.extendedProps?.type || '-'}</TableCell>
+                          <TableCell>{evt.extendedProps?.organizer || '-'}</TableCell>
+                        </TableRow>
+                      ))
+                    ) : (
+                      <TableRow>
+                        <TableCell colSpan={5} align="center">
+                          案件に関連するイベントはありません
+                        </TableCell>
+                      </TableRow>
+                    )}
+                  </TableBody>
+                </Table>
+              </Box>
             </Paper>
 
             {/* 添付資料 */}
             <Paper>
               <Box
                 sx={{
-                  p: 2,
+                  ...headerSx,
                   cursor: "pointer",
                   display: "flex",
                   justifyContent: "space-between",
                   alignItems: "center",
-                  backgroundColor: "grey.200",
                 }}
                 onClick={() =>
                   setExpanded((prev) => ({
@@ -488,7 +725,9 @@ export function EventDetailsModal({ open, onClose, eventData }) {
                 }
               >
                 <Typography variant="h6">添付資料</Typography>
-                <Icon>{expanded.attachments ? "expand_less" : "expand_more"}</Icon>
+                <Icon sx={{ color: 'white' }}>
+                  {expanded.attachments ? "expand_less" : "expand_more"}
+                </Icon>
               </Box>
               {expanded.attachments && (
                 <Box sx={{ p: 2 }}>
@@ -505,10 +744,7 @@ export function EventDetailsModal({ open, onClose, eventData }) {
                         <TableCell>資料1.pdf</TableCell>
                         <TableCell>案件関連資料</TableCell>
                         <TableCell>
-                          <Button
-                            variant="outlined"
-                            startIcon={<Icon>download</Icon>}
-                          >
+                          <Button variant="outlined" startIcon={<Icon>download</Icon>}>
                             DL
                           </Button>
                         </TableCell>
@@ -518,6 +754,7 @@ export function EventDetailsModal({ open, onClose, eventData }) {
                 </Box>
               )}
             </Paper>
+            
           </Container>
         </DialogContent>
         <DialogActions>
@@ -526,6 +763,13 @@ export function EventDetailsModal({ open, onClose, eventData }) {
           </Button>
         </DialogActions>
       </Dialog>
+
+      {/* 案件管理モーダル */}
+      <ProjectModal
+        open={projectModalOpen}
+        onClose={() => setProjectModalOpen(false)}
+        project={editingProject}
+      />
 
       {/* タスク作成／編集モーダル */}
       <TaskModal
