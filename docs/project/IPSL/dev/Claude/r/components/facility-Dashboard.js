@@ -229,12 +229,7 @@ function EventList({ events }) {
 }
 
 // ダッシュボード概要コンポーネント（概要エリア：各情報の合計値と内訳を表示）
-<<<<<<< HEAD
 function DashboardSummary({ stores, contracts, tenants, facilities, vendors, sales, competitors, histories, selectedStore }) {
-=======
-// ※ onCardClick プロパティを受け取り、各カードクリック時に対応するタブへ遷移できるようにします。
-function DashboardSummary({ stores, contracts, tenants, facilities, vendors, sales, competitors, histories, selectedStore, onCardClick }) {
->>>>>>> 528b81afcf9e00ebe37c9c1b206da5cf103d611c
   // 選択店舗でフィルタリングするヘルパー
   const filterByStore = (items) =>
     selectedStore ? items?.filter(item => item.store_id === selectedStore) : items;
@@ -255,11 +250,7 @@ function DashboardSummary({ stores, contracts, tenants, facilities, vendors, sal
     }, {});
   };
 
-<<<<<<< HEAD
   // 内訳（※各データは、店舗は businessType、契約は status、テナントは genre、設備は status、業者は type、競合は type、履歴は status として集計）
-=======
-  // 内訳
->>>>>>> 528b81afcf9e00ebe37c9c1b206da5cf103d611c
   const storeCountsByType     = groupBy(filteredStores,    'business_type');
   const contractsByStatus     = groupBy(filteredContracts, 'status');
   const tenantsByGenre        = groupBy(filteredTenants,   'genre');
@@ -605,15 +596,9 @@ function Dashboard() {
 
   // サンプルデータ（実際のデータに置き換えてください）
   const [stores, setStores] = useState([
-<<<<<<< HEAD
     // サンプル店舗データ例
     { store_id: 1, store_name: '店舗A', business_type: 'SM', building_category: 'ショッピングモール', floor_area: '150㎡', built_year: '2010' },
     { store_id: 2, store_name: '店舗B', business_type: '衣料', building_category: 'ビル', floor_area: '100㎡', built_year: '2015' }
-=======
-    { store_id: 1, store_name: '店舗A', business_type: 'SM', building_category: 'ショッピングモール', floor_area: '150㎡', built_year: '2010' },
-    { store_id: 2, store_name: '店舗B', business_type: '衣料', building_category: 'ショッピングモール', floor_area: '150㎡', built_year: '2010' },
-    { store_id: 3, store_name: '店舗C', business_type: 'SM', building_category: 'ビル', floor_area: '100㎡', built_year: '2015' }
->>>>>>> 528b81afcf9e00ebe37c9c1b206da5cf103d611c
   ]);
   const [contracts, setContracts] = useState([
     { contract_id: 1, contract_name: '契約A', contract_type: '賃貸', contract_period: '2023-2028', status: '契約中', store_id: 1 },
@@ -631,12 +616,7 @@ function Dashboard() {
   const [histories, setHistories] = useState([
     { history_id: 1, title: '契約更新確認', dueDate: '2025-02-10', status: 'open' },
     { history_id: 2, title: '設備点検', dueDate: '2025-02-08', status: 'open' },
-<<<<<<< HEAD
     { history_id: 3, title: 'テナント対応', dueDate: '2025-02-20', status: 'close' }
-=======
-    { history_id: 2, title: '設備点検', dueDate: '2025-02-08', status: 'close' },
-    { history_id: 3, title: 'テナント対応', dueDate: '2025-02-20', status: 'open' }
->>>>>>> 528b81afcf9e00ebe37c9c1b206da5cf103d611c
   ]);
   const [events, setEvents] = useState([
     { event_id: 1, title: 'システムメンテナンス', eventDate: '2025-02-15', description: '定期メンテナンスのお知らせ' },
