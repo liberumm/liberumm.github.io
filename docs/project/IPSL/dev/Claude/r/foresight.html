@@ -2,7 +2,7 @@
 <html lang="ja">
 <head>
   <meta charset="UTF-8">
-  <title>売上構成比計画（折りたたみグループ＋月次常時表示／ラベル削除）</title>
+  <title>売上構成比計画（折り畳みグラフ＋テーブル）</title>
   <!-- MUI用フォント＆アイコン -->
   <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Roboto:wght@300;400;500;700&display=swap" />
   <link rel="stylesheet" href="https://fonts.googleapis.com/icon?family=Material+Icons"/>
@@ -101,6 +101,8 @@
   <script src="https://cdn.jsdelivr.net/npm/@emotion/react@11.11.3/dist/emotion-react.umd.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/@emotion/styled@11.11.0/dist/emotion-styled.umd.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/@mui/material@5.15.3/umd/material-ui.production.min.js" crossorigin></script>
+  <!-- Chart.js の読み込み -->
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
 
   <!-- React / Babelコード -->
   <script type="text/babel">
@@ -116,7 +118,8 @@
       FormControl,
       InputLabel,
       Button,
-      Chip
+      Chip,
+      Collapse
     } = MaterialUI;
 
     // 親列：左端の「年度合計」＋各月
@@ -128,7 +131,7 @@
     // サブ列
     const SUB_COLUMNS = ["前年", "計画", "傾向", "実績"];
 
-    // 各グループの行定義
+    // 各グループの行定義（ここでは月次のみグラフ対象）
     const monthlyRows = [{ label: "月次", type: "monthly" }];
     const weeklyRows = [];
     for (let w = 1; w <= 6; w++) {
@@ -148,7 +151,7 @@
       return rows.map(() => {
         let row = {};
         PARENT_COLUMNS.forEach((col, pIndex) => {
-          row[pIndex] = (pIndex === 0) ? null : { old: 1, factor: 1, yoy: 100, actual: 0 };
+          row[pIndex] = (pIndex === 0) ? null : { old: Math.floor(Math.random()*100), factor: Math.floor(Math.random()*100), yoy: 100, actual: Math.floor(Math.random()*100) };
         });
         return row;
       });
@@ -157,6 +160,68 @@
     // 年度、表示対象の選択肢
     const FISCAL_YEARS = Array.from({ length: 6 }, (_, i) => 2020 + i);
     const DISPLAY_TYPES = ["全社", "部門", "コーナー", "ライン", "カテゴリ"];
+
+    // グラフ表示用コンポーネント
+    function ChartComponent({monthlyData}) {
+      const canvasRef = React.useRef(null);
+      React.useEffect(() => {
+        if (canvasRef.current) {
+          const ctx = canvasRef.current.getContext('2d');
+          // x軸のラベル：テーブルの「月」部分（年度合計を除く）
+          const labels = PARENT_COLUMNS.slice(1);
+          // monthlyData は、labels に対応するオブジェクトの配列
+          const dataOld = labels.map((_, i) => monthlyData[i+1].old);
+          const dataPlan = labels.map((_, i) => monthlyData[i+1].factor);
+          const dataActual = labels.map((_, i) => monthlyData[i+1].actual);
+          const chart = new Chart(ctx, {
+            type: 'line',
+            data: {
+              labels,
+              datasets: [
+                {
+                  label: '前年',
+                  data: dataOld,
+                  borderColor: 'blue',
+                  backgroundColor: 'blue',
+                  fill: false,
+                  tension: 0.1
+                },
+                {
+                  label: '計画',
+                  data: dataPlan,
+                  borderColor: 'green',
+                  backgroundColor: 'green',
+                  fill: false,
+                  tension: 0.1
+                },
+                {
+                  label: '実績',
+                  data: dataActual,
+                  borderColor: 'red',
+                  backgroundColor: 'red',
+                  fill: false,
+                  tension: 0.1
+                }
+              ]
+            },
+            options: {
+              responsive: true,
+              scales: {
+                y: {
+                  beginAtZero: true,
+                  title: { display: true, text: "月次" }
+                },
+                x: {
+                  title: { display: true, text: "月" }
+                }
+              }
+            }
+          });
+          return () => chart.destroy();
+        }
+      }, [monthlyData]);
+      return <canvas ref={canvasRef} />;
+    }
 
     function App() {
       const [selectedYear, setSelectedYear] = React.useState(new Date().getFullYear());
@@ -172,6 +237,8 @@
       const [globalShowWeekly, setGlobalShowWeekly] = React.useState(true);
       const [globalShowWeekday, setGlobalShowWeekday] = React.useState(true);
       const [globalShowDaily, setGlobalShowDaily] = React.useState(true);
+      // グラフエリアの展開状態
+      const [graphExpanded, setGraphExpanded] = React.useState(true);
 
       const handleInputBlur = (groupId, rowIndex, pIndex, key, event, dataSetter) => {
         const value = event.target.innerText;
@@ -315,7 +382,7 @@
             </TableRow>
           );
           if (group.children) {
-            // ここで月次のラベル行は削除し、直接月次データ行をレンダリング
+            // 月次データ行
             rows = rows.concat(renderRows(group.id + "_monthly", group.children.monthly, monthlyRows));
             if(isExpanded) {
               rows.push(
@@ -424,8 +491,12 @@
         setAllExpanded(!allExpanded);
       };
 
+      // グラフ用に最初のグループ（月次行）からデータを抽出
+      const groups = getGroups();
+      // 例として最初のグループの月次行データを利用
+      const monthlyData = groups[0]?.children?.monthly[0] || {};
+
       const renderTableBody = () => {
-        const groups = getGroups();
         return renderGroupRecursive(groups);
       };
 
@@ -433,6 +504,17 @@
         <div style={{ padding: 20 }}>
           <h1>売上構成比計画（{selectedDisplay}）</h1>
           
+          {/* グラフエリア（折りたたみ可能） */}
+          <Button variant="contained" style={{ marginBottom: 10 }} onClick={() => setGraphExpanded(prev => !prev)}>
+            {graphExpanded ? "グラフを折りたたむ" : "グラフを展開"}
+          </Button>
+          <Collapse in={graphExpanded}>
+            <Paper style={{ marginBottom: 20, padding: 20 }}>
+              {/* ChartComponent に月次データ（各月の「前年」「計画」「実績」）を渡す */}
+              <ChartComponent monthlyData={monthlyData} />
+            </Paper>
+          </Collapse>
+
           {/* 年度選択 */}
           <FormControl style={{ minWidth: 120, marginBottom: 20, marginRight: 20 }}>
             <InputLabel>年度</InputLabel>
