@@ -1,0 +1,911 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <title>売上構成比計画（折り畳みグラフ＋テーブル＋統合テーブル）</title>
+  <!-- MUI用フォント＆アイコン -->
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Roboto:wght@300;400;500;700&display=swap" />
+  <link rel="stylesheet" href="https://fonts.googleapis.com/icon?family=Material+Icons"/>
+  <style>
+    body {
+      margin: 20px;
+      font-family: Roboto, sans-serif;
+    }
+    /* MUI TableCell の基本設定 */
+    .MuiTableCell-root {
+      border-right: 1px solid #ccc;
+      border-bottom: 1px solid #ccc;
+      padding: 1px;
+    }
+    /* ヘッダーセル */
+    .header-cell {
+      white-space: nowrap;
+      font-weight: bold;
+      background-color: #f5f5f5;
+      text-align: center;
+    }
+    /* 編集可能セル */
+    .editable-cell {
+      min-width: 40px;
+      height: 24px;
+      line-height: 24px;
+      text-align: right;
+      border: 1px solid #ccc;
+      padding: 2px;
+      outline: none;
+    }
+    .editable-cell:focus {
+      border-color: #1976d2;
+      background-color: #e3f2fd;
+    }
+    /* ホバー */
+    .MuiTableCell-root:hover {
+      background-color: #fafafa;
+    }
+    /* MUI TableCell のパディング調整 */
+    .css-1pj6zck {
+      padding: 2px !important;
+    }
+    /* 非活性セル */
+    .disabled-cell {
+      background-color: #f5f5f5;
+      color: #999;
+      pointer-events: none;
+    }
+    /* 月次行の上罫線 */
+    tr.monthly > td {
+      border-top: 2px solid #000;
+    }
+    /* 月次行および第6週行の下罫線 */
+    tr.monthly > td,
+    tr.week6 > td {
+      border-bottom: 2px solid #000;
+    }
+    /* 日曜日の行の下罫線 */
+    tr.sunday > td {
+      border-bottom: 2px solid #000;
+    }
+    /* グループヘッダー行 */
+    .group-header {
+      background-color: #e0e0e0;
+      cursor: pointer;
+      font-weight: bold;
+    }
+    /* サブグループヘッダーはインデント */
+    .sub-group-header {
+      background-color: #eeeeee;
+      cursor: pointer;
+      font-weight: bold;
+    }
+    /* インデント用 */
+    .indent {
+      padding-left: 20px;
+    }
+    /* ボタン・Chip領域 */
+    .toggle-all-btn, .chip-area, .section-toggle-btn {
+      margin-bottom: 10px;
+      margin-right: 10px;
+    }
+    .chip-area > * {
+      margin-right: 5px;
+    }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+
+  <!-- ライブラリ群 -->
+  <script src="https://cdn.jsdelivr.net/npm/react@18.2.0/umd/react.production.min.js" crossorigin></script>
+  <script src="https://cdn.jsdelivr.net/npm/react-dom@18.2.0/umd/react-dom.production.min.js" crossorigin></script>
+  <script src="https://cdn.jsdelivr.net/npm/@babel/standalone@7.23.8/babel.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@emotion/react@11.11.3/dist/emotion-react.umd.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@emotion/styled@11.11.0/dist/emotion-styled.umd.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@mui/material@5.15.3/umd/material-ui.production.min.js" crossorigin></script>
+  <!-- Chart.js の読み込み -->
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+
+  <!-- React / Babelコード -->
+  <script type="text/babel">
+    const {
+      Table,
+      TableHead,
+      TableBody,
+      TableRow,
+      TableCell,
+      Paper,
+      Select,
+      MenuItem,
+      FormControl,
+      InputLabel,
+      Button,
+      Chip,
+      Collapse
+    } = MaterialUI;
+
+    // 親列：左端の「年度合計」＋各月
+    const PARENT_COLUMNS = [
+      "年度合計",
+      "3月", "4月", "5月", "6月", "7月", "8月", "9月", "10月", "11月", "12月",
+      "1月", "2月", "3月", "4月"
+    ];
+    // サブ列
+    const SUB_COLUMNS = ["前年", "計画", "傾向", "実績"];
+
+    // 各グループの行定義（ここでは月次のみグラフ対象）
+    const monthlyRows = [{ label: "月次", type: "monthly" }];
+    const weeklyRows = [];
+    for (let w = 1; w <= 6; w++) {
+      weeklyRows.push({ label: `第${w}週`, type: "weekly" });
+    }
+    const weekdayRows = [];
+    ["月曜", "火曜", "水曜", "木曜", "金曜", "土曜", "日曜"].forEach(label => {
+      weekdayRows.push({ label, type: "weekday" });
+    });
+    const dailyRows = [];
+    for (let d = 1; d <= 31; d++) {
+      dailyRows.push({ label: `${d}日`, type: "daily" });
+    }
+
+    // 初期データ生成（グラフ用）
+    const generateRowData = (rows) => {
+      return rows.map(() => {
+        let row = {};
+        PARENT_COLUMNS.forEach((col, pIndex) => {
+          row[pIndex] = (pIndex === 0) ? null : { old: Math.floor(Math.random()*100), factor: Math.floor(Math.random()*100), yoy: 100, actual: Math.floor(Math.random()*100) };
+        });
+        return row;
+      });
+    };
+
+    // 年度、表示対象の選択肢
+    const FISCAL_YEARS = Array.from({ length: 6 }, (_, i) => 2020 + i);
+    const DISPLAY_TYPES = ["全社", "部門", "コーナー", "ライン", "カテゴリ"];
+
+    // グラフ表示用コンポーネント
+    function ChartComponent({monthlyData}) {
+      const canvasRef = React.useRef(null);
+      React.useEffect(() => {
+        if (canvasRef.current) {
+          const ctx = canvasRef.current.getContext('2d');
+          // x軸のラベル：テーブルの「月」部分（年度合計を除く）
+          const labels = PARENT_COLUMNS.slice(1);
+          // monthlyData は、labels に対応するオブジェクトの配列
+          const dataOld = labels.map((_, i) => monthlyData[i+1].old);
+          const dataPlan = labels.map((_, i) => monthlyData[i+1].factor);
+          const dataActual = labels.map((_, i) => monthlyData[i+1].actual);
+          const chart = new Chart(ctx, {
+            type: 'line',
+            data: {
+              labels,
+              datasets: [
+                {
+                  label: '前年',
+                  data: dataOld,
+                  borderColor: 'blue',
+                  backgroundColor: 'blue',
+                  fill: false,
+                  tension: 0.1
+                },
+                {
+                  label: '計画',
+                  data: dataPlan,
+                  borderColor: 'green',
+                  backgroundColor: 'green',
+                  fill: false,
+                  tension: 0.1
+                },
+                {
+                  label: '実績',
+                  data: dataActual,
+                  borderColor: 'red',
+                  backgroundColor: 'red',
+                  fill: false,
+                  tension: 0.1
+                }
+              ]
+            },
+            options: {
+              responsive: true,
+              maintainAspectRatio: false,
+              scales: {
+                y: {
+                  beginAtZero: true,
+                  title: { display: true, text: "月次" }
+                },
+                x: {
+                  title: { display: true, text: "月" }
+                }
+              }
+            }
+          });
+          return () => chart.destroy();
+        }
+      }, [monthlyData]);
+      return <canvas ref={canvasRef} style={{ height: "100%", width: "100%" }} />;
+    }
+
+    // 昨年実績テーブルなどで使用する行定義
+    const LAST_YEAR_ROWS = [
+      { label: "期首在庫_原価", key: "beginningCost" },
+      { label: "期首在庫_売価", key: "beginningPrice" },
+      { label: "売上高", key: "sales" },
+      { label: "売上総利益", key: "grossProfit" },
+      { label: "期中仕入_原価", key: "midPurchaseCost" },
+      { label: "期中仕入_売価", key: "midPurchasePrice" },
+      { label: "値上_売価", key: "priceIncrease" },
+      { label: "値下_売価", key: "priceDecrease" },
+      { label: "ロス率_売価", key: "lossRate" },
+      { label: "リベート高_原価", key: "rebateCost" },
+      { label: "期末在庫_原価", key: "endingCost" },
+      { label: "期末在庫_売価", key: "endingPrice" },
+      { label: "回転日数", key: "turnoverDays" }
+    ];
+
+    function App() {
+      const [selectedYear, setSelectedYear] = React.useState(new Date().getFullYear());
+      const [selectedDisplay, setSelectedDisplay] = React.useState("全社");
+      // Chip選択（部門／コーナー）【フィルタリング用】
+      const [selectedDeptChip, setSelectedDeptChip] = React.useState(null);
+      const [selectedCornerChip, setSelectedCornerChip] = React.useState(null);
+      // 各グループの折りたたみ状態
+      const [toggleGroups, setToggleGroups] = React.useState({});
+      // 全体一括切替状態
+      const [allExpanded, setAllExpanded] = React.useState(true);
+      // 各セクションのグローバル表示状態
+      const [globalShowWeekly, setGlobalShowWeekly] = React.useState(true);
+      const [globalShowWeekday, setGlobalShowWeekday] = React.useState(true);
+      const [globalShowDaily, setGlobalShowDaily] = React.useState(true);
+      // グラフエリアの展開状態
+      const [graphExpanded, setGraphExpanded] = React.useState(true);
+      // 各テーブルの展開状態
+      const [progressExpanded, setProgressExpanded] = React.useState(true);
+      const [currentPlanExpanded, setCurrentPlanExpanded] = React.useState(true);
+      const [lastYearExpanded, setLastYearExpanded] = React.useState(true);
+      // 統合テーブルのサブカラム表示状態（前年、計画、実績）
+      const [showIntegratedColumns, setShowIntegratedColumns] = React.useState({
+        lastYear: true,
+        plan: true,
+        actual: true,
+      });
+      // 統合テーブルの各行の表示状態
+      const [showIntegratedRows, setShowIntegratedRows] = React.useState(() => {
+        const initial = {};
+        LAST_YEAR_ROWS.forEach(row => { initial[row.key] = true; });
+        return initial;
+      });
+
+      const handleInputBlur = (groupId, rowIndex, pIndex, key, event, dataSetter) => {
+        const value = event.target.innerText;
+        // ※ここでは実際のデータ更新処理は簡略化しています
+      };
+
+      const getActualMonthAndYear = (monthIndex, fiscalYear) => {
+        if (monthIndex === 0) return null;
+        let year = fiscalYear, month;
+        if (monthIndex === 1) { year = fiscalYear - 1; month = 3; }
+        else if (monthIndex === 14) { year = fiscalYear + 1; month = 4; }
+        else { month = ((monthIndex - 2 + 3) % 12) + 1; }
+        return { year, month };
+      };
+
+      const getDaysInMonth = (year, monthIndex) => {
+        if (monthIndex === 0) return 0;
+        const { year: actualYear, month: actualMonth } = getActualMonthAndYear(monthIndex, selectedYear);
+        return new Date(actualYear, actualMonth, 0).getDate();
+      };
+
+      const isCellDisabled = (rowType, monthIndex) => {
+        if (rowType.type === 'monthly' || rowType.type === 'weekday') return false;
+        if (monthIndex === 0) return true;
+        const daysInMonth = getDaysInMonth(selectedYear, monthIndex);
+        if (rowType.type === 'weekly') return false;
+        if (rowType.type === 'daily') {
+          const day = parseInt(rowType.label);
+          return day > daysInMonth;
+        }
+        return false;
+      };
+
+      const totalColSpan = 1 + (PARENT_COLUMNS.length * SUB_COLUMNS.length);
+
+      // 各グループのデータセット作成
+      const createGroupData = () => {
+        return {
+          monthly: generateRowData(monthlyRows),
+          weekly: generateRowData(weeklyRows),
+          weekday: generateRowData(weekdayRows),
+          daily: generateRowData(dailyRows)
+        };
+      };
+
+      // グループ構造の生成
+      const getGroups = () => {
+        switch(selectedDisplay) {
+          case "全社":
+          case "部門":
+            return Array.from({ length: (selectedDisplay === "全社" ? 1 : 5) }, (_, i) => ({
+              id: (selectedDisplay === "全社") ? "grp_all" : `dept_${i+1}`,
+              label: (selectedDisplay === "全社") ? "全社" : `部門${i+1}`,
+              children: createGroupData()
+            }));
+          case "コーナー": {
+            let groups = Array.from({ length: 5 }, (_, i) => ({
+              id: `dept_${i+1}`,
+              label: `部門${i+1}`,
+              subGroups: Array.from({ length: 5 }, (_, j) => ({
+                id: `dept_${i+1}_corner_${j+1}`,
+                label: `コーナー${j+1}`,
+                children: createGroupData()
+              }))
+            }));
+            if (selectedDeptChip) {
+              groups = groups.filter(g => g.id === `dept_${selectedDeptChip}`);
+            }
+            return groups;
+          }
+          case "ライン": {
+            let groups = Array.from({ length: 5 }, (_, i) => ({
+              id: `dept_${i+1}`,
+              label: `部門${i+1}`,
+              subGroups: Array.from({ length: 5 }, (_, j) => ({
+                id: `dept_${i+1}_corner_${j+1}`,
+                label: `コーナー${j+1}`,
+                subGroups: Array.from({ length: 5 }, (_, k) => ({
+                  id: `dept_${i+1}_corner_${j+1}_line_${k+1}`,
+                  label: `ライン${k+1}`,
+                  children: createGroupData()
+                }))
+              }))
+            }));
+            if (selectedDeptChip) {
+              groups = groups.filter(g => g.id === `dept_${selectedDeptChip}`);
+              if (selectedCornerChip) {
+                groups = groups.map(g => ({
+                  ...g,
+                  subGroups: g.subGroups.filter(sg => sg.id === `dept_${selectedDeptChip}_corner_${selectedCornerChip}`)
+                }));
+              }
+            }
+            return groups;
+          }
+          case "カテゴリ": {
+            return Array.from({ length: 5 }, (_, i) => ({
+              id: `dept_${i+1}`,
+              label: `部門${i+1}`,
+              subGroups: Array.from({ length: 5 }, (_, j) => ({
+                id: `dept_${i+1}_corner_${j+1}`,
+                label: `コーナー${j+1}`,
+                subGroups: Array.from({ length: 5 }, (_, k) => ({
+                  id: `dept_${i+1}_corner_${j+1}_line_${k+1}`,
+                  label: `ライン${k+1}`,
+                  subGroups: Array.from({ length: 3 }, (_, l) => ({
+                    id: `dept_${i+1}_corner_${j+1}_line_${k+1}_cat_${l+1}`,
+                    label: `カテゴリ${l+1}`,
+                    children: createGroupData()
+                  }))
+                }))
+              }))
+            }));
+          }
+          default:
+            return [];
+        }
+      };
+
+      // グループ（またはその子データ）がある場合、月次のデータ行は常に表示（ラベル行は削除）
+      const renderGroupRecursive = (groups, indent = 0) => {
+        let rows = [];
+        groups.forEach(group => {
+          const isExpanded = toggleGroups[group.id] !== false;
+          rows.push(
+            <TableRow key={group.id} 
+              className={indent === 0 ? "group-header" : "sub-group-header"}
+              onClick={(e) => {
+                e.stopPropagation();
+                setToggleGroups(prev => ({ ...prev, [group.id]: !isExpanded }));
+              }}
+            >
+              <TableCell style={{ paddingLeft: indent * 20 }} colSpan={totalColSpan}>
+                {group.label} {isExpanded ? "▼" : "▶"}
+              </TableCell>
+            </TableRow>
+          );
+          if (group.children) {
+            // 月次データ行
+            rows = rows.concat(renderRows(group.id + "_monthly", group.children.monthly, monthlyRows));
+            if(isExpanded) {
+              rows.push(
+                <TableRow key={group.id + "_weekly_header"} className="sub-group-header"
+                  onClick={(e) => { e.stopPropagation(); setGlobalShowWeekly(prev => !prev); }}
+                >
+                  <TableCell style={{ paddingLeft: (indent + 1) * 20 }} colSpan={totalColSpan}>
+                    週別 {globalShowWeekly ? "▼" : "▶"}
+                  </TableCell>
+                </TableRow>
+              );
+              if(globalShowWeekly) {
+                rows = rows.concat(renderRows(group.id + "_weekly", group.children.weekly, weeklyRows));
+              }
+              rows.push(
+                <TableRow key={group.id + "_weekday_header"} className="sub-group-header"
+                  onClick={(e) => { e.stopPropagation(); setGlobalShowWeekday(prev => !prev); }}
+                >
+                  <TableCell style={{ paddingLeft: (indent + 1) * 20 }} colSpan={totalColSpan}>
+                    曜日別 {globalShowWeekday ? "▼" : "▶"}
+                  </TableCell>
+                </TableRow>
+              );
+              if(globalShowWeekday) {
+                rows = rows.concat(renderRows(group.id + "_weekday", group.children.weekday, weekdayRows));
+              }
+              rows.push(
+                <TableRow key={group.id + "_daily_header"} className="sub-group-header"
+                  onClick={(e) => { e.stopPropagation(); setGlobalShowDaily(prev => !prev); }}
+                >
+                  <TableCell style={{ paddingLeft: (indent + 1) * 20 }} colSpan={totalColSpan}>
+                    日別 {globalShowDaily ? "▼" : "▶"}
+                  </TableCell>
+                </TableRow>
+              );
+              if(globalShowDaily) {
+                rows = rows.concat(renderRows(group.id + "_daily", group.children.daily, dailyRows));
+              }
+            }
+          }
+          if(group.subGroups) {
+            rows = rows.concat(renderGroupRecursive(group.subGroups, indent + 1));
+          }
+        });
+        return rows;
+      };
+
+      const renderRows = (groupIdPrefix, dataArray, rowDefs) => {
+        return dataArray.map((rowData, i) => {
+          let rowDef = rowDefs[i];
+          let rowClass = "";
+          if(rowDef.type === "weekly" && rowDef.label === "第6週") rowClass = "week6";
+          if(rowDef.type === "weekday" && rowDef.label === "日曜") rowClass = "sunday";
+          return (
+            <TableRow key={groupIdPrefix + "-" + i} className={rowClass}>
+              <TableCell className="header-cell">{rowDef.label}</TableCell>
+              {PARENT_COLUMNS.map((_, pIndex) => (
+                <React.Fragment key={pIndex}>
+                  {SUB_COLUMNS.map((sub, sIndex) => (
+                    <TableCell 
+                      key={`${groupIdPrefix}-${pIndex}-${sIndex}`} 
+                      align="center"
+                      className={ isCellDisabled(rowDef, pIndex) ? 'disabled-cell' : '' }
+                      style={(sIndex === SUB_COLUMNS.length - 1 && pIndex !== PARENT_COLUMNS.length - 1) ? { borderRight: '2px solid #000' } : {}}
+                    >
+                      {pIndex === 0 ? "" : (
+                        <div
+                          className="editable-cell"
+                          contentEditable={!isCellDisabled(rowDef, pIndex)}
+                          suppressContentEditableWarning
+                          onBlur={(e) =>
+                            handleInputBlur(groupIdPrefix, i, pIndex, 
+                              sIndex === 0 ? "old" : (sIndex === 1 ? "factor" : (sIndex === 2 ? "yoy" : "actual")), 
+                              e,
+                              () => {}
+                            )
+                          }
+                        >
+                          {rowData[pIndex][ sIndex === 0 ? "old" : (sIndex === 1 ? "factor" : (sIndex === 2 ? "yoy" : "actual")) ]}
+                        </div>
+                      )}
+                    </TableCell>
+                  ))}
+                </React.Fragment>
+              ))}
+            </TableRow>
+          );
+        });
+      };
+
+      const getAllGroupIds = (groups) => {
+        let ids = [];
+        groups.forEach(group => {
+          ids.push(group.id);
+          if(group.subGroups) ids = ids.concat(getAllGroupIds(group.subGroups));
+        });
+        return ids;
+      };
+
+      const handleToggleAll = () => {
+        const groups = getGroups();
+        const allIds = getAllGroupIds(groups);
+        const newToggle = {};
+        allIds.forEach(id => { newToggle[id] = !allExpanded; });
+        setToggleGroups(newToggle);
+        setAllExpanded(!allExpanded);
+      };
+
+      // グラフ用に最初のグループ（月次行）からデータを抽出
+      const groups = getGroups();
+      const monthlyData = groups[0]?.children?.monthly[0] || {};
+
+      // 今期計画テーブル用データ（各期間に対してランダムな値を生成）
+      const currentPlanData = {};
+      // 進捗テーブル用データ（各期間に対してランダムな値を生成）
+      const progressData = {};
+      // 昨年実績テーブル用データ
+      const lastYearData = {};
+      PARENT_COLUMNS.slice(1).forEach((month, index) => {
+        currentPlanData[index+1] = {
+          header: Math.floor(Math.random()*1000),
+          beginningCost: Math.floor(Math.random()*1000),
+          beginningPrice: Math.floor(Math.random()*1000),
+          sales: Math.floor(Math.random()*1000),
+          grossProfit: Math.floor(Math.random()*1000),
+          midPurchaseCost: Math.floor(Math.random()*1000),
+          midPurchasePrice: Math.floor(Math.random()*1000),
+          priceIncrease: Math.floor(Math.random()*1000),
+          priceDecrease: Math.floor(Math.random()*1000),
+          lossRate: Math.floor(Math.random()*1000),
+          rebateCost: Math.floor(Math.random()*1000),
+          endingCost: Math.floor(Math.random()*1000),
+          endingPrice: Math.floor(Math.random()*1000),
+          turnoverDays: Math.floor(Math.random()*1000)
+        };
+        progressData[index+1] = {
+          header: Math.floor(Math.random()*1000),
+          beginningCost: Math.floor(Math.random()*1000),
+          beginningPrice: Math.floor(Math.random()*1000),
+          sales: Math.floor(Math.random()*1000),
+          grossProfit: Math.floor(Math.random()*1000),
+          midPurchaseCost: Math.floor(Math.random()*1000),
+          midPurchasePrice: Math.floor(Math.random()*1000),
+          priceIncrease: Math.floor(Math.random()*1000),
+          priceDecrease: Math.floor(Math.random()*1000),
+          lossRate: Math.floor(Math.random()*1000),
+          rebateCost: Math.floor(Math.random()*1000),
+          endingCost: Math.floor(Math.random()*1000),
+          endingPrice: Math.floor(Math.random()*1000),
+          turnoverDays: Math.floor(Math.random()*1000)
+        };
+        lastYearData[index+1] = {
+          header: Math.floor(Math.random()*1000),
+          beginningCost: Math.floor(Math.random()*1000),
+          beginningPrice: Math.floor(Math.random()*1000),
+          sales: Math.floor(Math.random()*1000),
+          grossProfit: Math.floor(Math.random()*1000),
+          midPurchaseCost: Math.floor(Math.random()*1000),
+          midPurchasePrice: Math.floor(Math.random()*1000),
+          priceIncrease: Math.floor(Math.random()*1000),
+          priceDecrease: Math.floor(Math.random()*1000),
+          lossRate: Math.floor(Math.random()*1000),
+          rebateCost: Math.floor(Math.random()*1000),
+          endingCost: Math.floor(Math.random()*1000),
+          endingPrice: Math.floor(Math.random()*1000),
+          turnoverDays: Math.floor(Math.random()*1000)
+        };
+      });
+
+      return (
+        <div style={{ padding: 20 }}>
+          <h1>売上構成比計画（{selectedDisplay}）</h1>
+          
+          {/* グラフエリア（折りたたみ可能） */}
+          <Button variant="contained" style={{ marginBottom: 10 }} onClick={() => setGraphExpanded(prev => !prev)}>
+            {graphExpanded ? "グラフを折りたたむ" : "グラフを展開"}
+          </Button>
+          <Collapse in={graphExpanded}>
+            <Paper style={{ marginBottom: 20, padding: 20, height: '35vh' }}>
+              {/* ChartComponent に月次データ（各月の「前年」「計画」「実績」）を渡す */}
+              <ChartComponent monthlyData={monthlyData} />
+            </Paper>
+          </Collapse>
+
+          {/* グラフデータテーブル */}
+          <Paper style={{ marginBottom: 20, padding: 20, overflowX: "auto" }}>
+            <h2>グラフデータテーブル</h2>
+            <Table size="small">
+              <TableHead>
+                <TableRow>
+                  <TableCell className="header-cell">データ系列</TableCell>
+                  {PARENT_COLUMNS.slice(1).map((month, index) => (
+                    <TableCell key={index} className="header-cell" align="center">{month}</TableCell>
+                  ))}
+                </TableRow>
+              </TableHead>
+              <TableBody>
+                {["前年", "計画", "実績"].map(series => (
+                  <TableRow key={series}>
+                    <TableCell className="header-cell">{series}</TableCell>
+                    {PARENT_COLUMNS.slice(1).map((month, index) => {
+                      const data = monthlyData[index+1] || {};
+                      let value;
+                      if(series === "前年") value = data.old;
+                      else if(series === "計画") value = data.factor;
+                      else if(series === "実績") value = data.actual;
+                      return (
+                        <TableCell key={index} align="center">
+                          {value}
+                        </TableCell>
+                      );
+                    })}
+                  </TableRow>
+                ))}
+              </TableBody>
+            </Table>
+          </Paper>
+          
+          {/* ===== 統合テーブル（進捗／今期計画／昨年実績の統合） ===== */}
+          <div style={{ marginBottom: 20 }}>
+            <Paper style={{ padding: 20, overflowX: "auto" }}>
+              <div className="chip-area">
+                <span>統合テーブルの表示切替:</span>
+                <Chip 
+                  label="前年" 
+                  onClick={() => setShowIntegratedColumns(prev => ({...prev, lastYear: !prev.lastYear}))}
+                  color={showIntegratedColumns.lastYear ? "primary" : "default"}
+                />
+                <Chip 
+                  label="計画" 
+                  onClick={() => setShowIntegratedColumns(prev => ({...prev, plan: !prev.plan}))}
+                  color={showIntegratedColumns.plan ? "primary" : "default"}
+                />
+                <Chip 
+                  label="実績" 
+                  onClick={() => setShowIntegratedColumns(prev => ({...prev, actual: !prev.actual}))}
+                  color={showIntegratedColumns.actual ? "primary" : "default"}
+                />
+              </div>
+              {/* 各行の表示／非表示切替用Chipエリア */}
+              <div className="chip-area" style={{ marginTop: 10 }}>
+                <span>統合テーブル 行表示切替:</span>
+                {LAST_YEAR_ROWS.map(row => (
+                  <Chip 
+                    key={row.key}
+                    label={row.label}
+                    onClick={() => setShowIntegratedRows(prev => ({ ...prev, [row.key]: !prev[row.key] }))}
+                    color={showIntegratedRows[row.key] ? "primary" : "default"}
+                  />
+                ))}
+              </div>
+              <h2>統合テーブル</h2>
+              {/* 表示するサブカラムの数を算出 */}
+              {(() => {
+                const visibleCount = [showIntegratedColumns.lastYear, showIntegratedColumns.plan, showIntegratedColumns.actual].filter(Boolean).length;
+                return (
+                  <Table size="small">
+                    <TableHead>
+                      <TableRow>
+                        <TableCell className="header-cell" rowSpan={2}>期間</TableCell>
+                        {/* 年度合計のヘッダー */}
+                        <TableCell className="header-cell" align="center" colSpan={visibleCount}>年度合計</TableCell>
+                        {PARENT_COLUMNS.slice(1).map((month, index) => (
+                          <TableCell key={index} className="header-cell" align="center" colSpan={visibleCount}>
+                            {month}
+                          </TableCell>
+                        ))}
+                      </TableRow>
+                      <TableRow>
+                        {/* 年度合計のサブカラム */}
+                        {showIntegratedColumns.lastYear && <TableCell className="header-cell" align="center">前年</TableCell>}
+                        {showIntegratedColumns.plan && <TableCell className="header-cell" align="center">計画</TableCell>}
+                        {showIntegratedColumns.actual && <TableCell className="header-cell" align="center">実績</TableCell>}
+                        {PARENT_COLUMNS.slice(1).map((month, index) => {
+                          let cells = [];
+                          if (showIntegratedColumns.lastYear) {
+                            cells.push(<TableCell key={`ly-${index}`} className="header-cell" align="center">前年</TableCell>);
+                          }
+                          if (showIntegratedColumns.plan) {
+                            cells.push(<TableCell key={`plan-${index}`} className="header-cell" align="center">計画</TableCell>);
+                          }
+                          if (showIntegratedColumns.actual) {
+                            cells.push(<TableCell key={`act-${index}`} className="header-cell" align="center">実績</TableCell>);
+                          }
+                          return cells;
+                        })}
+                      </TableRow>
+                    </TableHead>
+                    <TableBody>
+                      {LAST_YEAR_ROWS.filter(row => showIntegratedRows[row.key]).map((row) => (
+                        <TableRow key={row.key}>
+                          <TableCell className="header-cell">{row.label}</TableCell>
+                          {/* 年度合計セル：4月～来年3月（PARENT_COLUMNS.slice(1) のうちインデックス 1～12 の合計） */}
+                          {showIntegratedColumns.lastYear && (
+                            <TableCell align="center">
+                              {(() => {
+                                let sum = 0;
+                                for (let key = 2; key <= 13; key++) {
+                                  sum += lastYearData[key] ? lastYearData[key][row.key] : 0;
+                                }
+                                return sum;
+                              })()}
+                            </TableCell>
+                          )}
+                          {showIntegratedColumns.plan && (
+                            <TableCell align="center">
+                              {(() => {
+                                let sum = 0;
+                                for (let key = 2; key <= 13; key++) {
+                                  sum += currentPlanData[key] ? currentPlanData[key][row.key] : 0;
+                                }
+                                return sum;
+                              })()}
+                            </TableCell>
+                          )}
+                          {showIntegratedColumns.actual && (
+                            <TableCell align="center">
+                              {(() => {
+                                let sum = 0;
+                                for (let key = 2; key <= 13; key++) {
+                                  sum += progressData[key] ? progressData[key][row.key] : 0;
+                                }
+                                return sum;
+                              })()}
+                            </TableCell>
+                          )}
+                          {/* 各月のセル（元々のデータ） */}
+                          {PARENT_COLUMNS.slice(1).map((month, index) => {
+                            const monthKey = index + 1;
+                            let cells = [];
+                            if (showIntegratedColumns.lastYear) {
+                              const data = lastYearData[monthKey] || {};
+                              cells.push(<TableCell key={`ly-${monthKey}-${row.key}`} align="center">{data[row.key]}</TableCell>);
+                            }
+                            if (showIntegratedColumns.plan) {
+                              const data = currentPlanData[monthKey] || {};
+                              cells.push(<TableCell key={`plan-${monthKey}-${row.key}`} align="center">{data[row.key]}</TableCell>);
+                            }
+                            if (showIntegratedColumns.actual) {
+                              const data = progressData[monthKey] || {};
+                              cells.push(<TableCell key={`act-${monthKey}-${row.key}`} align="center">{data[row.key]}</TableCell>);
+                            }
+                            return cells;
+                          })}
+                        </TableRow>
+                      ))}
+                    </TableBody>
+                  </Table>
+                );
+              })()}
+            </Paper>
+          </div>
+
+          {/* 昨年実績テーブル */}
+          <Button variant="contained" style={{ marginBottom: 10 }} onClick={() => setLastYearExpanded(prev => !prev)}>
+            {lastYearExpanded ? "昨年実績テーブルを折りたたむ" : "昨年実績テーブルを展開"}
+          </Button>
+          <Collapse in={lastYearExpanded}>
+            <Paper style={{ marginBottom: 20, padding: 20, overflowX: "auto" }}>
+              <h2>昨年実績テーブル</h2>
+              <Table size="small">
+                <TableHead>
+                  <TableRow>
+                    <TableCell className="header-cell">期間</TableCell>
+                    {PARENT_COLUMNS.slice(1).map((month, index) => (
+                      <TableCell key={index} className="header-cell" align="center">{month}</TableCell>
+                    ))}
+                  </TableRow>
+                </TableHead>
+                <TableBody>
+                  {LAST_YEAR_ROWS.map(series => (
+                    <TableRow key={series.key}>
+                      <TableCell className="header-cell">{series.label}</TableCell>
+                      {PARENT_COLUMNS.slice(1).map((month, index) => {
+                        const data = lastYearData[index+1] || {};
+                        return (
+                          <TableCell key={index} align="center">
+                            {data[series.key]}
+                          </TableCell>
+                        );
+                      })}
+                    </TableRow>
+                  ))}
+                </TableBody>
+              </Table>
+            </Paper>
+          </Collapse>
+
+          {/* 年度選択 */}
+          <FormControl style={{ minWidth: 120, marginBottom: 20, marginRight: 20 }}>
+            <InputLabel>年度</InputLabel>
+            <Select value={selectedYear} onChange={(e) => setSelectedYear(e.target.value)}>
+              {FISCAL_YEARS.map(year => (
+                <MenuItem key={year} value={year}>
+                  {year}年度（{year-1}年4月～{year}年3月）
+                </MenuItem>
+              ))}
+            </Select>
+          </FormControl>
+
+          {/* 表示対象選択 */}
+          <FormControl style={{ minWidth: 120, marginBottom: 20 }}>
+            <InputLabel>表示対象</InputLabel>
+            <Select
+              value={selectedDisplay}
+              onChange={(e) => { 
+                setSelectedDisplay(e.target.value); 
+                setToggleGroups({}); 
+                setAllExpanded(true); 
+                setSelectedDeptChip(null);
+                setSelectedCornerChip(null);
+              }}
+            >
+              {DISPLAY_TYPES.map(type => (
+                <MenuItem key={type} value={type}>{type}</MenuItem>
+              ))}
+            </Select>
+          </FormControl>
+
+          {/* Chipによるフィルタリング（コーナー、ライン、カテゴリの場合） */}
+          { (selectedDisplay === "コーナー" || selectedDisplay === "ライン" || selectedDisplay === "カテゴリ") && (
+            <div className="chip-area">
+              <span>部門を選ぶ:</span>
+              {Array.from({ length: 5 }, (_, i) => (
+                <Chip 
+                  key={`dept_chip_${i+1}`} 
+                  label={`部門${i+1}`} 
+                  onClick={() => { setSelectedDeptChip(i+1); setSelectedCornerChip(null); }}
+                  color={selectedDeptChip === i+1 ? "primary" : "default"}
+                />
+              ))}
+            </div>
+          )}
+          { (selectedDisplay === "ライン" || selectedDisplay === "カテゴリ") && selectedDeptChip && (
+            <div className="chip-area">
+              <span>コーナーを選ぶ:</span>
+              {Array.from({ length: 5 }, (_, j) => (
+                <Chip 
+                  key={`corner_chip_${j+1}`} 
+                  label={`コーナー${j+1}`} 
+                  onClick={() => setSelectedCornerChip(j+1)}
+                  color={selectedCornerChip === j+1 ? "primary" : "default"}
+                />
+              ))}
+            </div>
+          )}
+
+          {/* 全体一括グループ切替ボタン */}
+          <Button variant="contained" className="toggle-all-btn" onClick={handleToggleAll}>
+            {allExpanded ? "全て折りたたむ" : "全て展開"}
+          </Button>
+          {/* データテーブル（グループ別の詳細テーブル） */}
+          <Paper style={{ overflowX: 'auto', marginBottom: 20 }}>
+            <Table size="small">
+              <TableHead>
+                <TableRow>
+                  <TableCell rowSpan={2} className="header-cell">行/列</TableCell>
+                  {PARENT_COLUMNS.map((parent, index) => (
+                    <TableCell 
+                      key={index} 
+                      align="center" 
+                      colSpan={SUB_COLUMNS.length} 
+                      className="header-cell"
+                      style={ index !== PARENT_COLUMNS.length - 1 ? { borderRight: '2px solid #000' } : {} }
+                    >
+                      {parent}
+                    </TableCell>
+                  ))}
+                </TableRow>
+                <TableRow>
+                  {PARENT_COLUMNS.map((_, index) =>
+                    SUB_COLUMNS.map((sub, subIndex) => (
+                      <TableCell 
+                        key={`${index}-${subIndex}`} 
+                        align="center" 
+                        className="header-cell"
+                        style={(subIndex === SUB_COLUMNS.length - 1 && index !== PARENT_COLUMNS.length - 1) ? { borderRight: '2px solid #000' } : {}}
+                      >
+                        {sub}
+                      </TableCell>
+                    ))
+                  )}
+                </TableRow>
+              </TableHead>
+              <TableBody>
+                { renderGroupRecursive(groups) }
+              </TableBody>
+            </Table>
+          </Paper>
+        </div>
+      );
+    }
+
+    ReactDOM.render(<App />, document.getElementById("root"));
+  </script>
+</body>
+</html>
