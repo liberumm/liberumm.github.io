@@ -1,13 +1,8 @@
-// 分類レベル定義
+// 定数定義
 const CLASSIFICATION_LEVELS = [
-  { key: 'company', label: '全社' },
-  { key: 'department', label: '部門' },
-  { key: 'corner', label: 'コーナー' },
-  { key: 'line', label: 'ライン' },
-  { key: 'category', label: 'カテゴリ' }
+  { key: 'company', label: '全社' }
 ];
 
-// 分類階層構造の定義
 const HIERARCHY_STRUCTURE = {
   company: { 
     label: '全社',
@@ -45,7 +40,6 @@ const HIERARCHY_STRUCTURE = {
   }
 };
 
-// 表示項目定義（統合テーブルと同じ）
 const DISPLAY_ROWS = [
   { label: "期首在庫_原価", key: "beginningCost" },
   { label: "期首在庫_売価", key: "beginningPrice" },
@@ -63,38 +57,67 @@ const DISPLAY_ROWS = [
   { label: "回転日数", key: "turnoverDays" }
 ];
 
-// 表示モード定義
 const VIEW_MODES = [
   { key: 'company', label: '全社' },
   { key: 'classification', label: '分類別' },
   { key: 'store', label: '店舗別' }
 ];
 
-function MonthlyComparisonTable({ monthData, selectedMonth }) {
+function MonthlyComparisonTable({ monthData = {}, selectedMonth }) {
   const { 
     Table, TableHead, TableBody, TableRow, TableCell,
     Paper, FormControl, Select, MenuItem, Chip,
-    InputLabel, Radio, RadioGroup, FormControlLabel
+    InputLabel, Radio, RadioGroup, FormControlLabel,
+    Button, Stack, TextField
   } = MaterialUI;
+
+  // 編集可能なキー一覧
+  const editableKeys = [
+    "beginningCost",
+    "beginningPrice",
+    "sales",
+    "midPurchaseCost",
+    "midPurchasePrice",
+    "priceIncrease",
+    "priceDecrease",
+    "lossRate",
+    "rebateCost",
+    "endingCost",
+    "endingPrice"
+  ];
 
   // 表示モードの状態管理
   const [viewMode, setViewMode] = React.useState('company');
   const [selectedLevel, setSelectedLevel] = React.useState('company');
   const [selectedParent, setSelectedParent] = React.useState(null);
 
-  // 状態管理
+  // 表示項目の選択状態
   const [selectedRows, setSelectedRows] = React.useState(() => {
     const initial = {};
     DISPLAY_ROWS.forEach(row => { initial[row.key] = true; });
     return initial;
   });
 
-  // 表示する分類の選択状態
+  // 分類表示の切替状態
   const [visibleClassifications, setVisibleClassifications] = React.useState(() => {
     const initial = {};
     CLASSIFICATION_LEVELS.forEach(level => { initial[level.key] = true; });
     return initial;
   });
+
+  // 当月セルの編集値を保持する状態
+  // 構造は { [itemKey]: { [rowKey]: editedValue } }
+  const [editedValues, setEditedValues] = React.useState({});
+
+  const updateEdited = (itemKey, rowKey, newVal) => {
+    setEditedValues(prev => ({
+      ...prev,
+      [itemKey]: {
+        ...prev[itemKey],
+        [rowKey]: newVal
+      }
+    }));
+  };
 
   // 表示モード切替コントロール
   const renderViewModeControl = () => (
@@ -103,7 +126,7 @@ function MonthlyComparisonTable({ monthData, selectedMonth }) {
         setViewMode(e.target.value);
         // モード切替時に適切な初期レベルを設定
         setSelectedLevel(e.target.value === 'classification' ? 'department' : 
-                       e.target.value === 'store' ? 'block' : 'company');
+                         e.target.value === 'store' ? 'block' : 'company');
       }}>
         {VIEW_MODES.map(mode => (
           <FormControlLabel
@@ -158,7 +181,6 @@ function MonthlyComparisonTable({ monthData, selectedMonth }) {
           value={selectedParent || ''}
           onChange={(e) => setSelectedParent(e.target.value)}
         >
-          {/* 親レベルの選択肢を動的生成 */}
           {Array.from({ length: HIERARCHY_STRUCTURE[parentLevel].count }, (_, i) => (
             <MenuItem key={i} value={`${parentLevel}_${i+1}`}>
               {`${HIERARCHY_STRUCTURE[parentLevel].label}${i+1}`}
@@ -252,33 +274,42 @@ function MonthlyComparisonTable({ monthData, selectedMonth }) {
   const generateStoreData = () => {
     switch (selectedLevel) {
       case 'block':
-        return monthData.blocks.map(block => ({
+        return (monthData.blocks || []).map(block => ({
           key: block.id,
-          label: block.id,
+          label: block.label,
           data: block.data
         }));
       case 'store':
         if (!selectedParent) return [];
         const [_, blockIndex] = selectedParent.split('_');
-        return monthData.blocks[blockIndex - 1]?.stores.map(store => ({
+        return (monthData.blocks?.[blockIndex - 1]?.stores || []).map(store => ({
           key: store.id,
-          label: store.id,
+          label: store.label,
           data: store.data
-        })) || [];
+        }));
       default:
         return [];
     }
   };
 
-  // データ行の生成を修正
+  // データ行の生成（当月を中心とした３か月のみ表示）
   const renderDataRows = () => {
     const visibleRows = DISPLAY_ROWS.filter(row => selectedRows[row.key]);
-    
+
     // 表示データの取得
     const getDisplayData = () => {
       switch (viewMode) {
         case 'company':
-          return [{ key: 'company', label: '全社', data: monthData.company }];
+          const defaultCompanyData = {
+            prev: {},
+            current: {},
+            next: {}
+          };
+          return [{
+            key: 'company',
+            label: '全社',
+            data: monthData.company || defaultCompanyData
+          }];
         case 'classification':
           return generateClassificationData();
         case 'store':
@@ -289,28 +320,43 @@ function MonthlyComparisonTable({ monthData, selectedMonth }) {
     };
 
     const displayData = getDisplayData();
-    
+
     return visibleRows.map(row => (
       <TableRow key={row.key}>
         <TableCell className="header-cell">{row.label}</TableCell>
-        {displayData.map(item => (
-          <React.Fragment key={item.key}>
-            <TableCell align="right">{formatNumber(item.data.prev[row.key])}</TableCell>
-            <TableCell align="right">{formatNumber(item.data.current[row.key])}</TableCell>
-            <TableCell align="right">{formatNumber(item.data.next[row.key])}</TableCell>
-            <TableCell align="right">
-              {calculateRate(item.data.current[row.key], item.data.prev[row.key])}%
-            </TableCell>
-            <TableCell align="right">
-              {calculateRate(item.data.next[row.key], item.data.current[row.key])}%
-            </TableCell>
-          </React.Fragment>
-        ))}
+        {displayData.map(item => {
+          const prevValue = item.data?.prev?.[row.key] || 0;
+          const currentValue = item.data?.current?.[row.key] || 0;
+          const nextValue = item.data?.next?.[row.key] || 0;
+
+          return (
+            <React.Fragment key={item.key}>
+              <TableCell align="right">{formatNumber(prevValue)}</TableCell>
+              <TableCell align="right">
+                {editableKeys.includes(row.key) ? (
+                  <TextField
+                    value={
+                      editedValues[item.key]?.[row.key] ?? currentValue
+                    }
+                    onChange={(e) => updateEdited(item.key, row.key, e.target.value)}
+                    variant="standard"
+                    size="small"
+                    type="number"
+                    inputProps={{ style: { textAlign: 'right' } }}
+                  />
+                ) : (
+                  formatNumber(currentValue)
+                )}
+              </TableCell>
+              <TableCell align="right">{formatNumber(nextValue)}</TableCell>
+            </React.Fragment>
+          );
+        })}
       </TableRow>
     ));
   };
 
-  // ヘルパー関数
+  // ヘルパー関数：数値の整形
   const formatNumber = (num) => {
     if (typeof num === "number") {
       return num.toFixed(1);
@@ -318,13 +364,72 @@ function MonthlyComparisonTable({ monthData, selectedMonth }) {
     return "0.0";
   };
 
-  const calculateRate = (current, previous) => {
-    if (!previous) return "0.0";
-    return ((current / previous * 100) - 100).toFixed(1);
+  // CSVエクスポート機能（３か月分）
+  const exportToCSV = () => {
+    const rows = DISPLAY_ROWS.filter(row => selectedRows[row.key]);
+    const header = ['項目', '前月', '当月', '次月'];
+    const csvContent = [
+      header.join(','),
+      ...rows.map(row => {
+        const data = monthData.monthlyDetails[selectedMonth] || {};
+        return [
+          row.label,
+          data[row.key]?.prev || 0,
+          data[row.key]?.current || 0,
+          data[row.key]?.next || 0
+        ].join(',');
+      })
+    ].join('\n');
+
+    const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
+    const link = document.createElement('a');
+    link.href = URL.createObjectURL(blob);
+    link.download = `monthly_comparison_${selectedMonth}月.csv`;
+    link.click();
+  };
+
+  // Excelテンプレートダウンロード
+  const downloadTemplate = () => {
+    alert('テンプレートのダウンロードは準備中です');
+  };
+
+  // データのアップロード処理
+  const handleFileUpload = (event) => {
+    const file = event.target.files[0];
+    if (file) {
+      const reader = new FileReader();
+      reader.onload = (e) => {
+        const text = e.target.result;
+        const rows = text.split('\n');
+        // ヘッダー行をスキップしてデータを処理
+        rows.slice(1).forEach(row => {
+          const [label, prev, current, next] = row.split(',');
+          // データの更新処理をここに実装
+        });
+      };
+      reader.readAsText(file);
+    }
   };
 
   return (
     <Paper style={{ padding: 20, marginBottom: 20 }}>
+      <Stack direction="row" spacing={2} sx={{ mb: 2 }}>
+        <Button variant="contained" onClick={exportToCSV}>
+          CSVエクスポート
+        </Button>
+        <Button variant="contained" onClick={downloadTemplate}>
+          テンプレートダウンロード
+        </Button>
+        <Button variant="contained" component="label">
+          データアップロード
+          <input
+            type="file"
+            hidden
+            accept=".csv"
+            onChange={handleFileUpload}
+          />
+        </Button>
+      </Stack>
       <h2>単月比較表 ({selectedMonth}月)</h2>
       {renderViewModeControl()}
       {renderLevelSelector()}
@@ -354,7 +459,7 @@ function MonthlyComparisonTable({ monthData, selectedMonth }) {
   );
 }
 
-// グローバル登録（必須）
+// グローバル登録（ブラウザ環境の場合）
 if (typeof window !== 'undefined') {
   window.MonthlyComparisonTable = MonthlyComparisonTable;
 }
