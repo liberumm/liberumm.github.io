@@ -1,56 +1,74 @@
 // components/IntegratedTable.js
 // ※ React, MaterialUI はグローバルで利用可能な前提です
 
+// 必須入力項目の定義（これ以外は計算で導出）
+const REQUIRED_INPUTS = [
+  { label: "期首在庫_原価", key: "beginningCost" },
+  { label: "期首在庫_売価", key: "beginningPrice" },
+  { label: "売上高", key: "sales" },
+  { label: "期中仕入_原価", key: "midPurchaseCost" },
+  { label: "期中仕入_売価", key: "midPurchasePrice" },
+  { label: "値上_売価", key: "priceIncrease" },
+  { label: "値下_売価", key: "priceDecrease" },
+  { label: "リベート高_原価", key: "rebateCost" },
+  { label: "ロス率_売価", key: "lossRate" }
+];
+
+// 計算項目の定義
+const COMPUTED_ROWS = [
+  { label: "売上原価", key: "costOfGoodsSold" },
+  { label: "売上総利益", key: "grossProfit" },
+  { label: "期末在庫_原価", key: "endingCost" },
+  { label: "期末在庫_売価", key: "endingPrice" },
+  { label: "回転日数", key: "turnoverDays" }
+];
+
+// 全表示項目
+const ALL_ROWS = [...REQUIRED_INPUTS, ...COMPUTED_ROWS];
+
 // ----- 連続期間計算用のロジック -----
 // 1期間分の計算を行い、期末在庫などを求める
 function computePeriodData(data, prevEnding) {
-  // 入力に beginningCost / beginningPrice があればその値を優先、
-  // ない場合は前期間の期末在庫を反映（自動生成しない）
-  var beginningCost = (data.hasOwnProperty("beginningCost")) ? data.beginningCost : (prevEnding ? prevEnding.endingCost : 0);
-  var beginningPrice = (data.hasOwnProperty("beginningPrice")) ? data.beginningPrice : (prevEnding ? prevEnding.endingPrice : 0);
+  // 前期からの繰越がある場合は使用（ない場合は入力値を使用）
+  const beginningCost = data.beginningCost || (prevEnding ? prevEnding.endingCost : 0);
+  const beginningPrice = data.beginningPrice || (prevEnding ? prevEnding.endingPrice : 0);
   
-  var sales = data.sales || 0;
-  var midPurchaseCost = data.midPurchaseCost || 0;
-  var midPurchasePrice = data.midPurchasePrice || 0;
-  var priceIncrease = data.priceIncrease || 0;
-  var priceDecrease = data.priceDecrease || 0;
-  var lossRate = data.lossRate || 0;      // 例: 0.03 (3%ロス)
-  var rebateCost = data.rebateCost || 0;
+  // 必須入力項目の取得
+  const sales = data.sales || 0;
+  const midPurchaseCost = data.midPurchaseCost || 0;
+  const midPurchasePrice = data.midPurchasePrice || 0;
+  const priceIncrease = data.priceIncrease || 0;
+  const priceDecrease = data.priceDecrease || 0;
+  const lossRate = data.lossRate || 0;
+  const rebateCost = data.rebateCost || 0;
   
-  // 売価還元法：期首売価に仕入や値上げを加え、値下げ・売上高を控除して期末在庫（売価）を求める
-  var endingPrice = beginningPrice + midPurchasePrice + priceIncrease - priceDecrease - sales;
+  // 売価還元法による計算
+  const endingPrice = beginningPrice + midPurchasePrice + priceIncrease - priceDecrease - sales;
   
-  // 原価率の算出（例： (期首在庫原価＋期中仕入原価－リベート) ÷ (期首売価＋期中仕入売価＋値上げ－値下げ)）
-  var denominator = beginningPrice + midPurchasePrice + priceIncrease - priceDecrease;
-  var costRate = denominator !== 0 ? ((beginningCost + midPurchaseCost - rebateCost) / denominator) : 0;
+  // 原価率の計算
+  const totalPrice = beginningPrice + midPurchasePrice + priceIncrease - priceDecrease;
+  const costRate = totalPrice !== 0 ? 
+    (beginningCost + midPurchaseCost - rebateCost) / totalPrice : 0;
   
-  // 期末在庫（原価）は、期末在庫（売価）に原価率を乗じる
-  var endingCost = endingPrice * costRate;
+  // 売上原価と売上総利益の計算
+  const costOfGoodsSold = sales * costRate;
+  const grossProfit = sales - costOfGoodsSold;
   
-  // 売上原価は売上高×原価率、売上総利益は売上高から売上原価を差し引く
-  var costOfGoodsSold = sales * costRate;
-  var grossProfit = sales - costOfGoodsSold;
+  // 期末在庫（原価）の計算
+  const endingCost = endingPrice * costRate;
   
-  // 回転日数：ここでは月次（30日）として計算
-  var periodDays = 30;
-  var turnoverDays = costOfGoodsSold !== 0 ? (endingCost / costOfGoodsSold) * periodDays : 0;
-  
+  // 回転日数の計算（月平均）
+  const turnoverDays = costOfGoodsSold !== 0 ? 
+    (endingCost / costOfGoodsSold) * 30 : 0;
+
   return {
-    beginningCost: beginningCost,
-    beginningPrice: beginningPrice,
-    endingCost: endingCost,
-    endingPrice: endingPrice,
-    costOfGoodsSold: costOfGoodsSold,
-    grossProfit: grossProfit,
-    turnoverDays: turnoverDays,
-    sales: sales,
-    midPurchaseCost: midPurchaseCost,
-    midPurchasePrice: midPurchasePrice,
-    priceIncrease: priceIncrease,
-    priceDecrease: priceDecrease,
-    lossRate: lossRate,
-    rebateCost: rebateCost,
-    costRate: costRate
+    ...data, // 入力値はそのまま保持
+    endingCost,
+    endingPrice,
+    costOfGoodsSold,
+    grossProfit,
+    turnoverDays,
+    costRate // 内部計算用
   };
 }
 
@@ -129,8 +147,8 @@ function IntegratedTable(props) {
   ];
   
   var _React$useState2 = React.useState(function() {
-        var initial = {};
-        LAST_YEAR_ROWS.forEach(function(row) { initial[row.key] = true; });
+        const initial = {};
+        ALL_ROWS.forEach(row => { initial[row.key] = true; });
         return initial;
       }),
       showIntegratedRows = _React$useState2[0],
