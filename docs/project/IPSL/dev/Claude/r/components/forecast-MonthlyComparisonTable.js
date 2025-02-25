@@ -71,6 +71,9 @@ function MonthlyComparisonTable({ monthData = {}, selectedMonth }) {
     Button, Stack, TextField
   } = MaterialUI;
 
+  // セル共通のスタイル（罫線・パディング）
+  const cellStyle = { border: '1px solid #ccc', padding: '8px' };
+
   // 編集可能なキー一覧
   const editableKeys = [
     "beginningCost",
@@ -119,9 +122,17 @@ function MonthlyComparisonTable({ monthData = {}, selectedMonth }) {
     }));
   };
 
+  // ヘルパー関数：数値の整形（小数点第1位まで表示）
+  const formatNumber = (num) => {
+    if (typeof num === "number") {
+      return num.toFixed(1);
+    }
+    return "0.0";
+  };
+
   // 表示モード切替コントロール
   const renderViewModeControl = () => (
-    <FormControl component="fieldset">
+    <FormControl component="fieldset" style={{ marginBottom: '10px' }}>
       <RadioGroup row value={viewMode} onChange={(e) => {
         setViewMode(e.target.value);
         // モード切替時に適切な初期レベルを設定
@@ -154,6 +165,7 @@ function MonthlyComparisonTable({ monthData = {}, selectedMonth }) {
         <Select
           value={selectedLevel}
           onChange={(e) => setSelectedLevel(e.target.value)}
+          style={cellStyle}
         >
           {levels.map(level => (
             <MenuItem key={level} value={level}>
@@ -180,6 +192,7 @@ function MonthlyComparisonTable({ monthData = {}, selectedMonth }) {
         <Select
           value={selectedParent || ''}
           onChange={(e) => setSelectedParent(e.target.value)}
+          style={cellStyle}
         >
           {Array.from({ length: HIERARCHY_STRUCTURE[parentLevel].count }, (_, i) => (
             <MenuItem key={i} value={`${parentLevel}_${i+1}`}>
@@ -204,6 +217,7 @@ function MonthlyComparisonTable({ monthData = {}, selectedMonth }) {
             [level.key]: !prev[level.key]
           }))}
           color={visibleClassifications[level.key] ? "primary" : "default"}
+          style={{ marginRight: 5 }}
         />
       ))}
     </div>
@@ -213,9 +227,11 @@ function MonthlyComparisonTable({ monthData = {}, selectedMonth }) {
   const renderTableHeader = () => (
     <TableHead>
       <TableRow>
-        <TableCell className="header-cell" rowSpan={2}>項目</TableCell>
+        <TableCell style={{ ...cellStyle, verticalAlign: 'middle', textAlign: 'center' }} rowSpan={2}>
+          項目
+        </TableCell>
         {CLASSIFICATION_LEVELS.filter(level => visibleClassifications[level.key]).map(level => (
-          <TableCell key={level.key} className="header-cell" colSpan={3} align="center">
+          <TableCell key={level.key} style={{ ...cellStyle, textAlign: 'center' }} colSpan={3}>
             {level.label}
           </TableCell>
         ))}
@@ -223,9 +239,9 @@ function MonthlyComparisonTable({ monthData = {}, selectedMonth }) {
       <TableRow>
         {CLASSIFICATION_LEVELS.filter(level => visibleClassifications[level.key]).map(level => (
           <React.Fragment key={level.key}>
-            <TableCell className="header-cell">前月</TableCell>
-            <TableCell className="header-cell">当月</TableCell>
-            <TableCell className="header-cell">次月</TableCell>
+            <TableCell style={{ ...cellStyle, textAlign: 'center' }}>前月</TableCell>
+            <TableCell style={{ ...cellStyle, textAlign: 'center' }}>当月</TableCell>
+            <TableCell style={{ ...cellStyle, textAlign: 'center' }}>次月</TableCell>
           </React.Fragment>
         ))}
       </TableRow>
@@ -323,7 +339,7 @@ function MonthlyComparisonTable({ monthData = {}, selectedMonth }) {
 
     return visibleRows.map(row => (
       <TableRow key={row.key}>
-        <TableCell className="header-cell">{row.label}</TableCell>
+        <TableCell style={cellStyle}>{row.label}</TableCell>
         {displayData.map(item => {
           const prevValue = item.data?.prev?.[row.key] || 0;
           const currentValue = item.data?.current?.[row.key] || 0;
@@ -331,13 +347,11 @@ function MonthlyComparisonTable({ monthData = {}, selectedMonth }) {
 
           return (
             <React.Fragment key={item.key}>
-              <TableCell align="right">{formatNumber(prevValue)}</TableCell>
-              <TableCell align="right">
+              <TableCell style={cellStyle} align="right">{formatNumber(prevValue)}</TableCell>
+              <TableCell style={cellStyle} align="right">
                 {editableKeys.includes(row.key) ? (
                   <TextField
-                    value={
-                      editedValues[item.key]?.[row.key] ?? currentValue
-                    }
+                    value={editedValues[item.key]?.[row.key] ?? currentValue}
                     onChange={(e) => updateEdited(item.key, row.key, e.target.value)}
                     variant="standard"
                     size="small"
@@ -348,20 +362,12 @@ function MonthlyComparisonTable({ monthData = {}, selectedMonth }) {
                   formatNumber(currentValue)
                 )}
               </TableCell>
-              <TableCell align="right">{formatNumber(nextValue)}</TableCell>
+              <TableCell style={cellStyle} align="right">{formatNumber(nextValue)}</TableCell>
             </React.Fragment>
           );
         })}
       </TableRow>
     ));
-  };
-
-  // ヘルパー関数：数値の整形
-  const formatNumber = (num) => {
-    if (typeof num === "number") {
-      return num.toFixed(1);
-    }
-    return "0.0";
   };
 
   // CSVエクスポート機能（３か月分）
@@ -446,6 +452,7 @@ function MonthlyComparisonTable({ monthData = {}, selectedMonth }) {
               [row.key]: !prev[row.key]
             }))}
             color={selectedRows[row.key] ? "primary" : "default"}
+            style={{ marginRight: 5 }}
           />
         ))}
       </div>
