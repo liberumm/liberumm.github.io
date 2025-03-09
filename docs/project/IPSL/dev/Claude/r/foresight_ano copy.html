@@ -1,0 +1,635 @@
+<!DOCTYPE html>
+<html lang="ja">
+  <head>
+    <meta charset="UTF-8" />
+    <title>在庫・売上データ表（自動計算項目は編集不可）</title>
+    <!-- 基本ライブラリの読み込み -->
+    <script src="https://cdn.jsdelivr.net/npm/react@18.2.0/umd/react.production.min.js" crossorigin></script>
+    <script src="https://cdn.jsdelivr.net/npm/react-dom@18.2.0/umd/react-dom.production.min.js" crossorigin></script>
+    <script src="https://cdn.jsdelivr.net/npm/@babel/standalone@7.23.8/babel.min.js"></script>
+
+    <!-- Emotion (MUIの依存関係) -->
+    <script src="https://cdn.jsdelivr.net/npm/@emotion/react@11.11.3/dist/emotion-react.umd.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@emotion/styled@11.11.0/dist/emotion-styled.umd.min.js"></script>
+
+    <!-- MUI Core -->
+    <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Roboto:wght@300;400;500;700&display=swap" />
+    <script src="https://cdn.jsdelivr.net/npm/@mui/material@5.15.3/umd/material-ui.production.min.js" crossorigin></script>
+
+    <!-- Chart.js -->
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+
+    <!-- D3.jsの読み込み -->
+    <script src="https://d3js.org/d3.v6.min.js"></script>
+
+    <!-- EXCELライブラリの読み込み -->
+    <script src="https://cdn.sheetjs.com/xlsx-latest/package/dist/xlsx.full.min.js" defer></script>
+
+    <!-- Material Icons -->
+    <link rel="stylesheet" href="https://fonts.googleapis.com/icon?family=Material+Icons" />
+  </head>
+  <body>
+    <div id="root"></div>
+    <!-- React+BabelでJSXを書く -->
+    <script type="text/babel">
+      const {
+        Table,
+        TableHead,
+        TableBody,
+        TableRow,
+        TableCell,
+        Paper,
+        TableContainer,
+        TextField
+      } = MaterialUI;
+
+      // 半角数字・ドット・カンマのみ入力可能とする onKeyPress ハンドラ
+      const allowOnlyNumbers = (e) => {
+        if (!/[0-9.,]/.test(e.key)) {
+          e.preventDefault();
+        }
+      };
+
+      // 入力値をフォーマット（カンマ区切り）する関数
+      const formatNumber = (value) => {
+        const num = parseFloat(value.replace(/,/g, ""));
+        return !isNaN(num) ? num.toLocaleString() : value;
+      };
+
+      // 単位を返すヘルパー関数
+      function getUnit(target) {
+        if (target === "売価高" || target === "原価高" || target === "総利益高") {
+          return "千円";
+        } else if (target.indexOf("率") !== -1) {
+          return "%";
+        }
+        return "";
+      }
+
+      /*  
+          初期データ（initialData）
+          各行は [項目, 期間, 対象, 単位, 計画, 前年比] の形式です。
+          ユーザーが直接操作できる活性フィールドは初期値を持ち、
+          計算により表示すべき非活性フィールドは計算結果用に計画項目を空文字列としています。
+
+          以下は一例です。
+
+          【ユーザー入力可能】
+          - 期初在庫 当月 売価高 → "期初在庫", "当月", "売価高", "", "（例）", ""
+          - 売上 当月 売価高 → "売上", "当月", "売価高", "", "55745", ""
+          - 値下 当月 売価高 → "値下", "当月", "売価高", "", "13549", ""
+          - リベート 当月 原価高 → "リベート", "当月", "原価高", "", "750", ""
+          - 期首在庫 当月 売価高 → "期首在庫", "当月", "売価高", "", "188529", ""
+          - 期末在庫 当月 売価高 → "期末在庫", "当月", "売価高", "", "186398", ""
+          - 仕入 当月 売価高 → "仕入", "当月", "売価高", "", "68278", ""
+          - 仕入（リベート含） 当月 売価高 → "仕入（リベート含）", "当月", "売価高", "", "68278", ""
+          - 累計売上 当月 売価高 → "累計売上", "当月", "売価高", "", "475716", ""
+          - 累計仕入 当月 原価高（累計仕入 当月 原価高の入力値として）→ "累計仕入", "当月", "原価高", "", "311856", ""
+
+          【計算により表示（非活性）】
+          - 期初在庫 当月 原価率 → 計算結果で表示（空文字）
+          - 売上 当月 原価高 → 計算結果
+          - ロス 当月 売価高 → 計算結果
+          - 期末在庫 当月 原価率 → 計算結果
+          - 期末在庫 当月 原価高 → 計算結果（＝ 期末在庫 当月 売価高 × (累計期末在庫 当月 原価率 ÷ 100)）
+          - 仕入 当月 値入率 → 計算結果
+          - 累計売上 当月 原価高 → 計算結果
+          - 累計期末在庫 当月 原価率 → 計算結果
+
+          ※ここでは一例として、必要な行のみ値をセットし、計算すべき行は ""（空文字）としています。
+      */
+      const initialData = [
+        // 期初在庫
+        ["期初在庫", "当月", "売価高", "", "（入力）", ""],
+        ["期初在庫", "当月", "原価高", "", "117432", ""],
+        ["期初在庫", "当月", "原価率", "", "", ""],
+        // 売上
+        ["売上", "当月", "売価高", "", "55745", ""],
+        ["売上", "当月", "原価高", "", "", ""],
+        ["売上", "当月", "総利益高", "", "19745", ""],
+        // 値下
+        ["値下", "当月", "売価高", "", "13549", ""],
+        // リベート
+        ["リベート", "当月", "原価高", "", "750", ""],
+        // ロス
+        ["ロス", "当月", "売価高", "", "", ""],
+        ["ロス", "当月", "売価率", "", "2", ""],
+        // 期首在庫
+        ["期首在庫", "当月", "売価高", "", "188529", ""],
+        ["期首在庫", "当月", "原価高", "", "122298", ""],
+        ["期首在庫", "当月", "原価率", "", "", ""],
+        // 期末在庫
+        ["期末在庫", "当月", "売価高", "", "186398", ""],   // ユーザー入力可能
+        ["期末在庫", "当月", "原価高", "", "", ""],         // 自動計算
+        ["期末在庫", "当月", "原価率", "", "", ""],           // 自動計算
+        // 在庫高変動
+        ["在庫高変動", "当月", "売価高", "", "", ""],
+        // 仕入
+        ["仕入", "当月", "売価高", "", "68278", ""],         // ユーザー入力可能
+        ["仕入", "当月", "原価高", "", "34555", ""],         // ユーザー入力可能（※場合により計算される場合もあり）
+        ["仕入", "当月", "値入率", "", "", ""],              // 自動計算
+        // 仕入（リベート含）
+        ["仕入（リベート含）", "当月", "売価高", "", "68278", ""],
+        ["仕入（リベート含）", "当月", "原価高", "", "35305", ""],
+        ["仕入（リベート含）", "当月", "値入率", "", "48.3", ""],
+        // その他（累計）
+        ["累計売上", "前月", "売価高", "", "419971", ""],
+        ["累計原価", "前月", "原価高", "", "277301", ""],
+        ["累計期末在庫", "前月", "原価率", "", "64.9", ""],
+        ["累計売上", "当月", "売価高", "", "475716", ""],
+        ["累計売上", "当月", "原価高", "", "", ""],
+        ["累計仕入", "当月", "売価高", "", "", ""],
+        ["累計仕入", "当月", "原価高", "", "311856", ""],
+        // 累計期末在庫 当月 原価率（再計算対象）
+        ["累計期末在庫", "当月", "原価率", "", "", ""]
+      ];
+
+      // recalcData()は、ユーザーが「期末在庫 当月 売価高」（行13）を変更した際、
+      // まず「累計期末在庫 当月 原価率」（行最後）を再計算してから、
+      // 「期末在庫 当月 原価高」を計算するために用います。
+      const recalcData = () => {
+        const newData = initialData.map(row => [...row]);
+        // 再計算：累計期末在庫 当月 原価率
+        const cumRateIdx = newData.findIndex(
+          r => r[0] === "累計期末在庫" && r[1] === "当月" && r[2] === "原価率"
+        );
+        if (cumRateIdx !== -1) {
+          const beginningCost = parseFloat(
+            newData.find(r => r[0] === "期初在庫" && r[1] === "当月" && r[2] === "原価高")[4].replace(/,/g, "")
+          );
+          const cumPurchase = parseFloat(
+            newData.find(r => r[0] === "累計仕入" && r[1] === "当月" && r[2] === "原価高")[4].replace(/,/g, "")
+          );
+          const cumSales = parseFloat(
+            newData.find(r => r[0] === "累計売上" && r[1] === "当月" && r[2] === "売価高")[4].replace(/,/g, "")
+          );
+          const endingSales = parseFloat(
+            newData.find(r => r[0] === "期末在庫" && r[1] === "当月" && r[2] === "売価高")[4].replace(/,/g, "")
+          );
+          if (!isNaN(beginningCost) && !isNaN(cumPurchase) && !isNaN(cumSales) && !isNaN(endingSales) && (cumSales + endingSales) !== 0) {
+            newData[cumRateIdx][4] = (((beginningCost + cumPurchase) / (cumSales + endingSales)) * 100).toFixed(1) + "%";
+          }
+        }
+        return newData;
+      };
+
+      function App() {
+        // 状態は recalcData() により再計算済みのデータを初期値とする
+        const [tableData, setTableData] = React.useState(recalcData());
+
+        // ユーザー入力更新（計画列）
+        const handlePlanChange = (tableIndex, newValue) => {
+          if (/^[0-9.,]*$/.test(newValue)) {
+            setTableData(prev => {
+              const updated = prev.map(row => [...row]);
+              updated[tableIndex][4] = newValue;
+              // もし「期末在庫 当月 売価高」を変更した場合
+              if (updated[tableIndex][0] === "期末在庫" && updated[tableIndex][2] === "売価高") {
+                // 再計算：累計期末在庫 当月 原価率を更新
+                const newData = recalcData();
+                newData[tableIndex][4] = newValue;
+                // その後、【期末在庫 当月 原価高】＝（期末在庫 当月 売価高）×（累計期末在庫 当月 原価率 ÷ 100） を計算
+                const endingPrice = parseFloat(newData.find(r => r[0] === "期末在庫" && r[2] === "売価高")[4].replace(/,/g, ""));
+                const cumRate = parseFloat(newData.find(r => r[0] === "累計期末在庫" && r[1] === "当月" && r[2] === "原価率")[4].replace(/[%\s]/g, ""));
+                if (!isNaN(endingPrice) && !isNaN(cumRate)) {
+                  const targetIdx = newData.findIndex(r => r[0] === "期末在庫" && r[2] === "原価高");
+                  if (targetIdx !== -1) {
+                    newData[targetIdx][4] = (endingPrice * cumRate / 100).toLocaleString();
+                  }
+                }
+                return newData;
+              }
+              return updated;
+            });
+          }
+        };
+
+        // ユーザー入力更新（前年比列）
+        const handleYearOnYearChange = (tableIndex, newValue) => {
+          if (/^[0-9.,]*$/.test(newValue)) {
+            setTableData(prev => {
+              const updated = prev.map(row => [...row]);
+              updated[tableIndex][5] = newValue;
+              return updated;
+            });
+          }
+        };
+
+        const handlePlanBlur = (tableIndex, currentValue) => {
+          const formatted = formatNumber(currentValue);
+          setTableData(prev => {
+            const updated = prev.map(row => [...row]);
+            updated[tableIndex][4] = formatted;
+            return updated;
+          });
+        };
+        const handleYearOnYearBlur = (tableIndex, currentValue) => {
+          const formatted = formatNumber(currentValue);
+          setTableData(prev => {
+            const updated = prev.map(row => [...row]);
+            updated[tableIndex][5] = formatted;
+            return updated;
+          });
+        };
+
+        // computedValues と displayData の計算ロジックは、元のコードとほぼ同様です。
+        const computedValues = {};
+        const displayData = [];
+        tableData.forEach((row, originalIndex) => {
+          let rowData = [...row];
+
+          // (A)【ロス 当月 売価高】自動計算
+          if (rowData[0] === "ロス" && rowData[2] === "売価高") {
+            const salesRow = tableData.find(r => r[0] === "売上" && r[2] === "売価高");
+            const lossRateRow = tableData.find(r => r[0] === "ロス" && r[2] === "売価率");
+            if (salesRow && salesRow[4] && lossRateRow && lossRateRow[4]) {
+              const salesPrice = parseFloat(salesRow[4].replace(/,/g, ""));
+              const lossRate = parseFloat(lossRateRow[4].replace(/[%\s]/g, ""));
+              if (!isNaN(salesPrice) && !isNaN(lossRate)) {
+                rowData[4] = (salesPrice * (lossRate / 100)).toLocaleString();
+              }
+            }
+            displayData.push({ isComputed: true, data: rowData });
+            return;
+          }
+
+          // (B)【累計売上 当月 売価高】自動計算
+          if (rowData[0] === "累計売上" && rowData[1] === "当月" && rowData[2] === "売価高") {
+            const prevSalesRow = tableData.find(r => r[0] === "累計売上" && r[1] === "前月" && r[2] === "売価高");
+            const currentSalesRow = tableData.find(r => r[0] === "売上" && r[1] === "当月" && r[2] === "売価高");
+            if (prevSalesRow && prevSalesRow[4] && currentSalesRow && currentSalesRow[4]) {
+              const prevVal = parseFloat(prevSalesRow[4].replace(/,/g, ""));
+              const currentVal = parseFloat(currentSalesRow[4].replace(/,/g, ""));
+              if (!isNaN(prevVal) && !isNaN(currentVal)) {
+                rowData[4] = (prevVal + currentVal).toLocaleString();
+              }
+            }
+            displayData.push({ isComputed: true, data: rowData });
+            return;
+          }
+
+          // (C)【累計仕入 当月 原価高】自動計算
+          if (rowData[0] === "累計仕入" && rowData[1] === "当月" && rowData[2] === "原価高") {
+            const prevCostRow = tableData.find(r => r[0] === "累計原価" && r[1] === "前月" && r[2] === "原価高");
+            const purchaseCostRow = tableData.find(r => r[0] === "仕入" && r[1] === "当月" && r[2] === "原価高");
+            if (prevCostRow && prevCostRow[4] && purchaseCostRow && purchaseCostRow[4]) {
+              const prevCost = parseFloat(prevCostRow[4].replace(/,/g, ""));
+              const purchaseCost = parseFloat(purchaseCostRow[4].replace(/,/g, ""));
+              if (!isNaN(prevCost) && !isNaN(purchaseCost)) {
+                rowData[4] = (prevCost + purchaseCost).toLocaleString();
+              }
+            }
+            displayData.push({ isComputed: true, data: rowData });
+            return;
+          }
+
+          // (D)【期末在庫 当月 原価率】自動計算
+          if (rowData[0] === "期末在庫" && rowData[1] === "当月" && rowData[2] === "原価率") {
+            const endingCostRow = tableData.find(r => r[0] === "期末在庫" && r[1] === "当月" && r[2] === "原価高");
+            const endingPriceRow = tableData.find(r => r[0] === "期末在庫" && r[1] === "当月" && r[2] === "売価高");
+            if (endingCostRow && endingCostRow[4] && endingPriceRow && endingPriceRow[4]) {
+              const endingCost = parseFloat(endingCostRow[4].replace(/,/g, ""));
+              const endingPrice = parseFloat(endingPriceRow[4].replace(/,/g, ""));
+              if (!isNaN(endingCost) && !isNaN(endingPrice) && endingPrice !== 0) {
+                rowData[4] = ((endingCost / endingPrice) * 100).toFixed(1) + "%";
+              }
+            }
+            displayData.push({ isComputed: true, data: rowData });
+            return;
+          }
+
+          // (E)【売上 当月 原価高】自動計算
+          if (rowData[0] === "売上" && rowData[2] === "原価高") {
+            const saleRow = tableData.find(r => r[0] === "売上" && r[2] === "売価高");
+            const profitRow = tableData.find(r => r[0] === "売上" && r[2] === "総利益高");
+            if (saleRow && saleRow[4] && profitRow && profitRow[4]) {
+              const saleVal = parseFloat(saleRow[4].replace(/,/g, ""));
+              const profitVal = parseFloat(profitRow[4].replace(/,/g, ""));
+              if (!isNaN(saleVal) && !isNaN(profitVal)) {
+                rowData[4] = (saleVal - profitVal).toLocaleString();
+              }
+            }
+            displayData.push({ isComputed: true, data: rowData });
+            return;
+          }
+
+          // (F)【在庫高変動 当月 売価高】自動計算  
+          if (rowData[0] === "在庫高変動" && rowData[2] === "売価高") {
+            const salesRow = tableData.find(r => r[0] === "売上" && r[2] === "売価高");
+            const discountRow = tableData.find(r => r[0] === "値下" && r[2] === "売価高");
+            const lossObj = displayData.find(obj => obj.data[0] === "ロス" && obj.data[2] === "売価高");
+            if (salesRow && salesRow[4] && discountRow && discountRow[4] && lossObj && lossObj.data[4]) {
+              const salesVal = parseFloat(salesRow[4].replace(/,/g, ""));
+              const discountVal = parseFloat(discountRow[4].replace(/,/g, ""));
+              const lossVal = parseFloat(lossObj.data[4].replace(/,/g, ""));
+              if (!isNaN(salesVal) && !isNaN(discountVal) && !isNaN(lossVal)) {
+                rowData[4] = (salesVal + discountVal + lossVal).toLocaleString();
+                computedValues["fluctuation"] = rowData[4];
+              }
+            }
+            displayData.push({ isComputed: true, data: rowData });
+            return;
+          }
+
+          // (G)【仕入 当月 売価高】自動計算  
+          if (rowData[0] === "仕入" && rowData[2] === "売価高") {
+            const endInvRow = tableData.find(r => r[0] === "期末在庫" && r[1] === "当月" && r[2] === "売価高");
+            const startInvRow = tableData.find(r => r[0] === "期首在庫" && r[1] === "当月" && r[2] === "売価高");
+            const fluctuationValue = computedValues["fluctuation"];
+            if (endInvRow && startInvRow && fluctuationValue &&
+                endInvRow[4] && startInvRow[4] && fluctuationValue) {
+              const endInv = parseFloat(endInvRow[4].replace(/,/g, ""));
+              const startInv = parseFloat(startInvRow[4].replace(/,/g, ""));
+              const fluctuation = parseFloat(fluctuationValue.replace(/,/g, ""));
+              if (!isNaN(endInv) && !isNaN(startInv) && !isNaN(fluctuation)) {
+                rowData[4] = (endInv - (startInv - fluctuation)).toLocaleString();
+                computedValues["purchaseSales"] = rowData[4];
+              }
+            }
+            displayData.push({ isComputed: true, data: rowData });
+            return;
+          }
+
+          // (H)【仕入 当月 原価高】自動計算（既存処理）
+          if (rowData[0] === "仕入" && rowData[2] === "原価高") {
+            const salesCostObj = displayData.find(obj => obj.data[0] === "売上" && obj.data[2] === "原価高");
+            const termStockRow = tableData.find(r => r[0] === "期首在庫" && r[2] === "原価高");
+            const endInvRow = tableData.find(r => r[0] === "期末在庫" && r[2] === "売価高");
+            const cumSalesRow = tableData.find(r => r[0] === "累計売上" && r[1] === "当月" && r[2] === "売価高");
+            const initInvRow = tableData.find(r => r[0] === "期初在庫" && r[2] === "原価高");
+            const prevCumCostRow = tableData.find(r => r[0] === "累計原価" && r[1] === "前月" && r[2] === "原価高");
+            if (salesCostObj && salesCostObj.data[4] &&
+                termStockRow && termStockRow[4] &&
+                endInvRow && endInvRow[4] &&
+                cumSalesRow && cumSalesRow[4] &&
+                initInvRow && initInvRow[4] &&
+                prevCumCostRow && prevCumCostRow[4]) {
+              const salesCost = parseFloat(salesCostObj.data[4].replace(/,/g, ""));
+              const termStock = parseFloat(termStockRow[4].replace(/,/g, ""));
+              const endInv = parseFloat(endInvRow[4].replace(/,/g, ""));
+              const cumSales = parseFloat(cumSalesRow[4].replace(/,/g, ""));
+              const initInv = parseFloat(initInvRow[4].replace(/,/g, ""));
+              const prevCumCost = parseFloat(prevCumCostRow[4].replace(/,/g, ""));
+              if (!isNaN(salesCost) && !isNaN(termStock) &&
+                  !isNaN(endInv) && !isNaN(cumSales) && cumSales !== 0 &&
+                  !isNaN(initInv) && !isNaN(prevCumCost)) {
+                const baseDiff = salesCost - termStock;
+                const multiplier = initInv + prevCumCost;
+                const factor = endInv / cumSales;
+                rowData[4] = (baseDiff + factor * (baseDiff + multiplier)).toLocaleString();
+              }
+            }
+            displayData.push({ isComputed: true, data: rowData });
+            return;
+          }
+
+          // (I)【仕入 当月 値入率】自動計算
+          if (rowData[0] === "仕入" && rowData[2] === "値入率") {
+            const purchaseCostRow = tableData.find(r => r[0] === "仕入" && r[2] === "原価高");
+            const purchaseSalesRow = tableData.find(r => r[0] === "仕入" && r[2] === "売価高");
+            if (purchaseCostRow && purchaseCostRow[4] && purchaseSalesRow && purchaseSalesRow[4]) {
+              const costVal = parseFloat(purchaseCostRow[4].replace(/,/g, ""));
+              const salesVal = parseFloat(purchaseSalesRow[4].replace(/,/g, ""));
+              if (!isNaN(costVal) && !isNaN(salesVal) && salesVal !== 0) {
+                rowData[4] = ((1 - (costVal / salesVal)) * 100).toFixed(1) + "%";
+              }
+            }
+            displayData.push({ isComputed: true, data: rowData });
+            return;
+          }
+
+          // (J)【仕入（リベート含）】の処理
+          if (rowData[0] === "仕入（リベート含）") {
+            if (rowData[2] === "売価高") {
+              if (computedValues["purchaseSales"]) {
+                rowData[4] = computedValues["purchaseSales"];
+              }
+              displayData.push({ isComputed: true, data: rowData });
+              return;
+            } else if (rowData[2] === "原価高") {
+              const purchaseCostObj = displayData.find(obj => obj.data[0] === "仕入" && obj.data[2] === "原価高");
+              const rebateRow = tableData.find(r => r[0] === "リベート" && r[2] === "原価高");
+              if (purchaseCostObj && purchaseCostObj.data[4] && rebateRow && rebateRow[4]) {
+                const costVal = parseFloat(purchaseCostObj.data[4].replace(/,/g, ""));
+                const rebateVal = parseFloat(rebateRow[4].replace(/,/g, ""));
+                if (!isNaN(costVal) && !isNaN(rebateVal)) {
+                  rowData[4] = (costVal + rebateVal).toLocaleString();
+                }
+              }
+              displayData.push({ isComputed: true, data: rowData });
+              return;
+            } else if (rowData[2] === "値入率") {
+              const refSellObj = displayData.find(obj => obj.data[0] === "仕入（リベート含）" && obj.data[2] === "売価高");
+              const purchaseCostObj = displayData.find(obj => obj.data[0] === "仕入" && obj.data[2] === "原価高");
+              const rebateRow = tableData.find(r => r[0] === "リベート" && r[2] === "原価高");
+              if (refSellObj && refSellObj.data[4] && purchaseCostObj && purchaseCostObj.data[4] && rebateRow && rebateRow[4]) {
+                const sellPrice = parseFloat(refSellObj.data[4].replace(/,/g, ""));
+                const purchaseCost = parseFloat(purchaseCostObj.data[4].replace(/,/g, ""));
+                const rebateVal = parseFloat(rebateRow[4].replace(/,/g, ""));
+                if (!isNaN(sellPrice) && sellPrice !== 0 && !isNaN(purchaseCost) && !isNaN(rebateVal)) {
+                  const computedRate = ((1 - ((purchaseCost + rebateVal) / sellPrice)) * 100).toFixed(1) + "%";
+                  rowData[4] = computedRate;
+                }
+              }
+              displayData.push({ isComputed: true, data: rowData });
+              return;
+            }
+          }
+
+          // (K)【累計期末在庫 当月 原価率】自動計算
+          if (row[0] === "累計期末在庫" && row[1] === "前月" && row[2] === "原価率") {
+            const refRow = tableData.find(r => r[0] === "期首在庫" && r[2] === "原価率");
+            if (refRow && refRow[4]) {
+              rowData[4] = refRow[4];
+            }
+            displayData.push({ isComputed: true, data: rowData });
+            return;
+          }
+          if (row[0] === "累計期末在庫" && row[1] === "当月" && row[2] === "原価率") {
+            // この行は recalcData() により再計算済み
+            displayData.push({ isComputed: true, data: rowData });
+            return;
+          }
+          if (row[0] === "期首在庫" && row[2] === "原価率") {
+            const costRow = tableData.find(r => r[0] === "期首在庫" && r[2] === "原価高");
+            const priceRow = tableData.find(r => r[0] === "期首在庫" && r[2] === "売価高");
+            if (costRow && costRow[4] && priceRow && priceRow[4]) {
+              const cost = parseFloat(costRow[4].replace(/,/g, ""));
+              const price = parseFloat(priceRow[4].replace(/,/g, ""));
+              if (!isNaN(cost) && !isNaN(price) && price !== 0) {
+                rowData[4] = ((cost / price) * 100).toFixed(1) + "%";
+              }
+            }
+            displayData.push({ isComputed: true, data: rowData });
+            return;
+          }
+          // ★★【修正部分】★★
+          // (★)【期末在庫 当月 原価高】＝ (期末在庫 当月 売価高) × (累計期末在庫 当月 原価率 ÷ 100)
+          if (row[0] === "期末在庫" && row[2] === "原価高") {
+            const endingPriceRow = tableData.find(r => r[0] === "期末在庫" && r[1] === "当月" && r[2] === "売価高");
+            const cumulativeEndingRateRow = tableData.find(r => r[0] === "累計期末在庫" && r[1] === "当月" && r[2] === "原価率");
+            if (endingPriceRow && endingPriceRow[4] && cumulativeEndingRateRow && cumulativeEndingRateRow[4]) {
+              const endingPrice = parseFloat(endingPriceRow[4].replace(/,/g, ""));
+              const endingRate = parseFloat(cumulativeEndingRateRow[4].replace(/[%\s]/g, ""));
+              if (!isNaN(endingPrice) && !isNaN(endingRate)) {
+                rowData[4] = (endingPrice * endingRate / 100).toLocaleString();
+              }
+            }
+            displayData.push({ isComputed: true, data: rowData });
+            return;
+          }
+          // (K)【期末在庫 当月 原価高】以降の処理はそのまま...
+
+          // (O) 追加の自動計算（売上 総利益率、値下げ率、リベート率）
+          if (row[0] === "売上" && row[2] === "総利益高") {
+            const saleRow = tableData.find(r => r[0] === "売上" && r[2] === "売価高");
+            let computedMargin = "";
+            if (saleRow && saleRow[4] && row[4]) {
+              const saleVal = parseFloat(saleRow[4].replace(/,/g, ""));
+              const profitVal = parseFloat(row[4].replace(/,/g, ""));
+              if (!isNaN(saleVal) && saleVal !== 0 && !isNaN(profitVal)) {
+                computedMargin = ((profitVal / saleVal) * 100).toFixed(1) + "%";
+              }
+            }
+            displayData.push({ isComputed: true, data: ["売上", "当月", "総利益率", "", computedMargin, ""] });
+          }
+          if (row[0] === "値下" && row[2] === "売価高") {
+            const saleRow = tableData.find(r => r[0] === "売上" && r[2] === "売価高");
+            let computedRate = "";
+            if (saleRow && saleRow[4] && row[4]) {
+              const saleVal = parseFloat(saleRow[4].replace(/,/g, ""));
+              const discountVal = parseFloat(row[4].replace(/,/g, ""));
+              if (!isNaN(saleVal) && saleVal !== 0 && !isNaN(discountVal)) {
+                computedRate = ((discountVal / saleVal) * 100).toFixed(1) + "%";
+              }
+            }
+            displayData.push({ isComputed: true, data: ["値下", "当月", "値下げ率", "", computedRate, ""] });
+          }
+          if (row[0] === "リベート" && row[2] === "原価高") {
+            const salesCostRow = tableData.find(r => r[0] === "売上" && r[2] === "原価高");
+            let computedRate = "";
+            if (salesCostRow && salesCostRow[4] && row[4]) {
+              const salesCost = parseFloat(salesCostRow[4].replace(/,/g, ""));
+              const rebateVal = parseFloat(row[4].replace(/,/g, ""));
+              if (!isNaN(salesCost) && salesCost !== 0 && !isNaN(rebateVal)) {
+                computedRate = ((rebateVal / salesCost) * 100).toFixed(1) + "%";
+              }
+            }
+            displayData.push({ isComputed: true, data: ["リベート", "当月", "リベート率", "", computedRate, ""] });
+          }
+
+          // 最後に、ユーザー編集可能な行を追加
+          displayData.push({ isComputed: false, tableIndex: originalIndex, data: rowData });
+        });
+
+        const getRowStyle = (i) => {
+          const style = { height: "26px" };
+          if (i === displayData.length - 1) {
+            style.borderBottom = "2px solid black";
+          } else {
+            const currentGroup = displayData[i].data[0];
+            const nextGroup = displayData[i + 1].data[0];
+            if (currentGroup !== nextGroup) {
+              style.borderBottom = "2px solid black";
+            }
+          }
+          return style;
+        };
+
+        return (
+          <TableContainer component={Paper} style={{ maxWidth: 800, margin: "4px auto", padding: "2px" }}>
+            <Table size="small">
+              <TableHead>
+                <TableRow sx={{ height: "26px" }}>
+                  <TableCell sx={{ padding: "2px 4px", fontWeight: "bold", textAlign:"center" }}>No</TableCell>
+                  <TableCell sx={{ padding: "2px 4px", fontWeight: "bold", textAlign:"center" }}>項目</TableCell>
+                  <TableCell sx={{ padding: "2px 4px", fontWeight: "bold", textAlign:"center" }}>期間</TableCell>
+                  <TableCell sx={{ padding: "2px 4px", fontWeight: "bold", textAlign:"center" }}>対象</TableCell>
+                  <TableCell sx={{ padding: "2px 4px", fontWeight: "bold", textAlign:"center" }}>単位</TableCell>
+                  <TableCell sx={{ padding: "2px 4px", fontWeight: "bold", textAlign:"center" }}>計画</TableCell>
+                  <TableCell sx={{ padding: "2px 4px", fontWeight: "bold", textAlign:"center" }}>前年比</TableCell>
+                </TableRow>
+              </TableHead>
+              <TableBody>
+                {displayData.map((rowObj, index) => {
+                  const { data, isComputed, tableIndex } = rowObj;
+                  return (
+                    <TableRow key={index} sx={getRowStyle(index)}>
+                      <TableCell sx={{ padding: "2px 4px", textAlign:"center" }}>{index + 1}</TableCell>
+                      <TableCell sx={{ padding: "2px 4px", textAlign:"center" }}>{data[0]}</TableCell>
+                      <TableCell sx={{ padding: "2px 4px", textAlign:"center" }}>{data[1]}</TableCell>
+                      <TableCell sx={{ padding: "2px 4px", textAlign:"center" }}>{data[2]}</TableCell>
+                      <TableCell sx={{ padding: "2px 4px", textAlign:"center" }}>{getUnit(data[2])}</TableCell>
+                      <TableCell sx={{ padding: "2px 4px" }}>
+                        {isComputed ? (
+                          <TextField
+                            value={data[4]}
+                            variant="outlined"
+                            size="small"
+                            disabled
+                            fullWidth
+                            InputProps={{
+                              inputProps: { style: { textAlign: "right", padding: "2px" } },
+                              style: { backgroundColor: "#f0f0f0" }
+                            }}
+                          />
+                        ) : (
+                          <TextField
+                            variant="outlined"
+                            size="small"
+                            value={data[4]}
+                            onChange={(e) => handlePlanChange(tableIndex, e.target.value)}
+                            onBlur={(e) => handlePlanBlur(tableIndex, e.target.value)}
+                            fullWidth
+                            inputProps={{
+                              style: { textAlign: "right", padding: "2px" },
+                              inputMode: "decimal",
+                              pattern: "[0-9.,]*",
+                              onKeyPress: allowOnlyNumbers
+                            }}
+                          />
+                        )}
+                      </TableCell>
+                      <TableCell sx={{ padding: "2px 4px" }}>
+                        {isComputed ? (
+                          <TextField
+                            value={data[5]}
+                            variant="outlined"
+                            size="small"
+                            disabled
+                            fullWidth
+                            InputProps={{
+                              inputProps: { style: { textAlign: "right", padding: "2px" } },
+                              style: { backgroundColor: "#f0f0f0" }
+                            }}
+                          />
+                        ) : (
+                          <TextField
+                            variant="outlined"
+                            size="small"
+                            value={data[5]}
+                            onChange={(e) => handleYearOnYearChange(tableIndex, e.target.value)}
+                            onBlur={(e) => handleYearOnYearBlur(tableIndex, e.target.value)}
+                            fullWidth
+                            inputProps={{
+                              style: { textAlign: "right", padding: "2px" },
+                              inputMode: "decimal",
+                              pattern: "[0-9.,]*",
+                              onKeyPress: allowOnlyNumbers
+                            }}
+                          />
+                        )}
+                      </TableCell>
+                    </TableRow>
+                  );
+                })}
+              </TableBody>
+            </Table>
+          </TableContainer>
+        );
+      }
+
+      ReactDOM.render(<App />, document.getElementById("root"));
+    </script>
+  </body>
+</html>
