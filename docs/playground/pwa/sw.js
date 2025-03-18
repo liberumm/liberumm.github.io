@@ -5,17 +5,19 @@ self.addEventListener('install', event => {
   event.waitUntil(
     caches.open('v1').then(cache => {
       return cache.addAll([
-        '/',
+        '.',
         'index.html',
         'manifest.json',
         'icon-192.png',
         'icon-512.png'
       ]);
+    }).catch(error => {
+      console.error('Error caching assets:', error);
     })
   );
 });
 
-// ネットワークフェッチ時、キャッシュからレスポンスを返す
+// ネットワークから取得できない場合はキャッシュを返す
 self.addEventListener('fetch', event => {
   event.respondWith(
     caches.match(event.request)
@@ -24,7 +26,7 @@ self.addEventListener('fetch', event => {
 });
 
 // メッセージを受け取り、通知を表示する
-self.addEventListener('message', function (event) {
+self.addEventListener('message', function(event) {
   console.log('Received message in Service Worker:', event.data);
   self.registration.showNotification(event.data);
 });
