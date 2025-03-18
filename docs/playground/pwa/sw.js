@@ -28,5 +28,14 @@ self.addEventListener('fetch', event => {
 // メッセージを受け取り、通知を表示する
 self.addEventListener('message', function(event) {
   console.log('Received message in Service Worker:', event.data);
-  self.registration.showNotification(event.data);
+  self.registration.showNotification("Notification", {
+    body: event.data,
+    icon: 'icon-192.png'  // 適切なパスのアイコンを指定してください
+  })
+  .then(() => {
+    console.log("Notification displayed successfully.");
+  })
+  .catch(err => {
+    console.error("Error showing notification:", err);
+  });
 });
