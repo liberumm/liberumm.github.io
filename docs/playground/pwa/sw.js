@@ -25,5 +25,6 @@ self.addEventListener('fetch', event => {
 
 // メッセージを受け取り、通知を表示する
 self.addEventListener('message', function (event) {
+  console.log('Received message in Service Worker:', event.data);
   self.registration.showNotification(event.data);
 });
