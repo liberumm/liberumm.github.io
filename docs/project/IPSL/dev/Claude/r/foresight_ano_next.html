@@ -207,6 +207,105 @@
         if (prevProps.value === nextProps.value) return true;
         return false;
       });
+
+      // メモ化されたテーブル行コンポーネント
+      const MemoizedTableRow = React.memo(({ header, rowIndex, numericData, handlePlanChange, handleYearOnYearChange, handleFieldBlur, handleFieldFocus, handleKeyPress, handleKeyDown, renderTextField, getCellBg, getRowStyle, focusedCell }) => {
+        return (
+          <TableRow 
+            sx={{
+              ...getRowStyle(rowIndex),
+              backgroundColor: focusedCell && focusedCell.row === rowIndex ? "#ffe0b2" : "inherit"
+            }}
+          >
+            <TableCell 
+              sx={{
+                whiteSpace: "nowrap",
+                padding: "2px 4px",
+                textAlign:"center",
+                backgroundColor: getCellBg(rowIndex, 0)
+              }}
+            >
+              {rowIndex + 1}
+            </TableCell>
+            {["item", "period", "target", "unit"].map((field, i) => {
+              const colIndex = i + 1;
+              return (
+                <TableCell
+                  key={i}
+                  sx={{
+                    whiteSpace: "nowrap",
+                    padding: "2px 4px",
+                    textAlign: field === "item" ? "left" : "center",
+                    backgroundColor: getCellBg(rowIndex, colIndex)
+                  }}
+                >
+                  {header[field]}
+                </TableCell>
+              );
+            })}
+            <TableCell 
+              sx={{
+                whiteSpace: "nowrap",
+                padding: "2px 4px",
+                textAlign:"right",
+                backgroundColor: "#e3f2fd",
+                borderLeft: "2px solid #90caf9",
+                borderRight: "2px solid #90caf9"
+              }}
+            >
+              {numericData.sum ? numericData.sum[rowIndex] : ""}
+            </TableCell>
+            {numericData.plans.map((col, j) => {
+              const colIndex = 6 + j;
+              return (
+                <TableCell
+                  key={`plan-${j}`}
+                  sx={{
+                    whiteSpace: "nowrap",
+                    padding: "2px 4px",
+                    backgroundColor: getCellBg(rowIndex, colIndex)
+                  }}
+                >
+                  {renderTextField({
+                    value: col[rowIndex],
+                    onChange: (e) => handlePlanChange(rowIndex, j, e.target.value),
+                    onBlur: (e) => handleFieldBlur(rowIndex, 'plan', j, e.target.value, header),
+                    onFocus: () => handleFieldFocus(rowIndex, colIndex),
+                    onKeyPress: (e) => handleKeyPress(e, rowIndex, 'plan', j, e.target.value, header, colIndex),
+                    onKeyDown: (e) => handleKeyDown(e, rowIndex, colIndex),
+                    rowIndex,
+                    colIndex
+                  })}
+                </TableCell>
+              );
+            })}
+            <TableCell 
+              sx={{
+                whiteSpace: "nowrap",
+                padding: "2px 4px",
+                backgroundColor: getCellBg(rowIndex, 19)
+              }}
+            >
+              {renderTextField({
+                value: numericData.yoy ? numericData.yoy[rowIndex] : "",
+                onChange: (e) => handleYearOnYearChange(rowIndex, e.target.value),
+                onBlur: (e) => handleFieldBlur(rowIndex, 'yearOnYear', null, e.target.value, header),
+                onFocus: () => handleFieldFocus(rowIndex, 19),
+                onKeyPress: (e) => handleKeyPress(e, rowIndex, 'yearOnYear', null, e.target.value, header, 19),
+                onKeyDown: (e) => handleKeyDown(e, rowIndex, 19),
+                rowIndex,
+                colIndex: 19
+              })}
+            </TableCell>
+          </TableRow>
+        );
+      }, (prevProps, nextProps) => {
+        // 最適化された比較ロジック
+        if (prevProps.rowIndex !== nextProps.rowIndex) return false;
+        if (prevProps.focusedCell !== nextProps.focusedCell) return false;
+        if (JSON.stringify(prevProps.numericData) !== JSON.stringify(nextProps.numericData)) return false;
+        return true;
+      });
       
       function App() {
         // focusedCell: { row, col } を管理（フォーカス中のセルの位置）
@@ -229,7 +328,7 @@
           };
         };
 
-        // 計画値の変更：即時更新版
+        // 計画値の変更：値のチェックを blur 時のみに変更
         const handlePlanChange = React.useCallback((rowIndex, planIndex, newValue) => {
           requestAnimationFrame(() => {
             setNumericData(prev => {
@@ -251,7 +350,7 @@
           []
         );
 
-        // 前年比の変更：即時更新版
+        // 前年比の変更：値のチェックを blur 時のみに変更
         const handleYearOnYearChange = React.useCallback((rowIndex, newValue) => {
           requestAnimationFrame(() => {
             setNumericData(prev => {
@@ -334,59 +433,28 @@
           }, 0);
         }, []);
 
-        // キー入力処理を修正
-        const handleKeyPress = React.useCallback((e, rowIndex, fieldType, planIndex, currentValue, header, colIndex) => {
+        // キーイベント処理を統合
+        const handleKeyEvent = React.useCallback((e, rowIndex, fieldType, planIndex, currentValue, header, colIndex) => {
+          // Enterキーの処理
           if (e.key === 'Enter') {
             e.preventDefault();
-            
-            if (!currentValue) {
-              moveFocus(rowIndex, colIndex, 'down');
-              return;
-            }
-
-            // 数値検証を簡略化
-            if (!/^[0-9.,]*$/.test(currentValue)) {
-              moveFocus(rowIndex, colIndex, 'down');
-              return;
-            }
-            
-            // 現在の値を確定してフォーマット
-            const type = fieldType === 'plan' ? getValueType(header.item, header.target) : 'normal';
-            const formatted = formatNumber(currentValue, type);
-            
-            // 値を更新して次の行に移動
-            if (fieldType === 'plan') {
-              handlePlanChange(rowIndex, planIndex, formatted);
-            } else {
-              handleYearOnYearChange(rowIndex, formatted);
-            }
-
-            // フォーカスを移動
             requestAnimationFrame(() => {
               moveFocus(rowIndex, colIndex, 'down');
             });
+            return;
           }
-        }, [moveFocus, handlePlanChange, handleYearOnYearChange]);
-
-        // キーダウン処理を修正
-        const handleKeyDown = React.useCallback((e, rowIndex, colIndex) => {
+          
+          // 矢印キーの処理
           if (e.key.startsWith('Arrow')) {
             e.preventDefault();
             const direction = e.key.replace('Arrow', '').toLowerCase();
-            const currentValue = e.target.value;
-            
-            if (currentValue) {
-              const type = getValueType(rowHeaders[rowIndex].item, rowHeaders[rowIndex].target);
-              const formatted = formatNumber(currentValue, type);
-              e.target.value = formatted;
-            }
-            
             moveFocus(rowIndex, colIndex, direction);
+            return;
           }
         }, [moveFocus]);
-
+        
         // renderTextField を MemoizedTextField を使用するように変更
-        const renderTextField = React.useCallback(({ value, onChange, onBlur, onFocus, onKeyDown, onKeyPress, rowIndex, colIndex }) => (
+        const renderTextField = React.useCallback(({ value, onChange, onBlur, onFocus, rowIndex, colIndex }) => (
           <MemoizedTextField
             value={value}
             onChange={onChange}
@@ -395,12 +463,11 @@
               onFocus();
               e.target.select();
             }}
-            onKeyDown={onKeyDown}
-            onKeyPress={onKeyPress}  // onKeyPress を追加
+            onKeyDown={(e) => handleKeyEvent(e, rowIndex, fieldType, planIndex, value, header, colIndex)}
             rowIndex={rowIndex}
             colIndex={colIndex}
           />
-        ), []);
+        ), [handleKeyEvent]);
 
         // テキストフィールドの onFocus/onBlur により focusedCell 状態を更新
         const handleFieldFocus = (rowIndex, colIndex) => {
@@ -573,99 +640,22 @@
                 </TableHead>
                 <TableBody>
                   {rowHeaders.map((header, rowIndex) => (
-                    <TableRow 
-                      key={rowIndex} 
-                      sx={{
-                        ...getRowStyle(rowIndex),
-                        backgroundColor: focusedCell && focusedCell.row === rowIndex ? "#ffe0b2" : "inherit"
-                      }}
-                    >
-                      {/* No.列（列0） */}
-                      <TableCell 
-                        sx={{
-                          whiteSpace: "nowrap",
-                          padding: "2px 4px",
-                          textAlign:"center",
-                          backgroundColor: getCellBg(rowIndex, 0)
-                        }}
-                      >
-                        {rowIndex + 1}
-                      </TableCell>
-                      {/* 固定ラベル部分：項目, 期間, 対象, 単位 → 列1～4 */}
-                      {["item", "period", "target", "unit"].map((field, i) => {
-                        const colIndex = i + 1;
-                        return (
-                          <TableCell
-                            key={i}
-                            sx={{
-                              whiteSpace: "nowrap",
-                              padding: "2px 4px",
-                              textAlign: field === "item" ? "left" : "center",
-                              backgroundColor: getCellBg(rowIndex, colIndex)
-                            }}
-                          >
-                            {header[field]}
-                          </TableCell>
-                        );
-                      })}
-                      {/* 合計 → 列5 */}
-                      <TableCell 
-                        sx={{
-                          whiteSpace: "nowrap",
-                          padding: "2px 4px",
-                          textAlign:"center",
-                          backgroundColor: "#e3f2fd",
-                          borderLeft: "2px solid #90caf9",
-                          borderRight: "2px solid #90caf9"
-                        }}
-                      >
-                        {numericData.sum ? numericData.sum[rowIndex] : ""}
-                      </TableCell>
-                      {/* 計画値（plans）→ 列6～18 */}
-                      {numericData.plans.map((col, j) => {
-                        const colIndex = 6 + j;
-                        return (
-                          <TableCell
-                            key={`plan-${rowIndex}-${j}`}
-                            sx={{
-                              whiteSpace: "nowrap",
-                              padding: "2px 4px",
-                              backgroundColor: getCellBg(rowIndex, colIndex)
-                            }}
-                          >
-                            {renderTextField({
-                              value: col[rowIndex],
-                              onChange: (e) => handlePlanChange(rowIndex, j, e.target.value),
-                              onBlur: (e) => handleFieldBlur(rowIndex, 'plan', j, e.target.value, header),
-                              onFocus: () => handleFieldFocus(rowIndex, colIndex),
-                              onKeyPress: (e) => handleKeyPress(e, rowIndex, 'plan', j, e.target.value, header, colIndex),  // onKeyPressをpropsとして渡す
-                              onKeyDown: (e) => handleKeyDown(e, rowIndex, colIndex),
-                              rowIndex,
-                              colIndex
-                            })}
-                          </TableCell>
-                        );
-                      })}
-                      {/* 前年比 → 最終列（列19） */}
-                      <TableCell 
-                        sx={{
-                          whiteSpace: "nowrap",
-                          padding: "2px 4px",
-                          backgroundColor: getCellBg(rowIndex, 19)
-                        }}
-                      >
-                        {renderTextField({
-                          value: numericData.yoy ? numericData.yoy[rowIndex] : "",
-                          onChange: (e) => handleYearOnYearChange(rowIndex, e.target.value),
-                          onBlur: (e) => handleFieldBlur(rowIndex, 'yearOnYear', null, e.target.value, header),
-                          onFocus: () => handleFieldFocus(rowIndex, 19),
-                          onKeyPress: (e) => handleKeyPress(e, rowIndex, 'yearOnYear', null, e.target.value, header, 19),
-                          onKeyDown: (e) => handleKeyDown(e, rowIndex, 19),
-                          rowIndex,
-                          colIndex: 19
-                        })}
-                      </TableCell>
-                    </TableRow>
+                    <MemoizedTableRow
+                      key={rowIndex}
+                      header={header}
+                      rowIndex={rowIndex}
+                      numericData={numericData}
+                      handlePlanChange={handlePlanChange}
+                      handleYearOnYearChange={handleYearOnYearChange}
+                      handleFieldBlur={handleFieldBlur}
+                      handleFieldFocus={handleFieldFocus}
+                      handleKeyPress={handleKeyPress}
+                      handleKeyDown={handleKeyDown}
+                      renderTextField={renderTextField}
+                      getCellBg={getCellBg}
+                      getRowStyle={getRowStyle}
+                      focusedCell={focusedCell}
+                    />
                   ))}
                 </TableBody>
               </Table>
