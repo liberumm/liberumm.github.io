@@ -168,6 +168,46 @@
         return { ...data, sum };
       };
       
+      // 既存のrenderTextFieldを置き換え
+      const MemoizedTextField = React.memo(({ value, onChange, onBlur, onFocus, onKeyDown, onKeyPress, rowIndex, colIndex }) => {
+        const handleChange = React.useCallback((e) => {
+          const newValue = e.target.value;
+          // 数値とカンマ、ドットのみを許可
+          if (/^[0-9.,]*$/.test(newValue)) {
+            onChange(e);
+          }
+        }, [onChange]);
+      
+        return (
+          <TextField
+            variant="outlined"
+            size="small"
+            value={value || ''}
+            onChange={handleChange}
+            onBlur={onBlur}
+            onFocus={onFocus}
+            onKeyDown={onKeyDown}
+            onKeyPress={onKeyPress}  // onKeyPress を追加
+            fullWidth
+            inputProps={{
+              style: { 
+                whiteSpace: "nowrap", 
+                textAlign: "right", 
+                padding: "2px",
+                height: "20px", // 入力欄の高さを固定
+                fontSize: "14px" // フォントサイズを固定
+              },
+              'data-row': rowIndex,
+              'data-col': colIndex
+            }}
+          />
+        );
+      }, (prevProps, nextProps) => {
+        // 値が同じ場合は再レンダリングしない
+        if (prevProps.value === nextProps.value) return true;
+        return false;
+      });
+      
       function App() {
         // focusedCell: { row, col } を管理（フォーカス中のセルの位置）
         const [focusedCell, setFocusedCell] = React.useState(null);
@@ -180,32 +220,201 @@
           setNumericData(recalcNumericData(numericDataColumns));
         }, []);
         
-        // 計画値の変更：入力値をそのまま反映
-        const handlePlanChange = (rowIndex, planIndex, newValue) => {
-          if (/^[0-9.,]*$/.test(newValue)) {
-            setNumericData(prev => {
-              const newPlans = prev.plans.map((col, idx) => {
-                if (idx === planIndex) {
-                  const newCol = [...col];
-                  newCol[rowIndex] = newValue;
-                  return newCol;
-                }
-                return col;
-              });
-              return recalcNumericData({ ...prev, plans: newPlans });
-            });
-          }
+        // デバウンス処理用の関数
+        const debounce = (func, wait) => {
+          let timeout;
+          return (...args) => {
+            clearTimeout(timeout);
+            timeout = setTimeout(() => func(...args), wait);
+          };
         };
-        
-        // 前年比の変更：入力値をそのまま反映
-        const handleYearOnYearChange = (rowIndex, newValue) => {
-          if (/^[0-9.,]*$/.test(newValue)) {
+
+        // 計画値の変更：即時更新版
+        const handlePlanChange = React.useCallback((rowIndex, planIndex, newValue) => {
+          requestAnimationFrame(() => {
+            setNumericData(prev => {
+              const newPlans = [...prev.plans];
+              newPlans[planIndex] = [...newPlans[planIndex]];
+              newPlans[planIndex][rowIndex] = newValue;
+              return { ...prev, plans: newPlans };
+            });
+          });
+        }, []);
+
+        // 合計再計算を遅延実行（待ち時間を300msに延長）
+        const debouncedRecalc = React.useCallback(
+          debounce((data) => {
+            requestAnimationFrame(() => {
+              setNumericData(recalcNumericData(data));
+            });
+          }, 0),
+          []
+        );
+
+        // 前年比の変更：即時更新版
+        const handleYearOnYearChange = React.useCallback((rowIndex, newValue) => {
+          requestAnimationFrame(() => {
             setNumericData(prev => {
               const newYoy = [...prev.yoy];
               newYoy[rowIndex] = newValue;
-              return recalcNumericData({ ...prev, yoy: newYoy });
+              return { ...prev, yoy: newYoy };
+            });
+          });
+        }, []);
+
+        // フォーカス解除時の処理を更新
+        const handleFieldBlur = React.useCallback((rowIndex, fieldType, planIndex, currentValue, header) => {
+          if (!currentValue) {
+            setFocusedCell(null);
+            return;
+          }
+
+          // 数値検証を簡略化
+          if (!/^[0-9.,]*$/.test(currentValue)) {
+            setFocusedCell(null);
+            return;
+          }
+
+          const type = fieldType === 'plan' ? getValueType(header.item, header.target) : 'normal';
+          const formatted = formatNumber(currentValue, type);
+
+          requestAnimationFrame(() => {
+            setNumericData(prev => {
+              let newData;
+              if (fieldType === 'plan') {
+                const newPlans = [...prev.plans];
+                newPlans[planIndex] = [...newPlans[planIndex]];
+                newPlans[planIndex][rowIndex] = formatted;
+                newData = { ...prev, plans: newPlans };
+              } else {
+                const newYoy = [...prev.yoy];
+                newYoy[rowIndex] = formatted;
+                newData = { ...prev, yoy: newYoy };
+              }
+              debouncedRecalc(newData);
+              return newData;
+            });
+          });
+          
+          setFocusedCell(null);
+        }, [debouncedRecalc]);
+
+        // フォーカス移動処理を修正
+        const moveFocus = React.useCallback((rowIndex, colIndex, direction) => {
+          if (!direction) return;
+          
+          let nextRow = rowIndex;
+          let nextCol = colIndex;
+          
+          switch (direction) {
+            case 'down':
+              nextRow = Math.min(rowIndex + 1, rowHeaders.length - 1);
+              break;
+            case 'up':
+              nextRow = Math.max(rowIndex - 1, 0);
+              break;
+            case 'left':
+              nextCol = Math.max(colIndex - 1, 6);
+              break;
+            case 'right':
+              nextCol = Math.min(colIndex + 1, 19);
+              break;
+          }
+
+          // 少し遅延させてフォーカス移動を実行
+          setTimeout(() => {
+            const nextElement = document.querySelector(
+              `input[data-row="${nextRow}"][data-col="${nextCol}"]`
+            );
+            if (nextElement) {
+              nextElement.focus();
+              // フォーカス移動後にセレクト
+              nextElement.select();
+            }
+          }, 0);
+        }, []);
+
+        // キー入力処理を修正
+        const handleKeyPress = React.useCallback((e, rowIndex, fieldType, planIndex, currentValue, header, colIndex) => {
+          if (e.key === 'Enter') {
+            e.preventDefault();
+            
+            if (!currentValue) {
+              moveFocus(rowIndex, colIndex, 'down');
+              return;
+            }
+
+            // 数値検証を簡略化
+            if (!/^[0-9.,]*$/.test(currentValue)) {
+              moveFocus(rowIndex, colIndex, 'down');
+              return;
+            }
+            
+            // 現在の値を確定してフォーマット
+            const type = fieldType === 'plan' ? getValueType(header.item, header.target) : 'normal';
+            const formatted = formatNumber(currentValue, type);
+            
+            // 値を更新して次の行に移動
+            if (fieldType === 'plan') {
+              handlePlanChange(rowIndex, planIndex, formatted);
+            } else {
+              handleYearOnYearChange(rowIndex, formatted);
+            }
+
+            // フォーカスを移動
+            requestAnimationFrame(() => {
+              moveFocus(rowIndex, colIndex, 'down');
             });
           }
+        }, [moveFocus, handlePlanChange, handleYearOnYearChange]);
+
+        // キーダウン処理を修正
+        const handleKeyDown = React.useCallback((e, rowIndex, colIndex) => {
+          if (e.key.startsWith('Arrow')) {
+            e.preventDefault();
+            const direction = e.key.replace('Arrow', '').toLowerCase();
+            const currentValue = e.target.value;
+            
+            if (currentValue) {
+              const type = getValueType(rowHeaders[rowIndex].item, rowHeaders[rowIndex].target);
+              const formatted = formatNumber(currentValue, type);
+              e.target.value = formatted;
+            }
+            
+            moveFocus(rowIndex, colIndex, direction);
+          }
+        }, [moveFocus]);
+
+        // renderTextField を MemoizedTextField を使用するように変更
+        const renderTextField = React.useCallback(({ value, onChange, onBlur, onFocus, onKeyDown, onKeyPress, rowIndex, colIndex }) => (
+          <MemoizedTextField
+            value={value}
+            onChange={onChange}
+            onBlur={onBlur}
+            onFocus={(e) => {
+              onFocus();
+              e.target.select();
+            }}
+            onKeyDown={onKeyDown}
+            onKeyPress={onKeyPress}  // onKeyPress を追加
+            rowIndex={rowIndex}
+            colIndex={colIndex}
+          />
+        ), []);
+
+        // テキストフィールドの onFocus/onBlur により focusedCell 状態を更新
+        const handleFieldFocus = (rowIndex, colIndex) => {
+          setFocusedCell({ row: rowIndex, col: colIndex });
+        };
+        
+        // focusedCell に基づいて、該当する行または列の背景色を変更する関数
+        const getCellBg = (rowIndex, colIndex) => {
+          if (focusedCell) {
+            if (focusedCell.row === rowIndex || focusedCell.col === colIndex) {
+              return "#ffe0b2";
+            }
+          }
+          return "inherit";
         };
         
         // 行スタイル（境界線など）
@@ -219,13 +428,59 @@
           return style;
         };
         
-        // テーブルヘッダー用：全体で20列（No, 項目, 期間, 対象, 単位, 合計, 計画1～13, 前年比）
+        // 特定の計画列へのデータインポート処理
+        const handlePlanImport = (planIndex, file) => {
+          const reader = new FileReader();
+          reader.onload = (event) => {
+            const wb = XLSX.read(event.target.result, { type: 'binary' });
+            const wsname = wb.SheetNames[0];
+            const ws = wb.Sheets[wsname];
+            const data = XLSX.utils.sheet_to_json(ws, { header: 1 });
+            // ヘッダー行をスキップし、値のみを取得
+            const values = data.slice(1).map(row => row[3] || "");
+            
+            setNumericData(prev => {
+              const newPlans = prev.plans.map((col, idx) => {
+                if (idx === planIndex) {
+                  return values;
+                }
+                return col;
+              });
+              return recalcNumericData({ ...prev, plans: newPlans });
+            });
+          };
+          reader.readAsBinaryString(file);
+        };
+
+        // テーブルヘッダー用の修正
         const headerTexts = [
           "No.", "項目", "期間", "対象", "単位", "合計",
-          ...Array.from({ length: 13 }, (_, i) => "計画" + (i + 1)),
+          ...Array.from({ length: 13 }, (_, i) => (
+            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '4px' }}>
+              <span>{`計画${i + 1}`}</span>
+              <input
+                type="file"
+                accept=".xlsx"
+                onChange={(e) => {
+                  const file = e.target.files[0];
+                  if (file) {
+                    handlePlanImport(i, file);
+                    e.target.value = null;
+                  }
+                }}
+                style={{ display: 'none' }}
+                id={`plan-import-${i}`}
+              />
+              <label htmlFor={`plan-import-${i}`}>
+                <span className="material-icons" style={{ cursor: 'pointer', fontSize: '16px' }}>
+                  file_upload
+                </span>
+              </label>
+            </div>
+          )),
           "前年比"
         ];
-        
+
         return (
           <>
             <div className="data-buttons">
@@ -303,7 +558,12 @@
                           padding: "2px 4px",
                           fontWeight: "bold",
                           textAlign: "center",
-                          backgroundColor: focusedCell && focusedCell.col === colIndex ? "#ffe0b2" : "inherit"
+                          backgroundColor: colIndex === 5 ? "#e3f2fd" : 
+                            (focusedCell && focusedCell.col === colIndex ? "#ffe0b2" : "inherit"),
+                          ...(colIndex === 5 && {
+                            borderLeft: "2px solid #90caf9",
+                            borderRight: "2px solid #90caf9"
+                          })
                         }}
                       >
                         {text}
@@ -354,7 +614,9 @@
                           whiteSpace: "nowrap",
                           padding: "2px 4px",
                           textAlign:"center",
-                          backgroundColor: getCellBg(rowIndex, 5)
+                          backgroundColor: "#e3f2fd",
+                          borderLeft: "2px solid #90caf9",
+                          borderRight: "2px solid #90caf9"
                         }}
                       >
                         {numericData.sum ? numericData.sum[rowIndex] : ""}
@@ -371,19 +633,16 @@
                               backgroundColor: getCellBg(rowIndex, colIndex)
                             }}
                           >
-                            <TextField
-                              variant="outlined"
-                              size="small"
-                              value={col[rowIndex]}
-                              onChange={(e) => handlePlanChange(rowIndex, j, e.target.value)}
-                              fullWidth
-                              inputProps={{
-                                style: { whiteSpace: "nowrap", textAlign: "right", padding: "2px" },
-                                inputMode: "decimal",
-                                pattern: "[0-9.,]*",
-                                onKeyPress: allowOnlyNumbers
-                              }}
-                            />
+                            {renderTextField({
+                              value: col[rowIndex],
+                              onChange: (e) => handlePlanChange(rowIndex, j, e.target.value),
+                              onBlur: (e) => handleFieldBlur(rowIndex, 'plan', j, e.target.value, header),
+                              onFocus: () => handleFieldFocus(rowIndex, colIndex),
+                              onKeyPress: (e) => handleKeyPress(e, rowIndex, 'plan', j, e.target.value, header, colIndex),  // onKeyPressをpropsとして渡す
+                              onKeyDown: (e) => handleKeyDown(e, rowIndex, colIndex),
+                              rowIndex,
+                              colIndex
+                            })}
                           </TableCell>
                         );
                       })}
@@ -395,19 +654,16 @@
                           backgroundColor: getCellBg(rowIndex, 19)
                         }}
                       >
-                        <TextField
-                          variant="outlined"
-                          size="small"
-                          value={numericData.yoy ? numericData.yoy[rowIndex] : ""}
-                          onChange={(e) => handleYearOnYearChange(rowIndex, e.target.value)}
-                          fullWidth
-                          inputProps={{
-                            style: { whiteSpace: "nowrap", textAlign: "right", padding: "2px" },
-                            inputMode: "decimal",
-                            pattern: "[0-9.,]*",
-                            onKeyPress: allowOnlyNumbers
-                          }}
-                        />
+                        {renderTextField({
+                          value: numericData.yoy ? numericData.yoy[rowIndex] : "",
+                          onChange: (e) => handleYearOnYearChange(rowIndex, e.target.value),
+                          onBlur: (e) => handleFieldBlur(rowIndex, 'yearOnYear', null, e.target.value, header),
+                          onFocus: () => handleFieldFocus(rowIndex, 19),
+                          onKeyPress: (e) => handleKeyPress(e, rowIndex, 'yearOnYear', null, e.target.value, header, 19),
+                          onKeyDown: (e) => handleKeyDown(e, rowIndex, 19),
+                          rowIndex,
+                          colIndex: 19
+                        })}
                       </TableCell>
                     </TableRow>
                   ))}
