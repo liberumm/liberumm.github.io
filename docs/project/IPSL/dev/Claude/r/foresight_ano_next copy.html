@@ -1,0 +1,905 @@
+<!DOCTYPE html>
+<html lang="ja">
+  <head>
+    <meta charset="UTF-8" />
+    <title>在庫・売上データ表（列方向データ管理／フォーカス外時に状態更新）</title>
+    <!-- 基本ライブラリ -->
+    <script src="https://cdn.jsdelivr.net/npm/react@18.2.0/umd/react.production.min.js" crossorigin></script>
+    <script src="https://cdn.jsdelivr.net/npm/react-dom@18.2.0/umd/react-dom.production.min.js" crossorigin></script>
+    <script src="https://cdn.jsdelivr.net/npm/@babel/standalone@7.23.8/babel.min.js"></script>
+    
+    <!-- Emotion (MUI依存) -->
+    <script src="https://cdn.jsdelivr.net/npm/@emotion/react@11.11.3/dist/emotion-react.umd.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@emotion/styled@11.11.0/dist/emotion-styled.umd.min.js"></script>
+    
+    <!-- MUI Core -->
+    <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Roboto:wght@300;400;500;700&display=swap" />
+    <script src="https://cdn.jsdelivr.net/npm/@mui/material@5.15.3/umd/material-ui.production.min.js" crossorigin></script>
+    
+    <!-- Chart.js -->
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+    
+    <!-- D3.js -->
+    <script src="https://d3js.org/d3.v6.min.js"></script>
+    
+    <!-- Excelライブラリ -->
+    <script src="https://cdn.sheetjs.com/xlsx-latest/package/dist/xlsx.full.min.js" defer></script>
+    
+    <!-- Material Icons -->
+    <link rel="stylesheet" href="https://fonts.googleapis.com/icon?family=Material+Icons" />
+    
+    <!-- XLSX用スタイル -->
+    <style>
+      .data-buttons {
+        display: flex;
+        gap: 8px;
+        margin: 8px auto;
+        max-width: 800px;
+        justify-content: flex-end;
+      }
+      .data-buttons button {
+        padding: 6px 12px;
+        background: #1976d2;
+        color: white;
+        border: none;
+        border-radius: 4px;
+        cursor: pointer;
+      }
+      .data-buttons button:hover {
+        background: #1565c0;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="root"></div>
+    <!-- React+BabelでJSX記述 -->
+    <script type="text/babel">
+      const { Table, TableHead, TableBody, TableRow, TableCell, Paper, TableContainer, TextField, Box, Typography } = MaterialUI;
+      
+      // 入力時：半角数字・ドット・カンマのみ許可
+      const allowOnlyNumbers = (e) => {
+        if (!/[0-9.,]/.test(e.key)) {
+          e.preventDefault();
+        }
+      };
+      
+      // 数値フォーマット関数（対象に応じた書式変換）
+      const formatNumber = (value, type) => {
+        if (!value) return value;
+        const num = parseFloat(value.replace(/,/g, "").replace(/%/g, ""));
+        if (isNaN(num)) return value;
+        if (type === "loss_rate" || type === "rate") {
+          return num.toFixed(1) + "%";
+        } else if (type === "money") {
+          const rounded = Math.round(num);
+          const original = num.toFixed(1);
+          return rounded === num ? rounded.toLocaleString() : rounded.toLocaleString() + " (" + original + ")";
+        }
+        return num.toLocaleString();
+      };
+      
+      // 対象により値の種類を判定
+      const getValueType = (item, target) => {
+        if (item === "ロス" && target === "売価率") return "loss_rate";
+        if (target.indexOf("率") !== -1) return "rate";
+        if (target === "売価高" || target === "原価高" || target === "総利益高") return "money";
+        return "normal";
+      };
+      
+      /* 
+         行ヘッダー（ラベル部分）の定義（行方向）
+         rowHeaders の要素数は 37 行
+      */
+      const rowHeaders = [
+        { item: "期初在庫", period: "当月", target: "売価高", unit: "千円" },
+        { item: "期初在庫", period: "当月", target: "原価高", unit: "千円" },
+        { item: "期初在庫", period: "当月", target: "原価率", unit: "%" },
+        { item: "売上", period: "当月", target: "売価高", unit: "千円" },
+        { item: "売上", period: "当月", target: "原価高", unit: "千円" },
+        { item: "売上", period: "当月", target: "総利益高", unit: "千円" },
+        { item: "売上", period: "当月", target: "総利益率", unit: "%" },
+        { item: "値下", period: "当月", target: "売価高", unit: "千円" },
+        { item: "値下", period: "当月", target: "値下げ率", unit: "%" },
+        { item: "リベート", period: "当月", target: "原価高", unit: "千円" },
+        { item: "リベート", period: "当月", target: "リベート率", unit: "%" },
+        { item: "ロス", period: "当月", target: "売価高", unit: "千円" },
+        { item: "ロス", period: "当月", target: "売価率", unit: "%" },
+        { item: "期首在庫", period: "当月", target: "売価高", unit: "千円" },
+        { item: "期首在庫", period: "当月", target: "原価高", unit: "千円" },
+        { item: "期首在庫", period: "当月", target: "原価率", unit: "%" },
+        { item: "期末在庫", period: "当月", target: "売価高", unit: "千円" },
+        { item: "期末在庫", period: "当月", target: "原価高", unit: "千円" },
+        { item: "期末在庫", period: "当月", target: "原価率", unit: "%" },
+        { item: "在庫高変動", period: "当月", target: "売価高", unit: "千円" },
+        { item: "仕入", period: "当月", target: "売価高", unit: "千円" },
+        { item: "仕入", period: "当月", target: "原価高", unit: "千円" },
+        { item: "仕入", period: "当月", target: "値入率", unit: "%" },
+        { item: "仕入（リベート含）", period: "当月", target: "売価高", unit: "千円" },
+        { item: "仕入（リベート含）", period: "当月", target: "原価高", unit: "千円" },
+        { item: "仕入（リベート含）", period: "当月", target: "値入率", unit: "%" },
+        { item: "累計売上", period: "前月", target: "売価高", unit: "千円" },
+        { item: "累計原価", period: "前月", target: "原価高", unit: "千円" },
+        { item: "累計期末在庫", period: "前月", target: "原価率", unit: "%" },
+        { item: "累計売上", period: "当月", target: "売価高", unit: "千円" },
+        { item: "累計売上", period: "当月", target: "原価高", unit: "千円" },
+        { item: "累計仕入", period: "当月", target: "売価高", unit: "千円" },
+        { item: "累計仕入", period: "当月", target: "原価高", unit: "千円" },
+        { item: "累計期末在庫", period: "当月", target: "原価率", unit: "%" },
+
+      ];
+      
+      /* 
+         数値データを「列方向」で定義する
+         - plans: 13列分の配列（各配列の要素数は rowHeaders の行数＝37）
+           ※plan1 の配列は例として定義。以下の配列は plan1 のデータで、要素数が 37 になるように調整しています。
+         - yoy: 1列分の配列
+      */
+      const numericDataColumns = {
+        plans: [
+          [
+            "10000", "117432", "", "55745", "", "19745", "", "13549", "", "750",
+            "", "500", "2", "188529", "122298", "", "186398", "", "", "",
+            "68278", "34555", "", "68278", "35305", "", "419971", "277301", "",
+            "475716", "", "", "311856", "", "", ""  // ※要素数を37に合わせています
+          ],
+          // plan2 ～ plan13 はすべて空文字列の配列（37要素に合わせる）
+          ...Array.from({ length: 12 }, () => Array(rowHeaders.length).fill(""))
+        ],
+        yoy: Array(rowHeaders.length).fill("")
+      };
+      
+      // sum 列は、各行の plans の値の合計を計算して各行ごとに算出する
+      const recalcNumericData = (data) => {
+        const numRows = data.yoy.length;
+        const sum = [];
+        for (let i = 0; i < numRows; i++) {
+          let s = 0;
+          data.plans.forEach(planCol => {
+            const cellValue = planCol[i];
+            if (cellValue !== undefined) {
+              const num = parseFloat(cellValue.replace(/,/g, "").replace(/%/g, ""));
+              if (!isNaN(num)) {
+                s += num;
+              }
+            }
+          });
+          sum.push(s ? s.toLocaleString() : "");
+        }
+        return { ...data, sum };
+      };
+      
+      // 既存のrenderTextFieldを置き換え
+      const MemoizedTextField = React.memo(({ value, onChange, onBlur, onFocus, onKeyDown, onKeyPress, rowIndex, colIndex }) => {
+        const handleChange = React.useCallback((e) => {
+          const newValue = e.target.value;
+          // 数値とカンマ、ドットのみを許可
+          if (/^[0-9.,]*$/.test(newValue)) {
+            onChange(e);
+          }
+        }, [onChange]);
+      
+        return (
+          <TextField
+            variant="outlined"
+            size="small"
+            value={value || ''}
+            onChange={handleChange}
+            onBlur={onBlur}
+            onFocus={onFocus}
+            onKeyDown={onKeyDown}
+            onKeyPress={onKeyPress}  // onKeyPress を追加
+            fullWidth
+            inputProps={{
+              style: { 
+                whiteSpace: "nowrap", 
+                textAlign: "right", 
+                padding: "2px",
+                height: "20px", // 入力欄の高さを固定
+                fontSize: "14px" // フォントサイズを固定
+              },
+              'data-row': rowIndex,
+              'data-col': colIndex
+            }}
+          />
+        );
+      }, (prevProps, nextProps) => {
+        // 値が同じ場合は再レンダリングしない
+        if (prevProps.value === nextProps.value) return true;
+        return false;
+      });
+      
+      /* 共通のヘッダーテキスト定義 */
+      const createHeaderTexts = (handlePlanImport) => [
+        "No.", "項目", "期間", "対象", "単位", "合計",
+        ...Array.from({ length: 13 }, (_, i) => (
+          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '4px' }}>
+            <span>{`計画${i + 1}`}</span>
+            <input
+              type="file"
+              accept=".xlsx"
+              onChange={(e) => {
+                const file = e.target.files[0];
+                if (file) {
+                  handlePlanImport(i, file);
+                  e.target.value = null;
+                }
+              }}
+              style={{ display: 'none' }}
+              id={`plan-import-${i}`}
+            />
+            <label htmlFor={`plan-import-${i}`}>
+              <span className="material-icons" style={{ cursor: 'pointer', fontSize: '16px' }}>
+                file_upload
+              </span>
+            </label>
+          </div>
+        )),
+        "前年比"
+      ];
+
+      /* 追加テーブルのヘッダー定義 */
+      const additionalTables = [
+        {
+          title: "売上計画テーブル",
+          headers: [
+            { item: "売上", period: "当月", target: "売価高", unit: "千円" },
+            { item: "売上", period: "当月", target: "原価高", unit: "千円" }
+          ]
+        },
+        {
+          title: "売上総利益計画テーブル",
+          headers: [
+            { item: "売上総利益", period: "当月", target: "総利益高", unit: "千円" },
+            { item: "売上総利益", period: "当月", target: "総利益率", unit: "%" }
+          ]
+        },
+        {
+          title: "値上計画テーブル",
+          headers: [
+            { item: "値上", period: "当月", target: "売価高", unit: "千円" },
+            { item: "値上", period: "当月", target: "値上率", unit: "%" }
+          ]
+        },
+        {
+          title: "値下計画テーブル",
+          headers: [
+            { item: "値下", period: "当月", target: "売価高", unit: "千円" },
+            { item: "値下", period: "当月", target: "値下率", unit: "%" }
+          ]
+        },
+        {
+          title: "ロス率計画テーブル",
+          headers: [
+            { item: "ロス", period: "当月", target: "売価高", unit: "千円" },
+            { item: "ロス", period: "当月", target: "売価率", unit: "%" }
+          ]
+        },
+        {
+          title: "リベート率計画テーブル",
+          headers: [
+            { item: "リベート", period: "当月", target: "原価高", unit: "千円" },
+            { item: "リベート", period: "当月", target: "リベート率", unit: "%" }
+          ]
+        },
+        {
+          title: "商品回転日数計画テーブル",
+          headers: [
+            { item: "商品回転", period: "当月", target: "日数", unit: "日" },
+            { item: "商品回転", period: "当月", target: "回転率", unit: "回" }
+          ]
+        }
+      ];
+
+      // 追加テーブルのレンダリングコンポーネント
+      const AdditionalTable = React.memo(({ 
+        tableConfig, 
+        headerTexts, 
+        renderTextField,
+        focusedCell,
+        handleFieldFocus,
+        handleFieldBlur,
+        handlePlanChange,
+        handleYearOnYearChange,
+        handleKeyPress,
+        handleKeyDown,
+        getCellBg
+      }) => {
+        return (
+          <Box mt={4}>
+            <Typography variant="h7" gutterBottom>{tableConfig.title}</Typography>
+            <TableContainer 
+              component={Paper} 
+              style={{ 
+                width: "100%", 
+                margin: "4px auto", 
+                padding: "2px", 
+                overflowX: "auto",
+                minWidth: "1500px" // 最小幅を設定
+              }}
+            >
+              <Table size="small" style={{ tableLayout: "fixed" }}>
+                <TableHead>
+                  <TableRow>
+                    {headerTexts.map((text, colIndex) => (
+                      <TableCell
+                        key={colIndex}
+                        sx={{
+                          whiteSpace: "nowrap",
+                          padding: "2px 4px",
+                          fontWeight: "bold",
+                          textAlign: "center",
+                          overflow: "hidden",
+                          textOverflow: "ellipsis",
+                          backgroundColor: colIndex === 5 ? "#e3f2fd" : 
+                            (focusedCell && focusedCell.col === colIndex ? "#ffe0b2" : "inherit"),
+                          ...(colIndex === 5 && {
+                            borderLeft: "2px solid #90caf9",
+                            borderRight: "2px solid #90caf9"
+                          })
+                        }}
+                      >
+                        {text}
+                      </TableCell>
+                    ))}
+                  </TableRow>
+                </TableHead>
+                <TableBody>
+                  {tableConfig.headers.map((header, rowIndex) => (
+                    <TableRow key={rowIndex}>
+                      <TableCell sx={{ 
+                        textAlign: "center",
+                        whiteSpace: "nowrap",
+                        padding: "2px 4px",
+                        backgroundColor: getCellBg(rowIndex, 0)
+                      }}>
+                        {rowIndex + 1}
+                      </TableCell>
+                      {["item", "period", "target", "unit"].map((field, i) => (
+                        <TableCell
+                          key={i}
+                          sx={{
+                            whiteSpace: "nowrap",
+                            padding: "2px 4px",
+                            textAlign: field === "item" ? "left" : "center",
+                            backgroundColor: getCellBg(rowIndex, i + 1),
+                            overflow: "hidden",
+                            textOverflow: "ellipsis"
+                          }}
+                        >
+                          {header[field]}
+                        </TableCell>
+                      ))}
+                      <TableCell sx={{ 
+                        textAlign: "center", 
+                        backgroundColor: "#e3f2fd",
+                        borderLeft: "2px solid #90caf9",
+                        borderRight: "2px solid #90caf9"
+                      }}/>
+                      {Array(13).fill("").map((_, j) => (
+                        <TableCell key={j} sx={{
+                          whiteSpace: "nowrap",
+                          padding: "2px 4px",
+                          backgroundColor: getCellBg(rowIndex, j + 6)
+                        }}>
+                          {renderTextField({
+                            value: "",
+                            onChange: (e) => handlePlanChange(rowIndex, j, e.target.value),
+                            onBlur: (e) => handleFieldBlur(rowIndex, 'plan', j, e.target.value, header),
+                            onFocus: () => handleFieldFocus(rowIndex, j + 6),
+                            onKeyPress: (e) => handleKeyPress(e, rowIndex, 'plan', j, e.target.value, header, j + 6),
+                            onKeyDown: (e) => handleKeyDown(e, rowIndex, j + 6),
+                            rowIndex,
+                            colIndex: j + 6
+                          })}
+                        </TableCell>
+                      ))}
+                      <TableCell sx={{
+                        whiteSpace: "nowrap",
+                        padding: "2px 4px",
+                        backgroundColor: getCellBg(rowIndex, 19)
+                      }}>
+                        {renderTextField({
+                          value: "",
+                          onChange: (e) => handleYearOnYearChange(rowIndex, e.target.value),
+                          onBlur: (e) => handleFieldBlur(rowIndex, 'yearOnYear', null, e.target.value, header),
+                          onFocus: () => handleFieldFocus(rowIndex, 19),
+                          onKeyPress: (e) => handleKeyPress(e, rowIndex, 'yearOnYear', null, e.target.value, header, 19),
+                          onKeyDown: (e) => handleKeyDown(e, rowIndex, 19),
+                          rowIndex,
+                          colIndex: 19
+                        })}
+                      </TableCell>
+                    </TableRow>
+                  ))}
+                </TableBody>
+              </Table>
+            </TableContainer>
+          </Box>
+        );
+      });
+
+      function App() {
+        // focusedCell: { row, col } を管理（フォーカス中のセルの位置）
+        const [focusedCell, setFocusedCell] = React.useState(null);
+        
+        // 数値データは列方向のオブジェクトとして state で管理
+        const [numericData, setNumericData] = React.useState(numericDataColumns);
+        
+        // マウント後、初期数値データに sum 列を追加して反映
+        React.useEffect(() => {
+          setNumericData(recalcNumericData(numericDataColumns));
+        }, []);
+        
+        // デバウンス処理用の関数
+        const debounce = (func, wait) => {
+          let timeout;
+          return (...args) => {
+            clearTimeout(timeout);
+            timeout = setTimeout(() => func(...args), wait);
+          };
+        };
+
+        // 計画値の変更：即時更新版
+        const handlePlanChange = React.useCallback((rowIndex, planIndex, newValue) => {
+          requestAnimationFrame(() => {
+            setNumericData(prev => {
+              const newPlans = [...prev.plans];
+              newPlans[planIndex] = [...newPlans[planIndex]];
+              newPlans[planIndex][rowIndex] = newValue;
+              return { ...prev, plans: newPlans };
+            });
+          });
+        }, []);
+
+        // 合計再計算を遅延実行（待ち時間を300msに延長）
+        const debouncedRecalc = React.useCallback(
+          debounce((data) => {
+            requestAnimationFrame(() => {
+              setNumericData(recalcNumericData(data));
+            });
+          }, 0),
+          []
+        );
+
+        // 前年比の変更：即時更新版
+        const handleYearOnYearChange = React.useCallback((rowIndex, newValue) => {
+          requestAnimationFrame(() => {
+            setNumericData(prev => {
+              const newYoy = [...prev.yoy];
+              newYoy[rowIndex] = newValue;
+              return { ...prev, yoy: newYoy };
+            });
+          });
+        }, []);
+
+        // フォーカス解除時の処理を更新
+        const handleFieldBlur = React.useCallback((rowIndex, fieldType, planIndex, currentValue, header) => {
+          if (!currentValue) {
+            setFocusedCell(null);
+            return;
+          }
+
+          // 数値検証を簡略化
+          if (!/^[0-9.,]*$/.test(currentValue)) {
+            setFocusedCell(null);
+            return;
+          }
+
+          const type = fieldType === 'plan' ? getValueType(header.item, header.target) : 'normal';
+          const formatted = formatNumber(currentValue, type);
+
+          requestAnimationFrame(() => {
+            setNumericData(prev => {
+              let newData;
+              if (fieldType === 'plan') {
+                const newPlans = [...prev.plans];
+                newPlans[planIndex] = [...newPlans[planIndex]];
+                newPlans[planIndex][rowIndex] = formatted;
+                newData = { ...prev, plans: newPlans };
+              } else {
+                const newYoy = [...prev.yoy];
+                newYoy[rowIndex] = formatted;
+                newData = { ...prev, yoy: newYoy };
+              }
+              debouncedRecalc(newData);
+              return newData;
+            });
+          });
+          
+          setFocusedCell(null);
+        }, [debouncedRecalc]);
+
+        // フォーカス移動処理を修正
+        const moveFocus = React.useCallback((rowIndex, colIndex, direction) => {
+          if (!direction) return;
+          
+          let nextRow = rowIndex;
+          let nextCol = colIndex;
+          
+          switch (direction) {
+            case 'down':
+              nextRow = Math.min(rowIndex + 1, rowHeaders.length - 1);
+              break;
+            case 'up':
+              nextRow = Math.max(rowIndex - 1, 0);
+              break;
+            case 'left':
+              nextCol = Math.max(colIndex - 1, 6);
+              break;
+            case 'right':
+              nextCol = Math.min(colIndex + 1, 19);
+              break;
+          }
+
+          // 少し遅延させてフォーカス移動を実行
+          setTimeout(() => {
+            const nextElement = document.querySelector(
+              `input[data-row="${nextRow}"][data-col="${nextCol}"]`
+            );
+            if (nextElement) {
+              nextElement.focus();
+              // フォーカス移動後にセレクト
+              nextElement.select();
+            }
+          }, 0);
+        }, []);
+
+        // キー入力処理を修正
+        const handleKeyPress = React.useCallback((e, rowIndex, fieldType, planIndex, currentValue, header, colIndex) => {
+          if (e.key === 'Enter') {
+            e.preventDefault();
+            
+            if (!currentValue) {
+              moveFocus(rowIndex, colIndex, 'down');
+              return;
+            }
+
+            // 数値検証を簡略化
+            if (!/^[0-9.,]*$/.test(currentValue)) {
+              moveFocus(rowIndex, colIndex, 'down');
+              return;
+            }
+            
+            // 現在の値を確定してフォーマット
+            const type = fieldType === 'plan' ? getValueType(header.item, header.target) : 'normal';
+            const formatted = formatNumber(currentValue, type);
+            
+            // 値を更新して次の行に移動
+            if (fieldType === 'plan') {
+              handlePlanChange(rowIndex, planIndex, formatted);
+            } else {
+              handleYearOnYearChange(rowIndex, formatted);
+            }
+
+            // フォーカスを移動
+            requestAnimationFrame(() => {
+              moveFocus(rowIndex, colIndex, 'down');
+            });
+          }
+        }, [moveFocus, handlePlanChange, handleYearOnYearChange]);
+
+        // キーダウン処理を修正
+        const handleKeyDown = React.useCallback((e, rowIndex, colIndex) => {
+          if (e.key.startsWith('Arrow')) {
+            e.preventDefault();
+            const direction = e.key.replace('Arrow', '').toLowerCase();
+            const currentValue = e.target.value;
+            
+            if (currentValue) {
+              const type = getValueType(rowHeaders[rowIndex].item, rowHeaders[rowIndex].target);
+              const formatted = formatNumber(currentValue, type);
+              e.target.value = formatted;
+            }
+            
+            moveFocus(rowIndex, colIndex, direction);
+          }
+        }, [moveFocus]);
+
+        // renderTextField を MemoizedTextField を使用するように変更
+        const renderTextField = React.useCallback(({ value, onChange, onBlur, onFocus, onKeyDown, onKeyPress, rowIndex, colIndex }) => (
+          <MemoizedTextField
+            value={value}
+            onChange={onChange}
+            onBlur={onBlur}
+            onFocus={(e) => {
+              onFocus();
+              e.target.select();
+            }}
+            onKeyDown={onKeyDown}
+            onKeyPress={onKeyPress}  // onKeyPress を追加
+            rowIndex={rowIndex}
+            colIndex={colIndex}
+          />
+        ), []);
+
+        // テキストフィールドの onFocus/onBlur により focusedCell 状態を更新
+        const handleFieldFocus = (rowIndex, colIndex) => {
+          setFocusedCell({ row: rowIndex, col: colIndex });
+        };
+        
+        // focusedCell に基づいて、該当する行または列の背景色を変更する関数
+        const getCellBg = (rowIndex, colIndex) => {
+          if (focusedCell) {
+            if (focusedCell.row === rowIndex || focusedCell.col === colIndex) {
+              return "#ffe0b2";
+            }
+          }
+          return "inherit";
+        };
+        
+        // 行スタイル（境界線など）
+        const getRowStyle = (rowIndex) => {
+          const style = { height: "26px" };
+          if (rowIndex === rowHeaders.length - 1) {
+            style.borderBottom = "2px solid black";
+          } else if (rowHeaders[rowIndex].item !== rowHeaders[rowIndex + 1].item) {
+            style.borderBottom = "2px solid black";
+          }
+          return style;
+        };
+        
+        // 特定の計画列へのデータインポート処理
+        const handlePlanImport = (planIndex, file) => {
+          const reader = new FileReader();
+          reader.onload = (event) => {
+            const wb = XLSX.read(event.target.result, { type: 'binary' });
+            const wsname = wb.SheetNames[0];
+            const ws = wb.Sheets[wsname];
+            const data = XLSX.utils.sheet_to_json(ws, { header: 1 });
+            // ヘッダー行をスキップし、値のみを取得
+            const values = data.slice(1).map(row => row[3] || "");
+            
+            setNumericData(prev => {
+              const newPlans = prev.plans.map((col, idx) => {
+                if (idx === planIndex) {
+                  return values;
+                }
+                return col;
+              });
+              return recalcNumericData({ ...prev, plans: newPlans });
+            });
+          };
+          reader.readAsBinaryString(file);
+        };
+
+        // headerTextsをApp内で作成
+        const headerTexts = createHeaderTexts(handlePlanImport);
+
+        return (
+          <>
+            <div className="data-buttons">
+              <input type="file" accept=".xlsx" onChange={(e) => {
+                const file = e.target.files[0];
+                const reader = new FileReader();
+                reader.onload = (event) => {
+                  const wb = XLSX.read(event.target.result, { type: 'binary' });
+                  const wsname = wb.SheetNames[0];
+                  const ws = wb.Sheets[wsname];
+                  const data = XLSX.utils.sheet_to_json(ws, { header: 1 });
+                  // ヘッダー行をスキップし、行ごとのオブジェクトに変換後、列方向に再変換
+                  const rows = data.slice(1).map(row => ({
+                    plans: [row[3] || "", ...Array(12).fill("")],
+                    yoy: row[4] || ""
+                  }));
+                  const convertRowsToColumns = (rows) => {
+                    const numPlanCols = rows[0].plans.length;
+                    const plans = [];
+                    for (let j = 0; j < numPlanCols; j++) {
+                      plans.push(rows.map(row => row.plans[j]));
+                    }
+                    const yoy = rows.map(row => row.yoy);
+                    return { plans, yoy };
+                  };
+                  const newDataCols = convertRowsToColumns(rows);
+                  setNumericData(recalcNumericData(newDataCols));
+                };
+                reader.readAsBinaryString(file);
+                e.target.value = null;
+              }} style={{ display: 'none' }} id="import-button" />
+              <label htmlFor="import-button">
+                <button onClick={() => document.getElementById('import-button').click()}>
+                  データインポート
+                </button>
+              </label>
+              <button onClick={() => {
+                const exportRows = [];
+                for (let i = 0; i < rowHeaders.length; i++) {
+                  const rowData = {
+                    plans: numericData.plans.map(col => col[i]),
+                    yoy: numericData.yoy[i],
+                    sum: numericData.sum[i]
+                  };
+                  exportRows.push([ rowHeaders[i].item, rowHeaders[i].period, rowHeaders[i].target, rowData.sum, rowData.yoy ]);
+                }
+                const ws = XLSX.utils.aoa_to_sheet([
+                  ["項目", "期間", "対象", "計画", "前年比"],
+                  ...exportRows
+                ]);
+                const wb = XLSX.utils.book_new();
+                XLSX.utils.book_append_sheet(wb, ws, "Data");
+                XLSX.writeFile(wb, "data.xlsx");
+              }}>データエクスポート</button>
+              <button onClick={() => {
+                const template = [
+                  ["項目", "期間", "対象", "計画", "前年比"],
+                  ...rowHeaders.map(header => [header.item, header.period, header.target, "", ""])
+                ];
+                const ws = XLSX.utils.aoa_to_sheet(template);
+                const wb = XLSX.utils.book_new();
+                XLSX.utils.book_append_sheet(wb, ws, "Template");
+                XLSX.writeFile(wb, "template.xlsx");
+              }}>テンプレート取得</button>
+            </div>
+            {/* メインテーブル（収益達成計画） */}
+            <Box mt={2}>
+              <Typography variant="h7" gutterBottom>収益達成計画</Typography>
+              <TableContainer 
+                component={Paper} 
+                style={{ 
+                  width: "100%", 
+                  margin: "4px auto", 
+                  padding: "2px", 
+                  overflowX: "auto",
+                  minWidth: "1500px"
+                }}
+              >
+                <Table size="small" style={{ tableLayout: "fixed" }}>
+                  <TableHead>
+                    <TableRow>
+                      {headerTexts.map((text, colIndex) => (
+                        <TableCell
+                          key={colIndex}
+                          sx={{
+                            whiteSpace: "nowrap",
+                            padding: "2px 4px",
+                            fontWeight: "bold",
+                            textAlign: "center",
+                            overflow: "hidden",
+                            textOverflow: "ellipsis",
+                            backgroundColor: colIndex === 5 ? "#e3f2fd" : 
+                              (focusedCell && focusedCell.col === colIndex ? "#ffe0b2" : "inherit"),
+                            ...(colIndex === 5 && {
+                              borderLeft: "2px solid #90caf9",
+                              borderRight: "2px solid #90caf9"
+                            })
+                          }}
+                        >
+                          {text}
+                        </TableCell>
+                      ))}
+                    </TableRow>
+                  </TableHead>
+                  <TableBody>
+                    {rowHeaders.map((header, rowIndex) => (
+                      <TableRow 
+                        key={rowIndex} 
+                        sx={{
+                          ...getRowStyle(rowIndex),
+                          backgroundColor: focusedCell && focusedCell.row === rowIndex ? "#ffe0b2" : "inherit"
+                        }}
+                      >
+                        {/* No.列（列0） */}
+                        <TableCell 
+                          sx={{
+                            whiteSpace: "nowrap",
+                            padding: "2px 4px",
+                            textAlign:"center",
+                            backgroundColor: getCellBg(rowIndex, 0),
+                            overflow: "hidden",
+                            textOverflow: "ellipsis"
+                          }}
+                        >
+                          {rowIndex + 1}
+                        </TableCell>
+                        {/* 固定ラベル部分：項目, 期間, 対象, 単位 → 列1～4 */}
+                        {["item", "period", "target", "unit"].map((field, i) => {
+                          const colIndex = i + 1;
+                          return (
+                            <TableCell
+                              key={i}
+                              sx={{
+                                whiteSpace: "nowrap",
+                                padding: "2px 4px",
+                                textAlign: field === "item" ? "left" : "center",
+                                backgroundColor: getCellBg(rowIndex, colIndex),
+                                overflow: "hidden",
+                                textOverflow: "ellipsis"
+                              }}
+                            >
+                              {header[field]}
+                            </TableCell>
+                          );
+                        })}
+                        {/* 合計 → 列5 */}
+                        <TableCell 
+                          sx={{
+                            whiteSpace: "nowrap",
+                            padding: "2px 4px",
+                            textAlign:"center",
+                            backgroundColor: "#e3f2fd",
+                            borderLeft: "2px solid #90caf9",
+                            borderRight: "2px solid #90caf9"
+                          }}
+                        >
+                          {numericData.sum ? numericData.sum[rowIndex] : ""}
+                        </TableCell>
+                        {/* 計画値（plans）→ 列6～18 */}
+                        {numericData.plans.map((col, j) => {
+                          const colIndex = 6 + j;
+                          return (
+                            <TableCell
+                              key={`plan-${rowIndex}-${j}`}
+                              sx={{
+                                whiteSpace: "nowrap",
+                                padding: "2px 4px",
+                                backgroundColor: getCellBg(rowIndex, colIndex),
+                                overflow: "hidden",
+                                textOverflow: "ellipsis"
+                              }}
+                            >
+                              {renderTextField({
+                                value: col[rowIndex],
+                                onChange: (e) => handlePlanChange(rowIndex, j, e.target.value),
+                                onBlur: (e) => handleFieldBlur(rowIndex, 'plan', j, e.target.value, header),
+                                onFocus: () => handleFieldFocus(rowIndex, colIndex),
+                                onKeyPress: (e) => handleKeyPress(e, rowIndex, 'plan', j, e.target.value, header, colIndex),  // onKeyPressをpropsとして渡す
+                                onKeyDown: (e) => handleKeyDown(e, rowIndex, colIndex),
+                                rowIndex,
+                                colIndex
+                              })}
+                            </TableCell>
+                          );
+                        })}
+                        {/* 前年比 → 最終列（列19） */}
+                        <TableCell 
+                          sx={{
+                            whiteSpace: "nowrap",
+                            padding: "2px 4px",
+                            backgroundColor: getCellBg(rowIndex, 19),
+                            overflow: "hidden",
+                            textOverflow: "ellipsis"
+                          }}
+                        >
+                          {renderTextField({
+                            value: numericData.yoy ? numericData.yoy[rowIndex] : "",
+                            onChange: (e) => handleYearOnYearChange(rowIndex, e.target.value),
+                            onBlur: (e) => handleFieldBlur(rowIndex, 'yearOnYear', null, e.target.value, header),
+                            onFocus: () => handleFieldFocus(rowIndex, 19),
+                            onKeyPress: (e) => handleKeyPress(e, rowIndex, 'yearOnYear', null, e.target.value, header, 19),
+                            onKeyDown: (e) => handleKeyDown(e, rowIndex, 19),
+                            rowIndex,
+                            colIndex: 19
+                          })}
+                        </TableCell>
+                      </TableRow>
+                    ))}
+                  </TableBody>
+                </Table>
+              </TableContainer>
+            </Box>
+            
+            {/* 追加テーブルの表示 */}
+            {additionalTables.map((tableConfig, index) => (
+              <AdditionalTable 
+                key={index} 
+                tableConfig={tableConfig} 
+                headerTexts={headerTexts} 
+                renderTextField={renderTextField}
+                focusedCell={focusedCell}
+                handleFieldFocus={handleFieldFocus}
+                handleFieldBlur={handleFieldBlur}
+                handlePlanChange={handlePlanChange}
+                handleYearOnYearChange={handleYearOnYearChange}
+                handleKeyPress={handleKeyPress}
+                handleKeyDown={handleKeyDown}
+                getCellBg={getCellBg}
+              />
+            ))}
+          </>
+        );
+      }
+      
+      ReactDOM.render(<App />, document.getElementById("root"));
+    </script>
+  </body>
+</html>
