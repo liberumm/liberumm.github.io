@@ -24,22 +24,22 @@ const formatNumber = (value, type) => {
 
 // メモ化されたテキストフィールド
 const MemoizedTextField = React.memo(({ value, onChange, onBlur, onFocus, onKeyDown, onKeyPress, rowIndex, colIndex }) => {
-  const handleChange = React.useCallback((e) => {
-    const newValue = e.target.value;
-    if (/^[0-9.,]*$/.test(newValue)) {
-      onChange(e);
-    }
-  }, [onChange]);
-
   return (
     <TextField
       variant="outlined"
       size="small"
       value={value || ''}
-      onChange={handleChange}
+      onChange={onChange}
       onBlur={onBlur}
-      onFocus={onFocus}
-      onKeyDown={onKeyDown}
+      onFocus={(e) => {
+        onFocus(e);
+        e.target.select();
+      }}
+      onKeyDown={(e) => {
+        // IMEの確定時は処理をスキップ
+        if (e.keyCode === 229) return;
+        onKeyDown && onKeyDown(e);
+      }}
       onKeyPress={onKeyPress}
       fullWidth
       inputProps={{
@@ -63,7 +63,6 @@ const MemoizedTableRow = React.memo(({
   rowIndex, 
   numericData, 
   handlePlanChange, 
-  handleYearOnYearChange, 
   handleFieldBlur, 
   handleFieldFocus, 
   handleKeyEvent, 
@@ -134,23 +133,6 @@ const MemoizedTableRow = React.memo(({
           })}
         </TableCell>
       ))}
-      <TableCell 
-        sx={{
-          whiteSpace: "nowrap",
-          padding: "2px 4px",
-          backgroundColor: getCellBg(rowIndex, 19)
-        }}
-      >
-        {renderTextField({
-          value: numericData.yoy[rowIndex],
-          onChange: (e) => handleYearOnYearChange(rowIndex, e.target.value),
-          onBlur: (e) => handleFieldBlur(rowIndex, 'yearOnYear', null, e.target.value, header),
-          onFocus: () => handleFieldFocus(rowIndex, 19),
-          onKeyDown: (e) => handleKeyEvent(e, rowIndex, 'yearOnYear', null, numericData.yoy[rowIndex], header, 19),
-          rowIndex,
-          colIndex: 19
-        })}
-      </TableCell>
     </TableRow>
   );
 });
@@ -186,9 +168,10 @@ const excelUtils = {
   }
 };
 
-// 数値の合計を再計算する関数を追加
+// 数値の合計を再計算する関数を修正
 const recalcNumericData = (data) => {
-  const numRows = data.yoy.length;
+  // yoyの代わりにplansの長さを使用
+  const numRows = data.plans[0].length;
   const sum = [];
   for (let i = 0; i < numRows; i++) {
     let s = 0;
@@ -229,7 +212,69 @@ const styles = {
   }
 };
 
-// グローバルスコープで共有する必要のある関数や変数を定義
+// グローバルで共有する列幅定義をより詳細に設定
+const columnWidths = {
+  no: '50px',      // No.列を少し広く
+  item: '150px',   // 項目列を広く
+  period: '70px',  // 期間列
+  target: '100px', // 対象列を広く
+  unit: '60px',    // 単位列
+  sum: '120px',    // 合計列を広く
+  plan: '100px'    // 計画列
+};
+
+// キーボード処理のユーティリティ関数を追加
+const keyboardUtils = {
+  handleKeyDown: (e, rowIndex, colIndex, maxRows, tableId = null) => {
+    e.preventDefault();
+    let nextRow = rowIndex;
+    let nextCol = colIndex;
+
+    switch (e.key) {
+      case 'Enter':
+      case 'ArrowDown':
+        nextRow = Math.min(rowIndex + 1, maxRows - 1);
+        break;
+      case 'ArrowUp':
+        nextRow = Math.max(rowIndex - 1, 0);
+        break;
+      case 'ArrowLeft':
+        nextCol = Math.max(colIndex - 1, 6);
+        break;
+      case 'ArrowRight':
+        nextCol = Math.min(colIndex + 1, 18);
+        break;
+    }
+
+    // 対象要素のセレクタを構築
+    let selector = `input[data-row="${nextRow}"][data-col="${nextCol}"]`;
+    if (tableId) {
+      selector += `[data-table="${tableId}"]`;
+    }
+
+    requestAnimationFrame(() => {
+      const nextElement = document.querySelector(selector);
+      if (nextElement) {
+        nextElement.focus();
+        nextElement.select();
+      }
+    });
+
+    return { nextRow, nextCol };
+  }
+};
+
+window.keyboardUtils = keyboardUtils;
+
+window.columnWidths = columnWidths;
 window.formatNumber = formatNumber;
 window.recalcNumericData = recalcNumericData;
 window.styles = styles;
+
+// getValueTypeをwindowに追加してグローバルに利用可能に
+window.getValueType = (item, target) => {
+  if (item === "ロス" && target === "売価率") return "loss_rate";
+  if (target.indexOf("率") !== -1) return "rate";
+  if (target === "売価高" || target === "原価高" || target === "総利益高") return "money";
+  return "normal";
+};

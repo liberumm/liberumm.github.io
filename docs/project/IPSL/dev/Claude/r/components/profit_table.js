@@ -55,8 +55,7 @@ const numericDataColumns = {
     ],
     // plan2 ～ plan13 はすべて空文字列の配列（37要素に合わせる）
     ...Array.from({ length: 12 }, () => Array(rowHeaders.length).fill(""))
-  ],
-  yoy: Array(rowHeaders.length).fill("")
+  ]
 };
 
 function ProfitTable() {
@@ -99,17 +98,6 @@ function ProfitTable() {
     []
   );
 
-  // 前年比の変更：値のチェックを blur 時のみに変更
-  const handleYearOnYearChange = React.useCallback((rowIndex, newValue) => {
-    requestAnimationFrame(() => {
-      setNumericData(prev => {
-        const newYoy = [...prev.yoy];
-        newYoy[rowIndex] = newValue;
-        return { ...prev, yoy: newYoy };
-      });
-    });
-  }, []);
-
   // フォーカス解除時の処理を更新
   const handleFieldBlur = React.useCallback((rowIndex, fieldType, planIndex, currentValue, header) => {
     if (!currentValue) {
@@ -123,22 +111,15 @@ function ProfitTable() {
       return;
     }
 
-    const type = fieldType === 'plan' ? getValueType(header.item, header.target) : 'normal';
+    const type = getValueType(header.item, header.target);
     const formatted = formatNumber(currentValue, type);
 
     requestAnimationFrame(() => {
       setNumericData(prev => {
-        let newData;
-        if (fieldType === 'plan') {
-          const newPlans = [...prev.plans];
-          newPlans[planIndex] = [...newPlans[planIndex]];
-          newPlans[planIndex][rowIndex] = formatted;
-          newData = { ...prev, plans: newPlans };
-        } else {
-          const newYoy = [...prev.yoy];
-          newYoy[rowIndex] = formatted;
-          newData = { ...prev, yoy: newYoy };
-        }
+        const newPlans = [...prev.plans];
+        newPlans[planIndex] = [...newPlans[planIndex]];
+        newPlans[planIndex][rowIndex] = formatted;
+        const newData = { ...prev, plans: newPlans };
         debouncedRecalc(newData);
         return newData;
       });
@@ -165,7 +146,7 @@ function ProfitTable() {
         nextCol = Math.max(colIndex - 1, 6);
         break;
       case 'right':
-        nextCol = Math.min(colIndex + 1, 19);
+        nextCol = Math.min(colIndex + 1, 18); // 19から18に変更
         break;
     }
 
@@ -184,26 +165,24 @@ function ProfitTable() {
 
   // キーイベント処理を統合
   const handleKeyEvent = React.useCallback((e, rowIndex, fieldType, planIndex, currentValue, header, colIndex) => {
-    // Enterキーの処理
-    if (e.key === 'Enter') {
-      e.preventDefault();
-      requestAnimationFrame(() => {
-        moveFocus(rowIndex, colIndex, 'down');
-      });
-      return;
+    if (e.key === 'Enter' || e.key.startsWith('Arrow')) {
+      keyboardUtils.handleKeyDown(e, rowIndex, colIndex, rowHeaders.length);
     }
-    
-    // 矢印キーの処理
-    if (e.key.startsWith('Arrow')) {
-      e.preventDefault();
-      const direction = e.key.replace('Arrow', '').toLowerCase();
-      moveFocus(rowIndex, colIndex, direction);
-      return;
-    }
-  }, [moveFocus]);
+  }, []);
   
-  // renderTextField を MemoizedTextField を使用するように変更
-  const renderTextField = React.useCallback(({ value, onChange, onBlur, onFocus, rowIndex, colIndex }) => (
+  // renderTextField の修正
+  const renderTextField = React.useCallback(({ 
+    value, 
+    onChange, 
+    onBlur, 
+    onFocus, 
+    onKeyDown, 
+    rowIndex, 
+    colIndex, 
+    fieldType, 
+    planIndex, 
+    header 
+  }) => (
     <MemoizedTextField
       value={value}
       onChange={onChange}
@@ -212,11 +191,11 @@ function ProfitTable() {
         onFocus();
         e.target.select();
       }}
-      onKeyDown={(e) => handleKeyEvent(e, rowIndex, fieldType, planIndex, value, header, colIndex)}
+      onKeyDown={onKeyDown}
       rowIndex={rowIndex}
       colIndex={colIndex}
     />
-  ), [handleKeyEvent]);
+  ), []);
 
   // テキストフィールドの onFocus/onBlur により focusedCell 状態を更新
   const handleFieldFocus = (rowIndex, colIndex) => {
@@ -293,8 +272,7 @@ function ProfitTable() {
           </span>
         </label>
       </div>
-    )),
-    "前年比"
+    ))
   ];
 
   // コンポーネントのプロップスを修正
@@ -307,6 +285,17 @@ function ProfitTable() {
     handlePlanChange,
     handleKeyEvent,
     getCellBg  // getCellBgを明示的に追加
+  };
+
+  // columnWidths の定義を追加
+  const columnWidths = {
+    no: '40px',
+    item: '120px',
+    period: '60px',
+    target: '80px',
+    unit: '60px',
+    sum: '100px',
+    plan: '100px'
   };
 
   return (
@@ -322,8 +311,7 @@ function ProfitTable() {
             const data = XLSX.utils.sheet_to_json(ws, { header: 1 });
             // ヘッダー行をスキップし、行ごとのオブジェクトに変換後、列方向に再変換
             const rows = data.slice(1).map(row => ({
-              plans: [row[3] || "", ...Array(12).fill("")],
-              yoy: row[4] || ""
+              plans: [row[3] || "", ...Array(12).fill("")]
             }));
             const convertRowsToColumns = (rows) => {
               const numPlanCols = rows[0].plans.length;
@@ -331,8 +319,7 @@ function ProfitTable() {
               for (let j = 0; j < numPlanCols; j++) {
                 plans.push(rows.map(row => row.plans[j]));
               }
-              const yoy = rows.map(row => row.yoy);
-              return { plans, yoy };
+              return { plans };
             };
             const newDataCols = convertRowsToColumns(rows);
             setNumericData(recalcNumericData(newDataCols));
@@ -350,13 +337,12 @@ function ProfitTable() {
           for (let i = 0; i < rowHeaders.length; i++) {
             const rowData = {
               plans: numericData.plans.map(col => col[i]),
-              yoy: numericData.yoy[i],
               sum: numericData.sum[i]
             };
-            exportRows.push([ rowHeaders[i].item, rowHeaders[i].period, rowHeaders[i].target, rowData.sum, rowData.yoy ]);
+            exportRows.push([ rowHeaders[i].item, rowHeaders[i].period, rowHeaders[i].target, rowData.sum ]);
           }
           const ws = XLSX.utils.aoa_to_sheet([
-            ["項目", "期間", "対象", "計画", "前年比"],
+            ["項目", "期間", "対象", "計画"],
             ...exportRows
           ]);
           const wb = XLSX.utils.book_new();
@@ -365,8 +351,8 @@ function ProfitTable() {
         }}>データエクスポート</button>
         <button onClick={() => {
           const template = [
-            ["項目", "期間", "対象", "計画", "前年比"],
-            ...rowHeaders.map(header => [header.item, header.period, header.target, "", ""])
+            ["項目", "期間", "対象", "計画"],
+            ...rowHeaders.map(header => [header.item, header.period, header.target, ""])
           ];
           const ws = XLSX.utils.aoa_to_sheet(template);
           const wb = XLSX.utils.book_new();
@@ -374,8 +360,18 @@ function ProfitTable() {
           XLSX.writeFile(wb, "template.xlsx");
         }}>テンプレート取得</button>
       </Box>
-      <TableContainer component={Paper} sx={styles.tableContainer}>
-        <Table size="small">
+      <Typography variant="h7" gutterBottom>収益達成計画</Typography>
+      <TableContainer 
+        component={Paper} 
+        sx={{ 
+          width: "100%",
+          minWidth: "1500px", // 横スクロールを防ぐための最小幅指定
+          margin: "4px auto", 
+          padding: "2px",
+          overflowX: "hidden" // メインテーブルはスクロールを無効化
+        }}
+      >
+        <Table size="small" style={{ tableLayout: "fixed", width: "100%" }}>
           <TableHead>
             <TableRow>
               {headerTexts.map((text, colIndex) => (
@@ -391,7 +387,16 @@ function ProfitTable() {
                     ...(colIndex === 5 && {
                       borderLeft: "2px solid #90caf9",
                       borderRight: "2px solid #90caf9"
-                    })
+                    }),
+                    width: columnWidths[
+                      colIndex === 0 ? 'no' :
+                      colIndex === 1 ? 'item' :
+                      colIndex === 2 ? 'period' :
+                      colIndex === 3 ? 'target' :
+                      colIndex === 4 ? 'unit' :
+                      colIndex === 5 ? 'sum' :
+                      'plan'
+                    ]
                   }}
                 >
                   {text}
@@ -407,11 +412,21 @@ function ProfitTable() {
                 rowIndex={rowIndex}
                 numericData={numericData}
                 handlePlanChange={handlePlanChange}
-                handleYearOnYearChange={handleYearOnYearChange}
                 handleFieldBlur={handleFieldBlur}
                 handleFieldFocus={handleFieldFocus}
                 handleKeyEvent={handleKeyEvent} // handleKeyPress を handleKeyEvent に変更
-                renderTextField={renderTextField}
+                renderTextField={({ value, onChange, onBlur, onFocus, rowIndex, colIndex }) => renderTextField({
+                  value,
+                  onChange,
+                  onBlur,
+                  onFocus,
+                  onKeyDown: (e) => handleKeyEvent(e, rowIndex, 'plan', colIndex - 6, value, header, colIndex),
+                  rowIndex,
+                  colIndex,
+                  fieldType: 'plan',
+                  planIndex: colIndex - 6,
+                  header
+                })}
                 getCellBg={getCellBg}
                 getRowStyle={getRowStyle}
                 focusedCell={focusedCell}
@@ -420,7 +435,6 @@ function ProfitTable() {
           </TableBody>
         </Table>
       </TableContainer>
-      <PlanTable {...tableProps} />
     </Box>
   );
 }
