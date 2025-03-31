@@ -168,15 +168,14 @@ function generateDummyRowsForHierarchyFull(labels, hierarchy) {
 /**
  * ====== 予測単位ごとの集約関数 ======
  * 通常の「昨年実績」「今期実績」「今期予測」はダミーデータ rows から集計。
- * + 追加で「傾向」「今期予測(手動)」の2シリーズ分をユーザー入力(state)から合成。
+ * + 追加で「傾向」「今期予測(手動)」「最終予測」の3シリーズ分をユーザー入力(state)から合成。
  */
-// ★★★ 追加引数 trendCoefficients, manualForecasts を受け取る ★★★
 function aggregateRowsByForecastTarget(
   rows, 
   groupField, 
   forecastTargets,
-  trendCoefficients,   // [group][forecastTarget][index] => 数値(係数)
-  manualForecasts      // [group][forecastTarget][index] => 数値(絶対値)
+  trendCoefficients, 
+  manualForecasts
 ) {
   // 係数の設定（必要に応じて各シリーズの素の値に何らかの factor を掛ける想定の場合）
   const factorMapping = {
@@ -218,7 +217,7 @@ function aggregateRowsByForecastTarget(
   });
 
   // ★★★ ユーザー入力の「傾向」シリーズを追加 ★★★
-  // 「傾向」は 「昨年実績」× trendCoefficients[group][pred][i] で計算
+  // 「傾向」は常に100.0%に設定
   Object.keys(groups).forEach(groupKey => {
     forecastTargets.forEach(pred => {
       // まず「昨年実績_xxx」があるかチェック
@@ -231,10 +230,7 @@ function aggregateRowsByForecastTarget(
       groups[groupKey][newKey] = {
         series: "傾向",
         forecastTarget: pred,
-        data: lastYearData.map((val, i) => {
-          const coeff = trendCoefficients[groupKey]?.[pred]?.[i] ?? 1; // 未入力は1扱い
-          return val * coeff;
-        })
+        data: lastYearData.map(() => 1) // 常に100.0% (係数1)
       };
     });
   });
@@ -266,6 +262,29 @@ function aggregateRowsByForecastTarget(
             ...Array(diff).fill(0)
           ];
         }
+      }
+    });
+  });
+
+  // ★★★ 「最終予測」シリーズを追加 ★★★
+  Object.keys(groups).forEach(groupKey => {
+    forecastTargets.forEach(pred => {
+      const currentForecastKey = "今期予測_" + pred;
+      const trendKey = "傾向_" + pred;
+
+      if (groups[groupKey][currentForecastKey] && groups[groupKey][trendKey]) {
+        const currentForecastData = groups[groupKey][currentForecastKey].data;
+        const trendData = groups[groupKey][trendKey].data;
+
+        const finalKey = "最終予測_" + pred;
+        groups[groupKey][finalKey] = {
+          series: "最終予測",
+          forecastTarget: pred,
+          data: currentForecastData.map((currentVal, i) => {
+            const trendVal = trendData[i] ?? 1; // 傾向値がない場合は1を使用
+            return (currentVal ?? 0) * trendVal;
+          })
+        };
       }
     });
   });
@@ -339,7 +358,16 @@ function App() {
 
   // --- ★★★ 追加：ユーザー入力を保持する state ★★★
   // 「傾向」用係数: trendCoefficients[group][forecastTarget][index] => number
-  const [trendCoefficients, setTrendCoefficients] = React.useState({});
+  const [trendCoefficients, setTrendCoefficients] = React.useState(() => {
+    const initialCoefficients = {};
+    Object.keys(hierarchy["全社"]).forEach(department => {
+      initialCoefficients[department] = {};
+      predictionTargets.forEach(target => {
+        initialCoefficients[department][target] = Array(periodLabels.length).fill(1); // 初期値を1 (100%) に設定
+      });
+    });
+    return initialCoefficients;
+  });
   // 「今期予測(手動)」: manualForecasts[group][forecastTarget][index] => number
   const [manualForecasts, setManualForecasts] = React.useState({});
 
@@ -483,11 +511,12 @@ function App() {
       "回転日数": 6
     };
     const seriesOrder = {
-      "昨年実績": 0,
-      "傾向": 1,            // ★★★ 今回追加
-      "今期実績": 2,
-      "今期予測": 3,
-      "今期予測(手動)": 4   // ★★★ 今回追加
+      "今期予測": 0,
+      "今期実績": 1,
+      "昨年実績": 2,
+      "今期予測(手動)": 3, // ★★★ 並び順変更
+      "傾向": 4,            // 傾向は最後に
+      "最終予測": 5         // 最終予測を追加
     };
     return aggregatedRowsTable.slice().sort((a, b) => {
       // 1) 予測対象の順
@@ -516,19 +545,7 @@ function App() {
       return; // 数字以外は一旦無視
     }
 
-    if (series === "傾向") {
-      // trendCoefficients[group][forecastTarget][index] = numVal
-      setTrendCoefficients(prev => {
-        const newObj = { ...prev };
-        if (!newObj[group]) newObj[group] = {};
-        if (!newObj[group][forecastTarget]) {
-          // 期間ラベル分だけ初期化(長さ)
-          newObj[group][forecastTarget] = Array(periodLabels.length).fill(1);
-        }
-        newObj[group][forecastTarget][index] = numVal;
-        return newObj;
-      });
-    } else if (series === "今期予測(手動)") {
+    if (series === "今期予測(手動)") {
       // manualForecasts[group][forecastTarget][index] = numVal
       setManualForecasts(prev => {
         const newObj = { ...prev };
@@ -590,7 +607,7 @@ function App() {
     // 合計計算
     const rowTotal = row.data.reduce((sum, val) => sum + val, 0);
 
-    // ★★★ 「傾向」「今期予測(手動)」の場合は、セルを <TextField> で編集可にする ★★★
+    // ★★★ 「傾向」「今期予測(手動)」「最終予測」の場合は、セルを <TextField> で編集可にする ★★★
     groupedRowsElements.push(
       <TableRow key={`data-${i}`}>
         {/* 予測対象 */}
@@ -616,19 +633,44 @@ function App() {
         {row.data.map((val, j) => {
           if (displayMode === "absolute") {
             // 傾向 or 今期予測(手動) は入力欄にする
-            if (row.series === "傾向" || row.series === "今期予測(手動)") {
+            if (row.series === "傾向") {
               return (
                 <TableCell key={j} align="right">
                   <TextField
                     size="small"
-                    value={val?.toFixed(2) ?? ""}
-                    onChange={(e) => handleInputChange(row.group, row.forecastTarget, row.series, j, e.target.value)}
+                    value={val != null ? (val * 100).toFixed(1) : "100.0"} // 初期値を "100.0" に設定
+                    onChange={(e) => handleInputChange(row.group, row.forecastTarget, row.series, j, e.target.value / 100)}
                     sx={{ width: 80 }}
+                    InputProps={{ endAdornment: <Typography variant="body2">%</Typography> }}
                   />
                 </TableCell>
               );
+            } else if (row.series === "今期予測(手動)") {
+              return (
+                <TableCell key={j} align="right">
+                  <TextField
+                    size="small"
+                    value={val != null ? "" : ""} // 空欄に初期化
+                    onChange={(e) => handleInputChange(row.group, row.forecastTarget, row.series, j, parseInt(e.target.value, 10))}
+                    sx={{ width: 80 }}
+                    type="number"
+                  />
+                </TableCell>
+              );
+            } else if (row.series === "最終予測") {
+              return (
+                <TableCell key={j} align="right">
+                  {val != null ? val.toFixed(1) : "-"}
+                </TableCell>
+              );
+            } else if (row.series === "昨年実績") {
+              return (
+                <TableCell key={j} align="right">
+                  {val != null ? val.toFixed(1) : "-"}
+                </TableCell>
+              );
             } else {
-              // 通常(昨年実績,今期実績,今期予測)
+              // 通常(今期実績, 今期予測)
               return (
                 <TableCell key={j} align="right">
                   {val != null ? val.toFixed(1) : "-"}
@@ -727,7 +769,6 @@ function App() {
                       onClick={() => {
                         const newSet = new Set(selectedCorners);
                         newSet.has(corner) ? newSet.delete(corner) : newSet.add(corner);
-                        setSelectedCorners(newSet);
                       }}
                     />
                   ))}
@@ -856,7 +897,23 @@ function App() {
                 />
               );
             })}
-            {/* 傾向/今期予測(手動) もグラフで使いたいなら、必要に応じてChip追加してもOK */}
+            {/* 今期予測(手動), 傾向, 最終予測を追加 */}
+            {["今期予測(手動)", "傾向", "最終予測"].map(target => {
+              const selected = selectedPredictionTargets.has(target);
+              return (
+                <Chip key={target}
+                  label={target}
+                  variant={selected ? "filled" : "outlined"}
+                  color={selected ? "primary" : "default"}
+                  size="small"
+                  onClick={() => {
+                    const newSet = new Set(selectedPredictionTargets);
+                    newSet.has(target) ? newSet.delete(target) : newSet.add(target);
+                    setSelectedPredictionTargets(newSet);
+                  }}
+                />
+              );
+            })}
           </Box>
         </Box>
         {/* 表示切替トグルボタン（実数表示／構成比表示） */}
@@ -895,10 +952,10 @@ function App() {
               予測結果テーブル（全予測対象でグループ化）<br />
               （グループ表示順：予測対象 → 集約キー → シリーズ）<br />
               合計列を4列目に表示し、<br/>
-              「傾向」「今期予測(手動)」は入力欄で数値を更新できます。
+              「傾向」「今期予測(手動)」「最終予測」は入力欄で数値を更新できます。
             </Typography>
             <TableContainer sx={{ '& td, & th': { whiteSpace: 'nowrap' } }}>
-              <Table size="small" sx={{ '& .MuiTableCell-root': { py: 0.5, px: 1 } }}>
+              <Table size="small" sx={{ '& .MuiTableCell-root': { py: 0.25, px: 1 } }}>
                 <TableHead>
                   <TableRow>
                     <TableCell sx={{ backgroundColor: 'silver', borderRight: '1px solid #ccc', minWidth: 80 }}>
