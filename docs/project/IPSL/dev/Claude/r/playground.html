@@ -2,1340 +2,660 @@
 <html lang="ja">
 <head>
   <meta charset="UTF-8" />
-  <title>予測結果テーブル：合計列を4列目に表示＋傾向・手動予測入力＋ドラッグ更新</title>
-
+  <title>実績テーブル（期間＆階層選択：フルコード）</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <!-- Roboto & MUI -->
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Roboto:wght@300;400;500;700&display=swap" />
   <!-- React, ReactDOM, Babel -->
   <script src="https://cdn.jsdelivr.net/npm/react@18.2.0/umd/react.production.min.js" crossorigin></script>
   <script src="https://cdn.jsdelivr.net/npm/react-dom@18.2.0/umd/react-dom.production.min.js" crossorigin></script>
   <script src="https://cdn.jsdelivr.net/npm/@babel/standalone@7.23.8/babel.min.js"></script>
-
   <!-- Emotion (MUI依存) -->
   <script src="https://cdn.jsdelivr.net/npm/@emotion/react@11.11.3/dist/emotion-react.umd.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/@emotion/styled@11.11.0/dist/emotion-styled.umd.min.js"></script>
-
-  <!-- MUI Core & Roboto -->
-  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Roboto:wght@300;400;500;700&display=swap" />
+  <!-- MUI Core -->
   <script src="https://cdn.jsdelivr.net/npm/@mui/material@5.15.3/umd/material-ui.production.min.js" crossorigin></script>
-
-  <!-- Chart.js -->
-  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
-
-  <!-- chartjs-plugin-dragdata (ドラッグで値更新) -->
-  <script src="https://cdn.jsdelivr.net/npm/chartjs-plugin-dragdata@3.0.0-beta.4/dist/chartjs-plugin-dragdata.min.js"></script>
-
-  <style>
-    body { margin: 0; padding: 0; }
-    .group-header {
-      background-color: #ddd;
-      font-weight: bold;
-    }
-  </style>
 </head>
 <body>
-<div id="root"></div>
-<script type="text/babel">
+  <div id="root"></div>
+  
+  <script type="text/babel">
 
-const {
-  Container, Box, Typography, Paper, Chip, Button,
-  TextField, MenuItem, Tabs, Tab, Table, TableBody,
-  TableCell, TableContainer, TableHead, TableRow, Breadcrumbs,
-  ToggleButton, ToggleButtonGroup
-} = window['MaterialUI'];
+    const { useState, useMemo, useEffect } = React;
+    const {
+      Box,
+      Chip,
+      Typography,
+      TableContainer,
+      Table,
+      TableHead,
+      TableBody,
+      TableRow,
+      TableCell,
+      TextField,
+      Tabs,
+      Tab,
+      ToggleButton,
+      ToggleButtonGroup
+    } = MaterialUI;
 
-/** ====== 期間ラベル生成関数 ====== **/
-function getLabels(unit) {
-  if (unit === "年") {
-    return ["2024年", "2025年", "2026年"];
-  } else if (unit === "月") {
-    let arr = [];
-    for (let i = 1; i <= 14; i++){
-      arr.push(`${i}月`);
-    }
-    return arr;
-  } else if (unit === "週") {
-    let arr = [];
-    for (let i = 1; i <= 56; i++){
-      arr.push(`${i}週`);
-    }
-    return arr;
-  } else if (unit === "日") {
-    let arr = [];
-    let start = new Date("2025-04-16");
-    let end = new Date("2025-06-15");
-    for (let d = new Date(start); d <= end; d.setDate(d.getDate()+1)) {
-      let m = d.getMonth() + 1;
-      let day = d.getDate();
-      arr.push(`${m}/${day}`);
-    }
-    return arr;
-  } else if (unit === "時間") {
-    let arr = [];
-    for (let i = 0; i < 24; i++){
-      arr.push(`${i}時`);
-    }
-    return arr;
-  }
-  return [];
-}
+    // 商品階層レベル定義（全部門を追加）
+    const PRODUCT_LEVELS = ["全部門", "部門", "コーナー", "ライン", "カテゴリ", "アイテム", "SKU"];
+    // 拠点階層レベル定義（全店舗を追加）
+    const SITE_LEVELS = ["全店舗", "事業", "ブロック", "店舗"];
 
-/** ====== 階層構造の定義 ====== **/
-const hierarchy = {
-  "全社": {
-    "営業部": {
-      "コーナー1": {
-        "ライン1": ["カテゴリ1", "カテゴリ2", "カテゴリ3"],
-        "ライン2": ["カテゴリ1", "カテゴリ2", "カテゴリ3"]
-      },
-      "コーナー2": {
-        "ライン1": ["カテゴリ1", "カテゴリ2", "カテゴリ3"],
-        "ライン2": ["カテゴリ1", "カテゴリ2", "カテゴリ3"]
-      },
-      "コーナー3": {
-        "ライン1": ["カテゴリ1", "カテゴリ2", "カテゴリ3"],
-        "ライン2": ["カテゴリ1", "カテゴリ2", "カテゴリ3"]
+    // ------------------------------
+    //  1) 参照期間 (開始日・終了日)
+    //  2) 集計単位チップ
+    //  3) 商品分類軸（6階層）
+    //  4) 拠点分類軸（3階層）
+    //  テーブル表示は (SKU × 店舗) を選択してダミーデータを表示
+    // ------------------------------
+
+    // 集計単位の選択肢（"カスタム"を含む）
+    const AGGREGATION_UNITS = ["年", "月", "週", "日", "時間", "半期", "四半期", "カスタム"];
+
+    /**
+     * ユーザーが入力した [startDate, endDate] と
+     * 選択した集計単位 (unit) に基づいて、期間ラベルを生成。
+     * 
+     * - "年"     → 年ごとに
+     * - "月"     → 月ごとに
+     * - "週"     → 7日区切り
+     * - "日"     → 1日区切り
+     * - "時間"   → 1時間区切り
+     * - "半期"   → 1～6月、7～12月の区切り
+     * - "四半期" → 3か月区切り（Q1/Q2/Q3/Q4）
+     * - "カスタム" → ここでは「日」と同様、1日ずつ作成
+     *               （必要に応じて自由に定義可能）
+     */
+    function generatePeriodLabels(startDateStr, endDateStr, unit) {
+      const labels = [];
+      const start = new Date(startDateStr);
+      const end = new Date(endDateStr);
+
+      // 不正な日付 or 開始 > 終了 の場合は空配列
+      if (isNaN(start) || isNaN(end) || start > end) {
+        return { labels, periodCount: 0 };
       }
-    },
-    "開発部": {
-      "コーナー1": {
-        "ライン1": ["カテゴリ1", "カテゴリ2", "カテゴリ3"],
-        "ライン2": ["カテゴリ1", "カテゴリ2", "カテゴリ3"]
-      },
-      "コーナー2": {
-        "ライン1": ["カテゴリ1", "カテゴリ2", "カテゴリ3"],
-        "ライン2": ["カテゴリ1", "カテゴリ2", "カテゴリ3"]
-      },
-      "コーナー3": {
-        "ライン1": ["カテゴリ1", "カテゴリ2", "カテゴリ3"],
-        "ライン2": ["カテゴリ1", "カテゴリ2", "カテゴリ3"]
-      }
-    },
-    "管理部": {
-      "コーナー1": {
-        "ライン1": ["カテゴリ1", "カテゴリ2", "カテゴリ3"],
-        "ライン2": ["カテゴリ1", "カテゴリ2", "カテゴリ3"]
-      },
-      "コーナー2": {
-        "ライン1": ["カテゴリ1", "カテゴリ2", "カテゴリ3"],
-        "ライン2": ["カテゴリ1", "カテゴリ2", "カテゴリ3"]
-      },
-      "コーナー3": {
-        "ライン1": ["カテゴリ1", "カテゴリ2", "カテゴリ3"],
-        "ライン2": ["カテゴリ1", "カテゴリ2", "カテゴリ3"]
-      }
-    }
-  }
-};
 
-/** ====== ダミーデータ生成 ====== **/
-function generateDummyRowsForHierarchyFull(labels, hierarchy) {
-  let rows = [];
-  const company = hierarchy["全社"];
-  Object.entries(company).forEach(([department, corners]) => {
-    Object.entries(corners).forEach(([corner, lines]) => {
-      Object.entries(lines).forEach(([line, categories]) => {
-        categories.forEach(category => {
-          // 昨年実績
-          rows.push({
-            department,
-            corner,
-            line,
-            category,
-            series: "昨年実績",
-            data: labels.map((_, i) => 100 + i * 10 + Math.floor(Math.random() * 10))
-          });
-          // 今期実績
-          rows.push({
-            department,
-            corner,
-            line,
-            category,
-            series: "今期実績",
-            data: labels.map((_, i) => i < Math.floor(labels.length/2)
-              ? 105 + i * 8 + Math.floor(Math.random() * 5)
-              : null
-            )
-          });
-          // 今期予測
-          rows.push({
-            department,
-            corner,
-            line,
-            category,
-            series: "今期予測",
-            data: labels.map((_, i) => 110 + i * 9 + Math.floor(Math.random() * 5))
-          });
-        });
-      });
-    });
-  });
-  return rows;
-}
-
-/**
- * ====== 予測単位ごとの集約関数 ======
- * 通常の「昨年実績」「今期実績」「今期予測」はダミーデータ rows から集計。
- * + 追加で「傾向」「今期予測(手動)」「最終予測」の3シリーズ分をユーザー入力(state)から合成。
- */
-function aggregateRowsByForecastTarget(
-  rows,
-  groupField,
-  forecastTargets,
-  trendCoefficients,
-  manualForecasts
-) {
-  // 係数の設定（必要に応じて各シリーズの素の値に何らかの factor を掛ける想定）
-  const factorMapping = {
-    "売上": 1,
-    "値下": 0.9,
-    "値上": 1.1,
-    "ロス": 0.05,
-    "売上総利益": 1,
-    "期末在庫": 1,
-    "回転日数": 1
-  };
-
-  // 中間集計用
-  let groups = {}; // groups[groupKey][series-forecastTarget] => { data: [...], series, forecastTarget }
-
-  // ★★★ rows の「昨年実績」「今期実績」「今期予測」を集約
-  rows.forEach(row => {
-    const groupKey = groupField === "全社" ? "全社" : row[groupField];
-    if (!groups[groupKey]) groups[groupKey] = {};
-
-    forecastTargets.forEach(ft => {
-      if (row.series === "昨年実績" || row.series === "今期実績" || row.series === "今期予測") {
-        const key = row.series + "_" + ft;
-        if (!groups[groupKey][key]) {
-          groups[groupKey][key] = {
-            series: row.series,
-            forecastTarget: ft,
-            data: Array(row.data.length).fill(0)
-          };
-        }
-        const factor = factorMapping[ft] ?? 1;
-        row.data.forEach((val, idx) => {
-          const addVal = val == null ? 0 : (val * factor);
-          groups[groupKey][key].data[idx] += addVal;
-        });
-      }
-    });
-  });
-
-  // ★★★ 「傾向」シリーズをユーザー入力から追加
-  Object.keys(groups).forEach(groupKey => {
-    forecastTargets.forEach(ft => {
-      const lastYearKey = "昨年実績_" + ft;
-      if (!groups[groupKey][lastYearKey]) return;
-      const lastYearData = groups[groupKey][lastYearKey].data;
-      const newKey = "傾向_" + ft;
-      groups[groupKey][newKey] = {
-        series: "傾向",
-        forecastTarget: ft,
-        data: lastYearData.map((_, i) => {
-          const userVal = trendCoefficients[groupKey]?.[ft]?.[i];
-          return userVal != null ? userVal : 1; // デフォルトは1 (100%)
-        })
-      };
-    });
-  });
-
-  // ★★★ 「今期予測(手動)」シリーズをユーザー入力から追加
-  Object.keys(groups).forEach(groupKey => {
-    forecastTargets.forEach(ft => {
-      const manualKey = "今期予測(手動)_" + ft;
-      const lastYearKey = "昨年実績_" + ft;
-      const lengthRef = groups[groupKey][lastYearKey]?.data?.length ?? 0;
-      // 実際の入力データ
-      const arr = manualForecasts[groupKey]?.[ft] ?? [];
-      // 長さを lastYearData と整合させる
-      // => 入力していない箇所は null にして空欄に
-      const filledArr = arr.length >= lengthRef
-        ? arr.slice(0, lengthRef)
-        : [...arr, ...Array(lengthRef - arr.length).fill(null)];
-
-      groups[groupKey][manualKey] = {
-        series: "今期予測(手動)",
-        forecastTarget: ft,
-        data: lengthRef > 0 ? filledArr : []
-      };
-    });
-  });
-
-  // ★★★ 「最終予測」シリーズを追加
-  Object.keys(groups).forEach(groupKey => {
-    forecastTargets.forEach(ft => {
-      const currentForecastKey = "今期予測_" + ft;
-      const trendKey = "傾向_" + ft;
-      const manualKey = "今期予測(手動)_" + ft;
-
-      // 必要なデータがあるかチェック
-      if (groups[groupKey][currentForecastKey] && groups[groupKey][trendKey]) {
-        const currentForecastData = groups[groupKey][currentForecastKey].data;
-        const trendData = groups[groupKey][trendKey].data;
-        const manualForecastData = groups[groupKey][manualKey]?.data || [];
-        const finalKey = "最終予測_" + ft;
-
-        groups[groupKey][finalKey] = {
-          series: "最終予測",
-          forecastTarget: ft,
-          data: currentForecastData.map((val, i) => {
-            const trendVal = trendData[i] ?? 1;
-            const manualVal = manualForecastData[i];
-
-            // 今期予測(手動)が 0以上で入力されていればそれを使用、null なら (今期予測 × 傾向)
-            if (manualVal != null && !isNaN(manualVal) && manualVal >= 0) {
-              return manualVal;
-            } else {
-              return (val ?? 0) * trendVal;
-            }
-          })
-        };
-      }
-    });
-  });
-
-  // オブジェクト -> 配列へ
-  let result = [];
-  for (let groupKey in groups) {
-    for (let seriesKey in groups[groupKey]) {
-      const item = groups[groupKey][seriesKey];
-      result.push({
-        group: groupKey,
-        series: item.series,
-        forecastTarget: item.forecastTarget,
-        data: item.data
-      });
-    }
-  }
-  return result;
-}
-
-/** 
- * MemoizedTextField
- * - localState を持ち、親からの value 変更時のみ再設定
- * - フォーカス時にテキスト全選択
- * - 矢印キー上下左右 + Enter で対応セルへ移動
- */
-const MemoizedTextField = React.memo(({
-  value,
-  onBlur,
-  onChange,
-  isPercentage = false,
-  position = { row: 0, col: 0 }
-}) => {
-  const [localValue, setLocalValue] = React.useState(value);
-
-  // 外部からの value が変化した場合のみ localState に反映
-  React.useEffect(() => {
-    setLocalValue(value);
-  }, [value]);
-
-  const handleKeyDown = React.useCallback((e) => {
-    const { row, col } = position;
-    switch (e.key) {
-      case 'ArrowUp':
-        e.preventDefault();
-        {
-          const upInput = document.querySelector(`input[data-row="${row - 1}"][data-col="${col}"]`);
-          if (upInput) upInput.focus();
-        }
-        break;
-      case 'ArrowDown':
-        e.preventDefault();
-        {
-          const downInput = document.querySelector(`input[data-row="${row + 1}"][data-col="${col}"]`);
-          if (downInput) downInput.focus();
-        }
-        break;
-      case 'ArrowLeft':
-        e.preventDefault();
-        {
-          const leftInput = document.querySelector(`input[data-row="${row}"][data-col="${col - 1}"]`);
-          if (leftInput) leftInput.focus();
-        }
-        break;
-      case 'ArrowRight':
-        e.preventDefault();
-        {
-          const rightInput = document.querySelector(`input[data-row="${row}"][data-col="${col + 1}"]`);
-          if (rightInput) rightInput.focus();
-        }
-        break;
-      case 'Enter':
-        e.preventDefault();
-        {
-          const rightInput = document.querySelector(`input[data-row="${row}"][data-col="${col + 1}"]`);
-          if (rightInput) rightInput.focus();
-        }
-        break;
-      default:
-        break;
-    }
-  }, [position]);
-
-  const handleChange = React.useCallback((e) => {
-    setLocalValue(e.target.value);
-    onChange?.(e.target.value);
-  }, [onChange]);
-
-  const handleBlur = React.useCallback((e) => {
-    onBlur?.(e.target.value);
-  }, [onBlur]);
-
-  // フォーカス時にテキストを全選択
-  const handleFocus = React.useCallback((e) => {
-    e.target.select();
-  }, []);
-
-  return (
-    <TextField
-      size="small"
-      value={localValue}
-      onChange={handleChange}
-      onBlur={handleBlur}
-      onFocus={handleFocus}
-      onKeyDown={handleKeyDown}
-      sx={{ width: 80 }}
-      inputProps={{
-        "data-row": position.row,
-        "data-col": position.col,
-        inputMode: "numeric",
-        pattern: "[0-9]*"
-      }}
-      InputProps={{
-        endAdornment: isPercentage ? <Typography variant="body2">%</Typography> : null
-      }}
-    />
-  );
-}, (prevProps, nextProps) => {
-  // 値/位置/パーセント表示設定が同じなら再描画しない
-  return (
-    prevProps.value === nextProps.value &&
-    prevProps.isPercentage === nextProps.isPercentage &&
-    prevProps.position.row === nextProps.position.row &&
-    prevProps.position.col === nextProps.position.col
-  );
-});
-
-/** 
- * TableCellWithInput 
- * - シリーズ "傾向" と "今期予測(手動)" のときのみ入力可能
- * - 今期予測(手動) が null の場合は表示を空欄にする
- * - 傾向(%) が null の場合は "100.0" 表示
- */
-const TableCellWithInput = React.memo(({
-  rowIndex,
-  colIndex,
-  value,
-  series,
-  group,
-  forecastTarget,
-  onInputChange
-}) => {
-  const handleLocalChange = React.useCallback((newValue) => {
-    // 入力途中の変更時には特に何もしない（ローカルStateを更新のみ）
-  }, []);
-
-  const handleLocalBlur = React.useCallback((finalValue) => {
-    // blur時に親へ確定値を通知
-    onInputChange?.(group, forecastTarget, series, colIndex, finalValue);
-    // グラフ更新イベント
-    window.dispatchEvent(new CustomEvent('updateChart'));
-  }, [group, forecastTarget, series, colIndex, onInputChange]);
-
-  // 表示用
-  let displayValue = "";
-  if (series === "傾向") {
-    // 傾向がnull or undefined ならデフォルト 100%
-    displayValue = (value != null)
-      ? (value * 100).toFixed(1)
-      : "100.0";
-  } else if (series === "今期予測(手動)") {
-    // null の場合は空欄
-    displayValue = (value != null)
-      ? String(value)
-      : "";
-  }
-
-  return (
-    <TableCell align="right">
-      <MemoizedTextField
-        value={displayValue}
-        onChange={handleLocalChange}
-        onBlur={handleLocalBlur}
-        isPercentage={series === "傾向"}
-        position={{ row: rowIndex, col: colIndex }}
-      />
-    </TableCell>
-  );
-}, (prevProps, nextProps) => {
-  return (
-    prevProps.value === nextProps.value &&
-    prevProps.series === nextProps.series &&
-    prevProps.rowIndex === nextProps.rowIndex &&
-    prevProps.colIndex === nextProps.colIndex
-  );
-});
-
-/** 
- * グラフ描画コンポーネント
- */
-const ForecastChart = React.memo(({ periodLabels, chartData, onDragValueChange }) => {
-  const chartRef = React.useRef(null);
-  const canvasRef = React.useRef(null);
-  const dataRef = React.useRef({ periodLabels, chartData });
-
-  React.useEffect(() => {
-    if (!canvasRef.current) return;
-
-    // グラフ初期化は初回のみ
-    if (!chartRef.current) {
-      const ctx = canvasRef.current.getContext('2d');
-      chartRef.current = new Chart(ctx, {
-        type: 'line',
-        data: {
-          labels: periodLabels,
-          datasets: chartData
-        },
-        options: {
-          responsive: true,
-          maintainAspectRatio: false,
-          scales: {
-            y: { beginAtZero: false }
-          },
-          // ★★★ ドラッグ用プラグイン設定 ★★★
-          plugins: {
-            dragData: {
-              // X 軸のドラッグ無効化
-              dragX: false,
-              // 端数を丸める桁
-              round: 1,
-              // ドラッグ中にツールチップを表示するか
-              showTooltip: true,
-              // onDragStart - 最終予測以外はドラッグさせない
-              onDragStart: (e, datasetIndex, index, value) => {
-                const chart = e.chart;
-                const label = chart.data.datasets[datasetIndex].label || "";
-                // labelに "最終予測" を含む場合のみドラッグOK
-                if (!label.includes("最終予測")) {
-                  return false; 
-                }
-                return true;
-              },
-              onDragEnd: (e, datasetIndex, index, value) => {
-                // ドラッグ終了時に値をセットして再描画
-                const chart = e.chart;
-                const label = chart.data.datasets[datasetIndex].label || "";
-                // "○○ (最終予測-売上)" のような形式
-                if (!label.includes("最終予測")) return;
-
-                // ラベルから group, forecastTarget を抽出する簡易的パース
-                // 例: "営業部 (最終予測-売上)"
-                // => group = "営業部"
-                // => series = "最終予測"
-                // => forecastTarget = "売上"
-                const leftParenIdx = label.indexOf("(");
-                let group = label.substring(0, leftParenIdx).trim(); 
-                // 残り: "最終予測-売上)"
-                const insideParen = label.substring(leftParenIdx + 1, label.lastIndexOf(")"));
-                // insideParen を "-" で分割 → ["最終予測", "売上"]
-                const parts = insideParen.split("-");
-                const forecastTarget = (parts.length >= 2) ? parts[1].trim() : "";
-
-                // 親にコールバック
-                onDragValueChange?.(group, forecastTarget, "最終予測", index, value);
-
-                // すぐ再描画
-                chart.update('none');
-              }
-            }
+      switch (unit) {
+        case "年": {
+          let year = start.getFullYear();
+          const endYear = end.getFullYear();
+          for (; year <= endYear; year++) {
+            labels.push(String(year));
           }
+          break;
         }
-      });
-    }
-
-    // データの参照だけ更新
-    dataRef.current = { periodLabels, chartData };
-
-    // unmount時
-    return () => {
-      if (chartRef.current) {
-        chartRef.current.destroy();
-        chartRef.current = null;
-      }
-    };
-  }, [periodLabels, chartData, onDragValueChange]);
-
-  // TextFieldのblur時などにグラフを更新
-  React.useEffect(() => {
-    const handleUpdateChart = () => {
-      if (chartRef.current) {
-        const { periodLabels, chartData } = dataRef.current;
-        chartRef.current.data.labels = periodLabels;
-        chartRef.current.data.datasets = chartData;
-        chartRef.current.update('none');
-      }
-    };
-    window.addEventListener('updateChart', handleUpdateChart);
-    return () => window.removeEventListener('updateChart', handleUpdateChart);
-  }, []);
-
-  return (
-    <Box sx={{ position: 'relative', minHeight: '300px', width: '100%' }}>
-      <canvas ref={canvasRef} style={{ width: '100%', height: '40vh' }} />
-    </Box>
-  );
-}, (prevProps, nextProps) => {
-  // データやラベルが変更されていない場合は再描画回避
-  return (
-    JSON.stringify(prevProps.chartData) === JSON.stringify(nextProps.chartData) &&
-    JSON.stringify(prevProps.periodLabels) === JSON.stringify(nextProps.periodLabels)
-  );
-});
-
-/** 
- * 文字列内の全角数字を半角に変換
- */
-function toHalfWidth(str) {
-  if (typeof str !== 'string') str = String(str);
-  return str.replace(/[０-９]/g, (s) => {
-    return String.fromCharCode(s.charCodeAt(0) - 0xFEE0);
-  });
-}
-
-/** 
- * メインコンポーネント
- */
-function App() {
-  // 期間設定
-  const [selectedPeriodUnit, setSelectedPeriodUnit] = React.useState("月");
-  const [periodLabels, setPeriodLabels] = React.useState(getLabels(selectedPeriodUnit));
-
-  React.useEffect(() => {
-    setPeriodLabels(getLabels(selectedPeriodUnit));
-  }, [selectedPeriodUnit]);
-
-  const [recentPeriod, setRecentPeriod] = React.useState(60);
-  const [forecastStart, setForecastStart] = React.useState("2025-06-01");
-  const [forecastEnd, setForecastEnd] = React.useState("2025-08-31");
-
-  // ダミーデータ生成
-  const generatedDummyData = React.useMemo(() => {
-    return generateDummyRowsForHierarchyFull(periodLabels, hierarchy);
-  }, [periodLabels]);
-
-  // 全予測対象
-  const predictionTargets = ["売上", "値下", "値上", "ロス", "売上総利益", "期末在庫", "回転日数"];
-  // グラフ表示時に選択中の予測対象
-  const [selectedPredictionTargets, setSelectedPredictionTargets] = React.useState(new Set(["売上"]));
-
-  // 表示モード（実数/構成比）
-  const [displayMode, setDisplayMode] = React.useState("absolute");
-
-  // 集約レベル
-  const [selectedTab, setSelectedTab] = React.useState("全社");
-
-  // 部門
-  const allDepartments = Object.keys(hierarchy["全社"]);
-  const [selectedDepartments, setSelectedDepartments] = React.useState(new Set(allDepartments));
-
-  // コーナー
-  const [selectedDepartmentCorner, setSelectedDepartmentCorner] = React.useState(allDepartments[0]);
-  const cornersForDept = Object.keys(hierarchy["全社"][selectedDepartmentCorner] || {});
-  const [selectedCorners, setSelectedCorners] = React.useState(new Set(cornersForDept));
-
-  // ライン
-  const [selectedDepartmentLine, setSelectedDepartmentLine] = React.useState(allDepartments[0]);
-  const cornersForDeptLine = Object.keys(hierarchy["全社"][selectedDepartmentLine] || {});
-  const [selectedCornerLine, setSelectedCornerLine] = React.useState(cornersForDeptLine[0]);
-  const linesForCorner = Object.keys(hierarchy["全社"][selectedDepartmentLine]?.[selectedCornerLine] || {});
-  const [selectedLines, setSelectedLines] = React.useState(new Set(linesForCorner));
-
-  // カテゴリ
-  const [selectedDepartmentCategory, setSelectedDepartmentCategory] = React.useState(allDepartments[0]);
-  const cornersForDeptCat = Object.keys(hierarchy["全社"][selectedDepartmentCategory] || {});
-  const [selectedCornerCategory, setSelectedCornerCategory] = React.useState(cornersForDeptCat[0]);
-  const linesForCornerCat = Object.keys(hierarchy["全社"][selectedDepartmentCategory]?.[selectedCornerCategory] || {});
-  const [selectedLineCategory, setSelectedLineCategory] = React.useState(linesForCornerCat[0]);
-  const catsForLine = hierarchy["全社"][selectedDepartmentCategory]?.[selectedCornerCategory]?.[selectedLineCategory] || [];
-  const [selectedCategories, setSelectedCategories] = React.useState(new Set(catsForLine));
-
-  // ★★★ ユーザー入力を保持する state ★★★
-  // 傾向用: trendCoefficients[group][forecastTarget][i] => number
-  const [trendCoefficients, setTrendCoefficients] = React.useState(() => {
-    const init = {};
-    Object.keys(hierarchy["全社"]).forEach(dept => {
-      init[dept] = {};
-      predictionTargets.forEach(pt => {
-        init[dept][pt] = Array(periodLabels.length).fill(1);
-      });
-    });
-    return init;
-  });
-
-  // 今期予測(手動): manualForecasts[group][forecastTarget][i] => number or null
-  const [manualForecasts, setManualForecasts] = React.useState({});
-
-  // 入力値確定（blur）時のハンドラ
-  const handleInputChange = React.useCallback((group, forecastTarget, series, index, rawValue) => {
-    const value = toHalfWidth(rawValue);
-    const numVal = parseFloat(value);
-
-    // 今期予測(手動) か 傾向(%)
-    if (series === "傾向") {
-      if (!isNaN(numVal)) {
-        setTrendCoefficients(prev => {
-          const newObj = { ...prev };
-          if (!newObj[group]) newObj[group] = {};
-          if (!newObj[group][forecastTarget]) {
-            newObj[group][forecastTarget] = Array(periodLabels.length).fill(1);
+        case "月": {
+          let current = new Date(start.getFullYear(), start.getMonth(), 1);
+          while (current <= end) {
+            labels.push(`${current.getFullYear()}/${current.getMonth() + 1}`);
+            current.setMonth(current.getMonth() + 1);
           }
-          newObj[group][forecastTarget][index] = numVal / 100; // 100 -> 1
-          return newObj;
-        });
-      }
-    } else if (series === "今期予測(手動)") {
-      // 手動予測が空文字 or 数値以外なら null とする
-      const finalVal = (isNaN(numVal)) ? null : numVal;
-      setManualForecasts(prev => {
-        const newObj = { ...prev };
-        if (!newObj[group]) newObj[group] = {};
-        if (!newObj[group][forecastTarget]) {
-          // まだ配列がなければ periodLabels 長さで全部 null
-          newObj[group][forecastTarget] = Array(periodLabels.length).fill(null);
+          break;
         }
-        newObj[group][forecastTarget][index] = finalVal;
-        return newObj;
-      });
-    }
-  }, [periodLabels]);
-
-  // ドラッグによる値変更 (最終予測シリーズをドラッグして更新)
-  const handleDragValueChange = React.useCallback((group, forecastTarget, series, index, value) => {
-    // 「最終予測」ドラッグ時は、今期予測(手動)を上書きすることで最終予測に反映させる
-    // ただしドラッグ値が NaN の場合は無視
-    if (isNaN(value)) return;
-    const numVal = parseFloat(value);
-
-    // 0以上なら手動値、そうでなければnullにする等、制限したい場合は適宜処理
-    const finalVal = (numVal < 0) ? 0 : numVal; 
-
-    setManualForecasts(prev => {
-      const newObj = { ...prev };
-      if (!newObj[group]) newObj[group] = {};
-      if (!newObj[group][forecastTarget]) {
-        newObj[group][forecastTarget] = Array(periodLabels.length).fill(null);
-      }
-      newObj[group][forecastTarget][index] = finalVal;
-      return newObj;
-    });
-
-    // グラフ・テーブル更新
-    window.dispatchEvent(new CustomEvent('updateChart'));
-  }, [periodLabels]);
-
-  // 階層選択連動処理
-  React.useEffect(() => {
-    const newCorners = Object.keys(hierarchy["全社"][selectedDepartmentCorner] || {});
-    setSelectedCorners(new Set(newCorners));
-  }, [selectedDepartmentCorner]);
-
-  React.useEffect(() => {
-    const newCorners = Object.keys(hierarchy["全社"][selectedDepartmentLine] || {});
-    setSelectedCornerLine(newCorners[0]);
-  }, [selectedDepartmentLine]);
-
-  React.useEffect(() => {
-    const newLines = Object.keys(hierarchy["全社"][selectedDepartmentLine]?.[selectedCornerLine] || {});
-    setSelectedLines(new Set(newLines));
-  }, [selectedCornerLine, selectedDepartmentLine]);
-
-  React.useEffect(() => {
-    const newCorners = Object.keys(hierarchy["全社"][selectedDepartmentCategory] || {});
-    setSelectedCornerCategory(newCorners[0]);
-  }, [selectedDepartmentCategory]);
-
-  React.useEffect(() => {
-    const newLines = Object.keys(hierarchy["全社"][selectedDepartmentCategory]?.[selectedCornerCategory] || {});
-    setSelectedLineCategory(newLines[0]);
-  }, [selectedCornerCategory, selectedDepartmentCategory]);
-
-  React.useEffect(() => {
-    const newCats = hierarchy["全社"][selectedDepartmentCategory]?.[selectedCornerCategory]?.[selectedLineCategory] || [];
-    setSelectedCategories(new Set(newCats));
-  }, [selectedLineCategory, selectedCornerCategory, selectedDepartmentCategory]);
-
-  // フィルタリング
-  let filteredRows = generatedDummyData;
-  if (selectedTab === "部門") {
-    filteredRows = filteredRows.filter(r => selectedDepartments.has(r.department));
-  } else if (selectedTab === "コーナー") {
-    filteredRows = filteredRows.filter(r =>
-      r.department === selectedDepartmentCorner &&
-      selectedCorners.has(r.corner)
-    );
-  } else if (selectedTab === "ライン") {
-    filteredRows = filteredRows.filter(r =>
-      r.department === selectedDepartmentLine &&
-      r.corner === selectedCornerLine &&
-      selectedLines.has(r.line)
-    );
-  } else if (selectedTab === "カテゴリー") {
-    filteredRows = filteredRows.filter(r =>
-      r.department === selectedDepartmentCategory &&
-      r.corner === selectedCornerCategory &&
-      r.line === selectedLineCategory &&
-      selectedCategories.has(r.category)
-    );
-  }
-
-  // 集約処理
-  const groupKeyField =
-    selectedTab === "全社" ? "全社" :
-    (selectedTab === "部門" ? "department"
-      : (selectedTab === "コーナー" ? "corner"
-        : (selectedTab === "ライン" ? "line" : "category")));
-
-  // グラフ用：選択された予測対象のみ
-  const aggregatedRowsGraph = React.useMemo(() => {
-    return aggregateRowsByForecastTarget(
-      filteredRows,
-      groupKeyField,
-      Array.from(selectedPredictionTargets),
-      trendCoefficients,
-      manualForecasts
-    );
-  }, [
-    filteredRows,
-    groupKeyField,
-    selectedPredictionTargets,
-    trendCoefficients,
-    manualForecasts
-  ]);
-
-  // テーブル用：全予測対象
-  const aggregatedRowsTable = React.useMemo(() => {
-    return aggregateRowsByForecastTarget(
-      filteredRows,
-      groupKeyField,
-      predictionTargets,
-      trendCoefficients,
-      manualForecasts
-    );
-  }, [
-    filteredRows,
-    groupKeyField,
-    predictionTargets,
-    trendCoefficients,
-    manualForecasts
-  ]);
-
-  // グラフ用 dataset
-  const aggregatedChartData = React.useMemo(() => {
-    let colorIndex = 0;
-    const colors = [
-      "rgba(255,99,132,1)",
-      "rgba(54,162,235,1)",
-      "rgba(255,206,86,1)",
-      "rgba(75,192,192,1)",
-      "rgba(153,102,255,1)",
-      "rgba(255,159,64,1)",
-      "rgba(100,100,100,1)",
-    ];
-    return aggregatedRowsGraph.map(row => {
-      const c = colors[colorIndex % colors.length];
-      colorIndex++;
-      return {
-        label: `${row.group} (${row.series}-${row.forecastTarget})`,
-        data: row.data,
-        borderColor: c,
-        backgroundColor: c.replace("1)", "0.2)"),
-        tension: 0.2
-      };
-    });
-  }, [aggregatedRowsGraph]);
-
-  // テーブル表示用にソート
-  const sortedTableRows = React.useMemo(() => {
-    const order = {
-      "売上": 0,
-      "値下": 1,
-      "値上": 2,
-      "ロス": 3,
-      "売上総利益": 4,
-      "期末在庫": 5,
-      "回転日数": 6
-    };
-    const seriesOrder = {
-      "今期予測": 0,
-      "今期実績": 1,
-      "昨年実績": 2,
-      "今期予測(手動)": 3,
-      "傾向": 4,
-      "最終予測": 5
-    };
-    return aggregatedRowsTable.slice().sort((a, b) => {
-      if (a.forecastTarget !== b.forecastTarget) {
-        return (order[a.forecastTarget] ?? 999) - (order[b.forecastTarget] ?? 999);
-      }
-      if (a.group !== b.group) {
-        return a.group.localeCompare(b.group);
-      }
-      return (seriesOrder[a.series] ?? 999) - (seriesOrder[b.series] ?? 999);
-    });
-  }, [aggregatedRowsTable]);
-
-  // テーブル本体
-  let previousForecast = "";
-  let previousGroup = "";
-  const tableRows = [];
-
-  sortedTableRows.forEach((row, i) => {
-    // 予測対象ヘッダー
-    if (row.forecastTarget !== previousForecast) {
-      tableRows.push(
-        <TableRow key={`header-forecast-${row.forecastTarget}`} className="group-header">
-          <TableCell colSpan={4 + periodLabels.length}>
-            予測対象：{row.forecastTarget}
-          </TableCell>
-        </TableRow>
-      );
-      previousForecast = row.forecastTarget;
-      previousGroup = "";
-    }
-
-    // グループヘッダー (breadcrumb風)
-    if (row.group !== previousGroup) {
-      const getBreadcrumb = (grp) => {
-        if (selectedTab === "全社") {
-          return ["全社"];
-        } else if (selectedTab === "部門") {
-          return ["全社", grp];
-        } else if (selectedTab === "コーナー") {
-          return ["全社", selectedDepartmentCorner, grp];
-        } else if (selectedTab === "ライン") {
-          return ["全社", selectedDepartmentLine, selectedCornerLine, grp];
-        } else {
-          // "カテゴリー"
-          return ["全社", selectedDepartmentCategory, selectedCornerCategory, selectedLineCategory, grp];
+        case "週": {
+          let current = new Date(start);
+          let w = 1;
+          while (current <= end) {
+            labels.push(`W${w}`);
+            w++;
+            current.setDate(current.getDate() + 7);
+          }
+          break;
         }
-      };
-      const breadcrumbItems = getBreadcrumb(row.group);
-      tableRows.push(
-        <TableRow key={`header-group-${row.forecastTarget}-${row.group}`} className="group-header">
-          <TableCell colSpan={4 + periodLabels.length} style={{ paddingLeft: '20px' }}>
-            <Breadcrumbs aria-label="breadcrumb">
-              {breadcrumbItems.map((item, idx) => (
-                <Typography key={idx} color="text.primary" variant="body2">
-                  {item}
-                </Typography>
-              ))}
-            </Breadcrumbs>
-          </TableCell>
-        </TableRow>
-      );
-      previousGroup = row.group;
-    }
-
-    // 合計
-    const rowTotal = row.data.reduce((sum, v) => sum + (v || 0), 0);
-
-    // 通常の行
-    tableRows.push(
-      <TableRow key={`data-${i}`}>
-        {/* 予測対象 */}
-        <TableCell style={{ paddingLeft: '40px' }}>
-          {row.forecastTarget}
-        </TableCell>
-        {/* グループ */}
-        <TableCell>
-          {row.group}
-        </TableCell>
-        {/* シリーズ */}
-        <TableCell>
-          {row.series}
-        </TableCell>
-        {/* 合計 */}
-        <TableCell align="right">
-          {displayMode === "absolute"
-            ? (rowTotal ? rowTotal.toFixed(1) : "-")
-            : (rowTotal ? "100.0%" : "0.0%")}
-        </TableCell>
-
-        {/* 各期間 */}
-        {row.data.map((val, colIndex) => {
-          if (displayMode === "absolute") {
-            // 傾向 or 今期予測(手動) の場合は入力セル
-            if (row.series === "傾向" || row.series === "今期予測(手動)") {
-              return (
-                <TableCellWithInput
-                  key={`${i}-${colIndex}`}
-                  rowIndex={i}       // テーブル上の行インデックス
-                  colIndex={colIndex}
-                  value={val}
-                  series={row.series}
-                  group={row.group}
-                  forecastTarget={row.forecastTarget}
-                  onInputChange={handleInputChange}
-                />
-              );
-            } else {
-              return (
-                <TableCell key={`${i}-${colIndex}`} align="right">
-                  {val != null ? val.toFixed(1) : "-"}
-                </TableCell>
-              );
-            }
-          } else {
-            // 構成比表示
-            const ratio = rowTotal ? (val / rowTotal * 100) : 0;
-            return (
-              <TableCell key={`${i}-${colIndex}`} align="right">
-                {ratio.toFixed(1)}%
-              </TableCell>
+        case "日":
+        case "カスタム": {
+          // 「カスタム」もここでは日単位として扱うサンプル実装
+          let current = new Date(start);
+          while (current <= end) {
+            labels.push(`${current.getMonth() + 1}/${current.getDate()}`);
+            current.setDate(current.getDate() + 1);
+          }
+          break;
+        }
+        case "時間": {
+          let current = new Date(start);
+          while (current <= end) {
+            labels.push(
+              `${current.getMonth() + 1}/${current.getDate()} ${current.getHours()}時`
             );
+            current.setHours(current.getHours() + 1);
           }
-        })}
-      </TableRow>
-    );
-  });
+          break;
+        }
+        case "半期": {
+          // start～end にかかる上半期(1-6)・下半期(7-12)をチェック
+          const startYear = start.getFullYear();
+          const endYear = end.getFullYear();
+          for (let y = startYear; y <= endYear; y++) {
+            // 上半期
+            const h1Start = new Date(y, 0, 1);   // 1/1
+            const h1End   = new Date(y, 5, 30);  // 6/30
+            if (h1End >= start && h1Start <= end) {
+              labels.push(`${y}上半期`);
+            }
+            // 下半期
+            const h2Start = new Date(y, 6, 1);   // 7/1
+            const h2End   = new Date(y, 11, 31); // 12/31
+            if (h2End >= start && h2Start <= end) {
+              labels.push(`${y}下半期`);
+            }
+          }
+          break;
+        }
+        case "四半期": {
+          const startYear = start.getFullYear();
+          const endYear = end.getFullYear();
+          for (let y = startYear; y <= endYear; y++) {
+            // Q1
+            const q1Start = new Date(y, 0, 1);
+            const q1End   = new Date(y, 2, 31); // 3/31
+            if (q1End >= start && q1Start <= end) {
+              labels.push(`${y} Q1`);
+            }
+            // Q2
+            const q2Start = new Date(y, 3, 1);   // 4/1
+            const q2End   = new Date(y, 5, 30);  // 6/30
+            if (q2End >= start && q2Start <= end) {
+              labels.push(`${y} Q2`);
+            }
+            // Q3
+            const q3Start = new Date(y, 6, 1);   // 7/1
+            const q3End   = new Date(y, 8, 30);  // 9/30
+            if (q3End >= start && q3Start <= end) {
+              labels.push(`${y} Q3`);
+            }
+            // Q4
+            const q4Start = new Date(y, 9, 1);   // 10/1
+            const q4End   = new Date(y, 11, 31); // 12/31
+            if (q4End >= start && q4Start <= end) {
+              labels.push(`${y} Q4`);
+            }
+          }
+          break;
+        }
+        default:
+          break;
+      }
 
-  return (
-    <Container maxWidth={false} disableGutters sx={{ backgroundColor: '#f5f5f5', paddingBottom: 2 }}>
-      {/* 上部エリア */}
-      <Box sx={{ mb: 2 }}>
-        <Box sx={{ p: 1, backgroundColor: '#fff', borderBottom: '1px solid #ccc' }}>
-          <Typography variant="subtitle1" sx={{ fontWeight: 'bold' }}>
-            予測対象Chipでグラフ切替、テーブルは全予測対象表示（傾向・今期予測(手動) は編集可）<br />
-            グラフ上で「最終予測」データポイントをドラッグしても更新されます
+      return { labels, periodCount: labels.length };
+    }
+
+    // ランダム配列生成
+    function generateRandomArray(n) {
+      return Array.from({ length: n }, () => Math.floor(Math.random() * 100));
+    }
+
+    // ----------------- 商品階層 -----------------
+    function createProductHierarchy(periodCount) {
+      const depts = [];
+      // 通常の部門を作成
+      for (let d = 1; d <= 3; d++) {
+        const dept = { name: `部門${d}`, level: "部門", children: [] };
+        for (let c = 1; c <= 3; c++) {
+          const corner = { name: `部門${d} コーナー${c}`, level: "コーナー", children: [] };
+          for (let l = 1; l <= 4; l++) {
+            const line = { name: `部門${d} コーナー${c} ライン${l}`, level: "ライン", children: [] };
+            for (let cat = 1; cat <= 3; cat++) {
+              const category = { name: `部門${d} コーナー${c} ライン${l} カテゴリ${cat}`, level: "カテゴリ", children: [] };
+              for (let i = 1; i <= 3; i++) {
+                const item = { name: `部門${d} コーナー${c} ライン${l} カテゴリ${cat} アイテム${i}`, level: "アイテム", children: [] };
+                for (let s = 1; s <= 2; s++) {
+                  const sku = {
+                    name: `部門${d} コーナー${c} ライン${l} カテゴリ${cat} アイテム${i} SKU${s}`,
+                    level: "SKU",
+                    children: [],
+                    data: generateRandomArray(periodCount)
+                  };
+                  item.children.push(sku);
+                }
+                category.children.push(item);
+              }
+              line.children.push(category);
+            }
+            corner.children.push(line);
+          }
+          dept.children.push(corner);
+        }
+        depts.push(dept);
+      }
+
+      // 全部門ノードを作成（3部門の合計）
+      const totalDept = { 
+        name: "全部門合計", 
+        level: "部門",
+        children: [],
+        isTotal: true // 合計ノードフラグ
+      };
+      depts.push(totalDept);
+      
+      return depts;
+    }
+
+    // ----------------- 拠点階層 -----------------
+    function createSiteHierarchy(periodCount) {
+      const businesses = [];
+      // 通常の事業を作成
+      for (let b = 1; b <= 2; b++) {
+        const biz = { name: `事業${b}`, level: "事業", children: [] };
+        for (let bl = 1; bl <= 3; bl++) {
+          const block = { name: `事業${b} ブロック${bl}`, level: "ブロック", children: [] };
+          for (let s = 1; s <= 3; s++) {
+            const store = {
+              name: `事業${b} ブロック${bl} 店舗${s}`,
+              level: "店舗",
+              children: [],
+              data: generateRandomArray(periodCount)
+            };
+            block.children.push(store);
+          }
+          biz.children.push(block);
+        }
+        businesses.push(biz);
+      }
+
+      // 全店舗ノードを作成（2事業の合計）
+      const totalBiz = { 
+        name: "全店舗合計", 
+        level: "事業",
+        children: [],
+        isTotal: true // 合計ノードフラグ
+      };
+      businesses.push(totalBiz);
+
+      return businesses;
+    }
+
+    // 再帰的に子ノードのdataを合算して node.data に格納
+    function aggregateNode(node, periodCount) {
+      if (!node.children || node.children.length === 0) {
+        return node.data || new Array(periodCount).fill(0);
+      }
+
+      let sumData = new Array(periodCount).fill(0);
+      node.children.forEach(child => {
+        const childData = aggregateNode(child, periodCount);
+        for (let i = 0; i < periodCount; i++) {
+          sumData[i] += childData[i];
+        }
+      });
+      node.data = sumData;
+
+      // 合計ノードの場合は、同じレベルの他のノードのデータも合算
+      if (node.isTotal) {
+        const siblings = node.parent?.children.filter(n => !n.isTotal) || [];
+        siblings.forEach(sibling => {
+          if (sibling.data) {
+            for (let i = 0; i < periodCount; i++) {
+              node.data[i] += sibling.data[i];
+            }
+          }
+        });
+      }
+
+      return node.data;
+    }
+
+    // ----------------- メインコンポーネント -----------------
+    const App = () => {
+      // 参照期間（開始・終了）
+      const [startDate, setStartDate] = useState("2023-01-01");
+      const [endDate, setEndDate] = useState("2025-12-31");
+
+      // 集計単位
+      const [aggregationUnit, setAggregationUnit] = useState("年");
+
+      // 期間ラベル＆件数
+      const { labels, periodCount } = useMemo(() => {
+        return generatePeriodLabels(startDate, endDate, aggregationUnit);
+      }, [startDate, endDate, aggregationUnit]);
+
+      // 商品階層ツリーの生成＆集計
+      const productHierarchy = useMemo(() => {
+        const tree = createProductHierarchy(periodCount);
+        tree.forEach(node => aggregateNode(node, periodCount));
+        return tree;
+      }, [periodCount]);
+
+      // 拠点階層ツリーの生成＆集計
+      const siteHierarchy = useMemo(() => {
+        const tree = createSiteHierarchy(periodCount);
+        tree.forEach(node => aggregateNode(node, periodCount));
+        return tree;
+      }, [periodCount]);
+
+      // 商品分類軸の選択階層レベル - 初期値を「部門」に変更
+      const [productLevel, setProductLevel] = useState("部門");
+      // 拠点分類軸の選択階層レベル - 初期値を「事業」に変更
+      const [siteLevel, setSiteLevel] = useState("事業");
+
+      // 選択された商品ノード(複数可)
+      const [selectedProductNodes, setSelectedProductNodes] = useState([]);
+      // 選択された拠点ノード(複数可)
+      const [selectedSiteNodes, setSelectedSiteNodes] = useState([]);
+
+      // 商品軸の自動初期選択 - 全ノードを選択状態に
+      useEffect(() => {
+        if (productHierarchy.length > 0) {
+          const deptNodes = findNodesByLevel(productHierarchy, "部門");
+          setSelectedProductNodes(deptNodes);
+        }
+      }, [productHierarchy]);
+
+      // 拠点軸の自動初期選択 - 全ノードを選択状態に
+      useEffect(() => {
+        if (siteHierarchy.length > 0) {
+          const bizNodes = findNodesByLevel(siteHierarchy, "事業");
+          setSelectedSiteNodes(bizNodes);
+        }
+      }, [siteHierarchy]);
+
+      // 指定された階層レベルのノードを全て抽出 (親ノードの指定があれば、その子孫のみに限定)
+      const findNodesByLevel = (nodes, level, parentNodes = null) => {
+        const result = [];
+        
+        // 親ノードが指定されている場合は、その子孫のみを検索
+        if (parentNodes && parentNodes.length > 0) {
+          const traverse = (node) => {
+            if (node.level === level) {
+              result.push(node);
+            } else if (node.children) {
+              node.children.forEach(traverse);
+            }
+          };
+          parentNodes.forEach(parent => traverse(parent));
+        }
+        // 親ノード指定がない場合は全ノードを検索
+        else {
+          const traverse = (node) => {
+            if (node.level === level) {
+              result.push(node);
+            } else if (node.children) {
+              node.children.forEach(traverse);
+            }
+          };
+          nodes.forEach(traverse);
+        }
+        
+        return result;
+      };
+
+      // 商品階層の利用可能なノード
+      const availableProductNodes = useMemo(() => {
+        // 現在のレベルより上のレベルのインデックスを取得
+        const currentLevelIdx = PRODUCT_LEVELS.indexOf(productLevel);
+        if (currentLevelIdx <= 0) return findNodesByLevel(productHierarchy, productLevel);
+
+        // 1つ上の階層レベルを取得
+        const parentLevel = PRODUCT_LEVELS[currentLevelIdx - 1];
+        
+        // 選択中の親ノードの配下のみを返す
+        return findNodesByLevel(
+          productHierarchy,
+          productLevel,
+          selectedProductNodes.filter(node => node.level === parentLevel)
+        );
+      }, [productHierarchy, productLevel, selectedProductNodes]);
+
+      // 拠点階層の利用可能なノード
+      const availableSiteNodes = useMemo(() => {
+        // 現在のレベルより上のレベルのインデックスを取得
+        const currentLevelIdx = SITE_LEVELS.indexOf(siteLevel);
+        if (currentLevelIdx <= 0) return findNodesByLevel(siteHierarchy, siteLevel);
+
+        // 1つ上の階層レベルを取得
+        const parentLevel = SITE_LEVELS[currentLevelIdx - 1];
+        
+        // 選択中の親ノードの配下のみを返す
+        return findNodesByLevel(
+          siteHierarchy,
+          siteLevel,
+          selectedSiteNodes.filter(node => node.level === parentLevel)
+        );
+      }, [siteHierarchy, siteLevel, selectedSiteNodes]);
+
+      // タブ選択時の処理
+      const handleProductLevelChange = (newLevel) => {
+        setProductLevel(newLevel);
+        // 現在のレベルより下のレベルの選択をクリア
+        const newLevelIdx = PRODUCT_LEVELS.indexOf(newLevel);
+        setSelectedProductNodes(prev => 
+          prev.filter(node => 
+            PRODUCT_LEVELS.indexOf(node.level) <= newLevelIdx
+          )
+        );
+      };
+
+      const handleSiteLevelChange = (newLevel) => {
+        setSiteLevel(newLevel);
+        // 現在のレベルより下のレベルの選択をクリア
+        const newLevelIdx = SITE_LEVELS.indexOf(newLevel);
+        setSelectedSiteNodes(prev => 
+          prev.filter(node => 
+            SITE_LEVELS.indexOf(node.level) <= newLevelIdx
+          )
+        );
+      };
+
+      // テーブルの軸方向（true: 期間をX軸, false: 期間をY軸）
+      const [periodOnXAxis, setPeriodOnXAxis] = useState(true);
+
+      // クロス集計データ生成
+      const crossData = useMemo(() => {
+        // 選択中のノードの中から、現在の階層レベルのノードのみを使用
+        const currentProductNodes = selectedProductNodes.filter(node => 
+          node.level === (productLevel === "全部門" ? "部門" : productLevel)
+        );
+        const currentSiteNodes = selectedSiteNodes.filter(node => 
+          node.level === (siteLevel === "全店舗" ? "事業" : siteLevel)
+        );
+        
+        if (currentProductNodes.length === 0 || currentSiteNodes.length === 0) return [];
+        
+        const combinations = [];
+        currentProductNodes.forEach(product => {
+          currentSiteNodes.forEach(site => {
+            combinations.push({
+              product,
+              site,
+              data: product.data || new Array(periodCount).fill(0)
+            });
+          });
+        });
+        return combinations;
+      }, [selectedProductNodes, selectedSiteNodes, productLevel, siteLevel, periodCount]);
+
+      // 画面表示
+      return (
+        <Box sx={{ p: 2, fontFamily: 'Roboto' }}>
+          <Typography variant="h6" gutterBottom>
+            実績テーブル（期間＆階層選択：フルコード）
           </Typography>
-          <TextField
-            label="直近期間（日）"
-            type="number"
-            value={recentPeriod}
-            onChange={(e) => setRecentPeriod(e.target.value)}
-            sx={{ width: '130px' }}
-            size="small"
-          />
-          <TextField
-            label="予測開始"
-            type="date"
-            value={forecastStart}
-            onChange={(e) => setForecastStart(e.target.value)}
-            InputLabelProps={{ shrink: true }}
-            size="small"
-          />
-          <TextField
-            label="予測終了"
-            type="date"
-            value={forecastEnd}
-            onChange={(e) => setForecastEnd(e.target.value)}
-            InputLabelProps={{ shrink: true }}
-            size="small"
-          />
-          <TextField
-            select
-            label="期間単位"
-            value={selectedPeriodUnit}
-            onChange={(e) => setSelectedPeriodUnit(e.target.value)}
-            sx={{ width: '100px' }}
-            size="small"
-          >
-            {["年", "月", "週", "日", "時間"].map(unit => (
-              <MenuItem key={unit} value={unit}>{unit}</MenuItem>
-            ))}
-          </TextField>
-          <Button variant="contained" size="small" onClick={() => alert("傾向値計算(ダミー)")}>
-            傾向値計算
-          </Button>
-        </Box>
 
-        {/* 階層選択パネル */}
-        <Box sx={{ p: 1, backgroundColor: '#fff', borderBottom: '1px solid #ccc' }}>
-          <Typography variant="body1" gutterBottom>階層選択（集約レベル）</Typography>
-          <Tabs
-            value={selectedTab}
-            onChange={(e, newVal) => setSelectedTab(newVal)}
-            indicatorColor="primary"
-            textColor="primary"
-            variant="fullWidth"
-            sx={{ minHeight: '36px' }}
-          >
-            {["全社", "部門", "コーナー", "ライン", "カテゴリー"].map(level => (
-              <Tab key={level} label={level} value={level} sx={{ minHeight: '36px' }} />
-            ))}
-          </Tabs>
-          <Box sx={{ mt: 1, display: 'flex', gap: 1, flexWrap: 'wrap' }}>
-            {selectedTab === "全社" && (
-              <Chip label="全社" color="primary" />
-            )}
-            {selectedTab === "部門" && (
-              allDepartments.map(dep => (
-                <Chip
-                  key={dep}
-                  label={dep}
-                  variant={selectedDepartments.has(dep) ? "filled" : "outlined"}
-                  color={selectedDepartments.has(dep) ? "primary" : "default"}
-                  size="small"
-                  onClick={() => {
-                    const newSet = new Set(selectedDepartments);
-                    if (newSet.has(dep)) newSet.delete(dep); else newSet.add(dep);
-                    setSelectedDepartments(newSet);
-                  }}
-                />
-              ))
-            )}
-            {selectedTab === "コーナー" && (
-              <>
-                <Box>
-                  <Typography variant="subtitle2">部門</Typography>
-                  {allDepartments.map(dep => (
-                    <Chip
-                      key={dep}
-                      onClick={() => setSelectedDepartmentCorner(dep)}
-                      label={dep}
-                      variant={dep === selectedDepartmentCorner ? "filled" : "outlined"}
-                      color={dep === selectedDepartmentCorner ? "primary" : "default"}
-                      size="small"
-                    />
-                  ))}
-                </Box>
-                <Box>
-                  <Typography variant="subtitle2">コーナー</Typography>
-                  {Object.keys(hierarchy["全社"][selectedDepartmentCorner]).map(crn => (
-                    <Chip
-                      key={crn}
-                      label={crn}
-                      variant={selectedCorners.has(crn) ? "filled" : "outlined"}
-                      color={selectedCorners.has(crn) ? "primary" : "default"}
-                      size="small"
-                      onClick={() => {
-                        const newSet = new Set(selectedCorners);
-                        if (newSet.has(crn)) newSet.delete(crn); else newSet.add(crn);
-                        setSelectedCorners(newSet);
-                      }}
-                    />
-                  ))}
-                </Box>
-              </>
-            )}
-            {selectedTab === "ライン" && (
-              <>
-                <Box>
-                  <Typography variant="subtitle2">部門</Typography>
-                  {allDepartments.map(dep => (
-                    <Chip
-                      key={dep}
-                      onClick={() => setSelectedDepartmentLine(dep)}
-                      label={dep}
-                      variant={dep === selectedDepartmentLine ? "filled" : "outlined"}
-                      color={dep === selectedDepartmentLine ? "primary" : "default"}
-                      size="small"
-                    />
-                  ))}
-                </Box>
-                <Box>
-                  <Typography variant="subtitle2">コーナー</Typography>
-                  {Object.keys(hierarchy["全社"][selectedDepartmentLine]).map(crn => (
-                    <Chip
-                      key={crn}
-                      onClick={() => setSelectedCornerLine(crn)}
-                      label={crn}
-                      variant={crn === selectedCornerLine ? "filled" : "outlined"}
-                      color={crn === selectedCornerLine ? "primary" : "default"}
-                      size="small"
-                    />
-                  ))}
-                </Box>
-                <Box>
-                  <Typography variant="subtitle2">ライン</Typography>
-                  {Object.keys(hierarchy["全社"][selectedDepartmentLine][selectedCornerLine]).map(ln => (
-                    <Chip
-                      key={ln}
-                      label={ln}
-                      variant={selectedLines.has(ln) ? "filled" : "outlined"}
-                      color={selectedLines.has(ln) ? "primary" : "default"}
-                      size="small"
-                      onClick={() => {
-                        const newSet = new Set(selectedLines);
-                        if (newSet.has(ln)) newSet.delete(ln); else newSet.add(ln);
-                        setSelectedLines(newSet);
-                      }}
-                    />
-                  ))}
-                </Box>
-              </>
-            )}
-            {selectedTab === "カテゴリー" && (
-              <>
-                <Box>
-                  <Typography variant="subtitle2">部門</Typography>
-                  {allDepartments.map(dep => (
-                    <Chip
-                      key={dep}
-                      label={dep}
-                      variant={dep === selectedDepartmentCategory ? "filled" : "outlined"}
-                      color={dep === selectedDepartmentCategory ? "primary" : "default"}
-                      size="small"
-                      onClick={() => setSelectedDepartmentCategory(dep)}
-                    />
-                  ))}
-                </Box>
-                <Box>
-                  <Typography variant="subtitle2">コーナー</Typography>
-                  {Object.keys(hierarchy["全社"][selectedDepartmentCategory]).map(crn => (
-                    <Chip
-                      key={crn}
-                      label={crn}
-                      variant={crn === selectedCornerCategory ? "filled" : "outlined"}
-                      color={crn === selectedCornerCategory ? "primary" : "default"}
-                      size="small"
-                      onClick={() => setSelectedCornerCategory(crn)}
-                    />
-                  ))}
-                </Box>
-                <Box>
-                  <Typography variant="subtitle2">ライン</Typography>
-                  {Object.keys(hierarchy["全社"][selectedDepartmentCategory][selectedCornerCategory]).map(ln => (
-                    <Chip
-                      key={ln}
-                      label={ln}
-                      variant={ln === selectedLineCategory ? "filled" : "outlined"}
-                      color={ln === selectedLineCategory ? "primary" : "default"}
-                      size="small"
-                      onClick={() => setSelectedLineCategory(ln)}
-                    />
-                  ))}
-                </Box>
-                <Box>
-                  <Typography variant="subtitle2">カテゴリー</Typography>
-                  {(hierarchy["全社"][selectedDepartmentCategory][selectedCornerCategory][selectedLineCategory] || []).map(ct => (
-                    <Chip
-                      key={ct}
-                      label={ct}
-                      variant={selectedCategories.has(ct) ? "filled" : "outlined"}
-                      color={selectedCategories.has(ct) ? "primary" : "default"}
-                      size="small"
-                      onClick={() => {
-                        const newSet = new Set(selectedCategories);
-                        if (newSet.has(ct)) newSet.delete(ct); else newSet.add(ct);
-                        setSelectedCategories(newSet);
-                      }}
-                    />
-                  ))}
-                </Box>
-              </>
-            )}
+          {/* (1) 参照期間設定 */}
+          <Box sx={{ mb: 2 }}>
+            <Typography variant="subtitle1">参照期間</Typography>
+            <Box sx={{ display: 'flex', gap: 2, mt: 1 }}>
+              <TextField
+                label="開始日"
+                type="date"
+                InputLabelProps={{ shrink: true }}
+                value={startDate}
+                onChange={(e) => setStartDate(e.target.value)}
+              />
+              <TextField
+                label="終了日"
+                type="date"
+                InputLabelProps={{ shrink: true }}
+                value={endDate}
+                onChange={(e) => setEndDate(e.target.value)}
+              />
+            </Box>
           </Box>
-        </Box>
 
-        {/* 予測対象Chip（グラフ表示切替） */}
-        <Box sx={{ p: 1, backgroundColor: '#fff', borderBottom: '1px solid #ccc' }}>
-          <Typography variant="body1" gutterBottom>予測対象（グラフ表示切替）</Typography>
-          <Box sx={{ display: 'flex', gap: 1, flexWrap: 'wrap' }}>
-            {predictionTargets.map(pt => {
-              const selected = selectedPredictionTargets.has(pt);
-              return (
+          {/* (2) 集計単位の選択 */}
+          <Box sx={{ mb: 2 }}>
+            <Typography variant="subtitle1">集計単位</Typography>
+            <Box sx={{ display: 'flex', flexWrap: 'wrap', gap: 1, mt: 1 }}>
+              {AGGREGATION_UNITS.map(unit => (
                 <Chip
-                  key={pt}
-                  label={pt}
-                  variant={selected ? "filled" : "outlined"}
-                  color={selected ? "primary" : "default"}
-                  size="small"
-                  onClick={() => {
-                    const newSet = new Set(selectedPredictionTargets);
-                    if (selected) newSet.delete(pt); else newSet.add(pt);
-                    setSelectedPredictionTargets(newSet);
-                  }}
+                  key={unit}
+                  label={unit}
+                  color={aggregationUnit === unit ? "primary" : "default"}
+                  onClick={() => setAggregationUnit(unit)}
                 />
-              );
-            })}
+              ))}
+            </Box>
           </Box>
-        </Box>
 
-        {/* 表示切替トグルボタン（実数/構成比） */}
-        <Box sx={{ p: 1, backgroundColor: '#fff', borderBottom: '1px solid #ccc', textAlign: 'right' }}>
-          <ToggleButtonGroup
-            value={displayMode}
-            exclusive
-            onChange={(e, newMode) => { if(newMode) setDisplayMode(newMode); }}
-            size="small"
-          >
-            <ToggleButton value="absolute">実数表示</ToggleButton>
-            <ToggleButton value="ratio">構成比表示</ToggleButton>
-          </ToggleButtonGroup>
-        </Box>
-      </Box>
+          {/* (3) 商品分類軸の階層選択 */}
+          <Box sx={{ mb: 2 }}>
+            <Typography variant="subtitle1">商品分類軸</Typography>
+            <Tabs 
+              value={productLevel}
+              onChange={(_, newValue) => handleProductLevelChange(newValue)}
+            >
+              {PRODUCT_LEVELS.map(level => (
+                <Tab key={level} value={level} label={level} />
+              ))}
+            </Tabs>
+            <Box sx={{ mt: 1 }}>
+              <Box sx={{ display: 'flex', flexWrap: 'wrap', gap: 1, mt: 0.5 }}>
+                {availableProductNodes.map(node => (
+                  <Chip
+                    key={node.name}
+                    label={node.name}
+                    color={selectedProductNodes.includes(node) ? "primary" : "default"}
+                    onClick={() => {
+                      setSelectedProductNodes(prev => 
+                        prev.includes(node) 
+                          ? prev.filter(n => n !== node)
+                          : [...prev, node]
+                      );
+                    }}
+                  />
+                ))}
+              </Box>
+            </Box>
+          </Box>
 
-      {/* 下部エリア：グラフとテーブル */}
-      <Box sx={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
-        {/* グラフエリア */}
-        <Box sx={{ p: 1 }}>
-          <Paper sx={{ p: 1, minHeight: '200px' }}>
-            <Typography variant="body1" gutterBottom>
-              グラフ（Chipで選択された予測対象のみ表示）<br/>
-              「最終予測」をドラッグして値を変更可能です。
-            </Typography>
-            <ForecastChart
-              periodLabels={periodLabels}
-              chartData={aggregatedChartData}
-              onDragValueChange={handleDragValueChange}
-            />
-          </Paper>
-        </Box>
+          {/* (4) 拠点分類軸の階層選択 */}
+          <Box sx={{ mb: 2 }}>
+            <Typography variant="subtitle1">拠点分類軸</Typography>
+            <Tabs
+              value={siteLevel}
+              onChange={(_, newValue) => handleSiteLevelChange(newValue)}
+            >
+              {SITE_LEVELS.map(level => (
+                <Tab key={level} value={level} label={level} />
+              ))}
+            </Tabs>
+            <Box sx={{ mt: 1 }}>
+              <Box sx={{ display: 'flex', flexWrap: 'wrap', gap: 1, mt: 0.5 }}>
+                {availableSiteNodes.map(node => (
+                  <Chip
+                    key={node.name}
+                    label={node.name}
+                    color={selectedSiteNodes.includes(node) ? "primary" : "default"}
+                    onClick={() => {
+                      setSelectedSiteNodes(prev => 
+                        prev.includes(node) 
+                          ? prev.filter(n => n !== node)
+                          : [...prev, node]
+                      );
+                    }}
+                  />
+                ))}
+              </Box>
+            </Box>
+          </Box>
 
-        {/* テーブル */}
-        <Box sx={{ p: 1 }}>
-          <Paper sx={{ p: 1, display: 'flex', flexDirection: 'column' }}>
-            <Typography variant="body1" gutterBottom>
-              予測結果テーブル（全予測対象でグループ化）<br />
-              （グループ表示順：予測対象 → 集約キー → シリーズ）<br />
-              合計列を4列目に表示し、<br/>
-              「傾向」「今期予測(手動)」「最終予測」は入力欄で数値を更新できます。<br/>
-              ※ 今期予測(手動) が空欄の場合は「(今期予測 × 傾向)」を最終予測に反映、<br/>
-              &emsp;0以上が入力されていれば手動値を最優先します。<br/>
-              ※ グラフのドラッグ操作でも「最終予測」値を更新できます。
-            </Typography>
-            <TableContainer sx={{ '& td, & th': { whiteSpace: 'nowrap' } }}>
-              <Table size="small" sx={{ '& .MuiTableCell-root': { py: 0.25, px: 1 } }}>
-                <TableHead>
-                  <TableRow>
-                    <TableCell sx={{ backgroundColor: 'silver', borderRight: '1px solid #ccc', minWidth: 80 }}>
-                      予測対象
-                    </TableCell>
-                    <TableCell sx={{ backgroundColor: 'silver', borderRight: '1px solid #ccc', minWidth: 60 }}>
-                      集約キー
-                    </TableCell>
-                    <TableCell sx={{ backgroundColor: 'silver', borderRight: '1px solid #ccc', minWidth: 80 }}>
-                      シリーズ
-                    </TableCell>
-                    <TableCell sx={{ backgroundColor: 'silver', borderRight: '1px solid #ccc', minWidth: 60 }} align="right">
-                      合計
-                    </TableCell>
-                    {periodLabels.map(label => (
-                      <TableCell
-                        key={label}
-                        align="right"
-                        sx={{ backgroundColor: 'silver', borderRight: '1px solid #ccc', minWidth: 60 }}
-                      >
-                        {label}
-                      </TableCell>
+          {/* テーブル表示方向の切り替え */}
+          <Box sx={{ mb: 2 }}>
+            <Typography variant="subtitle1">テーブル表示方向</Typography>
+            <ToggleButtonGroup
+              value={periodOnXAxis}
+              exclusive
+              onChange={(_, newValue) => {
+                if (newValue !== null) setPeriodOnXAxis(newValue);
+              }}
+            >
+              <ToggleButton value={true}>期間をX軸に表示</ToggleButton>
+              <ToggleButton value={false}>期間をY軸に表示</ToggleButton>
+            </ToggleButtonGroup>
+          </Box>
+
+          {/* テーブル表示（期間の軸方向を切り替え可能に） */}
+          <TableContainer component={Box}>
+            <Table size="small">
+              {periodOnXAxis ? (
+                // 期間をX軸に表示
+                <>
+                  <TableHead>
+                    <TableRow>
+                      <TableCell>{`拠点（${siteLevel}）`}</TableCell>
+                      <TableCell>{`商品（${productLevel}）`}</TableCell>
+                      {labels.map((lbl, i) => (
+                        <TableCell key={i}>{lbl}</TableCell>
+                      ))}
+                    </TableRow>
+                  </TableHead>
+                  <TableBody>
+                    {crossData.length > 0 ? (
+                      crossData.map((combination, idx) => (
+                        <TableRow key={idx}>
+                          <TableCell>{combination.site.name}</TableCell>
+                          <TableCell>{combination.product.name}</TableCell>
+                          {combination.data.map((val, i) => (
+                            <TableCell key={i}>{val}</TableCell>
+                          ))}
+                        </TableRow>
+                      ))
+                    ) : (
+                      <TableRow>
+                        <TableCell colSpan={2 + labels.length} align="center">
+                          ※ 選択した階層のノードがありません
+                        </TableCell>
+                      </TableRow>
+                    )}
+                  </TableBody>
+                </>
+              ) : (
+                // 期間をY軸に表示
+                <>
+                  <TableHead>
+                    <TableRow>
+                      <TableCell>期間</TableCell>
+                      {crossData.map((combination, idx) => (
+                        <TableCell key={idx}>
+                          {`${combination.site.name} × ${combination.product.name}`}
+                        </TableCell>
+                      ))}
+                    </TableRow>
+                  </TableHead>
+                  <TableBody>
+                    {labels.map((label, i) => (
+                      <TableRow key={i}>
+                        <TableCell>{label}</TableCell>
+                        {crossData.map((combination, j) => (
+                          <TableCell key={j}>{combination.data[i]}</TableCell>
+                        ))}
+                      </TableRow>
                     ))}
-                  </TableRow>
-                </TableHead>
-                <TableBody>
-                  {tableRows}
-                </TableBody>
-              </Table>
-            </TableContainer>
-          </Paper>
+                  </TableBody>
+                </>
+              )}
+            </Table>
+          </TableContainer>
         </Box>
-      </Box>
-    </Container>
-  );
-}
+      );
+    };
 
-ReactDOM.render(<App />, document.getElementById("root"));
-</script>
+    const root = ReactDOM.createRoot(document.getElementById("root"));
+    root.render(<App />);
+  </script>
 </body>
 </html>
