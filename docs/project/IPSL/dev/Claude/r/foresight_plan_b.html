@@ -2,7 +2,7 @@
 <html lang="ja">
 <head>
   <meta charset="UTF-8" />
-  <title>予測結果テーブル：合計列を4列目に表示＋傾向・手動予測入力＋ドラッグ更新</title>
+  <title>予測結果テーブル：合計列を4列目に表示＋傾向・手動予測入力</title>
 
   <!-- React, ReactDOM, Babel -->
   <script src="https://cdn.jsdelivr.net/npm/react@18.2.0/umd/react.production.min.js" crossorigin></script>
@@ -17,11 +17,8 @@
   <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Roboto:wght@300;400;500;700&display=swap" />
   <script src="https://cdn.jsdelivr.net/npm/@mui/material@5.15.3/umd/material-ui.production.min.js" crossorigin></script>
 
-  <!-- Chart.js v4.4.1 -->
+  <!-- Chart.js -->
   <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
-
-  <!-- chartjs-plugin-dragdata v2.0.0 -->
-  <script src="https://cdn.jsdelivr.net/npm/chartjs-plugin-dragdata@2.0.0/dist/chartjs-plugin-dragdata.min.js"></script>
 
   <style>
     body { margin: 0; padding: 0; }
@@ -248,6 +245,7 @@ function aggregateRowsByForecastTarget(
       // 実際の入力データ
       const arr = manualForecasts[groupKey]?.[ft] ?? [];
       // 長さを lastYearData と整合させる
+      // => 入力していない箇所は null にして空欄に
       const filledArr = arr.length >= lengthRef
         ? arr.slice(0, lengthRef)
         : [...arr, ...Array(lengthRef - arr.length).fill(null)];
@@ -280,6 +278,7 @@ function aggregateRowsByForecastTarget(
           data: currentForecastData.map((val, i) => {
             const trendVal = trendData[i] ?? 1;
             const manualVal = manualForecastData[i];
+
             // 今期予測(手動)が 0以上で入力されていればそれを使用、null なら (今期予測 × 傾向)
             if (manualVal != null && !isNaN(manualVal) && manualVal >= 0) {
               return manualVal;
@@ -478,7 +477,7 @@ const TableCellWithInput = React.memo(({
 /** 
  * グラフ描画コンポーネント
  */
-const ForecastChart = React.memo(({ periodLabels, chartData, onDragValueChange }) => {
+const ForecastChart = React.memo(({ periodLabels, chartData }) => {
   const chartRef = React.useRef(null);
   const canvasRef = React.useRef(null);
   const dataRef = React.useRef({ periodLabels, chartData });
@@ -486,70 +485,18 @@ const ForecastChart = React.memo(({ periodLabels, chartData, onDragValueChange }
   React.useEffect(() => {
     if (!canvasRef.current) return;
 
-    // グラフ初期化は初回のみ
+    // グラフの初期化は初回のみ
     if (!chartRef.current) {
-      const ctx = canvasRef.current.getContext('2d');
-
-      // ★★★ 修正ポイント: chartjs-plugin-dragdata v2 のコールバック形式に合わせる ★★★
-      chartRef.current = new Chart(ctx, {
+      chartRef.current = new Chart(canvasRef.current.getContext('2d'), {
         type: 'line',
         data: {
           labels: periodLabels,
-          // すべての dataset はひとまず dragData: true にしておく
-          // → 実際にドラッグ可否を onDragStart で判定します
-          datasets: chartData.map(dataset => ({
-            ...dataset,
-            dragData: true, // ← 全部 true で持たせる
-            tension: 0.2
-          }))
+          datasets: chartData
         },
         options: {
           responsive: true,
           maintainAspectRatio: false,
-          scales: {
-            y: { beginAtZero: false }
-          },
-          plugins: {
-            dragData: {
-              round: 1,            // 値を四捨五入
-              dragX: false,        // X軸方向のドラッグは無効
-              showTooltip: true,   // ドラッグ中のツールチップ表示
-              onDragStart: function(e, datasetIndex, index, value) {
-                if (!chartRef.current) return false;
-                // ドラッグ対象のラベルをチェック
-                const dsLabel = chartRef.current.data.datasets[datasetIndex].label || "";
-                // 「最終予測」が含まれていないならドラッグさせない
-                return dsLabel.includes("最終予測");
-              },
-              onDrag: function(e, datasetIndex, index, value) {
-                // ドラッグ中に都度更新（アニメーションなし）
-                if (chartRef.current) {
-                  // chartjs-plugin-dragdata v2 は自動的にdataを書き換えてくれるので
-                  // 必要に応じて再描画のみ行う
-                  chartRef.current.update('none');
-                }
-              },
-              onDragEnd: function(e, datasetIndex, index, value) {
-                if (!chartRef.current) return;
-                // ドラッグ終了後にラベルから group, forecastTarget を特定して渡す
-                const dsLabel = chartRef.current.data.datasets[datasetIndex].label || "";
-                // 「XXX (最終予測-売上)」という形式をパース
-                const leftParenIdx = dsLabel.indexOf("(");
-                if (leftParenIdx < 0) return;
-                const group = dsLabel.substring(0, leftParenIdx).trim();
-                const insideParen = dsLabel.substring(leftParenIdx + 1, dsLabel.lastIndexOf(")"));
-                // 「最終予測-売上」等の形を "-" で分割
-                const parts = insideParen.split("-");
-                const forecastTarget = (parts.length >= 2) ? parts[1].trim() : "";
-
-                // 親に通知して state を書き換える
-                onDragValueChange?.(group, forecastTarget, "最終予測", index, value);
-
-                // 最後にアニメーションなしで再描画
-                chartRef.current.update('none');
-              }
-            }
-          }
+          scales: { y: { beginAtZero: false } }
         }
       });
     }
@@ -557,27 +504,22 @@ const ForecastChart = React.memo(({ periodLabels, chartData, onDragValueChange }
     // データの参照だけ更新
     dataRef.current = { periodLabels, chartData };
 
-    // unmount時: chart があれば破棄
+    // unmount時
     return () => {
       if (chartRef.current) {
         chartRef.current.destroy();
         chartRef.current = null;
       }
     };
-  }, [periodLabels, chartData, onDragValueChange]);
+  }, [periodLabels, chartData]);
 
-  // TextFieldのblur時などにグラフを更新
+  // TextFieldのblur時にグラフを更新
   React.useEffect(() => {
     const handleUpdateChart = () => {
       if (chartRef.current) {
         const { periodLabels, chartData } = dataRef.current;
-        // dataset の再生成
         chartRef.current.data.labels = periodLabels;
-        chartRef.current.data.datasets = chartData.map(dataset => ({
-          ...dataset,
-          dragData: true, // ここでもドラッグ設定を維持
-          tension: 0.2
-        }));
+        chartRef.current.data.datasets = chartData;
         chartRef.current.update('none');
       }
     };
@@ -706,33 +648,13 @@ function App() {
         const newObj = { ...prev };
         if (!newObj[group]) newObj[group] = {};
         if (!newObj[group][forecastTarget]) {
+          // まだ配列がなければ periodLabels 長さで全部 null
           newObj[group][forecastTarget] = Array(periodLabels.length).fill(null);
         }
         newObj[group][forecastTarget][index] = finalVal;
         return newObj;
       });
     }
-  }, [periodLabels]);
-
-  // ドラッグによる値変更 (最終予測シリーズをドラッグして更新)
-  const handleDragValueChange = React.useCallback((group, forecastTarget, series, index, value) => {
-    // 「最終予測」ドラッグ時は、今期予測(手動)を上書きすることで最終予測に反映
-    if (isNaN(value)) return;
-    const numVal = parseFloat(value);
-    const finalVal = (numVal < 0) ? 0 : numVal; 
-
-    setManualForecasts(prev => {
-      const newObj = { ...prev };
-      if (!newObj[group]) newObj[group] = {};
-      if (!newObj[group][forecastTarget]) {
-        newObj[group][forecastTarget] = Array(periodLabels.length).fill(null);
-      }
-      newObj[group][forecastTarget][index] = finalVal;
-      return newObj;
-    });
-
-    // グラフ・テーブル更新
-    window.dispatchEvent(new CustomEvent('updateChart'));
   }, [periodLabels]);
 
   // 階層選択連動処理
@@ -846,20 +768,12 @@ function App() {
     return aggregatedRowsGraph.map(row => {
       const c = colors[colorIndex % colors.length];
       colorIndex++;
-      const isFinalForecast = row.series === "最終予測";
       return {
         label: `${row.group} (${row.series}-${row.forecastTarget})`,
         data: row.data,
         borderColor: c,
-        backgroundColor: isFinalForecast ? c : c.replace("1)", "0.2)"),
-        tension: 0.2,
-        // 描画順の設定
-        order: isFinalForecast ? 2 : 1,
-        // データポイントのスタイル調整
-        pointRadius: isFinalForecast ? 12 : 4,
-        pointHoverRadius: isFinalForecast ? 14 : 6,
-        pointStyle: isFinalForecast ? "star" : "circle",
-        pointBackgroundColor: isFinalForecast ? c : c.replace("1)", "0.8)")
+        backgroundColor: c.replace("1)", "0.2)"),
+        tension: 0.2
       };
     });
   }, [aggregatedRowsGraph]);
@@ -894,6 +808,7 @@ function App() {
     });
   }, [aggregatedRowsTable]);
 
+  // テーブル本体
   let previousForecast = "";
   let previousGroup = "";
   const tableRows = [];
@@ -948,6 +863,7 @@ function App() {
     // 合計
     const rowTotal = row.data.reduce((sum, v) => sum + (v || 0), 0);
 
+    // 通常の行
     tableRows.push(
       <TableRow key={`data-${i}`}>
         {/* 予測対象 */}
@@ -977,7 +893,7 @@ function App() {
               return (
                 <TableCellWithInput
                   key={`${i}-${colIndex}`}
-                  rowIndex={i}
+                  rowIndex={i}       // テーブル上の行インデックス
                   colIndex={colIndex}
                   value={val}
                   series={row.series}
@@ -1013,8 +929,7 @@ function App() {
       <Box sx={{ mb: 2 }}>
         <Box sx={{ p: 1, backgroundColor: '#fff', borderBottom: '1px solid #ccc' }}>
           <Typography variant="subtitle1" sx={{ fontWeight: 'bold' }}>
-            予測対象Chipでグラフ切替、テーブルは全予測対象表示（傾向・今期予測(手動) は編集可）<br />
-            グラフ上で「最終予測」データポイントをドラッグしても更新されます
+            予測対象Chipでグラフ切替、テーブルは全予測対象表示（傾向・今期予測(手動) は編集可）
           </Typography>
           <TextField
             label="直近期間（日）"
@@ -1281,12 +1196,11 @@ function App() {
           <Paper sx={{ p: 1, minHeight: '200px' }}>
             <Typography variant="body1" gutterBottom>
               グラフ（Chipで選択された予測対象のみ表示）<br/>
-              「最終予測」をドラッグして値を変更可能です。
+              傾向・今期予測(手動) などを含めたい場合はChipをクリックしてください。
             </Typography>
             <ForecastChart
               periodLabels={periodLabels}
               chartData={aggregatedChartData}
-              onDragValueChange={handleDragValueChange}
             />
           </Paper>
         </Box>
@@ -1300,8 +1214,7 @@ function App() {
               合計列を4列目に表示し、<br/>
               「傾向」「今期予測(手動)」「最終予測」は入力欄で数値を更新できます。<br/>
               ※ 今期予測(手動) が空欄の場合は「(今期予測 × 傾向)」を最終予測に反映、<br/>
-              &emsp;0以上が入力されていれば手動値を最優先します。<br/>
-              ※ グラフのドラッグ操作でも「最終予測」値を更新できます。
+              &emsp;0以上が入力されていれば手動値を最優先します。
             </Typography>
             <TableContainer sx={{ '& td, & th': { whiteSpace: 'nowrap' } }}>
               <Table size="small" sx={{ '& .MuiTableCell-root': { py: 0.25, px: 1 } }}>
