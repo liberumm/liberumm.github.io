@@ -1,0 +1,661 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8" />
+  <title>実績テーブル（期間＆階層選択：フルコード）</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <!-- Roboto & MUI -->
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Roboto:wght@300;400;500;700&display=swap" />
+  <!-- React, ReactDOM, Babel -->
+  <script src="https://cdn.jsdelivr.net/npm/react@18.2.0/umd/react.production.min.js" crossorigin></script>
+  <script src="https://cdn.jsdelivr.net/npm/react-dom@18.2.0/umd/react-dom.production.min.js" crossorigin></script>
+  <script src="https://cdn.jsdelivr.net/npm/@babel/standalone@7.23.8/babel.min.js"></script>
+  <!-- Emotion (MUI依存) -->
+  <script src="https://cdn.jsdelivr.net/npm/@emotion/react@11.11.3/dist/emotion-react.umd.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@emotion/styled@11.11.0/dist/emotion-styled.umd.min.js"></script>
+  <!-- MUI Core -->
+  <script src="https://cdn.jsdelivr.net/npm/@mui/material@5.15.3/umd/material-ui.production.min.js" crossorigin></script>
+</head>
+<body>
+  <div id="root"></div>
+  
+  <script type="text/babel">
+
+    const { useState, useMemo, useEffect } = React;
+    const {
+      Box,
+      Chip,
+      Typography,
+      TableContainer,
+      Table,
+      TableHead,
+      TableBody,
+      TableRow,
+      TableCell,
+      TextField,
+      Tabs,
+      Tab,
+      ToggleButton,
+      ToggleButtonGroup
+    } = MaterialUI;
+
+    // 商品階層レベル定義（全部門を追加）
+    const PRODUCT_LEVELS = ["全部門", "部門", "コーナー", "ライン", "カテゴリ", "アイテム", "SKU"];
+    // 拠点階層レベル定義（全店舗を追加）
+    const SITE_LEVELS = ["全店舗", "事業", "ブロック", "店舗"];
+
+    // ------------------------------
+    //  1) 参照期間 (開始日・終了日)
+    //  2) 集計単位チップ
+    //  3) 商品分類軸（6階層）
+    //  4) 拠点分類軸（3階層）
+    //  テーブル表示は (SKU × 店舗) を選択してダミーデータを表示
+    // ------------------------------
+
+    // 集計単位の選択肢（"カスタム"を含む）
+    const AGGREGATION_UNITS = ["年", "月", "週", "日", "時間", "半期", "四半期", "カスタム"];
+
+    /**
+     * ユーザーが入力した [startDate, endDate] と
+     * 選択した集計単位 (unit) に基づいて、期間ラベルを生成。
+     * 
+     * - "年"     → 年ごとに
+     * - "月"     → 月ごとに
+     * - "週"     → 7日区切り
+     * - "日"     → 1日区切り
+     * - "時間"   → 1時間区切り
+     * - "半期"   → 1～6月、7～12月の区切り
+     * - "四半期" → 3か月区切り（Q1/Q2/Q3/Q4）
+     * - "カスタム" → ここでは「日」と同様、1日ずつ作成
+     *               （必要に応じて自由に定義可能）
+     */
+    function generatePeriodLabels(startDateStr, endDateStr, unit) {
+      const labels = [];
+      const start = new Date(startDateStr);
+      const end = new Date(endDateStr);
+
+      // 不正な日付 or 開始 > 終了 の場合は空配列
+      if (isNaN(start) || isNaN(end) || start > end) {
+        return { labels, periodCount: 0 };
+      }
+
+      switch (unit) {
+        case "年": {
+          let year = start.getFullYear();
+          const endYear = end.getFullYear();
+          for (; year <= endYear; year++) {
+            labels.push(String(year));
+          }
+          break;
+        }
+        case "月": {
+          let current = new Date(start.getFullYear(), start.getMonth(), 1);
+          while (current <= end) {
+            labels.push(`${current.getFullYear()}/${current.getMonth() + 1}`);
+            current.setMonth(current.getMonth() + 1);
+          }
+          break;
+        }
+        case "週": {
+          let current = new Date(start);
+          let w = 1;
+          while (current <= end) {
+            labels.push(`W${w}`);
+            w++;
+            current.setDate(current.getDate() + 7);
+          }
+          break;
+        }
+        case "日":
+        case "カスタム": {
+          // 「カスタム」もここでは日単位として扱うサンプル実装
+          let current = new Date(start);
+          while (current <= end) {
+            labels.push(`${current.getMonth() + 1}/${current.getDate()}`);
+            current.setDate(current.getDate() + 1);
+          }
+          break;
+        }
+        case "時間": {
+          let current = new Date(start);
+          while (current <= end) {
+            labels.push(
+              `${current.getMonth() + 1}/${current.getDate()} ${current.getHours()}時`
+            );
+            current.setHours(current.getHours() + 1);
+          }
+          break;
+        }
+        case "半期": {
+          // start～end にかかる上半期(1-6)・下半期(7-12)をチェック
+          const startYear = start.getFullYear();
+          const endYear = end.getFullYear();
+          for (let y = startYear; y <= endYear; y++) {
+            // 上半期
+            const h1Start = new Date(y, 0, 1);   // 1/1
+            const h1End   = new Date(y, 5, 30);  // 6/30
+            if (h1End >= start && h1Start <= end) {
+              labels.push(`${y}上半期`);
+            }
+            // 下半期
+            const h2Start = new Date(y, 6, 1);   // 7/1
+            const h2End   = new Date(y, 11, 31); // 12/31
+            if (h2End >= start && h2Start <= end) {
+              labels.push(`${y}下半期`);
+            }
+          }
+          break;
+        }
+        case "四半期": {
+          const startYear = start.getFullYear();
+          const endYear = end.getFullYear();
+          for (let y = startYear; y <= endYear; y++) {
+            // Q1
+            const q1Start = new Date(y, 0, 1);
+            const q1End   = new Date(y, 2, 31); // 3/31
+            if (q1End >= start && q1Start <= end) {
+              labels.push(`${y} Q1`);
+            }
+            // Q2
+            const q2Start = new Date(y, 3, 1);   // 4/1
+            const q2End   = new Date(y, 5, 30);  // 6/30
+            if (q2End >= start && q2Start <= end) {
+              labels.push(`${y} Q2`);
+            }
+            // Q3
+            const q3Start = new Date(y, 6, 1);   // 7/1
+            const q3End   = new Date(y, 8, 30);  // 9/30
+            if (q3End >= start && q3Start <= end) {
+              labels.push(`${y} Q3`);
+            }
+            // Q4
+            const q4Start = new Date(y, 9, 1);   // 10/1
+            const q4End   = new Date(y, 11, 31); // 12/31
+            if (q4End >= start && q4Start <= end) {
+              labels.push(`${y} Q4`);
+            }
+          }
+          break;
+        }
+        default:
+          break;
+      }
+
+      return { labels, periodCount: labels.length };
+    }
+
+    // ランダム配列生成
+    function generateRandomArray(n) {
+      return Array.from({ length: n }, () => Math.floor(Math.random() * 100));
+    }
+
+    // ----------------- 商品階層 -----------------
+    function createProductHierarchy(periodCount) {
+      const depts = [];
+      // 通常の部門を作成
+      for (let d = 1; d <= 3; d++) {
+        const dept = { name: `部門${d}`, level: "部門", children: [] };
+        for (let c = 1; c <= 3; c++) {
+          const corner = { name: `部門${d} コーナー${c}`, level: "コーナー", children: [] };
+          for (let l = 1; l <= 4; l++) {
+            const line = { name: `部門${d} コーナー${c} ライン${l}`, level: "ライン", children: [] };
+            for (let cat = 1; cat <= 3; cat++) {
+              const category = { name: `部門${d} コーナー${c} ライン${l} カテゴリ${cat}`, level: "カテゴリ", children: [] };
+              for (let i = 1; i <= 3; i++) {
+                const item = { name: `部門${d} コーナー${c} ライン${l} カテゴリ${cat} アイテム${i}`, level: "アイテム", children: [] };
+                for (let s = 1; s <= 2; s++) {
+                  const sku = {
+                    name: `部門${d} コーナー${c} ライン${l} カテゴリ${cat} アイテム${i} SKU${s}`,
+                    level: "SKU",
+                    children: [],
+                    data: generateRandomArray(periodCount)
+                  };
+                  item.children.push(sku);
+                }
+                category.children.push(item);
+              }
+              line.children.push(category);
+            }
+            corner.children.push(line);
+          }
+          dept.children.push(corner);
+        }
+        depts.push(dept);
+      }
+
+      // 全部門ノードを作成（3部門の合計）
+      const totalDept = { 
+        name: "全部門合計", 
+        level: "部門",
+        children: [],
+        isTotal: true // 合計ノードフラグ
+      };
+      depts.push(totalDept);
+      
+      return depts;
+    }
+
+    // ----------------- 拠点階層 -----------------
+    function createSiteHierarchy(periodCount) {
+      const businesses = [];
+      // 通常の事業を作成
+      for (let b = 1; b <= 2; b++) {
+        const biz = { name: `事業${b}`, level: "事業", children: [] };
+        for (let bl = 1; bl <= 3; bl++) {
+          const block = { name: `事業${b} ブロック${bl}`, level: "ブロック", children: [] };
+          for (let s = 1; s <= 3; s++) {
+            const store = {
+              name: `事業${b} ブロック${bl} 店舗${s}`,
+              level: "店舗",
+              children: [],
+              data: generateRandomArray(periodCount)
+            };
+            block.children.push(store);
+          }
+          biz.children.push(block);
+        }
+        businesses.push(biz);
+      }
+
+      // 全店舗ノードを作成（2事業の合計）
+      const totalBiz = { 
+        name: "全店舗合計", 
+        level: "事業",
+        children: [],
+        isTotal: true // 合計ノードフラグ
+      };
+      businesses.push(totalBiz);
+
+      return businesses;
+    }
+
+    // 再帰的に子ノードのdataを合算して node.data に格納
+    function aggregateNode(node, periodCount) {
+      if (!node.children || node.children.length === 0) {
+        return node.data || new Array(periodCount).fill(0);
+      }
+
+      let sumData = new Array(periodCount).fill(0);
+      node.children.forEach(child => {
+        const childData = aggregateNode(child, periodCount);
+        for (let i = 0; i < periodCount; i++) {
+          sumData[i] += childData[i];
+        }
+      });
+      node.data = sumData;
+
+      // 合計ノードの場合は、同じレベルの他のノードのデータも合算
+      if (node.isTotal) {
+        const siblings = node.parent?.children.filter(n => !n.isTotal) || [];
+        siblings.forEach(sibling => {
+          if (sibling.data) {
+            for (let i = 0; i < periodCount; i++) {
+              node.data[i] += sibling.data[i];
+            }
+          }
+        });
+      }
+
+      return node.data;
+    }
+
+    // ----------------- メインコンポーネント -----------------
+    const App = () => {
+      // 参照期間（開始・終了）
+      const [startDate, setStartDate] = useState("2023-01-01");
+      const [endDate, setEndDate] = useState("2025-12-31");
+
+      // 集計単位
+      const [aggregationUnit, setAggregationUnit] = useState("年");
+
+      // 期間ラベル＆件数
+      const { labels, periodCount } = useMemo(() => {
+        return generatePeriodLabels(startDate, endDate, aggregationUnit);
+      }, [startDate, endDate, aggregationUnit]);
+
+      // 商品階層ツリーの生成＆集計
+      const productHierarchy = useMemo(() => {
+        const tree = createProductHierarchy(periodCount);
+        tree.forEach(node => aggregateNode(node, periodCount));
+        return tree;
+      }, [periodCount]);
+
+      // 拠点階層ツリーの生成＆集計
+      const siteHierarchy = useMemo(() => {
+        const tree = createSiteHierarchy(periodCount);
+        tree.forEach(node => aggregateNode(node, periodCount));
+        return tree;
+      }, [periodCount]);
+
+      // 商品分類軸の選択階層レベル - 初期値を「部門」に変更
+      const [productLevel, setProductLevel] = useState("部門");
+      // 拠点分類軸の選択階層レベル - 初期値を「事業」に変更
+      const [siteLevel, setSiteLevel] = useState("事業");
+
+      // 選択された商品ノード(複数可)
+      const [selectedProductNodes, setSelectedProductNodes] = useState([]);
+      // 選択された拠点ノード(複数可)
+      const [selectedSiteNodes, setSelectedSiteNodes] = useState([]);
+
+      // 商品軸の自動初期選択 - 全ノードを選択状態に
+      useEffect(() => {
+        if (productHierarchy.length > 0) {
+          const deptNodes = findNodesByLevel(productHierarchy, "部門");
+          setSelectedProductNodes(deptNodes);
+        }
+      }, [productHierarchy]);
+
+      // 拠点軸の自動初期選択 - 全ノードを選択状態に
+      useEffect(() => {
+        if (siteHierarchy.length > 0) {
+          const bizNodes = findNodesByLevel(siteHierarchy, "事業");
+          setSelectedSiteNodes(bizNodes);
+        }
+      }, [siteHierarchy]);
+
+      // 指定された階層レベルのノードを全て抽出 (親ノードの指定があれば、その子孫のみに限定)
+      const findNodesByLevel = (nodes, level, parentNodes = null) => {
+        const result = [];
+        
+        // 親ノードが指定されている場合は、その子孫のみを検索
+        if (parentNodes && parentNodes.length > 0) {
+          const traverse = (node) => {
+            if (node.level === level) {
+              result.push(node);
+            } else if (node.children) {
+              node.children.forEach(traverse);
+            }
+          };
+          parentNodes.forEach(parent => traverse(parent));
+        }
+        // 親ノード指定がない場合は全ノードを検索
+        else {
+          const traverse = (node) => {
+            if (node.level === level) {
+              result.push(node);
+            } else if (node.children) {
+              node.children.forEach(traverse);
+            }
+          };
+          nodes.forEach(traverse);
+        }
+        
+        return result;
+      };
+
+      // 商品階層の利用可能なノード
+      const availableProductNodes = useMemo(() => {
+        // 現在のレベルより上のレベルのインデックスを取得
+        const currentLevelIdx = PRODUCT_LEVELS.indexOf(productLevel);
+        if (currentLevelIdx <= 0) return findNodesByLevel(productHierarchy, productLevel);
+
+        // 1つ上の階層レベルを取得
+        const parentLevel = PRODUCT_LEVELS[currentLevelIdx - 1];
+        
+        // 選択中の親ノードの配下のみを返す
+        return findNodesByLevel(
+          productHierarchy,
+          productLevel,
+          selectedProductNodes.filter(node => node.level === parentLevel)
+        );
+      }, [productHierarchy, productLevel, selectedProductNodes]);
+
+      // 拠点階層の利用可能なノード
+      const availableSiteNodes = useMemo(() => {
+        // 現在のレベルより上のレベルのインデックスを取得
+        const currentLevelIdx = SITE_LEVELS.indexOf(siteLevel);
+        if (currentLevelIdx <= 0) return findNodesByLevel(siteHierarchy, siteLevel);
+
+        // 1つ上の階層レベルを取得
+        const parentLevel = SITE_LEVELS[currentLevelIdx - 1];
+        
+        // 選択中の親ノードの配下のみを返す
+        return findNodesByLevel(
+          siteHierarchy,
+          siteLevel,
+          selectedSiteNodes.filter(node => node.level === parentLevel)
+        );
+      }, [siteHierarchy, siteLevel, selectedSiteNodes]);
+
+      // タブ選択時の処理
+      const handleProductLevelChange = (newLevel) => {
+        setProductLevel(newLevel);
+        // 現在のレベルより下のレベルの選択をクリア
+        const newLevelIdx = PRODUCT_LEVELS.indexOf(newLevel);
+        setSelectedProductNodes(prev => 
+          prev.filter(node => 
+            PRODUCT_LEVELS.indexOf(node.level) <= newLevelIdx
+          )
+        );
+      };
+
+      const handleSiteLevelChange = (newLevel) => {
+        setSiteLevel(newLevel);
+        // 現在のレベルより下のレベルの選択をクリア
+        const newLevelIdx = SITE_LEVELS.indexOf(newLevel);
+        setSelectedSiteNodes(prev => 
+          prev.filter(node => 
+            SITE_LEVELS.indexOf(node.level) <= newLevelIdx
+          )
+        );
+      };
+
+      // テーブルの軸方向（true: 期間をX軸, false: 期間をY軸）
+      const [periodOnXAxis, setPeriodOnXAxis] = useState(true);
+
+      // クロス集計データ生成
+      const crossData = useMemo(() => {
+        // 選択中のノードの中から、現在の階層レベルのノードのみを使用
+        const currentProductNodes = selectedProductNodes.filter(node => 
+          node.level === (productLevel === "全部門" ? "部門" : productLevel)
+        );
+        const currentSiteNodes = selectedSiteNodes.filter(node => 
+          node.level === (siteLevel === "全店舗" ? "事業" : siteLevel)
+        );
+        
+        if (currentProductNodes.length === 0 || currentSiteNodes.length === 0) return [];
+        
+        const combinations = [];
+        currentProductNodes.forEach(product => {
+          currentSiteNodes.forEach(site => {
+            combinations.push({
+              product,
+              site,
+              data: product.data || new Array(periodCount).fill(0)
+            });
+          });
+        });
+        return combinations;
+      }, [selectedProductNodes, selectedSiteNodes, productLevel, siteLevel, periodCount]);
+
+      // 画面表示
+      return (
+        <Box sx={{ p: 2, fontFamily: 'Roboto' }}>
+          <Typography variant="h6" gutterBottom>
+            実績テーブル（期間＆階層選択：フルコード）
+          </Typography>
+
+          {/* (1) 参照期間設定 */}
+          <Box sx={{ mb: 2 }}>
+            <Typography variant="subtitle1">参照期間</Typography>
+            <Box sx={{ display: 'flex', gap: 2, mt: 1 }}>
+              <TextField
+                label="開始日"
+                type="date"
+                InputLabelProps={{ shrink: true }}
+                value={startDate}
+                onChange={(e) => setStartDate(e.target.value)}
+              />
+              <TextField
+                label="終了日"
+                type="date"
+                InputLabelProps={{ shrink: true }}
+                value={endDate}
+                onChange={(e) => setEndDate(e.target.value)}
+              />
+            </Box>
+          </Box>
+
+          {/* (2) 集計単位の選択 */}
+          <Box sx={{ mb: 2 }}>
+            <Typography variant="subtitle1">集計単位</Typography>
+            <Box sx={{ display: 'flex', flexWrap: 'wrap', gap: 1, mt: 1 }}>
+              {AGGREGATION_UNITS.map(unit => (
+                <Chip
+                  key={unit}
+                  label={unit}
+                  color={aggregationUnit === unit ? "primary" : "default"}
+                  onClick={() => setAggregationUnit(unit)}
+                />
+              ))}
+            </Box>
+          </Box>
+
+          {/* (3) 商品分類軸の階層選択 */}
+          <Box sx={{ mb: 2 }}>
+            <Typography variant="subtitle1">商品分類軸</Typography>
+            <Tabs 
+              value={productLevel}
+              onChange={(_, newValue) => handleProductLevelChange(newValue)}
+            >
+              {PRODUCT_LEVELS.map(level => (
+                <Tab key={level} value={level} label={level} />
+              ))}
+            </Tabs>
+            <Box sx={{ mt: 1 }}>
+              <Box sx={{ display: 'flex', flexWrap: 'wrap', gap: 1, mt: 0.5 }}>
+                {availableProductNodes.map(node => (
+                  <Chip
+                    key={node.name}
+                    label={node.name}
+                    color={selectedProductNodes.includes(node) ? "primary" : "default"}
+                    onClick={() => {
+                      setSelectedProductNodes(prev => 
+                        prev.includes(node) 
+                          ? prev.filter(n => n !== node)
+                          : [...prev, node]
+                      );
+                    }}
+                  />
+                ))}
+              </Box>
+            </Box>
+          </Box>
+
+          {/* (4) 拠点分類軸の階層選択 */}
+          <Box sx={{ mb: 2 }}>
+            <Typography variant="subtitle1">拠点分類軸</Typography>
+            <Tabs
+              value={siteLevel}
+              onChange={(_, newValue) => handleSiteLevelChange(newValue)}
+            >
+              {SITE_LEVELS.map(level => (
+                <Tab key={level} value={level} label={level} />
+              ))}
+            </Tabs>
+            <Box sx={{ mt: 1 }}>
+              <Box sx={{ display: 'flex', flexWrap: 'wrap', gap: 1, mt: 0.5 }}>
+                {availableSiteNodes.map(node => (
+                  <Chip
+                    key={node.name}
+                    label={node.name}
+                    color={selectedSiteNodes.includes(node) ? "primary" : "default"}
+                    onClick={() => {
+                      setSelectedSiteNodes(prev => 
+                        prev.includes(node) 
+                          ? prev.filter(n => n !== node)
+                          : [...prev, node]
+                      );
+                    }}
+                  />
+                ))}
+              </Box>
+            </Box>
+          </Box>
+
+          {/* テーブル表示方向の切り替え */}
+          <Box sx={{ mb: 2 }}>
+            <Typography variant="subtitle1">テーブル表示方向</Typography>
+            <ToggleButtonGroup
+              value={periodOnXAxis}
+              exclusive
+              onChange={(_, newValue) => {
+                if (newValue !== null) setPeriodOnXAxis(newValue);
+              }}
+            >
+              <ToggleButton value={true}>期間をX軸に表示</ToggleButton>
+              <ToggleButton value={false}>期間をY軸に表示</ToggleButton>
+            </ToggleButtonGroup>
+          </Box>
+
+          {/* テーブル表示（期間の軸方向を切り替え可能に） */}
+          <TableContainer component={Box}>
+            <Table size="small">
+              {periodOnXAxis ? (
+                // 期間をX軸に表示
+                <>
+                  <TableHead>
+                    <TableRow>
+                      <TableCell>{`拠点（${siteLevel}）`}</TableCell>
+                      <TableCell>{`商品（${productLevel}）`}</TableCell>
+                      {labels.map((lbl, i) => (
+                        <TableCell key={i}>{lbl}</TableCell>
+                      ))}
+                    </TableRow>
+                  </TableHead>
+                  <TableBody>
+                    {crossData.length > 0 ? (
+                      crossData.map((combination, idx) => (
+                        <TableRow key={idx}>
+                          <TableCell>{combination.site.name}</TableCell>
+                          <TableCell>{combination.product.name}</TableCell>
+                          {combination.data.map((val, i) => (
+                            <TableCell key={i}>{val}</TableCell>
+                          ))}
+                        </TableRow>
+                      ))
+                    ) : (
+                      <TableRow>
+                        <TableCell colSpan={2 + labels.length} align="center">
+                          ※ 選択した階層のノードがありません
+                        </TableCell>
+                      </TableRow>
+                    )}
+                  </TableBody>
+                </>
+              ) : (
+                // 期間をY軸に表示
+                <>
+                  <TableHead>
+                    <TableRow>
+                      <TableCell>期間</TableCell>
+                      {crossData.map((combination, idx) => (
+                        <TableCell key={idx}>
+                          {`${combination.site.name} × ${combination.product.name}`}
+                        </TableCell>
+                      ))}
+                    </TableRow>
+                  </TableHead>
+                  <TableBody>
+                    {labels.map((label, i) => (
+                      <TableRow key={i}>
+                        <TableCell>{label}</TableCell>
+                        {crossData.map((combination, j) => (
+                          <TableCell key={j}>{combination.data[i]}</TableCell>
+                        ))}
+                      </TableRow>
+                    ))}
+                  </TableBody>
+                </>
+              )}
+            </Table>
+          </TableContainer>
+        </Box>
+      );
+    };
+
+    const root = ReactDOM.createRoot(document.getElementById("root"));
+    root.render(<App />);
+  </script>
+</body>
+</html>
