@@ -62,6 +62,48 @@
       color: #283593;
       font-weight: 500;
     }
+    /* アイコンフォントを少し小さめにする */
+    .material-icons {
+      font-size: 20px; /* デフォルト24px → 20pxに縮小 */
+    }
+
+    /* モバイル用の調整 */
+    @media (max-width: 600px) {
+      #root {
+        padding: 4px; /* 画面端にわずかに余白 */
+      }
+      /* AppBarやフッターの高さを縮小 */
+      .MuiToolbar-root {
+        min-height: 48px !important;
+      }
+      /* アイコンのサイズをさらに少し小さく */
+      .material-icons {
+        font-size: 18px; /* モバイルでさらに縮小 */
+      }
+      .home-icon {
+        width: 40px;
+        height: 40px;
+        border-radius: 8px;
+        margin: 4px auto;
+      }
+      .home-label {
+        font-size: 0.7rem;
+        margin-top: 2px;
+      }
+      .chat-message {
+        font-size: 0.75rem;
+        margin-bottom: 6px;
+      }
+      /* テキスト入力やボタンのフォントサイズを少し小さく */
+      .MuiButton-root {
+        font-size: 0.75rem !important;
+        padding: 4px 8px !important;
+        min-height: 28px !important;
+      }
+      .MuiInputBase-input {
+        font-size: 0.8rem !important;
+      }
+    }
   </style>
 </head>
 <body>
@@ -81,8 +123,7 @@
     Switch,
     FormControlLabel,
     Container,
-    useMediaQuery,
-    Modal
+    useMediaQuery
   } = MaterialUI;
   
   /**
@@ -116,102 +157,72 @@
   ];
 
   /**
-   * チャットインターフェースコンポーネント
-   * - メッセージ履歴の表示
-   * - テキスト入力
-   * - 音声入力
-   * - MRモード切り替え
-   */
-  function AIMRChatArea({ messages, input, setInput, handleSend, handleVoiceInput, isMRMode, setIsMRMode }) {
-    return (
-      <Box sx={{ height: '100%', display: 'flex', flexDirection: 'column', p: 0 }}>
-        <Box
-          sx={{
-            flex: 1,
-            overflowY: 'auto',
-            border: '1px solid rgba(0,0,0,0.1)',
-            borderRadius: 1,
-            p: 2,
-            mb: 2,
-            backgroundColor: '#fff'
-          }}
-        >
-          {messages.map((msg, i) => (
-            <div key={i} className={`chat-message ${msg.role}`}>
-              {msg.role === "agent" ? "AI: " : "あなた: "}
-              {msg.text}
-            </div>
-          ))}
-        </Box>
-        <Box sx={{ p: 2, pt: 0 }}>
-          <TextField
-            variant="outlined"
-            multiline
-            minRows={2}
-            maxRows={4}
-            size="small"
-            fullWidth
-            value={input}
-            placeholder="メッセージを入力..."
-            onChange={(e) => setInput(e.target.value)}
-          />
-          <Box sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', mt: 2 }}>
-            <FormControlLabel
-              control={
-                <Switch
-                  checked={isMRMode}
-                  onChange={(event) => setIsMRMode(event.target.checked)}
-                  color="primary"
-                  size="small"
-                />
-              }
-              label="MRモード"
-            />
-            <Box sx={{ display: 'flex', gap: 1 }}>
-              <Button size="small" variant="outlined" onClick={handleVoiceInput}>
-                音声入力
-              </Button>
-              <Button size="small" variant="contained" onClick={handleSend}>
-                送信
-              </Button>
-            </Box>
-          </Box>
-        </Box>
-      </Box>
-    );
-  }
-
-  /**
    * ビデオ表示コンポーネント
    */
   function VideoDisplay() {
     const videoRef = React.useRef(null);
+    const streamRef = React.useRef(null);
     const [devices, setDevices] = React.useState([]);
     const [activeDeviceId, setActiveDeviceId] = React.useState(null);
+    const [error, setError] = React.useState(null);
 
-    // デバイス一覧の取得
+    // デバイス一覧の取得と初期カメラのセットアップ
     React.useEffect(() => {
-      navigator.mediaDevices.enumerateDevices()
-        .then(devices => {
+      async function setupCamera() {
+        try {
+          // まず初期ストリームを取得してカメラ許可を得る
+          const initialStream = await navigator.mediaDevices.getUserMedia({ video: true });
+          streamRef.current = initialStream;
+          videoRef.current.srcObject = initialStream;
+
+          // デバイス一覧を取得
+          const devices = await navigator.mediaDevices.enumerateDevices();
           const videoDevices = devices.filter(device => device.kind === 'videoinput');
           setDevices(videoDevices);
+          
           if (videoDevices.length > 0) {
             setActiveDeviceId(videoDevices[0].deviceId);
           }
-        });
+        } catch (err) {
+          setError('カメラへのアクセスが許可されていません');
+          console.error('Camera setup error:', err);
+        }
+      }
+
+      setupCamera();
+
+      // クリーンアップ関数
+      return () => {
+        if (streamRef.current) {
+          const tracks = streamRef.current.getTracks();
+          tracks.forEach(track => track.stop());
+        }
+      };
     }, []);
 
-    // カメラストリームの開始
+    // カメラの切り替え
     React.useEffect(() => {
-      if (activeDeviceId) {
-        navigator.mediaDevices.getUserMedia({
-          video: { deviceId: activeDeviceId }
-        })
-        .then(stream => {
-          videoRef.current.srcObject = stream;
-        })
-        .catch(err => console.error('カメラアクセスエラー:', err));
+      async function switchCamera() {
+        if (activeDeviceId && streamRef.current) {
+          try {
+            // 現在のストリームを停止
+            const tracks = streamRef.current.getTracks();
+            tracks.forEach(track => track.stop());
+
+            // 新しいストリームを取得
+            const newStream = await navigator.mediaDevices.getUserMedia({
+              video: { deviceId: { exact: activeDeviceId } }
+            });
+            streamRef.current = newStream;
+            videoRef.current.srcObject = newStream;
+          } catch (err) {
+            setError('カメラの切り替えに失敗しました');
+            console.error('Camera switch error:', err);
+          }
+        }
       }
+
+      switchCamera();
     }, [activeDeviceId]);
 
     const handleDeviceChange = () => {
@@ -219,6 +230,24 @@
       const nextIndex = (currentIndex + 1) % devices.length;
       setActiveDeviceId(devices[nextIndex].deviceId);
     };
+
+    if (error) {
+      return (
+        <Box sx={{ 
+          height: '100%', 
+          display: 'flex', 
+          alignItems: 'center', 
+          justifyContent: 'center',
+          flexDirection: 'column',
+          gap: 2 
+        }}>
+          <Typography color="error">{error}</Typography>
+          <Button variant="contained" onClick={() => window.location.reload()}>
+            再試行
+          </Button>
+        </Box>
+      );
+    }
 
     return (
       <Box sx={{ position: 'relative', height: '100%' }}>
@@ -229,7 +258,8 @@
           style={{
             width: '100%',
             height: '100%',
-            objectFit: 'cover'
+            objectFit: 'cover',
+            backgroundColor: '#000'
           }}
         />
         {devices.length > 1 && (
@@ -269,7 +299,7 @@
     const [openChat, setOpenChat] = React.useState(false);
     const handleOpenChat = () => setOpenChat(!openChat);
 
-    // メッセージ関連の状態をAppコンポーネントに移動
+    // メッセージ関連の状態
     const [messages, setMessages] = React.useState([
       { role: "agent", text: "こんにちは、AIエージェントです。ご用件は何でしょうか？" },
     ]);
@@ -297,7 +327,20 @@
         alert("このブラウザでは音声認識がサポートされていません。");
         return;
       }
+      // 音声入力時にメッセージエリアを展開
+      if (!openChat) {
+        setOpenChat(true);
+      }
       recognitionRef.current.start();
+    };
+
+    // MRモード切り替え時の処理
+    const handleMRModeChange = () => {
+      setIsMRMode(!isMRMode);
+      // MRモード有効時にメッセージエリアを展開
+      if (!openChat) {
+        setOpenChat(true);
+      }
     };
 
     const handleSend = () => {
@@ -314,21 +357,29 @@
     };
 
     // デバイスに応じたサイズ設定
+    // モバイル時にやや小さく、PC時にやや大きく
     const appBarHeight = isMobile ? '48px' : '64px';
-    const footerHeight = isMobile ? '48px' : '56px';
+    const footerHeight = isMobile ? '44px' : '56px';
 
     return (
       <Box sx={{ height: "100vh", display: 'flex', flexDirection: 'column' }}>
         {/* ヘッダー */}
         <AppBar position="static" elevation={4} sx={{ minHeight: appBarHeight }}>
           <Toolbar sx={{ minHeight: appBarHeight }}>
-            <IconButton edge="start" color="inherit" sx={{ mr: 2 }}>
+            <IconButton edge="start" color="inherit" sx={{ mr: 1 }}>
               <span className="material-icons">menu</span>
             </IconButton>
-            <Typography variant="h6" sx={{ flexGrow: 1, fontWeight: 'bold', fontSize: isMobile ? '1rem' : '1.25rem' }}>
+            <Typography 
+              variant="h6" 
+              sx={{ 
+                flexGrow: 1, 
+                fontWeight: 'bold', 
+                fontSize: isMobile ? '1rem' : '1.25rem' 
+              }}
+            >
               MR+AI Assistant
             </Typography>
-            <IconButton color="inherit">
+            <IconButton color="inherit" sx={{ mr: 1 }}>
               <span className="material-icons">notifications</span>
             </IconButton>
             <IconButton color="inherit">
@@ -397,41 +448,41 @@
                   disableUnderline: true,
                   sx: { 
                     padding: '0 8px',
-                    fontSize: '0.95rem'
+                    fontSize: isMobile ? '0.8rem' : '0.95rem'
                   }
                 }}
               />
               <Button 
                 size="small" 
                 variant={isMRMode ? "contained" : "outlined"}
-                onClick={() => setIsMRMode(!isMRMode)}
+                onClick={handleMRModeChange}
                 sx={{ 
-                  minWidth: '40px',
-                  height: '36px',
+                  minWidth: '36px',
+                  height: '32px',
                   borderRadius: '8px',
-                  backgroundColor: isMRMode ? '#1976d2' : 'transparent'
+                  ...(isMRMode && { backgroundColor: '#1976d2' })
                 }}
               >
-                <span className="material-icons" style={{ fontSize: '20px' }}>view_in_ar</span>
+                <span className="material-icons">view_in_ar</span>
               </Button>
               <Button 
                 size="small" 
                 variant="outlined"
                 onClick={handleVoiceInput}
                 sx={{ 
-                  minWidth: '40px',
-                  height: '36px',
+                  minWidth: '36px',
+                  height: '32px',
                   borderRadius: '8px'
                 }}
               >
-                <span className="material-icons" style={{ fontSize: '20px' }}>mic</span>
+                <span className="material-icons">mic</span>
               </Button>
               <Button 
                 size="small" 
                 variant="contained"
                 onClick={handleSend}
                 sx={{ 
-                  height: '36px',
+                  height: '32px',
                   borderRadius: '8px',
                   px: 2
                 }}
@@ -441,11 +492,16 @@
             </Box>
           </Box>
 
-          {/* メニューアイコングリッド */}
+          {/* メニューアイコングリッド - スクロール可能に */}
           <Box sx={{ 
             flex: 1, 
-            p: 2, 
-            overflowY: 'hidden' // スクロールバーを非表示に
+            p: 2,
+            overflowY: 'auto',
+            msOverflowStyle: 'none',  // IEのスクロールバー非表示
+            scrollbarWidth: 'none',   // Firefoxのスクロールバー非表示
+            '&::-webkit-scrollbar': { // Chromeのスクロールバー非表示
+              display: 'none'
+            }
           }}>
             <Grid container spacing={2} justifyContent="center">
               {menuItems.map((item, index) => (
@@ -485,7 +541,7 @@
             <span className="material-icons">
               {openChat ? 'expand_more' : 'expand_less'}
             </span>
-            <Typography>
+            <Typography sx={{ fontSize: isMobile ? '0.85rem' : '1rem' }}>
               {openChat ? 'メッセージを閉じる' : 'メッセージを表示'}
             </Typography>
           </Box>
