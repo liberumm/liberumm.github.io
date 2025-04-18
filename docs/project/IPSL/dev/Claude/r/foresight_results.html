@@ -446,6 +446,58 @@
 
       // テーブル方向
       const [periodOnXAxis, setPeriodOnXAxis] = useState(true);
+      // 拠点・商品の列順序（true: 拠点→商品, false: 商品→拠点）
+      const [siteFirstOrder, setSiteFirstOrder] = useState(true);
+
+      // ピボット設定
+      const [pivotConfig, setPivotConfig] = useState({
+        rows: ['site'],           // 行配置: site, product, period から選択
+        columns: ['period'],      // 列配置: site, product, period から選択
+        measures: selectedMetrics, // 集計項目
+        sort: {
+          site: 'asc',           // asc, desc
+          product: 'asc',
+          period: 'asc'
+        }
+      });
+
+      // 順序変更のハンドラー
+      const handleOrderChange = (type, oldIndex, newIndex) => {
+        setPivotConfig(prev => {
+          const list = type === 'rows' ? prev.rows : prev.columns;
+          const result = [...list];
+          const [removed] = result.splice(oldIndex, 1);
+          result.splice(newIndex, 0, removed);
+          return {
+            ...prev,
+            [type]: result
+          };
+        });
+      };
+
+      // ドラッグ&ドロップ用のハンドラー
+      const handleDragStart = (e, type, index) => {
+        e.dataTransfer.setData('text/plain', JSON.stringify({ type, index }));
+      };
+
+      const handleDragOver = (e) => {
+        e.preventDefault();
+      };
+
+      const handleDrop = (e, type, index) => {
+        e.preventDefault();
+        const data = JSON.parse(e.dataTransfer.getData('text/plain'));
+        if (data.type === type) {
+          handleOrderChange(type, data.index, index);
+        }
+      };
+
+      // ピボットUI用の設定項目
+      const PIVOT_DIMENSIONS = [
+        { id: 'site', label: '拠点', icon: '🏢' },
+        { id: 'product', label: '商品', icon: '📦' },
+        { id: 'period', label: '期間', icon: '📅' }
+      ];
 
       // クロスデータ
       const crossData = useMemo(() => {
@@ -461,18 +513,27 @@
         if (currentProductNodes.length === 0 || currentSiteNodes.length === 0) {
           return [];
         }
+
+        // データ生成時にソート
+        const sortedProductNodes = [...currentProductNodes].sort((a, b) => a.name.localeCompare(b.name));
+        const sortedSiteNodes = [...currentSiteNodes].sort((a, b) => a.name.localeCompare(b.name));
+
         const list = [];
-        currentProductNodes.forEach(product => {
-          currentSiteNodes.forEach(site => {
+        const primary = siteFirstOrder ? sortedSiteNodes : sortedProductNodes;
+        const secondary = siteFirstOrder ? sortedProductNodes : sortedSiteNodes;
+
+        primary.forEach(p => {
+          secondary.forEach(s => {
             list.push({
-              product,
-              site,
-              data: product.data
+              product: siteFirstOrder ? s : p,
+              site: siteFirstOrder ? p : s,
+              data: (siteFirstOrder ? s : p).data
             });
           });
         });
+
         return list;
-      }, [selectedProductNodes, selectedSiteNodes, productLevel, siteLevel]);
+      }, [selectedProductNodes, selectedSiteNodes, productLevel, siteLevel, siteFirstOrder]);
 
       // カラム：期間をX軸
       const columnsWhenPeriodOnX = useMemo(() => {
@@ -495,6 +556,158 @@
         });
         return cols;
       }, [crossData, selectedMetrics]);
+
+      // テーブル描画用のヘルパー関数
+      const renderPivotTableCell = (content, isHeader = false) => (
+        <TableCell
+          component={isHeader ? "th" : "td"}
+          sx={{
+            whiteSpace: 'normal',
+            wordBreak: 'break-word',
+            minWidth: 120,
+            backgroundColor: isHeader ? '#e3f2fd' : 'inherit',
+            fontWeight: isHeader ? 'bold' : 'normal',
+            color: isHeader ? '#1976d2' : 'inherit'
+          }}
+        >
+          {content}
+        </TableCell>
+      );
+
+      // ピボット用データ加工
+      const pivotData = useMemo(() => {
+        const items = {
+          site: selectedSiteNodes,
+          product: selectedProductNodes,
+          period: labels.map((label, index) => ({ label, index }))
+        };
+
+        // 行・列キーの生成
+        const rows = [];
+        const generateRows = (current = [], depth = 0) => {
+          if (depth === pivotConfig.rows.length) {
+            rows.push(current);
+            return;
+          }
+          const dim = pivotConfig.rows[depth];
+          items[dim].forEach(item => {
+            generateRows([...current, { type: dim, ...item }], depth + 1);
+          });
+        };
+        generateRows();
+
+        const columns = [];
+        const generateColumns = (current = [], depth = 0) => {
+          if (depth === pivotConfig.columns.length) {
+            columns.push(current);
+            return;
+          }
+          const dim = pivotConfig.columns[depth];
+          items[dim].forEach(item => {
+            generateColumns([...current, { type: dim, ...item }], depth + 1);
+          });
+        };
+        generateColumns();
+
+        // ソート関数
+        const sortItems = (a, b, type) => {
+          const direction = pivotConfig.sort[type] === 'asc' ? 1 : -1;
+          if (type === 'period') {
+            return (a.index - b.index) * direction;
+          }
+          return a.name.localeCompare(b.name) * direction;
+        };
+
+        // キーのソート
+        rows.sort((a, b) => {
+          for (let i = 0; i < a.length; i++) {
+            const result = sortItems(a[i], b[i], a[i].type);
+            if (result !== 0) return result;
+          }
+          return 0;
+        });
+
+        columns.sort((a, b) => {
+          for (let i = 0; i < a.length; i++) {
+            const result = sortItems(a[i], b[i], a[i].type);
+            if (result !== 0) return result;
+          }
+          return 0;
+        });
+
+        return { rows, columns };
+      }, [pivotConfig, selectedSiteNodes, selectedProductNodes, labels]);
+
+      // テーブル描画
+      const renderPivotTable = () => {
+        const getLabel = (item) => item.name || item.label;
+        const getValue = (row, col, metric) => {
+          const elements = [...row, ...col];
+          const product = elements.find(e => e.type === 'product');
+          const period = elements.find(e => e.type === 'period');
+          if (product?.data?.[metric] && period) {
+            return product.data[metric][period.index];
+          }
+          return '-';
+        };
+
+        return (
+          <Table stickyHeader size="small" sx={{/* ...existing styles... */}}>
+            <TableHead>
+              <TableRow>
+                {pivotConfig.rows.length > 0 && (
+                  <TableCell
+                    colSpan={pivotConfig.rows.length}
+                    rowSpan={2}
+                    sx={{
+                      backgroundColor: '#e3f2fd',
+                      fontWeight: 'bold',
+                      color: '#1976d2'
+                    }}
+                  >
+                    {pivotConfig.rows.map(dim => 
+                      PIVOT_DIMENSIONS.find(d => d.id === dim)?.label
+                    ).join(' / ')}
+                  </TableCell>
+                )}
+                {pivotData.columns.map((col, idx) => (
+                  <TableCell
+                    key={idx}
+                    colSpan={selectedMetrics.length}
+                    align="center"
+                    sx={{
+                      backgroundColor: '#e3f2fd',
+                      fontWeight: 'bold',
+                      color: '#1976d2'
+                    }}
+                  >
+                    {col.map(getLabel).join(' / ')}
+                  </TableCell>
+                ))}
+              </TableRow>
+              <TableRow>
+                {pivotData.columns.map((col, colIdx) =>
+                  selectedMetrics.map((metric, metricIdx) => 
+                    renderPivotTableCell(metric, true)
+                  )
+                )}
+              </TableRow>
+            </TableHead>
+            <TableBody>
+              {pivotData.rows.map((row, rowIdx) => (
+                <TableRow key={rowIdx}>
+                  {row.map((item, i) => renderPivotTableCell(getLabel(item)))}
+                  {pivotData.columns.map((col, colIdx) =>
+                    selectedMetrics.map(metric => 
+                      renderPivotTableCell(getValue(row, col, metric))
+                    )
+                  )}
+                </TableRow>
+              ))}
+            </TableBody>
+          </Table>
+        );
+      };
 
       // ---------- 描画 ----------
       return (
@@ -631,19 +844,138 @@
             </Box>
           </Box>
 
-          {/* (6) テーブル表示方向 */}
+          {/* ピボット設定UI */}
           <Box sx={{ mb: 2 }}>
-            <Typography variant="subtitle1">テーブル表示方向</Typography>
-            <ToggleButtonGroup
-              value={periodOnXAxis}
-              exclusive
-              onChange={(_, newValue) => {
-                if (newValue !== null) setPeriodOnXAxis(newValue);
-              }}
-            >
-              <ToggleButton value={true}>期間をX軸に表示</ToggleButton>
-              <ToggleButton value={false}>期間をY軸に表示</ToggleButton>
-            </ToggleButtonGroup>
+            <Typography variant="subtitle1">ピボット設定</Typography>
+            <Box sx={{ display: 'flex', flexDirection: 'column', gap: 2, p: 2, border: '1px solid #ccc', borderRadius: 1 }}>
+              {/* 行設定 */}
+              <Box>
+                <Typography variant="subtitle2">行の配置（ドラッグで順序変更可能）</Typography>
+                <Box sx={{ display: 'flex', gap: 1, mt: 1 }}>
+                  {PIVOT_DIMENSIONS.map(dim => (
+                    <Chip
+                      key={dim.id}
+                      label={`${dim.icon} ${dim.label}`}
+                      color={pivotConfig.rows.includes(dim.id) ? "primary" : "default"}
+                      onClick={() => {
+                        setPivotConfig(prev => ({
+                          ...prev,
+                          rows: prev.rows.includes(dim.id)
+                            ? prev.rows.filter(r => r !== dim.id)
+                            : [...prev.rows, dim.id],
+                          // 行に追加した次元を列から削除
+                          columns: prev.columns.filter(c => c !== dim.id)
+                        }));
+                      }}
+                    />
+                  ))}
+                </Box>
+                <Box sx={{ 
+                  display: 'flex', 
+                  gap: 1, 
+                  mt: 1,
+                  p: 1,
+                  border: '1px dashed #ccc',
+                  borderRadius: 1,
+                  minHeight: 40
+                }}>
+                  {pivotConfig.rows.map((dimId, index) => {
+                    const dim = PIVOT_DIMENSIONS.find(d => d.id === dimId);
+                    return (
+                      <Chip
+                        key={dimId}
+                        label={`${dim.icon} ${dim.label}`}
+                        color="primary"
+                        draggable
+                        onDragStart={(e) => handleDragStart(e, 'rows', index)}
+                        onDragOver={handleDragOver}
+                        onDrop={(e) => handleDrop(e, 'rows', index)}
+                        sx={{ cursor: 'move' }}
+                      />
+                    );
+                  })}
+                </Box>
+              </Box>
+
+              {/* 列設定 */}
+              <Box>
+                <Typography variant="subtitle2">列の配置（ドラッグで順序変更可能）</Typography>
+                <Box sx={{ display: 'flex', gap: 1, mt: 1 }}>
+                  {PIVOT_DIMENSIONS.map(dim => (
+                    <Chip
+                      key={dim.id}
+                      label={`${dim.icon} ${dim.label}`}
+                      color={pivotConfig.columns.includes(dim.id) ? "primary" : "default"}
+                      onClick={() => {
+                        setPivotConfig(prev => ({
+                          ...prev,
+                          columns: prev.columns.includes(dim.id)
+                            ? prev.columns.filter(c => c !== dim.id)
+                            : [...prev.columns, dim.id],
+                          // 列に追加した次元を行から削除
+                          rows: prev.rows.filter(r => r !== dim.id)
+                        }));
+                      }}
+                    />
+                  ))}
+                </Box>
+                <Box sx={{ 
+                  display: 'flex', 
+                  gap: 1, 
+                  mt: 1,
+                  p: 1,
+                  border: '1px dashed #ccc',
+                  borderRadius: 1,
+                  minHeight: 40
+                }}>
+                  {pivotConfig.columns.map((dimId, index) => {
+                    const dim = PIVOT_DIMENSIONS.find(d => d.id === dimId);
+                    return (
+                      <Chip
+                        key={dimId}
+                        label={`${dim.icon} ${dim.label}`}
+                        color="primary"
+                        draggable
+                        onDragStart={(e) => handleDragStart(e, 'columns', index)}
+                        onDragOver={handleDragOver}
+                        onDrop={(e) => handleDrop(e, 'columns', index)}
+                        sx={{ cursor: 'move' }}
+                      />
+                    );
+                  })}
+                </Box>
+              </Box>
+
+              {/* 並び順設定 */}
+              <Box>
+                <Typography variant="subtitle2">並び順</Typography>
+                <Box sx={{ display: 'flex', gap: 2, mt: 1 }}>
+                  {PIVOT_DIMENSIONS.map(dim => (
+                    <ToggleButtonGroup
+                      key={dim.id}
+                      size="small"
+                      value={pivotConfig.sort[dim.id]}
+                      exclusive
+                      onChange={(_, value) => {
+                        if (value) {
+                          setPivotConfig(prev => ({
+                            ...prev,
+                            sort: { ...prev.sort, [dim.id]: value }
+                          }));
+                        }
+                      }}
+                    >
+                      <ToggleButton value="asc" aria-label="昇順">
+                        {dim.icon} ↑
+                      </ToggleButton>
+                      <ToggleButton value="desc" aria-label="降順">
+                        {dim.icon} ↓
+                      </ToggleButton>
+                    </ToggleButtonGroup>
+                  ))}
+                </Box>
+              </Box>
+            </Box>
           </Box>
 
           {/* (7) テーブル表示（スプレッドシート風） */}
@@ -665,178 +997,7 @@
               }
             }}
           >
-            <Table
-              stickyHeader
-              size="small"
-              sx={{
-                borderCollapse: 'collapse',
-                '& .MuiTableCell-root': {
-                  border: '1px solid #ccc',
-                },
-                '& th.MuiTableCell-stickyHeader': {
-                  backgroundColor: '#f5f5f5',
-                  zIndex: 3,
-                  borderLeft: '1px solid #ccc',
-                  borderRight: '1px solid #ccc'
-                },
-                '& .MuiTableCell-root:first-of-type, & .MuiTableCell-root:nth-of-type(2)': {
-                  position: 'sticky',
-                  left: (theme) => theme.spacing(0),
-                  backgroundColor: '#fff',
-                  zIndex: 2,
-                  borderRight: '1px solid #ccc'
-                },
-                '& th.MuiTableCell-root:first-of-type, & th.MuiTableCell-root:nth-of-type(2)': {
-                  zIndex: 4,
-                  borderRight: '1px solid #ccc'
-                }
-              }}
-            >
-              {periodOnXAxis ? (
-                <>
-                  <TableHead>
-                    <TableRow>
-                      <TableCell rowSpan={2}>{`拠点\n(${siteLevel})`}</TableCell>
-                      <TableCell rowSpan={2}>{`商品\n(${productLevel})`}</TableCell>
-                      {selectedMetrics.map(metric => (
-                        <TableCell
-                          key={metric}
-                          colSpan={labels.length}
-                          align="center"
-                          sx={{
-                            whiteSpace: 'normal',
-                            wordBreak: 'break-word',
-                            minWidth: 120 * labels.length
-                          }}
-                        >
-                          {metric}
-                        </TableCell>
-                      ))}
-                    </TableRow>
-                    <TableRow>
-                      {selectedMetrics.map(metric =>
-                        labels.map((label, idx) => (
-                          <TableCell
-                            key={`${metric}-${idx}`}
-                            align="center"
-                            sx={{
-                              whiteSpace: 'normal',
-                              wordBreak: 'break-word',
-                              minWidth: 120
-                            }}
-                          >
-                            {label}
-                          </TableCell>
-                        ))
-                      )}
-                    </TableRow>
-                  </TableHead>
-                  <TableBody>
-                    {crossData.length > 0 ? (
-                      crossData.map((combination, rowIdx) => {
-                        const { site, product, data } = combination;
-                        return (
-                          <TableRow key={rowIdx}>
-                            <TableCell
-                              sx={{
-                                whiteSpace: 'normal',
-                                wordBreak: 'break-word'
-                              }}
-                            >
-                              {site.name}
-                            </TableCell>
-                            <TableCell
-                              sx={{
-                                whiteSpace: 'normal',
-                                wordBreak: 'break-word'
-                              }}
-                            >
-                              {product.name}
-                            </TableCell>
-                            {columnsWhenPeriodOnX.map((col, cIdx) => {
-                              const { metric, periodIndex } = col;
-                              if (!data || !data[metric]) {
-                                return <TableCell key={cIdx}>-</TableCell>;
-                              }
-                              return (
-                                <TableCell key={cIdx}>
-                                  {data[metric][periodIndex]}
-                                </TableCell>
-                              );
-                            })}
-                          </TableRow>
-                        );
-                      })
-                    ) : (
-                      <TableRow>
-                        <TableCell colSpan={2 + columnsWhenPeriodOnX.length} align="center">
-                          ※ 選択した階層のノードがありません
-                        </TableCell>
-                      </TableRow>
-                    )}
-                  </TableBody>
-                </>
-              ) : (
-                <>
-                  <TableHead>
-                    <TableRow>
-                      <TableCell rowSpan={2}>期間</TableCell>
-                      {crossData.map((combo, idx) => (
-                        <TableCell
-                          key={idx}
-                          colSpan={selectedMetrics.length}
-                          align="center"
-                          sx={{
-                            whiteSpace: 'normal',
-                            wordBreak: 'break-word',
-                            minWidth: 120 * selectedMetrics.length
-                          }}
-                        >
-                          {`${combo.site.name} × ${combo.product.name}`}
-                        </TableCell>
-                      ))}
-                    </TableRow>
-                    <TableRow>
-                      {crossData.map(combo =>
-                        selectedMetrics.map(metric => (
-                          <TableCell
-                            key={`${combo.site.name}-${combo.product.name}-${metric}`}
-                            align="center"
-                            sx={{
-                              whiteSpace: 'normal',
-                              wordBreak: 'break-word',
-                              minWidth: 120
-                            }}
-                          >
-                            {metric}
-                          </TableCell>
-                        ))
-                      )}
-                    </TableRow>
-                  </TableHead>
-                  <TableBody>
-                    {labels.map((label, rowIdx) => (
-                      <TableRow key={rowIdx}>
-                        <TableCell>{label}</TableCell>
-                        {columnsWhenPeriodOnY.map((col, cIdx) => {
-                          const { combinationIndex, metric } = col;
-                          const combo = crossData[combinationIndex];
-                          const d = combo.data;
-                          if (!d || !d[metric]) {
-                            return <TableCell key={cIdx}>-</TableCell>;
-                          }
-                          return (
-                            <TableCell key={cIdx}>
-                              {d[metric][rowIdx]}
-                            </TableCell>
-                          );
-                        })}
-                      </TableRow>
-                    ))}
-                  </TableBody>
-                </>
-              )}
-            </Table>
+            {renderPivotTable()}
           </TableContainer>
         </Box>
       );
