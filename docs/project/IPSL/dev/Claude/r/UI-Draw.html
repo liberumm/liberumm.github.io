@@ -1,0 +1,465 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Multi-Board Painter with Undo/Redo & Context Menu</title>
+
+  <!-- React / ReactDOM / MUI / Babel / Fabric.js -->
+  <script src="https://cdn.jsdelivr.net/npm/react@18/umd/react.production.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/react-dom@18/umd/react-dom.production.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@mui/material@5.15.14/umd/material-ui.production.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.2/babel.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/fabric.js/5.2.4/fabric.min.js"></script>
+
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Roboto:300,400,500,700&display=swap">
+  <link rel="stylesheet" href="https://fonts.googleapis.com/icon?family=Material+Icons">
+
+  <style>
+    html, body, #root { height:100%; margin:0; overflow:hidden; }
+    /* 左右中央寄せ：上下は上詰め */
+    .canvas-container {
+      flex: 1;
+      display: flex;
+      justify-content: center;    /* 水平方向中央 */
+      align-items: flex-start;    /* 垂直方向 上詰め */
+      background: #eee;
+      padding-top: 16px;           /* 上に少し余白 */
+      overflow: auto;
+    }
+    /* Canvas 自体もブロック中央寄せ */
+    canvas {
+      display: block;
+      margin: 0 auto;
+      border: 1px solid #999;
+    }
+    .tool-scroll {
+      display: flex;
+      overflow-x: auto;
+      gap: .5rem;
+      padding: .5rem;
+      background: #fafafa;
+    }
+    .layer-color {
+      width:24px; height:24px;
+      border:none; padding:0; margin-right:8px;
+      cursor:pointer;
+    }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+
+  <script type="text/babel">
+    const {
+      Box, AppBar, Toolbar, IconButton, Typography, Button, CssBaseline,
+      Drawer, List, ListItem, ListItemText, Divider, Tooltip,
+      Dialog, DialogTitle, DialogContent, DialogActions, TextField,
+      Menu, MenuItem, Grid
+    } = MaterialUI;
+
+    function App() {
+      const drawerWidth = 260;
+
+      const [boards, setBoards] = React.useState([
+        { id:1, name:'ボード1', w:800, h:600, json:null, history:[], historyIndex:-1 }
+      ]);
+      const [cur,    setCur]    = React.useState(0);
+      const [view,   setView]   = React.useState('single');
+      const [drawerOpen, setDrawerOpen] = React.useState(false);
+
+      const [tool, setTool] = React.useState('select');
+      const [textDlg, setTextDlg] = React.useState(false);
+      const [textVal, setTextVal] = React.useState('');
+      const [sizeDlg, setSizeDlg] = React.useState(false);
+      const [sizeVal, setSizeVal] = React.useState({ w:800, h:600 });
+
+      const [layers, setLayers] = React.useState([]);
+      const [contextMenu, setContextMenu] = React.useState(null);
+      const [colorDlg, setColorDlg] = React.useState(false);
+      const [colorVal, setColorVal] = React.useState('#000000');
+
+      const fabricRef = React.useRef(null);
+
+      // 初回マウントで Fabric Canvas を生成
+      React.useEffect(() => {
+        const cv = new fabric.Canvas('fabricCanvas', { preserveObjectStacking:true });
+        cv.freeDrawingBrush.color = '#000';
+        cv.freeDrawingBrush.width = 2;
+        fabricRef.current = cv;
+
+        cv.on('object:added',   updateLayers);
+        cv.on('object:removed', updateLayers);
+        cv.on('object:modified',updateLayers);
+
+        cv.on('mouse:down', opt => {
+          if (opt.e.button===2 && opt.target) {
+            opt.e.preventDefault();
+            setContextMenu({
+              mouseX: opt.e.clientX,
+              mouseY: opt.e.clientY,
+              object: opt.target
+            });
+          }
+        });
+        cv.upperCanvasEl.addEventListener('contextmenu', e=>e.preventDefault());
+
+        loadBoard(0);
+        return () => cv.dispose();
+      }, []);
+
+      // ボード切替時
+      React.useEffect(()=>{
+        if (fabricRef.current) loadBoard(cur);
+      }, [cur]);
+
+      // JSON→Canvas描画
+      function loadJSON(json,w,h){
+        const cv = fabricRef.current;
+        cv.clear();
+        cv.setWidth(w).setHeight(h);
+        cv.setBackgroundColor('#fff',cv.renderAll.bind(cv));
+        if(json){
+          cv.loadFromJSON(json, ()=>{
+            cv.renderAll();
+            updateLayers();
+          });
+        } else {
+          cv.renderAll();
+          updateLayers();
+        }
+      }
+
+      // ボードロード
+      function loadBoard(idx){
+        const b = boards[idx];
+        loadJSON(b.json,b.w,b.h);
+        setBoards(bs=>bs.map((bd,i)=>{
+          if(i===idx && bd.history.length===0){
+            const snap = fabricRef.current.toJSON();
+            return {...bd,history:[snap],historyIndex:0};
+          }
+          return bd;
+        }));
+        selectTool('select',false);
+      }
+
+      // 保存＋履歴追加
+      function saveCurrent(){
+        const cv = fabricRef.current;
+        const newJson = cv.toJSON();
+        setBoards(bs=>bs.map((b,i)=>{
+          if(i===cur){
+            const hist = b.history.slice(0,b.historyIndex+1);
+            hist.push(newJson);
+            return {...b,json:newJson,history:hist,historyIndex:hist.length-1};
+          }
+          return b;
+        }));
+        updateLayers();
+      }
+
+      // Undo/Redo
+      function undo(){
+        const b = boards[cur];
+        if(b.historyIndex>0){
+          const idx = b.historyIndex-1;
+          loadJSON(b.history[idx],b.w,b.h);
+          setBoards(bs=>bs.map((bd,i)=>i===cur?{...bd,historyIndex:idx,json:bd.history[idx]}:bd));
+        }
+      }
+      function redo(){
+        const b = boards[cur];
+        if(b.historyIndex < b.history.length-1){
+          const idx = b.historyIndex+1;
+          loadJSON(b.history[idx],b.w,b.h);
+          setBoards(bs=>bs.map((bd,i)=>i===cur?{...bd,historyIndex:idx,json:bd.history[idx]}:bd));
+        }
+      }
+      const bcur = boards[cur];
+      const canUndo = bcur.historyIndex>0;
+      const canRedo = bcur.historyIndex < bcur.history.length-1;
+
+      // ツール切替
+      function selectTool(name,save=true){
+        if(save) saveCurrent();
+        const cv = fabricRef.current;
+        setTool(name);
+        cv.isDrawingMode = (name==='draw');
+        const sel = (name==='select');
+        cv.selection = sel;
+        cv.forEachObject(o=>o.selectable=sel);
+      }
+
+      // レイヤー更新
+      function updateLayers(){
+        const objs = fabricRef.current.getObjects();
+        setLayers(objs.map((o,i)=>({id:i,obj:o,name:`${o.type} ${i+1}`})));
+      }
+
+      // 画像追加
+      function addImage(file){
+        if(!file?.type.startsWith('image/')) return;
+        const url = URL.createObjectURL(file);
+        fabric.Image.fromURL(url,img=>{
+          img.set({left:40,top:40,objectCaching:false});
+          fabricRef.current.add(img).setActiveObject(img);
+          saveCurrent();
+        });
+      }
+
+      // コンテキストメニュー操作
+      function handleCopy(obj){
+        obj.clone(cloned=>{
+          cloned.set({left:cloned.left+10,top:cloned.top+10});
+          fabricRef.current.add(cloned).setActiveObject(cloned);
+          saveCurrent();
+        });
+        closeContextMenu();
+      }
+      function handleDelete(obj){
+        fabricRef.current.remove(obj);
+        saveCurrent();
+        closeContextMenu();
+      }
+      function openColorDlg(obj){
+        setColorVal(obj.fill||obj.stroke||'#000000');
+        setContextMenu(cm=>({...cm,forObject:obj}));
+        setColorDlg(true);
+      }
+      function applyColor(){
+        const obj = contextMenu.forObject;
+        if(obj.set){
+          if(obj.fill!==undefined) obj.set('fill',colorVal);
+          else if(obj.stroke!==undefined) obj.set('stroke',colorVal);
+          fabricRef.current.requestRenderAll();
+          saveCurrent();
+        }
+        setColorDlg(false);
+        closeContextMenu();
+      }
+      function closeContextMenu(){
+        setContextMenu(null);
+      }
+
+      // Drawer 内容
+      const drawerContent = (
+        <Box sx={{width:drawerWidth}}>
+          <Toolbar/>
+          <Typography sx={{px:2,py:1}} variant="subtitle1">Artboards</Typography>
+          <List>
+            {boards.map((b,i)=>(
+              <ListItem button key={b.id} selected={i===cur}
+                onClick={()=>{saveCurrent();setCur(i);setView('single');setDrawerOpen(false);}}
+              >
+                <ListItemText primary={b.name} secondary={`${b.w}×${b.h}`}/>
+              </ListItem>
+            ))}
+          </List>
+          <Divider/>
+          <Button fullWidth onClick={()=>{
+            const nid = boards[boards.length-1].id+1;
+            setBoards([...boards,{id:nid,name:`ボード${nid}`,w:800,h:600,json:null,history:[],historyIndex:-1}]);
+            saveCurrent(); setCur(boards.length); setView('single'); setDrawerOpen(false);
+          }}>＋ 新規ボード</Button>
+          <Divider sx={{my:2}}/>
+          <Typography sx={{px:2,py:1}} variant="subtitle1">Layers</Typography>
+          <List>
+            {layers.slice().reverse().map(layer=>(
+              <ListItem key={layer.id} secondaryAction={
+                <Box sx={{display:'flex',alignItems:'center'}}>
+                  <input type="color" className="layer-color"
+                    value={layer.obj.fill||layer.obj.stroke||'#000'}
+                    onChange={e=>{layer.obj.set(layer.obj.fill!==undefined?'fill':'stroke',e.target.value);fabricRef.current.requestRenderAll();saveCurrent();}}/>
+                  <IconButton size="small" onClick={()=>handleDelete(layer.obj)}>
+                    <span className="material-icons">delete</span>
+                  </IconButton>
+                </Box>
+              }
+              onClick={()=>{fabricRef.current.setActiveObject(layer.obj);fabricRef.current.requestRenderAll();}}
+              >
+                <ListItemText primary={layer.name}/>
+              </ListItem>
+            ))}
+          </List>
+        </Box>
+      );
+
+      // Toolbar ボタン
+      const ToolBtn = ({icon,label,active,onClick,disabled})=>(
+        <Tooltip title={label}>
+          <IconButton size="small" color={active?'primary':'default'} onClick={onClick} disabled={disabled}>
+            <span className="material-icons">{icon}</span>
+          </IconButton>
+        </Tooltip>
+      );
+
+      return (
+        <Box sx={{height:'100%',display:'flex'}} onDragOver={e=>e.preventDefault()} onDrop={e=>addImage(e.dataTransfer.files[0])}>
+          <CssBaseline/>
+
+          {/* AppBar */}
+          <AppBar position="fixed" sx={{zIndex:t=>t.zIndex.drawer+1}}>
+            <Toolbar variant="dense">
+              <IconButton color="inherit" edge="start" onClick={()=>setDrawerOpen(true)}>
+                <span className="material-icons">menu</span>
+              </IconButton>
+              <Typography sx={{flexGrow:1}} variant="h6">お絵描きシステム</Typography>
+              <Button color="inherit" onClick={()=>setView(v=>v==='single'?'gallery':'single')}>
+                {view==='single'?'一覧':'戻る'}
+              </Button>
+            </Toolbar>
+          </AppBar>
+
+          {/* Drawer（常にハンバーガー） */}
+          <Drawer variant="temporary" open={drawerOpen} onClose={()=>setDrawerOpen(false)} ModalProps={{keepMounted:true}}>
+            {drawerContent}
+          </Drawer>
+
+          {/* Main */}
+          <Box sx={{flex:1,display:'flex',flexDirection:'column',overflow:'hidden'}}>
+            <Toolbar variant="dense"/>
+
+            {/* ツールバー */}
+            <Box className="tool-scroll">
+              <ToolBtn icon="undo" label="元に戻す" onClick={undo} disabled={!canUndo}/>
+              <ToolBtn icon="redo" label="やり直す" onClick={redo} disabled={!canRedo}/>
+              <ToolBtn icon="mouse" label="選択" active={tool==='select'} onClick={()=>selectTool('select')}/>
+              <ToolBtn icon="draw"  label="フリードロー" active={tool==='draw'}  onClick={()=>selectTool('draw')}/>
+              <ToolBtn icon="crop_square" label="矩形" onClick={()=>{
+                selectTool('rect');
+                const o=new fabric.Rect({left:60,top:60,width:100,height:60,fill:'transparent',stroke:'#000'});
+                fabricRef.current.add(o).setActiveObject(o); saveCurrent();
+              }}/>
+              <ToolBtn icon="circle" label="楕円" onClick={()=>{
+                selectTool('ellipse');
+                const o=new fabric.Ellipse({left:80,top:80,rx:50,ry:30,fill:'transparent',stroke:'#000'});
+                fabricRef.current.add(o).setActiveObject(o); saveCurrent();
+              }}/>
+              <ToolBtn icon="arrow_forward" label="矢印" onClick={()=>{
+                selectTool('arrow');
+                const l=new fabric.Line([40,150,140,150],{stroke:'#000'});
+                const t=new fabric.Triangle({width:14,height:20,fill:'#000',left:140,top:150,angle:90,originX:'center',originY:'center'});
+                const g=new fabric.Group([l,t],{left:40,top:150});
+                fabricRef.current.add(g).setActiveObject(g); saveCurrent();
+              }}/>
+              <ToolBtn icon="title" label="テキスト" onClick={()=>setTextDlg(true)}/>
+              <ToolBtn icon="image" label="画像" onClick={()=>document.getElementById('fileUp').click()}/>
+              <ToolBtn icon="straighten" label="サイズ" onClick={()=>{
+                const b=boards[cur];
+                setSizeVal({w:b.w,h:b.h});
+                setSizeDlg(true);
+              }}/>
+            </Box>
+
+            {/* アートボード：左右中央寄せ */}
+            <Box className="canvas-container">
+              <canvas id="fabricCanvas"></canvas>
+            </Box>
+
+            {/* ギャラリー */}
+            {view==='gallery'&&(
+              <Box sx={{flex:1,overflow:'auto',p:2}}>
+                <Grid container spacing={2}>
+                  {boards.map((b,i)=>(
+                    <Grid item xs={6} sm={4} md={3} lg={2} key={b.id}
+                      onClick={()=>{saveCurrent();setCur(i);setView('single');}}
+                      sx={{cursor:'pointer'}}
+                    >
+                      <canvas className="thumb" ref={node=>{
+                        if(!node) return;
+                        node.width=b.w;node.height=b.h;
+                        const ctx=node.getContext('2d');
+                        ctx.fillStyle='#fff';ctx.fillRect(0,0,node.width,node.height);
+                        if(b.json){
+                          const tmp=new fabric.StaticCanvas(null,{width:b.w,height:b.h});
+                          tmp.loadFromJSON(b.json,()=>{
+                            tmp.renderAll();
+                            ctx.drawImage(tmp.lowerCanvasEl,0,0);
+                            tmp.dispose();
+                          });
+                        }
+                      }} />
+                      <Typography variant="caption">{b.name}</Typography>
+                    </Grid>
+                  ))}
+                </Grid>
+              </Box>
+            )}
+          </Box>
+
+          {/* 隠しファイル入力 */}
+          <input id="fileUp" type="file" accept="image/*" style={{display:'none'}}
+            onChange={e=>addImage(e.target.files[0])} />
+
+          {/* コンテキストメニュー */}
+          <Menu open={!!contextMenu} onClose={closeContextMenu}
+            anchorReference="anchorPosition"
+            anchorPosition={ contextMenu ? { top:contextMenu.mouseY, left:contextMenu.mouseX } : undefined }
+          >
+            <MenuItem onClick={()=>handleCopy(contextMenu.object)}>コピー</MenuItem>
+            <MenuItem onClick={()=>handleDelete(contextMenu.object)}>削除</MenuItem>
+            <MenuItem onClick={()=>openColorDlg(contextMenu.object)}>色変更</MenuItem>
+          </Menu>
+
+          {/* 色変更ダイアログ */}
+          <Dialog open={colorDlg} onClose={()=>setColorDlg(false)}>
+            <DialogTitle>色を選択</DialogTitle>
+            <DialogContent>
+              <input type="color" value={colorVal} onChange={e=>setColorVal(e.target.value)} />
+            </DialogContent>
+            <DialogActions>
+              <Button onClick={()=>setColorDlg(false)}>キャンセル</Button>
+              <Button onClick={applyColor}>OK</Button>
+            </DialogActions>
+          </Dialog>
+
+          {/* テキストダイアログ */}
+          <Dialog open={textDlg} onClose={()=>setTextDlg(false)}>
+            <DialogTitle>テキスト追加</DialogTitle>
+            <DialogContent>
+              <TextField fullWidth multiline rows={2}
+                value={textVal} onChange={e=>setTextVal(e.target.value)} />
+            </DialogContent>
+            <DialogActions>
+              <Button onClick={()=>setTextDlg(false)}>キャンセル</Button>
+              <Button onClick={()=>{
+                if(textVal.trim()){
+                  const t=new fabric.Textbox(textVal,{left:70,top:70,fontSize:20,fill:'#000'});
+                  fabricRef.current.add(t).setActiveObject(t);
+                  saveCurrent();
+                }
+                setTextVal(''); setTextDlg(false);
+              }}>OK</Button>
+            </DialogActions>
+          </Dialog>
+
+          {/* サイズダイアログ */}
+          <Dialog open={sizeDlg} onClose={()=>setSizeDlg(false)}>
+            <DialogTitle>ボードサイズ変更</DialogTitle>
+            <DialogContent sx={{display:'flex',gap:2,mt:1}}>
+              <TextField type="number" label="幅(px)" fullWidth
+                value={sizeVal.w} onChange={e=>setSizeVal(s=>({...s,w:e.target.value}))} />
+              <TextField type="number" label="高さ(px)" fullWidth
+                value={sizeVal.h} onChange={e=>setSizeVal(s=>({...s,h:e.target.value}))} />
+            </DialogContent>
+            <DialogActions>
+              <Button onClick={()=>setSizeDlg(false)}>キャンセル</Button>
+              <Button onClick={()=>{
+                const w=parseInt(sizeVal.w,10), h=parseInt(sizeVal.h,10);
+                if(w>0&&h>0){
+                  setBoards(bs=>bs.map((b,i)=>i===cur?{...b,w,h,json:null,history:[],historyIndex:-1}:b));
+                  loadBoard(cur);
+                }
+                setSizeDlg(false);
+              }}>適用</Button>
+            </DialogActions>
+          </Dialog>
+        </Box>
+      );
+    }
+
+    ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+  </script>
+</body>
+</html>
