@@ -383,9 +383,23 @@
     function App() {
       const drawerWidth = 260;
 
-      const [boards, setBoards] = React.useState([
-        { id: 1, name: 'ボード1', w: 500, h: 500, json: null, history: [], historyIndex: -1 }
-      ]);
+      // [修正] アートボードの初期状態
+      const [boards, setBoards] = React.useState(() => {
+        // 初期ボード作成時にキャンバスも生成
+        const initialId = 1;
+        const initialW = 500, initialH = 500;
+        const initialCanvas = initializeCanvas(initialId, initialW, initialH, null);
+        return [{
+          id: initialId,
+          name: 'ボード1',
+          w: initialW,
+          h: initialH,
+          json: null,
+          history: [],
+          historyIndex: -1,
+          canvas: initialCanvas
+        }];
+      });
       const [cur, setCur] = React.useState(0);
       const [view, setView] = React.useState('single');
       const [drawerOpen, setDrawerOpen] = React.useState(false);
@@ -448,11 +462,41 @@
 
       // フリードロー設定の更新
       React.useEffect(() => {
-        if (fabricRef.current) {
+        const canvas = getActiveCanvas();
+        if (canvas) {
           const color = colorToString(strokeColor);
-          fabricRef.current.freeDrawingBrush.color = color || '#000000';
+          canvas.freeDrawingBrush.color = color || '#000000';
         }
       }, [strokeColor]);
+
+      // [修正] キャンバス管理用のヘルパー関数
+      function initializeCanvas(id, width, height, json = null) {
+        const canvas = new fabric.Canvas(`fabricCanvas-${id}`, {
+          preserveObjectStacking: true,
+          width,
+          height
+        });
+        canvas.freeDrawingBrush.color = '#000';
+        canvas.freeDrawingBrush.width = 2;
+
+        // イベントリスナーを設定
+        canvas.on('object:added', () => updateLayers(id));
+        canvas.on('object:removed', () => updateLayers(id));
+        canvas.on('object:modified', () => updateLayers(id));
+        canvas.on('selection:created', () => updateLayers(id));
+        canvas.on('selection:updated', () => updateLayers(id));
+        
+        if (json) {
+          canvas.loadFromJSON(json, () => {
+            canvas.renderAll();
+            updateLayers(id);
+          });
+        } else {
+          canvas.setBackgroundColor('#fff', canvas.renderAll.bind(canvas));
+        }
+        
+        return canvas;
+      }
 
       // 初回マウントで Fabric Canvas を生成する部分の修正
       React.useEffect(() => {
@@ -526,10 +570,12 @@
         selectTool('select', false);
       }
 
-      // 保存＋履歴追加
+      // [修正] saveCurrent関数
       function saveCurrent() {
-        const cv = fabricRef.current;
-        const newJson = cv.toJSON();
+        const canvas = getActiveCanvas();
+        if (!canvas) return;
+
+        const newJson = canvas.toJSON();
         setBoards(bs => bs.map((b, i) => {
           if (i === cur) {
             const hist = b.history.slice(0, b.historyIndex + 1);
@@ -538,7 +584,7 @@
           }
           return b;
         }));
-        updateLayers();
+        updateLayers(boards[cur].id);
       }
 
       // Undo/Redo
@@ -566,110 +612,116 @@
       const [artboardPositions, setArtboardPositions] = React.useState([]);
       const [isDragging, setIsDragging] = React.useState(false);
       const [dragOffset, setDragOffset] = React.useState({ x: 0, y: 0 });
+    
 
-      // ワークスペースモード用のキャンバス生成処理
+    // [修正] 現在のモードに応じたキャンバスを返すヘルパ関数
+    function getActiveCanvas() {
+      return boards[cur]?.canvas;
+    }
+
+      // ワークスペースモード用の描画処理を追加
       React.useEffect(() => {
-        if (workspaceMode !== 'workspace') return;
-
-        boards.forEach((b, i) => {
-          const canvasElem = document.getElementById(`fabricCanvas-${i}`);
+        boards.forEach(board => {
+          const canvasElem = document.getElementById(`fabricCanvas-${board.id}`);
           if (!canvasElem) return;
-          // Dispose previous dynamic canvas if exists
-          if (canvasElem._dynamicCanvas) {
-            canvasElem._dynamicCanvas.dispose();
+
+          if (workspaceMode === 'workspace') {
+            // ワークスペースモードでは全てのキャンバスを表示
+            const canvas = board.canvas || initializeCanvas(board.id, board.w, board.h, board.json);
+            if (!board.canvas) {
+              setBoards(prev => prev.map(b =>
+                b.id === board.id ? { ...b, canvas } : b
+              ));
+            }
+          } else if (board.id === boards[cur].id) {
+            // アートボードモードでは現在選択中のキャンバスのみ表示
+            if (!board.canvas) {
+              const canvas = initializeCanvas(board.id, board.w, board.h, board.json);
+              setBoards(prev => prev.map(b =>
+                b.id === board.id ? { ...b, canvas } : b
+              ));
+            }
           }
-          // Create new interactive canvas instead of StaticCanvas
-          const dynamicCanvas = new fabric.Canvas(canvasElem, {
-            selection: true
-          });
-          dynamicCanvas.setWidth(b.w);
-          dynamicCanvas.setHeight(b.h);
-          dynamicCanvas.setBackgroundColor('#fff', dynamicCanvas.renderAll.bind(dynamicCanvas));
-          if (b.json) {
-            dynamicCanvas.loadFromJSON(b.json, () => {
-              dynamicCanvas.requestRenderAll();
-            });
-          }
-          canvasElem._dynamicCanvas = dynamicCanvas;
         });
+      }, [workspaceMode, cur, boards]);
 
-        // Clean up function
-        return () => {
-          boards.forEach((_, i) => {
-            const canvasElem = document.getElementById(`fabricCanvas-${i}`);
-            if (canvasElem?._dynamicCanvas) {
-              canvasElem._dynamicCanvas.dispose();
-              canvasElem._dynamicCanvas = null;
-            }
-          });
-        };
-      }, [workspaceMode, boards, artboardPositions]);
-
-      // モード切替時の処理を修正
+      // [修正] モード切替処理
       React.useEffect(() => {
+        // 現在のキャンバス状態を保存（存在する場合のみ）
+        const currentCanvas = getActiveCanvas();
+        if (currentCanvas) {
+          const json = currentCanvas.toJSON();
+          setBoards(bs => bs.map((b, i) => 
+            i === cur ? { ...b, json } : b
+          ));
+        }
+
         if (workspaceMode === 'artboard') {
-          // dynamicCanvas上のオブジェクトがあれば現在のボードのjsonへ統合
-          const canvasId = `fabricCanvas-${cur}`;
-          const wsCanvasElem = document.getElementById(canvasId);
-          if (wsCanvasElem && wsCanvasElem._dynamicCanvas) {
-            const dynamicCV = wsCanvasElem._dynamicCanvas;
-            // 既存のjsonオブジェクト配列（なければ空配列）とdynamicCanvas上のオブジェクトをマージ
-            let baseJson = {};
-            try {
-              baseJson = boards[cur].json ? JSON.parse(JSON.stringify(boards[cur].json)) : { objects: [] };
-            } catch (err) {
-              baseJson = { objects: [] };
-            }
-            const newObjs = dynamicCV.getObjects().map(obj => obj.toObject());
-            const combined = {
-              ...baseJson,
-              objects: [...baseJson.objects, ...newObjs]
-            };
-            setBoards(bs =>
-              bs.map((b, i) => i === cur ? { ...b, json: combined } : b)
-            );
-          }
-          // アートボード編集モード用のcanvasを再生成
+          // アートボード編集モードに切り替え
           const canvasElem = document.getElementById('fabricCanvas');
           if (canvasElem) {
-            if (fabricRef.current) {
-              fabricRef.current.dispose();
-            }
-            const cv = new fabric.Canvas('fabricCanvas', { preserveObjectStacking: true });
-            cv.freeDrawingBrush.color = '#000';
-            cv.freeDrawingBrush.width = 2;
-            // 必要なイベントハンドラを再登録
-            cv.on('object:added', updateLayers);
-            cv.on('object:removed', updateLayers);
-            cv.on('object:modified', updateLayers);
-            cv.on('selection:created', updateLayers);
-            cv.on('selection:updated', updateLayers);
-            cv.upperCanvasEl.addEventListener('contextmenu', e => e.preventDefault());
-            fabricRef.current = cv;
+            try {
+              // 既存のキャンバスを破棄
+              if (fabricRef.current) {
+                fabricRef.current.dispose();
+                fabricRef.current = null;
+              }
 
-            const b = boards[cur];
-            cv.setWidth(b.w);
-            cv.setHeight(b.h);
-            loadJSON(b.json, b.w, b.h);
-            selectTool('select', false);
+              // 新しいキャンバスを生成
+              const cv = new fabric.Canvas('fabricCanvas', { preserveObjectStacking: true });
+              cv.freeDrawingBrush.color = '#000';
+              cv.freeDrawingBrush.width = 2;
+
+              // イベントリスナー設定
+              cv.on('object:added', updateLayers);
+              cv.on('object:removed', updateLayers);
+              cv.on('object:modified', updateLayers);
+              cv.on('selection:created', updateLayers);
+              cv.on('selection:updated', updateLayers);
+              cv.upperCanvasEl.addEventListener('contextmenu', e => e.preventDefault());
+
+              fabricRef.current = cv;
+
+              // 保存された状態を復元
+              const b = boards[cur];
+              cv.setWidth(b.w);
+              cv.setHeight(b.h);
+              
+              if (b.json) {
+                loadJSON(b.json, b.w, b.h);
+              } else {
+                cv.setBackgroundColor('#fff', cv.renderAll.bind(cv));
+                cv.renderAll();
+                updateLayers();
+              }
+
+              selectTool('select', false);
+            } catch (e) {
+              console.error('Canvas initialization error:', e);
+            }
           }
         } else {
           // ワークスペースモードに切り替え
           if (fabricRef.current) {
-            saveCurrent(); // 現在の状態を保存
-            fabricRef.current.dispose(); // メインキャンバスを破棄
+            fabricRef.current.dispose();
             fabricRef.current = null;
-            fitWorkspaceToScreen(); // 全体表示
           }
+          
+          setTimeout(() => {
+            try {
+              fitWorkspaceToScreen();
+            } catch (e) {
+              console.warn('Workspace fit error:', e);
+            }
+          }, 100);
         }
       }, [workspaceMode, cur]);
 
       // ツール切替の修正
       function selectTool(name, save = true) {
-        if (workspaceMode !== 'artboard') return; // アートボード編集モードでのみ有効
-        
         if (save) saveCurrent();
-        const cv = fabricRef.current;
+        const cv = getActiveCanvas();
+        if (!cv) return; // ← 追加: キャンバスがnullなら何もしない
         setTool(name);
         cv.isDrawingMode = (name === 'draw');
         const sel = (name === 'select');
@@ -679,42 +731,54 @@
 
       // 2. オブジェクトブラウザーの順序修正：表示順をCanvas上の順番と一致させる
       // 更新処理はupdateLayers()内でCanvas.getObjects()の配列順をそのままセット
-      function updateLayers() {
-        const objs = fabricRef.current.getObjects();
-        // すべてのオブジェクトに作成順の連番名を付与
+      // [変更] updateLayers()関数を修正して、オブジェクト生成時にもoriginalNameを保持し、以降はそれを利用するように変更
+      function updateLayers(boardId) {
+        const board = boards.find(b => b.id === boardId);
+        if (!board?.canvas) return;
+
+        const objs = board.canvas.getObjects();
+        // 各オブジェクトに対して、初回ならoriginalNameを保存
         objs.forEach((o, i) => {
-          o.name = `${o.type} ${i + 1}`;
+          if (!o.originalName) {
+            o.originalName = o.name || `${o.type} ${i + 1}`;
+          }
         });
-        // 配列を反転させて、上のレイヤーが前面に表示されるようにする
-        setLayers(objs.slice().reverse().map((o, i) => ({
-          id: i,
-          obj: o,
-          name: o.name
-        })));
+        // レイヤーリストにはoriginalNameを表示
+        if (boardId === boards[cur].id) {
+          setLayers(
+            objs.slice().reverse().map(o => ({
+              id: o.id, // ...必要に応じて識別子を設定...
+              obj: o,
+              name: o.originalName
+            }))
+          );
+        }
       }
 
       // ボード追加時にpositionも追加
       function addNewBoard() {
         const nid = Math.max(...boards.map(b => b.id)) + 1;
+        const w = 500, h = 500;
+        const canvas = initializeCanvas(nid, w, h, null);
         const newBoard = {
           id: nid,
           name: `ボード${nid}`,
-          w: 500,
-          h: 500,
+          w,
+          h,
           json: null,
           history: [],
-          historyIndex: -1
+          historyIndex: -1,
+          canvas
         };
+
         setBoards(prev => [...prev, newBoard]);
-        // 新しいボードの位置を設定
         setArtboardPositions(prev => [
-          ...prev, 
+          ...prev,
           {
             x: (prev.length * 50 + 100),
             y: (prev.length * 50 + 100)
           }
         ]);
-        saveCurrent();
         setCur(boards.length);
       }
 
@@ -741,7 +805,7 @@
         const url = URL.createObjectURL(file);
         fabric.Image.fromURL(url, img => {
           img.set({ left: 40, top: 40, objectCaching: false });
-          fabricRef.current.add(img).setActiveObject(img);
+          getActiveCanvas().add(img).setActiveObject(img);
           saveCurrent();
         });
       }
@@ -1152,27 +1216,12 @@
 
       // 形状追加
       function handleShape(type) {
-        let cv;
-        if (workspaceMode === 'workspace') {
-          const canvasElem = document.getElementById(`fabricCanvas-${cur}`);
-          // 既に動的キャンバスが作成されている場合は再利用
-          if (canvasElem._dynamicCanvas) {
-            cv = canvasElem._dynamicCanvas;
-          } else {
-            // StaticCanvas が存在していれば破棄して動的キャンバスに切り替え
-            if (canvasElem._staticCanvas) {
-              canvasElem._staticCanvas.dispose();
-              canvasElem._staticCanvas = null;
-            }
-            cv = new fabric.Canvas(`fabricCanvas-${cur}`, { preserveObjectStacking: true });
-            cv.freeDrawingBrush.color = '#000';
-            cv.freeDrawingBrush.width = 2;
-            canvasElem._dynamicCanvas = cv;
-          }
-        } else {
-          cv = fabricRef.current;
-        }
+        if (workspaceMode !== 'artboard' && workspaceMode !== 'workspace') return;
         
+        selectTool('select');
+        const cv = getActiveCanvas();
+        let obj;
+
         const commonProps = {
           left: 60,
           top: 60,
@@ -1181,7 +1230,6 @@
           strokeWidth: 2
         };
 
-        let obj;
         switch (type) {
           case 'rect':
             obj = new fabric.Rect({
@@ -1197,7 +1245,7 @@
               ry: 30
             });
             break;
-          case 'arrow': {
+          case 'arrow':
             const line = new fabric.Line([0, 0, 100, 0], {
               stroke: strokeColor,
               strokeWidth: 2
@@ -1216,7 +1264,6 @@
               ...commonProps
             });
             break;
-          }
         }
 
         if (obj) {
@@ -1225,7 +1272,7 @@
           });
           cv.add(obj);
           cv.setActiveObject(obj);
-          cv.requestRenderAll();
+          cv.requestRenderAll(); // 明示的に再描画
           saveCurrent();
         }
       }
@@ -1376,28 +1423,30 @@
         saveCurrent();
       }
 
-      // アートボード追加
+      // ボード追加時にpositionも追加
       function addNewBoard() {
         const nid = Math.max(...boards.map(b => b.id)) + 1;
+        const w = 500, h = 500;
+        const canvas = initializeCanvas(nid, w, h, null);
         const newBoard = {
           id: nid,
           name: `ボード${nid}`,
-          w: 500,
-          h: 500,
+          w,
+          h,
           json: null,
           history: [],
-          historyIndex: -1
+          historyIndex: -1,
+          canvas
         };
+
         setBoards(prev => [...prev, newBoard]);
-        // 新しいボードの位置を設定
         setArtboardPositions(prev => [
-          ...prev, 
+          ...prev,
           {
             x: (prev.length * 50 + 100),
             y: (prev.length * 50 + 100)
           }
         ]);
-        saveCurrent();
         setCur(boards.length);
       }
 
@@ -1516,7 +1565,7 @@
             ...textStyle,
             width: 200
           });
-          fabricRef.current.add(t).setActiveObject(t);
+          getActiveCanvas().add(t).setActiveObject(t);
           saveCurrent();
         }
         setTextVal('');
@@ -1619,17 +1668,6 @@
       // ドラッグ終了
       const handleDragEnd = () => {
         setIsDragging(false);
-        // 追加: ワークスペースモードの場合、動的キャンバスの状態を保存
-        if (workspaceMode === 'workspace') {
-          const canvasElem = document.getElementById(`fabricCanvas-${cur}`);
-          if (canvasElem && canvasElem._dynamicCanvas) {
-            const dynamicCV = canvasElem._dynamicCanvas;
-            const newJson = dynamicCV.toJSON();
-            setBoards(bs => bs.map((b, i) =>
-              i === cur ? { ...b, json: newJson } : b
-            ));
-          }
-        }
       };
 
       // ワークスペースズーム
@@ -1705,6 +1743,48 @@
         if (workspaceMode === 'workspace') {
           return (
             <>
+              {/* ツールバーを常に表示 */}
+              <Box className="tool-scroll">
+                <div className="tool-group">
+                  <ToolBtn icon="undo" label="元に戻す" onClick={undo} disabled={!canUndo} />
+                  <ToolBtn icon="redo" label="やり直す" onClick={redo} disabled={!canRedo} />
+                </div>
+                <div className="tool-group">
+                  <ToolBtn icon="mouse" label="選択" active={tool === 'select'} onClick={() => selectTool('select')} />
+                  <ToolBtn icon="draw" label="フリードロー" active={tool === 'draw'} onClick={() => selectTool('draw')} />
+                </div>
+                <div className="tool-group">
+                  <ToolBtn icon="crop_square" label="矩形" active={tool === 'rect'} onClick={() => handleShape('rect')} />
+                  <ToolBtn icon="circle" label="楕円" active={tool === 'ellipse'} onClick={() => handleShape('ellipse')} />
+                  <ToolBtn icon="arrow_forward" label="矢印" active={tool === 'arrow'} onClick={() => handleShape('arrow')} />
+                </div>
+                <div className="tool-group">
+                  <ToolBtn icon="title" label="テキスト" onClick={() => setTextDlg(true)} />
+                  <ToolBtn icon="image" label="画像" onClick={() => document.getElementById('fileUp').click()} />
+                </div>
+                <div className="tool-group">
+                  {/* 塗りの色・透明度 */}
+                  <ColorControl
+                    label="塗りの色"
+                    color={fillColor.color}
+                    alpha={fillColor.alpha}
+                    onColor={c => setFillColor(fc => ({ ...fc, color: c }))}
+                    onAlpha={a => setFillColor(fc => ({ ...fc, alpha: a }))}
+                  />
+                  {/* 線の色・透明度 */}
+                  <ColorControl
+                    label="線の色"
+                    color={strokeColor.color}
+                    alpha={strokeColor.alpha}
+                    onColor={c => setStrokeColor(sc => ({ ...sc, color: c }))}
+                    onAlpha={a => setStrokeColor(sc => ({ ...sc, alpha: a }))}
+                  />
+                </div>
+                <div className="tool-group">
+                  <ToolBtn icon="camera_alt" label="カメラ" onClick={startCamera} />
+                </div>
+              </Box>
+              {/* ...既存のワークスペース表示部分... */}
               <div
                 className="workspace"
                 onMouseDown={handleWsMouseDown}
@@ -1738,9 +1818,8 @@
                         width: b.w + 4,
                         height: b.h + 42
                       }}
-                      // ヘッダー以外の領域ではドラッグ開始しないようにしています
                     >
-                      <div 
+                      <div
                         className="artboard-header"
                         onMouseDown={e => {
                           setCur(i);
@@ -1782,11 +1861,7 @@
           return (
             <Box className="canvas-container">
               <div className="canvas-wrapper" style={{ transform: `scale(${zoom})` }}>
-                <canvas
-                  id="fabricCanvas"
-                  width={boards[cur].w}
-                  height={boards[cur].h}
-                />
+                <canvas id="fabricCanvas" width={boards[cur].w} height={boards[cur].h} />
               </div>
 
               <StatusBar
@@ -1863,7 +1938,7 @@
             </Toolbar>
           </AppBar>
 
-          {/* Drawer */} 
+          {/* Drawer （常にハンバーガー） */}
           <Drawer variant="temporary" open={drawerOpen} onClose={() => setDrawerOpen(false)} ModalProps={{ keepMounted: true }}>
             {drawerContent}
           </Drawer>
@@ -1872,46 +1947,51 @@
           <Box sx={{ flex: 1, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
             <Toolbar variant="dense" />
 
-            {/* ツールバーを常に表示 */}
-            <Box className="tool-scroll">
-              <div className="tool-group">
-                <ToolBtn icon="undo" label="元に戻す" onClick={undo} disabled={!canUndo} />
-                <ToolBtn icon="redo" label="やり直す" onClick={redo} disabled={!canRedo} />
-              </div>
-              <div className="tool-group">
-                <ToolBtn icon="mouse" label="選択" active={tool === 'select'} onClick={() => selectTool('select')} />
-                <ToolBtn icon="draw" label="フリードロー" active={tool === 'draw'} onClick={() => selectTool('draw')} />
-              </div>
-              <div className="tool-group">
-                <ToolBtn icon="crop_square" label="矩形" active={tool === 'rect'} onClick={() => handleShape('rect')} />
-                <ToolBtn icon="circle" label="楕円" active={tool === 'ellipse'} onClick={() => handleShape('ellipse')} />
-                <ToolBtn icon="arrow_forward" label="矢印" active={tool === 'arrow'} onClick={() => handleShape('arrow')} />
-              </div>
-              <div className="tool-group">
-                <ToolBtn icon="title" label="テキスト" onClick={() => setTextDlg(true)} />
-                <ToolBtn icon="image" label="画像" onClick={() => document.getElementById('fileUp').click()} />
-              </div>
-              <div className="tool-group">
-                <ColorControl
-                  label="塗りの色"
-                  color={fillColor.color}
-                  alpha={fillColor.alpha}
-                  onColor={c => setFillColor(fc => ({ ...fc, color: c }))}
-                  onAlpha={a => setFillColor(fc => ({ ...fc, alpha: a }))}
-                />
-                <ColorControl
-                  label="線の色"
-                  color={strokeColor.color}
-                  alpha={strokeColor.alpha}
-                  onColor={c => setStrokeColor(sc => ({ ...sc, color: c }))}
-                  onAlpha={a => setStrokeColor(sc => ({ ...sc, alpha: a }))}
-                />
-              </div>
-              <div className="tool-group">
-                <ToolBtn icon="camera_alt" label="カメラ" onClick={startCamera} />
-              </div>
-            </Box>
-
+            {/* ツールバー */}
+            {workspaceMode === 'artboard' && (
+              <Box className="tool-scroll">
+                <div className="tool-group">
+                  <ToolBtn icon="undo" label="元に戻す" onClick={undo} disabled={!canUndo} />
+                  <ToolBtn icon="redo" label="やり直す" onClick={redo} disabled={!canRedo} />
+                </div>
+                <div className="tool-group">
+                  <ToolBtn icon="mouse" label="選択" active={tool === 'select'} onClick={() => selectTool('select')} />
+                  <ToolBtn icon="draw" label="フリードロー" active={tool === 'draw'} onClick={() => selectTool('draw')} />
+                </div>
+                <div className="tool-group">
+                  <ToolBtn icon="crop_square" label="矩形" active={tool === 'rect'} onClick={() => handleShape('rect')} />
+                  <ToolBtn icon="circle" label="楕円" active={tool === 'ellipse'} onClick={() => handleShape('ellipse')} />
+                  <ToolBtn icon="arrow_forward" label="矢印" active={tool === 'arrow'} onClick={() => handleShape('arrow')} />
+                </div>
+                
+                <div className="tool-group">
+                  <ToolBtn icon="title" label="テキスト" onClick={() => setTextDlg(true)} />
+                  <ToolBtn icon="image" label="画像" onClick={() => document.getElementById('fileUp').click()} />
+                </div>
+                <div className="tool-group">
+                  {/* 塗りの色・透明度 */}
+                  <ColorControl
+                    label="塗りの色"
+                    color={fillColor.color}
+                    alpha={fillColor.alpha}
+                    onColor={c => setFillColor(fc => ({ ...fc, color: c }))}
+                    onAlpha={a => setFillColor(fc => ({ ...fc, alpha: a }))}
+                  />
+                  {/* 線の色・透明度 */}
+                  <ColorControl
+                    label="線の色"
+                    color={strokeColor.color}
+                    alpha={strokeColor.alpha}
+                    onColor={c => setStrokeColor(sc => ({ ...sc, color: c }))}
+                    onAlpha={a => setStrokeColor(sc => ({ ...sc, alpha: a }))}
+                  />
+                </div>
+                
+                <div className="tool-group">
+                  <ToolBtn icon="camera_alt" label="カメラ" onClick={startCamera} />
+                </div>
+              </Box>
+            )}
             {modeControls}
             {mainContent()}
           </Box>
@@ -1954,11 +2034,11 @@
                     <input type="color"
                       value={colorVal}
                       onChange={e => setColorVal(e.target.value)}
-                      style={{ width: '60px',height: 40 }}
+                      style={{ width: '60px', height: 40 }}
                     />
                     <Slider
                       className="alpha-slider"
-                      value={contextMenu?.colorType === 'fill' ?fillColor.alpha : strokeColor.alpha}
+                      value={contextMenu?.colorType === 'fill' ? fillColor.alpha : strokeColor.alpha}
                       min={0}
                       max={1}
                       step={0.01}
@@ -1978,7 +2058,7 @@
               </div>
             </DialogContent>
             <DialogActions>
-              <Button onClick={e => setColorDlg(false)}>キャンセル</Button>
+              <Button onClick={() => setColorDlg(false)}>キャンセル</Button>
               <Button onClick={applyColor} variant="contained">適用</Button>
             </DialogActions>
           </Dialog>
