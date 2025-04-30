@@ -276,10 +276,15 @@
   <div id="root"></div>
 
   <script type="text/babel">
-    const { Box, AppBar, Toolbar, IconButton, Typography, Button, CssBaseline,
-      Drawer, List, ListItem, ListItemText, Divider, Tooltip,
-      Dialog, DialogTitle, DialogContent, DialogContentText, DialogActions, TextField,
-      Menu, MenuItem, Grid, ListItemIcon, FormControl, FormLabel, RadioGroup, CardContent, CardActionArea, Card, FormControlLabel, Radio, Slider } = MaterialUI;
+   const { Box, AppBar, Toolbar, IconButton, Typography, Button, CssBaseline,
+          Drawer, List, ListItem, ListItemText, Divider, Tooltip,
+          Dialog, DialogTitle, DialogContent, DialogContentText, DialogActions, TextField,
+          Menu, MenuItem, Grid, ListItemIcon,
+          FormControl, FormLabel, RadioGroup,
+          FormControlLabel, FormGroup, Checkbox,  // ← ここに追加
+          Radio, Slider,
+          CardContent, CardActionArea, Card, Stack, Paper,
+        } = MaterialUI;
 
     // 色関連のユーティリティ関数を最初に定義
     function colorToString(color) {
@@ -1297,74 +1302,133 @@ boards.forEach((b, i) => {
         setSizeDlg(true);
       }
 
-      // ----- Excel出力機能 修正 -----
+      // exportOpts に以下のプロパティを想定しています：
+      //   mode: 'active' | 'all' | 'selected'
+      //   selectedBoards: number[]  （mode==='selected'時に出力したいインデックスの配列）
+      //   paperSize: 'A4' | 'A3'
+      //   orientation: 'portrait' | 'landscape'
       const handleExport = async () => {
         try {
-          const cv = fabricRef.current;
-          const b = boards[cur];
+          // 1) モードに応じた出力対象インデックスを決定
+          let indices;
+          if (exportOpts.mode === 'all') {
+            indices = boards.map((_, i) => i);
+          } else if (exportOpts.mode === 'selected' && exportOpts.selectedBoards.length > 0) {
+            indices = exportOpts.selectedBoards;
+          } else {
+            // デフォルトはアクティブボードのみ
+            indices = [cur];
+          }
 
-          // タイムスタンプ付きのデフォルトファイル名を作成
+          if (indices.length === 0) {
+            alert('出力対象のアートボードが選択されていません');
+            return;
+          }
+
+          // 2) 新規ワークブック生成
+          const workbook = new ExcelJS.Workbook();
+
+          // 3) 各ボードごとにワークシートを作成
+          for (const idx of indices) {
+            const b = boards[idx];
+
+            // 3-1) 描画用 Fabric.Canvas を取得 or 一時生成
+            let cv;
+            if (workspaceMode === 'workspace') {
+              cv = document.getElementById(`fabricCanvas-${idx}`)?._dynamicCanvas;
+            } else if (idx === cur) {
+              cv = fabricRef.current;
+            } else {
+              // artboardモードで非アクティブボードなら StaticCanvas でJSONを読み込む
+              cv = new fabric.StaticCanvas(null, { width: b.w, height: b.h });
+              await new Promise(resolve => {
+                cv.loadFromJSON(b.json, () => {
+                  cv.renderAll();
+                  resolve();
+                });
+              });
+            }
+
+            if (!cv) continue;  // 念のためスキップ
+
+            // 3-2) プレビュー用キャンバスへ合成
+            const preview = document.createElement('canvas');
+            preview.width = b.w;
+            preview.height = b.h;
+            const ctx = preview.getContext('2d');
+            ctx.fillStyle = '#fff';
+            ctx.fillRect(0, 0, b.w, b.h);
+            ctx.drawImage(cv.lowerCanvasEl, 0, 0);
+            ctx.drawImage(cv.upperCanvasEl, 0, 0);
+
+            // 3-3) ワークシート追加と画像埋め込み
+            const sheet = workbook.addWorksheet(b.name);
+            sheet.pageSetup.paperSize = exportOpts.paperSize === 'A4' ? 9 : 10;
+            sheet.pageSetup.orientation = exportOpts.orientation;
+
+            const imgId = workbook.addImage({
+              base64: preview.toDataURL('image/png').split(',')[1],
+              extension: 'png'
+            });
+            const pageW = exportOpts.paperSize === 'A4'
+              ? (exportOpts.orientation === 'portrait' ? 595 : 842)
+              : (exportOpts.orientation === 'portrait' ? 842 : 1191);
+            const scale = Math.min(pageW / b.w, pageW / b.h);
+
+            sheet.addImage(imgId, {
+              tl: { col: 0, row: 0 },
+              ext: { width: b.w * scale, height: b.h * scale }
+            });
+          }
+
+          // 4) ファイル名作成
           const now = new Date();
-          const timestamp = now.getFullYear() +
+          const stamp = now.getFullYear() +
             ('0' + (now.getMonth() + 1)).slice(-2) +
             ('0' + now.getDate()).slice(-2) + '_' +
             ('0' + now.getHours()).slice(-2) +
             ('0' + now.getMinutes()).slice(-2);
-          const defaultFilename = `${b.name}_${timestamp}.xlsx`;
+          const filename = `artboards_${stamp}.xlsx`;
 
-          // プレビュー用Canvasから画像データを生成
-          const previewCanvas = document.createElement('canvas');
-          const ctx = previewCanvas.getContext('2d');
-          previewCanvas.width = b.w;
-          previewCanvas.height = b.h;
-          ctx.fillStyle = '#fff';
-          ctx.fillRect(0, 0, b.w, b.h);
-          ctx.drawImage(cv.lowerCanvasEl, 0, 0);
-          ctx.drawImage(cv.upperCanvasEl, 0, 0);
-          const base64Data = previewCanvas.toDataURL('image/png').split(',')[1];
-
-          // ExcelJSワークブック作成
-          const workbook = new ExcelJS.Workbook();
-          const worksheet = workbook.addWorksheet(b.name);
-          worksheet.pageSetup.paperSize = exportOpts.paperSize === 'A4' ? 9 : 10;
-          worksheet.pageSetup.orientation = exportOpts.orientation;
-
-          const imageId = workbook.addImage({
-            base64: base64Data,
-            extension: 'png',
-          });
-
-          const pageWidth = exportOpts.paperSize === 'A4' ?
-            (exportOpts.orientation === 'portrait' ? 595 : 842) :
-            (exportOpts.orientation === 'portrait' ? 842 : 1191);
-          const scale = Math.min(pageWidth / b.w, pageWidth / b.h);
-          worksheet.addImage(imageId, {
-            tl: { col: 0, row: 0 },
-            ext: { width: b.w * scale, height: b.h * scale }
-          });
-
-          // 保存ダイアログで保存先を選択する
-          const fileHandle = await window.showSaveFilePicker({
-            suggestedName: defaultFilename,
-            types: [{
-              description: 'Excel ファイル',
-              accept: {
-                'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet': ['.xlsx']
-              }
-            }]
-          });
+          // 5) バッファを書き出し
           const buffer = await workbook.xlsx.writeBuffer();
-          const writable = await fileHandle.createWritable();
-          await writable.write(buffer);
-          await writable.close();
 
+          // 6) ダイアログで保存 or フォールバック
+          try {
+            const handle = await window.showSaveFilePicker({
+              suggestedName: filename,
+              types: [{
+                description: 'Excel ファイル',
+                accept: { 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet': ['.xlsx'] }
+              }]
+            });
+            const writable = await handle.createWritable();
+            await writable.write(buffer);
+            await writable.close();
+          } catch {
+            // 非対応 or キャンセル時→ダウンロードリンクで保存
+            const blob = new Blob([buffer], {
+              type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+            });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = filename;
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+            URL.revokeObjectURL(url);
+          }
+
+          // 7) ダイアログを閉じる
           setExportDlg(false);
+
         } catch (err) {
           console.error('Export error:', err);
           alert('エクスポートに失敗しました:\n' + err.message);
         }
       };
-
+      
       // キーボードイベント処理
       React.useEffect(() => {
         const handleKeyDown = (e) => {
@@ -2244,39 +2308,97 @@ boards.forEach((b, i) => {
             </DialogContent>
           </Dialog>
 
-          {/* Excel出力設定ダイアログ */}
-          <Dialog open={exportDlg} onClose={() => setExportDlg(false)} maxWidth="sm" fullWidth>
-            <DialogTitle>Excel出力設定</DialogTitle>
-            <DialogContent>
-              <Box sx={{ mt: 2 }}>
-                <FormControl component="fieldset" sx={{ mb: 2 }}>
-                  <FormLabel>用紙サイズ</FormLabel>
-                  <RadioGroup
-                    value={exportOpts.paperSize}
-                    onChange={(e) => setExportOpts(prev => ({ ...prev, paperSize: e.target.value }))}
-                  >
-                    <FormControlLabel value="A4" control={<Radio />} label="A4" />
-                    <FormControlLabel value="A3" control={<Radio />} label="A3" />
-                  </RadioGroup>
-                </FormControl>
+        {/* Excel出力設定ダイアログ */}
+<Dialog open={exportDlg} onClose={() => setExportDlg(false)} maxWidth="sm" fullWidth>
+  <DialogTitle>Excel出力設定</DialogTitle>
 
-                <FormControl component="fieldset">
-                  <FormLabel>用紙の向き</FormLabel>
-                  <RadioGroup
-                    value={exportOpts.orientation}
-                    onChange={(e) => setExportOpts(prev => ({ ...prev, orientation: e.target.value }))}
-                  >
-                    <FormControlLabel value="portrait" control={<Radio />} label="縦" />
-                    <FormControlLabel value="landscape" control={<Radio />} label="横" />
-                  </RadioGroup>
-                </FormControl>
-              </Box>
-            </DialogContent>
-            <DialogActions>
-              <Button onClick={() => setExportDlg(false)}>キャンセル</Button>
-              <Button onClick={handleExport} variant="contained">出力</Button>
-            </DialogActions>
-          </Dialog>
+  <DialogContent>
+    <Stack spacing={3}>
+      {/* 用紙設定セクション */}
+      <Paper variant="outlined" sx={{ p: 2 }}>
+        <Typography variant="subtitle1" gutterBottom>用紙設定</Typography>
+        <Stack direction="row" spacing={4}>
+          <FormControl component="fieldset">
+            <FormLabel>用紙サイズ</FormLabel>
+            <RadioGroup
+              value={exportOpts.paperSize}
+              onChange={e => setExportOpts(prev => ({ ...prev, paperSize: e.target.value }))}
+            >
+              <FormControlLabel value="A4" control={<Radio />} label="A4" />
+              <FormControlLabel value="A3" control={<Radio />} label="A3" />
+            </RadioGroup>
+          </FormControl>
+
+          <FormControl component="fieldset">
+            <FormLabel>向き</FormLabel>
+            <RadioGroup
+              value={exportOpts.orientation}
+              onChange={e => setExportOpts(prev => ({ ...prev, orientation: e.target.value }))}
+            >
+              <FormControlLabel value="portrait" control={<Radio />} label="縦" />
+              <FormControlLabel value="landscape" control={<Radio />} label="横" />
+            </RadioGroup>
+          </FormControl>
+        </Stack>
+      </Paper>
+
+      {/* 出力モードセクション */}
+      <Paper variant="outlined" sx={{ p: 2 }}>
+        <Typography variant="subtitle1" gutterBottom>出力モード</Typography>
+        <FormControl component="fieldset">
+          <RadioGroup
+            value={exportOpts.mode}
+            onChange={e => setExportOpts(prev => {
+              const newMode = e.target.value;
+              return {
+                ...prev,
+                mode: newMode,
+                // active/all に戻したら選択済みをリセット
+                selectedBoards: newMode === 'selected' ? prev.selectedBoards : []
+              };
+            })}
+          >
+            <FormControlLabel value="active" control={<Radio />} label="アクティブのみ" />
+            <FormControlLabel value="all"    control={<Radio />} label="全てのアートボード" />
+            <FormControlLabel value="selected" control={<Radio />} label="選択したアートボード" />
+          </RadioGroup>
+        </FormControl>
+      </Paper>
+
+      {/* 選択ボード一覧セクション */}
+      {exportOpts.mode === 'selected' && (
+        <Paper variant="outlined" sx={{ p: 2 }}>
+          <Typography variant="subtitle1" gutterBottom>出力するボードを選択</Typography>
+          <Grid container spacing={1}>
+            {boards.map((b, i) => (
+              <Grid item xs={6} key={b.id}>
+                <FormControlLabel
+                  control={
+                    <Checkbox
+                      checked={exportOpts.selectedBoards.includes(i)}
+                      onChange={e => setExportOpts(prev => {
+                        const set = new Set(prev.selectedBoards);
+                        if (e.target.checked) set.add(i);
+                        else set.delete(i);
+                        return { ...prev, selectedBoards: [...set] };
+                      })}
+                    />
+                  }
+                  label={b.name}
+                />
+              </Grid>
+            ))}
+          </Grid>
+        </Paper>
+      )}
+    </Stack>
+  </DialogContent>
+
+  <DialogActions>
+    <Button onClick={() => setExportDlg(false)}>キャンセル</Button>
+    <Button onClick={handleExport} variant="contained">出力</Button>
+  </DialogActions>
+</Dialog>
 
           {/* Floating Panels */}
           {panels.artboards.open && (
