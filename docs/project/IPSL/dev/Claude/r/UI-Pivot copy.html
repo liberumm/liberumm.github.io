@@ -1,0 +1,287 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8" />
+  <title>ピボット – 複数軸対応フルコード（修正版）</title>
+
+  <!-- CDN -->
+  <script src="https://cdn.jsdelivr.net/npm/react@18/umd/react.production.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/react-dom@18/umd/react-dom.production.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@mui/material@5.15.14/umd/material-ui.production.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.2/babel.min.js"></script>
+  <script src="https://unpkg.com/xlsx/dist/xlsx.full.min.js"></script>
+
+  <!-- Roboto / Icons -->
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Roboto:300,400,500,700&display=swap" />
+  <link rel="stylesheet" href="https://fonts.googleapis.com/icon?family=Material+Icons" />
+
+  <style>
+    body { font-family: Roboto, sans-serif; margin: 16px; }
+    #root { max-width: 1280px; margin: auto; }
+    .row { display: flex; gap: 12px; flex-wrap: wrap; margin-bottom: 12px; align-items: center; }
+    .table-container { overflow: auto; }
+    .spreadsheet-table { border-collapse: collapse; width: 100%; }
+    .spreadsheet-table th, .spreadsheet-table td { border: 1px solid #ccc; padding: 4px 8px; }
+    .spreadsheet-table thead th { position: sticky; top: 0; background: #f5f5f5; z-index: 2; }
+    .row-header { position: sticky; left: 0; background: #fff; z-index: 1; font-weight: bold; }
+    .spreadsheet-table tbody tr:nth-of-type(odd) { background: #fafafa; }
+    .numeric { text-align: right; }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+
+  <script type="text/babel">
+    const {
+      Box, Typography, Button, TextField,
+      Autocomplete, MenuItem, Select, InputLabel, FormControl,
+      TableContainer, Paper, Table, TableHead, TableRow, TableCell, TableBody,
+    } = MaterialUI;
+
+    // マスタ＆サンプル生成
+    const defaultProductMaster = [
+      { 製品ID:'A01', 商品名:'フジりんご', 製品名:'Apple', 部門:'果物', コーナー:'青果', ライン:'A', カテゴリ:'リンゴ', 売価:150 },
+      { 製品ID:'B01', 商品名:'完熟バナナ', 製品名:'Banana', 部門:'果物', コーナー:'青果', ライン:'B', カテゴリ:'バナナ', 売価:100 },
+      { 製品ID:'C01', 商品名:'さくらんぼ', 製品名:'Cherry', 部門:'果物', コーナー:'果物', ライン:'C', カテゴリ:'さくらんぼ', 売価:200 }
+    ];
+    const defaultStoreMaster = [
+      { 店舗ID:'001', 店舗名:'東京本店', ブロック:'東', 大きさ:200 },
+      { 店舗ID:'002', 店舗名:'大阪店',   ブロック:'西', 大きさ:180 },
+      { 店舗ID:'003', 店舗名:'名古屋店', ブロック:'中', 大きさ:150 }
+    ];
+    function generateSampleSalesData(pm, sm) {
+      const data = [];
+      const start = new Date('2025-03-01'), end = new Date('2025-04-30');
+      for (let d = new Date(start); d <= end; d.setDate(d.getDate() + 1)) {
+        const date = d.toISOString().slice(0,10);
+        sm.forEach(store => pm.forEach(prod => {
+          data.push({
+            日付: date,
+            店舗ID: store.店舗ID,
+            製品ID: prod.製品ID,
+            売上: Math.floor(Math.random() * 100) + 20
+          });
+        }));
+      }
+      return data;
+    }
+
+    function PivotApp() {
+      // State: マスタ＆実績データ
+      const [productMaster, setProductMaster] = React.useState(defaultProductMaster);
+      const [storeMaster  , setStoreMaster]   = React.useState(defaultStoreMaster);
+      const [salesData    , setSalesData]     = React.useState(
+        generateSampleSalesData(defaultProductMaster, defaultStoreMaster)
+      );
+
+      // State: フィルタ＆複数軸設定
+      const [rowFields, setRowFields] = React.useState(['日付']);
+      const [colFields, setColFields] = React.useState(['商品名']);
+      const [valField , setValField ] = React.useState('売上');
+      const [aggFunc  , setAggFunc  ] = React.useState('sum');
+      const [filterCol, setFilterCol] = React.useState('商品名');
+      const [filterVal, setFilterVal] = React.useState('');
+
+      // インポートハンドラ
+      const handleImport = (type, e) => {
+        const file = e.target.files[0];
+        if (!file) return;
+        const reader = new FileReader();
+        reader.onload = ({ target: { result } }) => {
+          const wb = XLSX.read(result, { type: 'array' });
+          const js = XLSX.utils.sheet_to_json(wb.Sheets[wb.SheetNames[0]], { defval: null });
+          if (!js.length) return;
+          if (type === 'product') setProductMaster(js);
+          if (type === 'store')   setStoreMaster(js);
+          if (type === 'sales')   setSalesData(js);
+        };
+        reader.readAsArrayBuffer(file);
+      };
+
+      // JOIN & 平坦化
+      const flatData = React.useMemo(() => (
+        salesData.map(r => {
+          const p = productMaster.find(x => x.製品ID === r.製品ID) || {};
+          const s = storeMaster  .find(x => x.店舗ID === r.店舗ID) || {};
+          return {
+            日付:   r.日付,
+            店舗ID: r.店舗ID,
+            店舗名: s.店舗名 || r.店舗ID,
+            ブロック: s.ブロック || '',
+            大きさ:  s.大きさ || 0,
+            製品ID: r.製品ID,
+            商品名: p.商品名 || '',
+            製品名: p.製品名 || r.製品ID,
+            部門:   p.部門 || '',
+            コーナー: p.コーナー || '',
+            ライン: p.ライン || '',
+            カテゴリ: p.カテゴリ || '',
+            売価:   p.売価 || 0,
+            売上:   r.売上
+          };
+        })
+      ), [salesData, productMaster, storeMaster]);
+
+      // フィルタ適用／リセット
+      const applyFilter = () => {
+        setSalesData(flatData.filter(r =>
+          String(r[filterCol] ?? '').includes(filterVal)
+        ));
+      };
+      const resetFilter = () => {
+        setSalesData(flatData);
+        setFilterVal('');
+      };
+
+      // フィールド一覧
+      const fields        = Object.keys(flatData[0] || {});
+      const numericFields = fields.filter(f => typeof flatData[0][f] === 'number');
+
+      // 複数軸ピボット集計
+      const pivot = React.useMemo(() => {
+        if (!rowFields.length || !colFields.length || !valField) return { rows: [], cols: [], map: {} };
+        const rSet = new Set(), cSet = new Set(), bucket = {};
+        salesData.forEach(r => {
+          const rk = rowFields.map(f => r[f]).join('||');
+          const ck = colFields.map(f => r[f]).join('||');
+          rSet.add(rk); cSet.add(ck);
+          (bucket[`${rk}||${ck}`] = bucket[`${rk}||${ck}`] || []).push(Number(r[valField]) || 0);
+        });
+        const rows = [...rSet], cols = [...cSet], map = {};
+        rows.forEach(rk => cols.forEach(ck => {
+          const arr = bucket[`${rk}||${ck}`] || [];
+          map[`${rk}||${ck}`] = aggFunc === 'sum'
+            ? arr.reduce((s, x) => s + x, 0)
+            : arr.length;
+        }));
+        return { rows, cols, map };
+      }, [salesData, rowFields, colFields, valField, aggFunc]);
+
+      // フィールド分類（Autocomplete groupBy 用）
+      const categorize = f => {
+        if (f === '日付') return '時系列';
+        if (['商品名','製品名','製品ID','部門','コーナー','ライン','カテゴリ','売価'].includes(f)) return '商品';
+        if (['店舗名','店舗ID','ブロック','大きさ'].includes(f)) return '店舗';
+        if (['売上'].includes(f)) return '実績';
+        return 'その他';
+      };
+
+      // 複数選択用
+      const FieldMulti = ({ label, value, onChange, options }) => (
+        <Autocomplete
+          multiple
+          size="small"
+          options={options}
+          groupBy={categorize}
+          value={value}
+          onChange={(e, nv) => onChange(nv)}
+          renderInput={params => <TextField {...params} label={label} />}
+          sx={{ width: 260 }}
+        />
+      );
+      // 単一選択用
+      const FieldSingle = ({ label, value, onChange, options }) => (
+        <Autocomplete
+          size="small"
+          options={options}
+          groupBy={categorize}
+          value={value}
+          onChange={(e, nv) => nv !== null && onChange(nv)}
+          renderInput={params => <TextField {...params} label={label} />}
+          sx={{ width: 260 }}
+        />
+      );
+
+      return (
+        <Box>
+          <Typography variant="h5" gutterBottom>複数軸ピボットテーブル</Typography>
+
+          {/* インポートエリア */}
+          <Box className="row">
+            <Button variant="outlined" component="label">商品マスタ
+              <input type="file" hidden accept=".xlsx,.csv" onChange={e => handleImport('product', e)} />
+            </Button>
+            <Button variant="outlined" component="label">店舗マスタ
+              <input type="file" hidden accept=".xlsx,.csv" onChange={e => handleImport('store', e)} />
+            </Button>
+            <Button variant="contained" color="primary" component="label">販売実績データ
+              <input type="file" hidden accept=".xlsx,.csv" onChange={e => handleImport('sales', e)} />
+            </Button>
+          </Box>
+
+          {/* フィルタ */}
+          <Box className="row">
+            <FieldSingle label="フィルタ列" value={filterCol} onChange={setFilterCol} options={fields} />
+            <TextField
+              label="フィルタ値"
+              size="small"
+              value={filterVal}
+              onChange={e => setFilterVal(e.target.value)}
+              sx={{ minWidth: 220 }}
+            />
+            <Button variant="outlined" onClick={applyFilter}>適用</Button>
+            <Button variant="text" onClick={resetFilter}>リセット</Button>
+          </Box>
+
+          {/* 複数軸設定 */}
+          <Box className="row">
+            <FieldMulti label="行軸" value={rowFields} onChange={setRowFields} options={fields} />
+            <FieldMulti label="列軸" value={colFields} onChange={setColFields} options={fields} />
+            <FormControl size="small" sx={{ minWidth: 160 }}>
+              <InputLabel>集計項目</InputLabel>
+              <Select value={valField} label="集計項目" onChange={e => setValField(e.target.value)}>
+                {numericFields.map(f => <MenuItem key={f} value={f}>{f}</MenuItem>)}
+              </Select>
+            </FormControl>
+            <FormControl size="small" sx={{ minWidth: 140 }}>
+              <InputLabel>集計関数</InputLabel>
+              <Select value={aggFunc} label="集計関数" onChange={e => setAggFunc(e.target.value)}>
+                <MenuItem value="sum">合計</MenuItem>
+                <MenuItem value="count">件数</MenuItem>
+              </Select>
+            </FormControl>
+          </Box>
+
+          {/* ピボットテーブル */}
+          {pivot.rows.length ? (
+            <TableContainer component={Paper} className="table-container">
+              <Table size="small" className="spreadsheet-table">
+                <TableHead>
+                  <TableRow>
+                    <TableCell className="row-header">
+                      {rowFields.join(' / ')} ⧫ {colFields.join(' / ')}
+                    </TableCell>
+                    {pivot.cols.map(ck => (
+                      <TableCell key={ck} align="center">
+                        {ck.split('||').join(' / ')}
+                      </TableCell>
+                    ))}
+                  </TableRow>
+                </TableHead>
+                <TableBody>
+                  {pivot.rows.map(rk => (
+                    <TableRow key={rk}>
+                      <TableCell className="row-header">
+                        {rk.split('||').join(' / ')}
+                      </TableCell>
+                      {pivot.cols.map(ck => (
+                        <TableCell key={ck} className="numeric">
+                          {pivot.map[`${rk}||${ck}`]}
+                        </TableCell>
+                      ))}
+                    </TableRow>
+                  ))}
+                </TableBody>
+              </Table>
+            </TableContainer>
+          ) : (
+            <Typography sx={{ mt: 2 }}>行軸／列軸／集計項目を指定してください。</Typography>
+          )}
+        </Box>
+      );
+    }
+
+    ReactDOM.render(<PivotApp />, document.getElementById('root'));
+  </script>
+</body>
+</html>
