@@ -1,0 +1,381 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8" />
+  <title>ピボット＆マスタ切替対応版（WebDataRocks 版）</title>
+
+  <!-- React / MUI / 既存 CDN -->
+  <script src="https://cdn.jsdelivr.net/npm/react@18/umd/react.production.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/react-dom@18/umd/react-dom.production.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@mui/material@5.15.14/umd/material-ui.production.min.js"></script>
+  <script src="https://unpkg.com/react-beautiful-dnd@13.1.0/dist/react-beautiful-dnd.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.2/babel.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/fabric.js/5.2.4/fabric.min.js"></script>
+  <script src="https://unpkg.com/xlsx/dist/xlsx.full.min.js"></script>
+  <script src="https://unpkg.com/exceljs/dist/exceljs.min.js"></script>
+
+  <!-- WebDataRocks CDN -->
+  <link rel="stylesheet" href="https://cdn.webdatarocks.com/latest/webdatarocks.min.css" />
+  <script src="https://cdn.webdatarocks.com/latest/webdatarocks.toolbar.min.js"></script>
+  <script src="https://cdn.webdatarocks.com/latest/webdatarocks.js"></script>
+
+  <!-- Roboto / Icons -->
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Roboto:300,400,500,700&display=swap" />
+  <link rel="stylesheet" href="https://fonts.googleapis.com/icon?family=Material+Icons" />
+
+  <style>
+    body { font-family: Roboto, sans-serif; margin: 16px; }
+    #root { max-width: 1280px; margin: auto; }
+    .row { display: flex; gap: 12px; flex-wrap: wrap; margin-bottom: 12px; align-items: center; }
+    .dnd-list { display: flex; gap: 8px; flex-wrap: wrap; padding: 4px; border: 1px dashed #ccc; border-radius: 4px; min-height: 40px; }
+    .dnd-item { background: #e0e0e0; border-radius: 16px; padding: 4px 8px; display: flex; align-items: center; }
+    .drag-handle { cursor: grab; margin-right: 4px; font-size: 1rem; }
+    .table-container { overflow: auto; margin-top: 16px; }
+    .spreadsheet-table { border-collapse: collapse; width: 100%; }
+    .spreadsheet-table th, .spreadsheet-table td { border: 1px solid #ccc; padding: 4px 8px; }
+    .spreadsheet-table thead th { position: sticky; top: 0; background: #f5f5f5; z-index: 2; }
+    .row-header { position: sticky; left: 0; background: #fff; z-index: 1; font-weight: bold; }
+    .spreadsheet-table tbody tr:nth-of-type(odd) { background: #fafafa; }
+    .numeric { text-align: right; }
+    .sortable { cursor: pointer; user-select: none; }
+    .material-icons { vertical-align: middle; font-size: 1rem; }
+    /* WebDataRocks サイズ調整 */
+    #pivotContainer { height: 600px; margin-top: 8px; }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+
+  <script type="text/babel">
+    const {
+      Box, Typography, Button, TextField,
+      Select, MenuItem, InputLabel, FormControl, Tabs, Tab
+    } = MaterialUI;
+    const { DragDropContext, Droppable, Draggable } = ReactBeautifulDnd;
+
+    /* ---------- サンプルマスタ ---------- */
+    const defaultProductMaster = [
+      { 製品ID:'A01', 商品名:'フジりんご', 製品名:'Apple', 部門:'果物', コーナー:'青果', ライン:'A', カテゴリ:'リンゴ', 売価:150 },
+      { 製品ID:'B01', 商品名:'完熟バナナ', 製品名:'Banana', 部門:'果物', コーナー:'青果', ライン:'B', カテゴリ:'バナナ', 売価:100 },
+      { 製品ID:'C01', 商品名:'さくらんぼ', 製品名:'Cherry', 部門:'果物', コーナー:'果物', ライン:'C', カテゴリ:'さくらんぼ', 売価:200 }
+    ];
+    const defaultStoreMaster = [
+      { 店舗ID:'001', 店舗名:'東京本店', ブロック:'東', 大きさ:200 },
+      { 店舗ID:'002', 店舗名:'大阪店', ブロック:'西', 大きさ:180 },
+      { 店舗ID:'003', 店舗名:'名古屋店', ブロック:'中', 大きさ:150 }
+    ];
+
+    /* ---------- ダミー売上生成 ---------- */
+    function generateSampleSalesData(pm, sm){
+      const data=[];
+      const start=new Date('2024-05-01'), end=new Date('2025-04-30');
+      for(let d=new Date(start); d<=end; d.setDate(d.getDate()+1)){
+        const date=d.toISOString().slice(0,10);
+        sm.forEach(st => pm.forEach(p=>{
+          data.push({
+            日付:date,
+            製品ID:p.製品ID,
+            店舗ID:st.店舗ID,
+            売上金額:Math.floor(Math.random()*100)+100,
+            点数:Math.floor(Math.random()*5)+1,
+            値下金額:Math.floor(Math.random()*30)
+          });
+        }));
+      }
+      return data;
+    }
+
+    /* ---------- MAIN APP ---------- */
+    function PivotApp(){
+      /* --- state 定義 --- */
+      const [productMaster,setProductMaster] = React.useState(defaultProductMaster);
+      const [storeMaster,setStoreMaster]     = React.useState(defaultStoreMaster);
+      const [salesData,setSalesData]         = React.useState(generateSampleSalesData(defaultProductMaster,defaultStoreMaster));
+
+      const [filterCol,setFilterCol] = React.useState('商品名');
+      const [filterVal,setFilterVal] = React.useState('');
+      const [rowFields,setRowFields] = React.useState(['日付']);
+      const [colFields,setColFields] = React.useState(['年月']);
+      const [valField,setValField]   = React.useState('売上金額');
+      const [aggFunc,setAggFunc]     = React.useState('sum');
+      const [tab,setTab]             = React.useState(0);
+
+      /* --- WebDataRocks instance 用 ref --- */
+      const pivotRef = React.useRef(null);
+
+      /* --- インポート --- */
+      const handleImport = (type,e)=>{
+        const file=e.target.files[0]; if(!file) return;
+        const reader=new FileReader();
+        reader.onload = ({target:{result}})=>{
+          const wb=XLSX.read(result,{type:'array'});
+          const js=XLSX.utils.sheet_to_json(wb.Sheets[wb.SheetNames[0]],{defval:null});
+          if(!js.length) return;
+          if(type==='product') setProductMaster(js);
+          if(type==='store')   setStoreMaster(js);
+          if(type==='sales')   setSalesData(js);
+        };
+        reader.readAsArrayBuffer(file);
+      };
+
+      /* --- JOIN → flatData --- */
+      const flatData = React.useMemo(()=>{
+        return salesData.map(r=>{
+          const p=productMaster.find(x=>x.製品ID===r.製品ID)||{};
+          const s=storeMaster.find(x=>x.店舗ID===r.店舗ID)||{};
+          const dt=new Date(r.日付);
+          const 年=dt.getFullYear();
+          const 月=dt.getMonth()+1;
+          const 年月 = `${年}-${String(月).padStart(2,'0')}`;
+          return {
+            日付:r.日付, 年, 年月,
+            製品ID:r.製品ID, 商品名:p.商品名||r.製品ID, 部門:p.部門||'', コーナー:p.コーナー||'',
+            ライン:p.ライン||'', カテゴリ:p.カテゴリ||'', 売価:p.売価||0,
+            店舗ID:r.店舗ID, 店舗名:s.店舗名||r.店舗ID, ブロック:s.ブロック||'', 大きさ:s.大きさ||0,
+            売上金額:r.売上金額, 点数:r.点数, 値下金額:r.値下金額
+          };
+        });
+      },[salesData,productMaster,storeMaster]);
+
+      const fields = React.useMemo(()=> flatData.length?Object.keys(flatData[0]):[], [flatData]);
+      const numericFields = fields.filter(f=> typeof flatData[0]?.[f]==='number');
+      const availableFields = fields.filter(f=>!rowFields.includes(f)&&!colFields.includes(f));
+
+      /* --- フィルタ --- */
+      const applyFilter = ()=> setSalesData(
+        flatData.filter(r=> String(r[filterCol]??'').includes(filterVal))
+      );
+      const resetFilter = ()=>{ setSalesData(flatData); setFilterVal(''); };
+
+      /* ---------- WebDataRocks 初期化 ---------- */
+      React.useEffect(()=>{
+        if(tab!==0) return;               // pivotタブの時だけ
+        if(pivotRef.current) return;      // 既に生成済み
+        pivotRef.current = new WebDataRocks({
+          container:"#pivotContainer",
+          toolbar:true,
+          width:"100%",
+          height:"100%",
+          report:{
+            dataSource:{ data: flatData },
+            formats:[{name:"yen",currencySymbol:"¥",currencySymbolAlign:"left",thousandsSeparator:",",decimalPlaces:0}],
+            slice:{
+              rows: rowFields.map(f=>({uniqueName:f})),
+              columns: colFields.map(f=>({uniqueName:f})),
+              measures:[{uniqueName:valField,aggregation:aggFunc,format:"yen"}]
+            }
+          }
+        });
+      },[tab]); // eslint-disable-line
+
+      /* ---------- レポート更新 ---------- */
+      React.useEffect(()=>{
+        if(!pivotRef.current) return;
+        pivotRef.current.updateData({ data: flatData });  // まずデータ更新
+        pivotRef.current.setReport({
+          dataSource:{ data: flatData },
+          slice:{
+            rows: rowFields.map(f=>({uniqueName:f})),
+            columns: colFields.map(f=>({uniqueName:f})),
+            measures:[{uniqueName:valField,aggregation:aggFunc,format:"yen"}]
+          }
+        });
+      },[flatData,rowFields,colFields,valField,aggFunc]);
+
+      /* ---------- DnD ---------- */
+      const onDragEnd = r=>{
+        const {source,destination,draggableId}=r;
+        if(!destination) return;
+        const id=draggableId.split('-')[1];
+        const move=(list,set)=>{const a=[...list];const [m]=a.splice(source.index,1);a.splice(destination.index,0,m);set(a);}
+        const remove=(list,set)=>set(list.filter(f=>f!==id));
+        if(source.droppableId===destination.droppableId){
+          if(source.droppableId==='rows') move(rowFields,setRowFields);
+          if(source.droppableId==='cols') move(colFields,setColFields);
+        }else{
+          if(source.droppableId==='rows') remove(rowFields,setRowFields);
+          if(source.droppableId==='cols') remove(colFields,setColFields);
+          if(destination.droppableId==='rows'){const a=[...rowFields];a.splice(destination.index,0,id);setRowFields(a);}
+          if(destination.droppableId==='cols'){const a=[...colFields];a.splice(destination.index,0,id);setColFields(a);}
+        }
+      };
+
+      /* ---------- JSX ---------- */
+      return(
+        <Box>
+          <Typography variant="h5" gutterBottom>マスタ＆ピボット（WebDataRocks 版）</Typography>
+          <Tabs value={tab} onChange={(e,v)=>setTab(v)}>
+            <Tab label="ピボット" /><Tab label="データセット" /><Tab label="商品マスタ" />
+            <Tab label="拠点マスタ" /><Tab label="販売実績" />
+          </Tabs>
+
+          {/* 共通フィルタ */}
+          <Box className="row">
+            <FormControl size="small"><InputLabel>フィルタ列</InputLabel>
+              <Select value={filterCol} label="フィルタ列" onChange={e=>setFilterCol(e.target.value)}>
+                {fields.map(f=> <MenuItem key={f} value={f}>{f}</MenuItem>)}
+              </Select>
+            </FormControl>
+            <TextField label="フィルタ値" size="small" value={filterVal} onChange={e=>setFilterVal(e.target.value)} />
+            <Button variant="outlined" onClick={applyFilter}>適用</Button>
+            <Button variant="text" onClick={resetFilter}>リセット</Button>
+          </Box>
+
+          {tab===0 && (
+            <>
+              {/* 軸選択 */}
+              <DragDropContext onDragEnd={onDragEnd}>
+                <Typography>可用フィールド</Typography>
+                <Droppable droppableId="available" direction="horizontal">
+                  {prov=>(
+                    <div className="dnd-list" ref={prov.innerRef}{...prov.droppableProps}>
+                      {availableFields.map((f,i)=>(
+                        <Draggable key={`avail-${f}`} draggableId={`avail-${f}`} index={i}>
+                          {p=>(
+                            <div ref={p.innerRef}{...p.draggableProps}{...p.dragHandleProps} className="dnd-item">
+                              <span className="drag-handle">☰</span>{f}
+                            </div>
+                          )}
+                        </Draggable>
+                      ))}
+                      {prov.placeholder}
+                    </div>
+                  )}
+                </Droppable>
+
+                <Typography>行軸</Typography>
+                <Droppable droppableId="rows" direction="horizontal">
+                  {prov=>(
+                    <div className="dnd-list" ref={prov.innerRef}{...prov.droppableProps}>
+                      {rowFields.map((f,i)=>(
+                        <Draggable key={`row-${f}`} draggableId={`row-${f}`} index={i}>
+                          {p=>(
+                            <div ref={p.innerRef}{...p.draggableProps}{...p.dragHandleProps} className="dnd-item">
+                              <span className="drag-handle">☰</span>{f}
+                            </div>
+                          )}
+                        </Draggable>
+                      ))}
+                      {prov.placeholder}
+                    </div>
+                  )}
+                </Droppable>
+
+                <Typography>列軸</Typography>
+                <Droppable droppableId="cols" direction="horizontal">
+                  {prov=>(
+                    <div className="dnd-list" ref={prov.innerRef}{...prov.droppableProps}>
+                      {colFields.map((f,i)=>(
+                        <Draggable key={`col-${f}`} draggableId={`col-${f}`} index={i}>
+                          {p=>(
+                            <div ref={p.innerRef}{...p.draggableProps}{...p.dragHandleProps} className="dnd-item">
+                              <span className="drag-handle">☰</span>{f}
+                            </div>
+                          )}
+                        </Draggable>
+                      ))}
+                      {prov.placeholder}
+                    </div>
+                  )}
+                </Droppable>
+              </DragDropContext>
+
+              {/* 集計設定 */}
+              <Box className="row">
+                <FormControl size="small"><InputLabel>集計項目</InputLabel>
+                  <Select value={valField} label="集計項目" onChange={e=>setValField(e.target.value)}>
+                    {numericFields.map(f=> <MenuItem key={f} value={f}>{f}</MenuItem>)}
+                  </Select>
+                </FormControl>
+                <FormControl size="small"><InputLabel>集計関数</InputLabel>
+                  <Select value={aggFunc} label="集計関数" onChange={e=>setAggFunc(e.target.value)}>
+                    <MenuItem value="sum">合計</MenuItem>
+                    <MenuItem value="count">件数</MenuItem>
+                    <MenuItem value="average">平均</MenuItem>
+                    <MenuItem value="max">最大</MenuItem>
+                    <MenuItem value="min">最小</MenuItem>
+                  </Select>
+                </FormControl>
+              </Box>
+
+              {/* WebDataRocks ピボット描画領域 */}
+              <div id="pivotContainer"></div>
+            </>
+          )}
+
+          {/* -------- データセットプレビュー -------- */}
+          {tab===1 && (
+            <Box className="table-container">
+              <Typography variant="h6" sx={{mt:2}}>データセットプレビュー</Typography>
+              <table className="spreadsheet-table">
+                <thead><tr>{fields.map(f=><th key={f}>{f}</th>)}</tr></thead>
+                <tbody>
+                  {flatData.map((r,i)=>(
+                    <tr key={i}>{fields.map(f=><td key={f} className={typeof r[f]==='number'?'numeric':''}>{r[f]}</td>)}</tr>
+                  ))}
+                </tbody>
+              </table>
+            </Box>
+          )}
+
+          {/* -------- 商品マスタ -------- */}
+          {tab===2 && (
+            <>
+              <Button variant="outlined" component="label">商品マスタをインポート
+                <input type="file" hidden accept=".xlsx,.csv" onChange={e=>handleImport('product',e)}/>
+              </Button>
+              <Box className="table-container">
+                <Typography variant="h6" sx={{mt:1}}>商品マスタ</Typography>
+                <table className="spreadsheet-table">
+                  <thead><tr>{Object.keys(productMaster[0]||{}).map(f=><th key={f}>{f}</th>)}</tr></thead>
+                  <tbody>
+                    {productMaster.map((r,i)=><tr key={i}>{Object.keys(r).map(f=><td key={f} className={typeof r[f]==='number'?'numeric':''}>{r[f]}</td>)}</tr>)}
+                  </tbody>
+                </table>
+              </Box>
+            </>
+          )}
+
+          {/* -------- 拠点マスタ -------- */}
+          {tab===3 && (
+            <>
+              <Button variant="outlined" component="label">拠点マスタをインポート
+                <input type="file" hidden accept=".xlsx,.csv" onChange={e=>handleImport('store',e)}/>
+              </Button>
+              <Box className="table-container">
+                <Typography variant="h6" sx={{mt:1}}>拠点マスタ</Typography>
+                <table className="spreadsheet-table">
+                  <thead><tr>{Object.keys(storeMaster[0]||{}).map(f=><th key={f}>{f}</th>)}</tr></thead>
+                  <tbody>
+                    {storeMaster.map((r,i)=><tr key={i}>{Object.keys(r).map(f=><td key={f} className={typeof r[f]==='number'?'numeric':''}>{r[f]}</td>)}</tr>)}
+                  </tbody>
+                </table>
+              </Box>
+            </>
+          )}
+
+          {/* -------- 販売実績 -------- */}
+          {tab===4 && (
+            <>
+              <Button variant="outlined" component="label">販売実績をインポート
+                <input type="file" hidden accept=".xlsx,.csv" onChange={e=>handleImport('sales',e)}/>
+              </Button>
+              <Box className="table-container">
+                <Typography variant="h6" sx={{mt:1}}>販売実績データ</Typography>
+                <table className="spreadsheet-table">
+                  <thead><tr>{Object.keys(salesData[0]||{}).map(f=><th key={f}>{f}</th>)}</tr></thead>
+                  <tbody>
+                    {salesData.map((r,i)=><tr key={i}>{Object.keys(r).map(f=><td key={f} className={typeof r[f]==='number'?'numeric':''}>{r[f]}</td>)}</tr>)}
+                  </tbody>
+                </table>
+              </Box>
+            </>
+          )}
+        </Box>
+      );
+    }
+
+    ReactDOM.render(<PivotApp/>, document.getElementById('root'));
+  </script>
+</body>
+</html>
