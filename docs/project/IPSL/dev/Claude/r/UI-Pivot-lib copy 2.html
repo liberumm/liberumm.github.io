@@ -1,0 +1,322 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8" />
+  <title>データインポート＋タブ切替＋Tabulator Pivot＋連動グラフ デモ</title>
+
+  <!-- Roboto / Icons ------------------------------------------------------ -->
+  <link rel="stylesheet"
+        href="https://fonts.googleapis.com/css?family=Roboto:300,400,500,700&display=swap">
+  <link rel="stylesheet"
+        href="https://fonts.googleapis.com/icon?family=Material+Icons">
+
+  <!-- C3.js --------------------------------------------------------------- -->
+  <link rel="stylesheet"
+        href="https://cdnjs.cloudflare.com/ajax/libs/c3/0.7.20/c3.min.css">
+
+  <!-- Tabulator ----------------------------------------------------------- -->
+  <link
+    href="https://unpkg.com/tabulator-tables@6.3.1/dist/css/tabulator.min.css"
+    rel="stylesheet"
+  />
+
+  <style>
+    body { font-family: "Roboto", sans-serif; margin: 0; padding: 0; }
+    #root { padding: 16px; }
+    /* 分析タブ */
+    #chart { width: 100%; min-height: 300px; }
+    #tabulator-table { width: 100%; }
+    /* テーブル共通 */
+    .data-table { width:100%; border-collapse:collapse; }
+    .data-table th,.data-table td {
+      border:1px solid #ccc; padding:4px 8px; text-align:left;
+    }
+    .data-table tbody tr:nth-child(even){ background:#f7f7f7; }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+
+  <!-- ライブラリ (CDN) ---------------------------------------------------- -->
+  <script src="https://cdn.jsdelivr.net/npm/react@18/umd/react.production.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/react-dom@18/umd/react-dom.production.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@mui/material@5.15.14/umd/material-ui.production.min.js"></script>
+  <script src="https://unpkg.com/xlsx/dist/xlsx.full.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/d3/5.16.0/d3.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/c3/0.7.20/c3.min.js"></script>
+  <script src="https://unpkg.com/tabulator-tables@6.3.1/dist/js/tabulator.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.2/babel.min.js"></script>
+
+  <!-- React + MUI + Tabulator + C3 アプリ ------------------------------ -->
+  <script type="text/babel">
+    const {
+      Accordion, AccordionSummary, AccordionDetails,
+      Tabs, Tab, Box, Typography, Container, Paper,
+      FormControl, InputLabel, Select, MenuItem, TextField
+    } = MaterialUI;
+    const { useState, useEffect, useRef } = React;
+
+    const a11yProps = (i) => ({ id:`tab-${i}`, 'aria-controls':`tabpanel-${i}` });
+    const TabPanel = ({children,value,index})=>(
+      <div role="tabpanel" hidden={value!==index} id={`tabpanel-${index}`}>
+        {value===index && <Box sx={{p:2}}>{children}</Box>}
+      </div>
+    );
+
+    function App(){
+      // データ
+      const [products,setProducts]   = useState([]);
+      const [locations,setLocations] = useState([]);
+      const [salesData,setSalesData] = useState([]);
+      const [dataset,setDataset]     = useState([]);
+      // タブ
+      const [tabIndex,setTabIndex]   = useState(0);
+
+      // グループ設定
+      const [groupType,setGroupType] = useState('none');
+      const [priceTh,setPriceTh]     = useState(200);
+      const [qtyStep,setQtyStep]     = useState(5);
+      const tabulatorRef             = useRef(null);
+      const tableInstance            = useRef(null);
+
+      // グラフ
+      const chartRef  = useRef(null);
+      const chartInst = useRef(null);
+
+      // 1) 初期サンプルデータ生成
+      useEffect(()=>{
+        const prods = [
+          {商品ID:"P01",商品名:"りんご",価格:120},
+          {商品ID:"P02",商品名:"みかん",価格:100},
+          {商品ID:"P03",商品名:"バナナ",価格:110},
+          {商品ID:"P04",商品名:"ぶどう",価格:300},
+          {商品ID:"P05",商品名:"メロン",価格:450},
+          {商品ID:"P06",商品名:"いちご",価格:350},
+          {商品ID:"P07",商品名:"もも",  価格:250},
+          {商品ID:"P08",商品名:"キウイ",価格:180},
+        ];
+        const locs = ["東京","大阪","名古屋","福岡","札幌","仙台","広島","高松"]
+          .map((n,i)=>({拠点ID:`S${i+1}`,拠点名:`${n}店`}));
+        const today=new Date(),MS=864e5, sales=[];
+        for(let d=0;d<90;d++){
+          const 日付=new Date(today-d*MS).toISOString().slice(0,10);
+          prods.forEach(p=>locs.forEach(l=>{
+            const qty=Math.floor(Math.random()*21);
+            if(!qty) return;
+            sales.push({
+              日付, 商品ID:p.商品ID, 商品名:p.商品名,
+              拠点ID:l.拠点ID, 拠点名:l.拠点名,
+              売上数量:qty, 売上金額:qty*p.価格
+            });
+          }));
+        }
+        setProducts(prods);
+        setLocations(locs);
+        setSalesData(sales);
+      },[]);
+
+      // 2) マージして dataset 更新
+      useEffect(()=>{
+        const ds = salesData.map(r=>{
+          const prod = products.find(p=>p.商品ID===r.商品ID)||{};
+          return {...r, 価格:prod.価格||0};
+        });
+        setDataset(ds);
+      },[products,salesData]);
+
+      // 3) Tabulator ピボットテーブル (集約表示)
+      useEffect(()=>{
+        if(!tabulatorRef.current) return;
+        if(!tableInstance.current){
+          tableInstance.current = new Tabulator(tabulatorRef.current,{
+            data: dataset,
+            layout:"fitColumns",
+            columns:[
+              {title:"日付",     field:"日付"},
+              {title:"拠点",     field:"拠点名"},
+              {title:"商品",     field:"商品名"},
+              {title:"価格",     field:"価格",    hozAlign:"right"},
+              {title:"数量",     field:"売上数量",hozAlign:"right"},
+              {title:"売上金額", field:"売上金額",hozAlign:"right"},
+            ],
+            groupBy: makeGroupFunc(groupType, priceTh, qtyStep) || false,
+            groupStartOpen: false,
+            groupHeader: function(value, count, data){
+              // 売上金額合計を計算して表示
+              const sum = data.reduce((a,r)=>a + r.売上金額, 0);
+              return `${value} (件数: ${count}, 合計売上: ${sum.toLocaleString()})`;
+            },
+          });
+        } else {
+          tableInstance.current.setData(dataset);
+          tableInstance.current.setGroupBy(makeGroupFunc(groupType, priceTh, qtyStep)||false);
+        }
+      },[dataset, groupType, priceTh, qtyStep]);
+
+      // 4) グラフをグループ集計に連動
+      useEffect(()=>{
+        if(tabIndex!==0||dataset.length===0) return;
+        if(chartInst.current) chartInst.current.destroy();
+        const keyFn = makeGroupFunc(groupType, priceTh, qtyStep)
+                      || ((r)=>r.商品名);
+        const agg = {};
+        dataset.forEach(r=>{
+          const k = keyFn(r);
+          agg[k] = (agg[k]||0) + r.売上金額;
+        });
+        chartInst.current = c3.generate({
+          bindto: chartRef.current,
+          data: {
+            columns: [['売上金額', ...Object.values(agg)]],
+            type: 'bar',
+          },
+          axis:{
+            x:{ type:'category', categories:Object.keys(agg), tick:{rotate:15} },
+            y:{ label:{text:'売上金額',position:'outer-middle'} }
+          },
+          bar:{ width:{ratio:0.5} }
+        });
+      },[tabIndex, dataset, groupType, priceTh, qtyStep]);
+
+      // 5) ファイル読み込み
+      const handleFile = (e, setter) => {
+        const f=e.target.files[0]; if(!f) return;
+        const rdr=new FileReader();
+        rdr.onload=ev=>{
+          const wb = XLSX.read(new Uint8Array(ev.target.result),{type:'array'});
+          const json = XLSX.utils.sheet_to_json(wb.Sheets[wb.SheetNames[0]],{defval:''});
+          setter(json);
+        };
+        rdr.readAsArrayBuffer(f);
+      };
+
+      // グループ関数生成
+      const makeGroupFunc=(type, price, qty)=>{
+        switch(type){
+          case 'price': return r=> r.価格<price?`${price}円未満`:`${price}円以上`;
+          case 'qty':   return r=>{const b=Math.floor(r.売上数量/qty)*qty;return`${b}–${b+qty-1}`};
+          case 'ym':    return r=> r.日付.slice(0,7);
+          case 'yq':    return r=>{const [y,m]=r.日付.split('-');const q=Math.floor((+m-1)/3)+1;return`${y}Q${q}`};
+          case 'loc':   return r=> r.拠点名;
+          default:      return null;
+        }
+      };
+
+      return (
+        <Container maxWidth="lg">
+          {/* データインポート */}
+          <Accordion>
+            <AccordionSummary expandIcon={<span className="material-icons">expand_more</span>}>
+              <Typography>データインポート</Typography>
+            </AccordionSummary>
+            <AccordionDetails>
+              <Box sx={{display:'flex',flexDirection:'column',gap:2}}>
+                <input type="file" accept=".csv,.xlsx" onChange={e=>handleFile(e,setProducts)} />
+                <input type="file" accept=".csv,.xlsx" onChange={e=>handleFile(e,setLocations)} />
+                <input type="file" accept=".csv,.xlsx" onChange={e=>handleFile(e,setSalesData)} />
+                <Typography variant="caption" color="text.secondary">
+                  商品 → 拠点 → 販売データの順に読み込めます。（未読み込みでもサンプル動作）
+                </Typography>
+              </Box>
+            </AccordionDetails>
+          </Accordion>
+
+          {/* グループ設定 */}
+          <Paper sx={{p:2,my:2}}>
+            <Typography variant="h6">ピボット（グループ）設定</Typography>
+            <Box sx={{display:'flex',flexWrap:'wrap',gap:2,alignItems:'center'}}>
+              <FormControl size="small">
+                <InputLabel>グループ種別</InputLabel>
+                <Select value={groupType} label="グループ種別"
+                        onChange={e=>setGroupType(e.target.value)}>
+                  <MenuItem value="none">商品別 (デフォルト)</MenuItem>
+                  <MenuItem value="loc">拠点別</MenuItem>
+                  <MenuItem value="price">価格帯</MenuItem>
+                  <MenuItem value="qty">数量レンジ</MenuItem>
+                  <MenuItem value="ym">年月</MenuItem>
+                  <MenuItem value="yq">四半期</MenuItem>
+                </Select>
+              </FormControl>
+              {groupType==='price'&&(
+                <TextField size="small" label="価格閾値(円)" type="number"
+                           value={priceTh} onChange={e=>setPriceTh(+e.target.value)} />
+              )}
+              {groupType==='qty'&&(
+                <TextField size="small" label="数量刻み" type="number"
+                           value={qtyStep} onChange={e=>setQtyStep(+e.target.value)} />
+              )}
+            </Box>
+          </Paper>
+
+          {/* タブ切替 */}
+          <Paper>
+            <Tabs value={tabIndex} onChange={(_,v)=>setTabIndex(v)} variant="scrollable">
+              <Tab label="分析" {...a11yProps(0)} />
+              <Tab label="データセット" {...a11yProps(1)} />
+              <Tab label="商品マスタ" {...a11yProps(2)} />
+              <Tab label="拠点マスタ" {...a11yProps(3)} />
+              <Tab label="販売データ" {...a11yProps(4)} />
+            </Tabs>
+
+            {/* 分析：グラフ＋ピボット */}
+            <TabPanel value={tabIndex} index={0}>
+              <div ref={chartRef} id="chart"></div>
+              <div id="tabulator-table" ref={tabulatorRef}></div>
+            </TabPanel>
+
+            {/* データセット */}
+            <TabPanel value={tabIndex} index={1}>
+              <table className="data-table">
+                <thead>
+                  <tr>{dataset[0]&&Object.keys(dataset[0]).map(k=><th key={k}>{k}</th>)}</tr>
+                </thead>
+                <tbody>
+                  {dataset.map((r,i)=><tr key={i}>{Object.values(r).map((v,j)=><td key={j}>{v}</td>)}</tr>)}
+                </tbody>
+              </table>
+            </TabPanel>
+
+            {/* 商品マスタ */}
+            <TabPanel value={tabIndex} index={2}>
+              <table className="data-table">
+                <thead>
+                  <tr>{products[0]&&Object.keys(products[0]).map(k=><th key={k}>{k}</th>)}</tr>
+                </thead>
+                <tbody>
+                  {products.map((r,i)=><tr key={i}>{Object.values(r).map((v,j)=><td key={j}>{v}</td>)}</tr>)}
+                </tbody>
+              </table>
+            </TabPanel>
+
+            {/* 拠点マスタ */}
+            <TabPanel value={tabIndex} index={3}>
+              <table className="data-table">
+                <thead>
+                  <tr>{locations[0]&&Object.keys(locations[0]).map(k=><th key={k}>{k}</th>)}</tr>
+                </thead>
+                <tbody>
+                  {locations.map((r,i)=><tr key={i}>{Object.values(r).map((v,j)=><td key={j}>{v}</td>)}</tr>)}
+                </tbody>
+              </table>
+            </TabPanel>
+
+            {/* 販売データ */}
+            <TabPanel value={tabIndex} index={4}>
+              <table className="data-table">
+                <thead>
+                  <tr>{salesData[0]&&Object.keys(salesData[0]).map(k=><th key={k}>{k}</th>)}</tr>
+                </thead>
+                <tbody>
+                  {salesData.map((r,i)=><tr key={i}>{Object.values(r).map((v,j)=><td key={j}>{v}</td>)}</tr>)}
+                </tbody>
+              </table>
+            </TabPanel>
+          </Paper>
+        </Container>
+      );
+    }
+
+    ReactDOM.render(<App />, document.getElementById('root'));
+  </script>
+</body>
+</html>
