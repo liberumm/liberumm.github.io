@@ -132,7 +132,66 @@ const BudgetView = () => {
     );
   };
 
-  // ─── テーブル用：1部署＝1行、No.・期間を復活 ───
+  return (
+    <Box sx={{ width: '100%', px: 2 }}>
+      <Typography variant="h5" sx={{ mb: 2, fontWeight: 700 }}>
+        会社全体・部署別 予実ダッシュボード
+      </Typography>
+
+      {/* 全社パネル */}
+      <Grid container spacing={2} sx={{ mb: 2 }}>
+        <Grid item xs={12}>
+          <SummaryPanel panel={companyPanel} color={companyColor} />
+        </Grid>
+      </Grid>
+
+      {/* 部署別パネル（横3列表示） */}
+      <Grid container spacing={2} sx={{ mb: 3 }}>
+        {deptPanels.map(panel => (
+          <Grid item xs={12} sm={6} md={4} key={panel.dept}>
+            <SummaryPanel panel={panel} color={deptColors[panel.dept]} />
+          </Grid>
+        ))}
+      </Grid>
+    </Box>
+  );
+};
+
+// 予実一覧テーブル部分のみをコンポーネント化
+const DashboardTabTable = () => {
+  // サマリーデータ生成ロジックを再利用
+  const budgets = [
+    { id: 'B001', amount: 1000000, start: '2024-06-01', end: '2024-06-30', department: '店舗開発部' },
+    { id: 'B002', amount:  500000, start: '2024-06-01', end: '2024-06-30', department: 'サイト開発部' },
+    { id: 'B003', amount:  300000, start: '2024-06-01', end: '2024-06-30', department: '施設活性化部' },
+    { id: 'B004', amount:  200000, start: '2024-06-01', end: '2024-06-30', department: '店舗開発部' }
+  ];
+  const estimates = [
+    { id: 'E001', amount: 800000, department: '店舗開発部' },
+    { id: 'E002', amount: 300000, department: 'サイト開発部' }
+  ];
+  const invoices = [
+    { id: 'I001', amount: 800000, department: '店舗開発部' },
+    { id: 'I002', amount: 300000, department: 'サイト開発部' }
+  ];
+  const payments = [
+    { id: 'PM001', amount: 800000, department: '店舗開発部' },
+    { id: 'PM002', amount: 300000, department: 'サイト開発部' }
+  ];
+  const deptColors = {
+    '店舗開発部':   { bg: '#e3f2fd', iconColor: '#1976d2', icon: 'store' },
+    'サイト開発部': { bg: '#f3e5f5', iconColor: '#9c27b0', icon: 'web' },
+    '施設活性化部': { bg: '#e8f5e9', iconColor: '#43a047', icon: 'domain' }
+  };
+  const departments = Object.keys(deptColors);
+  const deptPanels = departments.map(dept => {
+    const bs = budgets.filter(b => b.department === dept);
+    const budgetSum   = bs.reduce((s,b) => s + b.amount, 0);
+    const estimateSum = estimates.filter(e => e.department === dept).reduce((s,e) => s + e.amount, 0);
+    const invoiceSum  = invoices.filter(i => i.department === dept).reduce((s,i) => s + i.amount, 0);
+    const paymentSum  = payments.filter(p => p.department === dept).reduce((s,p) => s + p.amount, 0);
+    return { dept, budgetSum, estimateSum, invoiceSum, paymentSum, budgets: bs };
+  });
   const tableRows = deptPanels.map((panel, idx) => {
     const starts = panel.budgets.map(b => b.start).sort();
     const ends   = panel.budgets.map(b => b.end).sort();
@@ -157,69 +216,47 @@ const BudgetView = () => {
   });
 
   return (
-    <Box sx={{ width: '100%', px: 2 }}>
-      <Typography variant="h5" sx={{ mb: 2, fontWeight: 700 }}>
-        会社全体・部署別 予実ダッシュボード
+    <Paper sx={{ p: 1 }}>
+      <Typography variant="h6" gutterBottom sx={{ mb: 1 }}>
+        予実一覧
       </Typography>
-
-      {/* 全社パネル */}
-      <Grid container spacing={2} sx={{ mb: 2 }}>
-        <Grid item xs={12}>
-          <SummaryPanel panel={companyPanel} color={companyColor} />
-        </Grid>
-      </Grid>
-
-      {/* 部署別パネル（横3列表示） */}
-      <Grid container spacing={2} sx={{ mb: 3 }}>
-        {deptPanels.map(panel => (
-          <Grid item xs={12} sm={6} md={4} key={panel.dept}>
-            <SummaryPanel panel={panel} color={deptColors[panel.dept]} />
-          </Grid>
-        ))}
-      </Grid>
-
-      {/* 予実一覧テーブル（1部署＝1行、No.・期間あり） */}
-      <Paper sx={{ p: 1 }}>
-        <Typography variant="h6" gutterBottom sx={{ mb: 1 }}>
-          予実一覧
-        </Typography>
-        <TableContainer sx={{ overflowX: 'auto' }}>
-          <Table size="small" sx={{ minWidth: 700 }}>
-            <TableHead>
-              <TableRow>
-                <TableCell>No.</TableCell>
-                <TableCell>期間</TableCell>
-                <TableCell>部署</TableCell>
-                <TableCell>進捗率</TableCell>
-                <TableCell>予算</TableCell>
-                <TableCell>見積</TableCell>
-                <TableCell>請求</TableCell>
-                <TableCell>支払</TableCell>
-                <TableCell>差異</TableCell>
+      <TableContainer sx={{ overflowX: 'auto' }}>
+        <Table size="small" sx={{ minWidth: 700 }}>
+          <TableHead>
+            <TableRow>
+              <TableCell>No.</TableCell>
+              <TableCell>期間</TableCell>
+              <TableCell>部署</TableCell>
+              <TableCell>進捗率</TableCell>
+              <TableCell>予算</TableCell>
+              <TableCell>見積</TableCell>
+              <TableCell>請求</TableCell>
+              <TableCell>支払</TableCell>
+              <TableCell>差異</TableCell>
+            </TableRow>
+          </TableHead>
+          <TableBody>
+            {tableRows.map(row => (
+              <TableRow key={row.department} hover>
+                <TableCell>{row.no}</TableCell>
+                <TableCell>{row.period}</TableCell>
+                <TableCell>{row.department}</TableCell>
+                <TableCell>{row.progress.toFixed(1)}%</TableCell>
+                <TableCell>{row.budget.toLocaleString()}</TableCell>
+                <TableCell>{row.estimate.toLocaleString()}</TableCell>
+                <TableCell>{row.invoice.toLocaleString()}</TableCell>
+                <TableCell>{row.payment.toLocaleString()}</TableCell>
+                <TableCell sx={{ color: row.diff < 0 ? '#d32f2f' : 'inherit' }}>
+                  {row.diff.toLocaleString()}
+                </TableCell>
               </TableRow>
-            </TableHead>
-            <TableBody>
-              {tableRows.map(row => (
-                <TableRow key={row.department} hover>
-                  <TableCell>{row.no}</TableCell>
-                  <TableCell>{row.period}</TableCell>
-                  <TableCell>{row.department}</TableCell>
-                  <TableCell>{row.progress.toFixed(1)}%</TableCell>
-                  <TableCell>{row.budget.toLocaleString()}</TableCell>
-                  <TableCell>{row.estimate.toLocaleString()}</TableCell>
-                  <TableCell>{row.invoice.toLocaleString()}</TableCell>
-                  <TableCell>{row.payment.toLocaleString()}</TableCell>
-                  <TableCell sx={{ color: row.diff < 0 ? '#d32f2f' : 'inherit' }}>
-                    {row.diff.toLocaleString()}
-                  </TableCell>
-                </TableRow>
-              ))}
-            </TableBody>
-          </Table>
-        </TableContainer>
-      </Paper>
-    </Box>
+            ))}
+          </TableBody>
+        </Table>
+      </TableContainer>
+    </Paper>
   );
 };
 
 window.DashboardTab = BudgetView;
+window.DashboardTabTable = DashboardTabTable;
