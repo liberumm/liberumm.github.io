@@ -1,3 +1,4 @@
+// 全体で MaterialUI をグローバル読み込みしている前提
 const {
   Box,
   Paper,
@@ -23,8 +24,16 @@ const deptColors = {
 };
 const companyColor = { bg: '#fff3e0', iconColor: '#fb8c00', icon: 'business' };
 
+// 今月文字列取得用
+const now = new Date();
+const thisYear = now.getFullYear();
+const thisMonth = now.getMonth() + 1;
+const currentMonthStr = `${thisYear}-${String(thisMonth).padStart(2, '0')}`;
+function getMonthFromDate(d) { return d?.slice(0,7) || ''; }
+
+// ─── サマリービュー ───
 const BudgetView = () => {
-  // ─── サンプルデータ：開始日・終了日を復活 ───
+  // サンプルデータ
   const budgets = [
     { id: 'B001', amount: 1000000, start: '2024-06-01', end: '2024-06-30', department: '店舗開発部' },
     { id: 'B002', amount:  500000, start: '2024-06-01', end: '2024-06-30', department: 'サイト開発部' },
@@ -40,31 +49,28 @@ const BudgetView = () => {
     { id: 'I002', amount: 300000, department: 'サイト開発部' }
   ];
   const payments = [
-    { id: 'PM001', amount: 800000, department: '店舗開発部' },
-    { id: 'PM002', amount: 300000, department: 'サイト開発部' }
+    { id: 'PM001', amount: 800000, department: '店舗開発部', paymentDate: '2024-06-20', recordedDate: '2024-06-25', status: 'advance' },
+    { id: 'PM002', amount: 300000, department: 'サイト開発部', paymentDate: '2024-06-22', recordedDate: '2024-06-28', status: 'recorded' }
   ];
 
-  // ─── 部署別サマリー計算 ───
   const departments = Object.keys(deptColors);
   const deptPanels = departments.map(dept => {
-    const bs = budgets.filter(b => b.department === dept);
+    const bs = budgets.filter(b => b.department === dept && getMonthFromDate(b.start) === currentMonthStr);
     const budgetSum   = bs.reduce((s,b) => s + b.amount, 0);
     const estimateSum = estimates.filter(e => e.department === dept).reduce((s,e) => s + e.amount, 0);
     const invoiceSum  = invoices.filter(i => i.department === dept).reduce((s,i) => s + i.amount, 0);
-    const paymentSum  = payments.filter(p => p.department === dept).reduce((s,p) => s + p.amount, 0);
-    return { dept, budgetSum, estimateSum, invoiceSum, paymentSum, budgets: bs };
+    const paymentSum  = payments.filter(p => p.department === dept && getMonthFromDate(p.paymentDate) === currentMonthStr).reduce((s,p) => s + p.amount, 0);
+    return { dept, budgetSum, estimateSum, invoiceSum, paymentSum };
   });
 
-  // ─── 全社サマリー ───
   const companyPanel = {
     dept: '全社合計',
-    budgetSum:   budgets.reduce((s,b) => s + b.amount, 0),
+    budgetSum:   budgets.filter(b => getMonthFromDate(b.start) === currentMonthStr).reduce((s,b) => s + b.amount, 0),
     estimateSum: estimates.reduce((s,e) => s + e.amount, 0),
     invoiceSum:  invoices.reduce((s,i) => s + i.amount, 0),
-    paymentSum:  payments.reduce((s,p) => s + p.amount, 0)
+    paymentSum:  payments.filter(p => getMonthFromDate(p.paymentDate) === currentMonthStr).reduce((s,p) => s + p.amount, 0)
   };
 
-  // ─── サマリーパネル ───
   const SummaryPanel = ({ panel, color }) => {
     const progress = panel.budgetSum > 0
       ? (panel.paymentSum / panel.budgetSum) * 100
@@ -81,12 +87,7 @@ const BudgetView = () => {
       }}>
         <CardContent sx={{ p: 2 }}>
           <Box sx={{ display: 'flex', alignItems: 'center', mb: 1 }}>
-            <Avatar sx={{
-              bgcolor: color.iconColor,
-              color: '#fff',
-              mr: 1,
-              width: 32, height: 32
-            }}>
+            <Avatar sx={{ bgcolor: color.iconColor, color: '#fff', mr: 1, width: 32, height: 32 }}>
               <span className="material-icons">{color.icon}</span>
             </Avatar>
             <Typography variant="subtitle2" sx={{ fontWeight: 700 }}>
@@ -121,11 +122,7 @@ const BudgetView = () => {
             <Typography variant="caption" sx={{ mb: 0.5, display: 'block' }}>
               進捗率：{progress.toFixed(1)}%
             </Typography>
-            <LinearProgress
-              variant="determinate"
-              value={progress}
-              sx={{ height: 6, borderRadius: 3 }}
-            />
+            <LinearProgress variant="determinate" value={progress} sx={{ height: 6, borderRadius: 3 }} />
           </Box>
         </CardContent>
       </Card>
@@ -135,21 +132,17 @@ const BudgetView = () => {
   return (
     <Box sx={{ width: '100%', px: 2 }}>
       <Typography variant="h5" sx={{ mb: 2, fontWeight: 700 }}>
-        会社全体・部署別 予実ダッシュボード
+        会社全体・部署別 予実ダッシュボード（当月）
       </Typography>
-
-      {/* 全社パネル */}
       <Grid container spacing={2} sx={{ mb: 2 }}>
         <Grid item xs={12}>
           <SummaryPanel panel={companyPanel} color={companyColor} />
         </Grid>
       </Grid>
-
-      {/* 部署別パネル（横3列表示） */}
       <Grid container spacing={2} sx={{ mb: 3 }}>
-        {deptPanels.map(panel => (
-          <Grid item xs={12} sm={6} md={4} key={panel.dept}>
-            <SummaryPanel panel={panel} color={deptColors[panel.dept]} />
+        {deptPanels.map(p => (
+          <Grid item xs={12} sm={6} md={4} key={p.dept}>
+            <SummaryPanel panel={p} color={deptColors[p.dept]} />
           </Grid>
         ))}
       </Grid>
@@ -157,100 +150,85 @@ const BudgetView = () => {
   );
 };
 
-// 予実一覧テーブル部分のみをコンポーネント化
+// ─── テーブルビュー ───
 const DashboardTabTable = () => {
-  // サマリーデータ生成ロジックを再利用
-  const budgets = [
-    { id: 'B001', amount: 1000000, start: '2024-06-01', end: '2024-06-30', department: '店舗開発部' },
-    { id: 'B002', amount:  500000, start: '2024-06-01', end: '2024-06-30', department: 'サイト開発部' },
-    { id: 'B003', amount:  300000, start: '2024-06-01', end: '2024-06-30', department: '施設活性化部' },
-    { id: 'B004', amount:  200000, start: '2024-06-01', end: '2024-06-30', department: '店舗開発部' }
-  ];
-  const estimates = [
-    { id: 'E001', amount: 800000, department: '店舗開発部' },
-    { id: 'E002', amount: 300000, department: 'サイト開発部' }
-  ];
-  const invoices = [
-    { id: 'I001', amount: 800000, department: '店舗開発部' },
-    { id: 'I002', amount: 300000, department: 'サイト開発部' }
-  ];
-  const payments = [
-    { id: 'PM001', amount: 800000, department: '店舗開発部' },
-    { id: 'PM002', amount: 300000, department: 'サイト開発部' }
-  ];
-  const deptColors = {
-    '店舗開発部':   { bg: '#e3f2fd', iconColor: '#1976d2', icon: 'store' },
-    'サイト開発部': { bg: '#f3e5f5', iconColor: '#9c27b0', icon: 'web' },
-    '施設活性化部': { bg: '#e8f5e9', iconColor: '#43a047', icon: 'domain' }
+  const departments = ["店舗開発部", "サイト開発部", "施設活性化部"];
+  const months = ["2024-04","2024-05","2024-06","2024-07","2024-08","2024-09","2024-10","2024-11","2024-12","2025-01","2025-02","2025-03"];
+  const dummyData = {
+    "店舗開発部":   { budget:1000000, invoice:800000, payment:750000, recorded:700000 },
+    "サイト開発部": { budget:500000,  invoice:400000, payment:370000, recorded:350000 },
+    "施設活性化部": { budget:300000,  invoice:250000, payment:240000, recorded:220000 }
   };
-  const departments = Object.keys(deptColors);
-  const deptPanels = departments.map(dept => {
-    const bs = budgets.filter(b => b.department === dept);
-    const budgetSum   = bs.reduce((s,b) => s + b.amount, 0);
-    const estimateSum = estimates.filter(e => e.department === dept).reduce((s,e) => s + e.amount, 0);
-    const invoiceSum  = invoices.filter(i => i.department === dept).reduce((s,i) => s + i.amount, 0);
-    const paymentSum  = payments.filter(p => p.department === dept).reduce((s,p) => s + p.amount, 0);
-    return { dept, budgetSum, estimateSum, invoiceSum, paymentSum, budgets: bs };
-  });
-  const tableRows = deptPanels.map((panel, idx) => {
-    const starts = panel.budgets.map(b => b.start).sort();
-    const ends   = panel.budgets.map(b => b.end).sort();
-    const period = starts.length
-      ? `${starts[0]} - ${ends[ends.length - 1]}`
-      : '';
-    const diff = panel.budgetSum - panel.paymentSum;
-    const progress = panel.budgetSum > 0
-      ? (panel.paymentSum / panel.budgetSum) * 100
-      : 0;
-    return {
-      no: idx + 1,
-      period,
-      department: panel.dept,
-      progress,
-      budget: panel.budgetSum,
-      estimate: panel.estimateSum,
-      invoice: panel.invoiceSum,
-      payment: panel.paymentSum,
-      diff
-    };
-  });
 
   return (
     <Paper sx={{ p: 1 }}>
       <Typography variant="h6" gutterBottom sx={{ mb: 1 }}>
-        予実一覧
+        予実一覧（12か月：各月6行/部）
       </Typography>
       <TableContainer sx={{ overflowX: 'auto' }}>
-        <Table size="small" sx={{ minWidth: 700 }}>
+        <Table
+          size="small"
+          sx={{
+            minWidth: 1200,
+            borderCollapse: 'collapse',
+            '& td, & th': { borderRight: '1px solid #ddd' }
+          }}
+        >
           <TableHead>
             <TableRow>
-              <TableCell>No.</TableCell>
-              <TableCell>期間</TableCell>
-              <TableCell>部署</TableCell>
-              <TableCell>進捗率</TableCell>
-              <TableCell>予算</TableCell>
-              <TableCell>見積</TableCell>
-              <TableCell>請求</TableCell>
-              <TableCell>支払</TableCell>
-              <TableCell>差異</TableCell>
+              <TableCell rowSpan={2} sx={{ borderRight: '1px solid #ddd' }}>部署</TableCell>
+              <TableCell rowSpan={2} sx={{ borderRight: '1px solid #ddd' }}>項目</TableCell>
+              {months.map(m => (
+                <TableCell key={m} align="center">{m}</TableCell>
+              ))}
+            </TableRow>
+            <TableRow>
+              {months.map(m => (
+                <TableCell key={m} align="center" sx={{ borderRight: '1px solid #ddd' }} />
+              ))}
             </TableRow>
           </TableHead>
           <TableBody>
-            {tableRows.map(row => (
-              <TableRow key={row.department} hover>
-                <TableCell>{row.no}</TableCell>
-                <TableCell>{row.period}</TableCell>
-                <TableCell>{row.department}</TableCell>
-                <TableCell>{row.progress.toFixed(1)}%</TableCell>
-                <TableCell>{row.budget.toLocaleString()}</TableCell>
-                <TableCell>{row.estimate.toLocaleString()}</TableCell>
-                <TableCell>{row.invoice.toLocaleString()}</TableCell>
-                <TableCell>{row.payment.toLocaleString()}</TableCell>
-                <TableCell sx={{ color: row.diff < 0 ? '#d32f2f' : 'inherit' }}>
-                  {row.diff.toLocaleString()}
-                </TableCell>
-              </TableRow>
-            ))}
+            {departments.map(dept => {
+              const d = dummyData[dept];
+              const budgetProg = d.budget > 0 ? (d.recorded / d.budget * 100).toFixed(1) + '%' : '-';
+              const payProg    = d.invoice > 0 ? (d.payment / d.invoice * 100).toFixed(1) + '%' : '-';
+              return (
+                <React.Fragment key={dept}>
+                  {[
+                    ['予算',   d.budget.toLocaleString()],
+                    ['請求',   d.invoice.toLocaleString()],
+                    ['支払',   d.payment.toLocaleString()],
+                    ['計上',   d.recorded.toLocaleString()],
+                    ['予算進捗', budgetProg],
+                    ['支払進捗', payProg]
+                  ].map(([label, value], idx) => (
+                    <TableRow key={label} sx={{ '& td': { borderRight: '1px solid #ddd' } }}>
+                      {idx === 0 && (
+                        <TableCell
+                          rowSpan={6}
+                          sx={{
+                            fontWeight: 700,
+                            background: '#f5f5f5',
+                            borderRight: '1px solid #ddd'
+                          }}
+                        >
+                          {dept}
+                        </TableCell>
+                      )}
+                      <TableCell sx={{ fontWeight: 700 }}>{label}</TableCell>
+                      {months.map(m => (
+                        <TableCell key={m} align="right">
+                          {/* 数値行以外はラベル列と同一表示 */}
+                          {idx < 4 ? /* 金額 */ d[['budget','invoice','payment','recorded'][idx]].toLocaleString()
+                                     : /* 進捗% */ (idx === 4 ? budgetProg : payProg)}
+                        </TableCell>
+                      ))}
+                    </TableRow>
+                  ))}
+                </React.Fragment>
+              );
+            })}
           </TableBody>
         </Table>
       </TableContainer>
@@ -258,5 +236,6 @@ const DashboardTabTable = () => {
   );
 };
 
+// グローバルにアタッチ
 window.DashboardTab = BudgetView;
 window.DashboardTabTable = DashboardTabTable;
