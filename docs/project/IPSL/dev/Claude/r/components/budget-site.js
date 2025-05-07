@@ -3,11 +3,30 @@ const ProjectTab = () => {
     { id: 'P001', name: '新店舗開発', date: '2024-06-01' },
     { id: 'P002', name: '改装プロジェクト', date: '2024-06-10' }
   ]);
+  
+  const exportCSV = () => {
+    let csvContent = "data:text/csv;charset=utf-8,No.,日付,案件名\n";
+    projects.forEach((p, index) => {
+      const row = [index + 1, p.date, p.name].join(",");
+      csvContent += row + "\n";
+    });
+    const encodedUri = encodeURI(csvContent);
+    const link = document.createElement("a");
+    link.setAttribute("href", encodedUri);
+    link.setAttribute("download", "案件管理.csv");
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+  };
+  
   return (
     <MaterialUI.Paper sx={{ p: 2, mb: 2 }}>
       <MaterialUI.Typography variant="h6" gutterBottom>
         案件管理
       </MaterialUI.Typography>
+      <MaterialUI.Button variant="contained" size="small" onClick={exportCSV} sx={{ mb: 1 }}>
+        エクスポート
+      </MaterialUI.Button>
       <MaterialUI.TableContainer sx={{ overflowX: 'auto' }}>
         <MaterialUI.Table size="small">
           <MaterialUI.TableHead>
