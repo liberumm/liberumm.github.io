@@ -69,6 +69,13 @@ const EstimateTab = () => {
   const [page, setPage] = React.useState(0);
   const rowsPerPage = 20;
 
+  // ステータス判定（例: 請求済/未請求）
+  function getStatus(e) {
+    // サンプル: 金額が50万以上なら「請求済」、未満なら「未請求」
+    if (e.amount >= 500000) return { label: '請求済', color: 'success' };
+    return { label: '未請求', color: 'default' };
+  }
+
   // ページネーション用データ
   const pagedEstimates = React.useMemo(() => {
     return estimates.slice(page * rowsPerPage, page * rowsPerPage + rowsPerPage);
@@ -119,6 +126,7 @@ const EstimateTab = () => {
           <MaterialUI.TableHead>
             <MaterialUI.TableRow>
               <MaterialUI.TableCell sx={{ width: 48, textAlign: 'center' }}>No.</MaterialUI.TableCell>
+              <MaterialUI.TableCell sx={{ width: 80, textAlign: 'center' }}>ステータス</MaterialUI.TableCell>
               {['見積ID','日付','見積名','負担部署','勘定科目','金額','取引先','取引先見積ID']
                 .map((h,idx)=>
                   <MaterialUI.TableCell key={h} sx={estimateTableCellSx[idx]}>{h}</MaterialUI.TableCell>
@@ -129,6 +137,9 @@ const EstimateTab = () => {
             {pagedEstimates.map((e, index) => (
               <MaterialUI.TableRow key={e.estimateId} hover>
                 <MaterialUI.TableCell sx={{ width: 48, textAlign: 'center' }}>{page * rowsPerPage + index + 1}</MaterialUI.TableCell>
+                <MaterialUI.TableCell sx={{ width: 80, textAlign: 'center' }}>
+                  <MaterialUI.Chip label={getStatus(e).label} color={getStatus(e).color} size="small" />
+                </MaterialUI.TableCell>
                 <MaterialUI.TableCell sx={estimateTableCellSx[0]}>{e.estimateId}</MaterialUI.TableCell>
                 <MaterialUI.TableCell sx={estimateTableCellSx[1]}>{e.date}</MaterialUI.TableCell>
                 <MaterialUI.TableCell sx={estimateTableCellSx[2]}>{e.estimateName}</MaterialUI.TableCell>

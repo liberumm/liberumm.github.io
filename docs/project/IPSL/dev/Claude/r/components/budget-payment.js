@@ -140,6 +140,13 @@ const PaymentTab = () => {
     document.body.removeChild(link);
   };
 
+  // ステータス判定（例: 計上済/未計上）
+  function getStatus(p) {
+    // サンプル: postingDateがあれば「計上済」、なければ「未計上」
+    if (p.postingDate) return { label: '計上済', color: 'success' };
+    return { label: '未計上', color: 'default' };
+  }
+
   return (
     <Paper sx={{ p: 2, mb: 2 }}>
       <Typography variant="h6" gutterBottom>
@@ -157,6 +164,7 @@ const PaymentTab = () => {
           <TableHead>
             <TableRow>
               <TableCell sx={{ width: 48, textAlign: 'center' }}>No.</TableCell>
+              <TableCell sx={{ width: 80, textAlign: 'center' }}>ステータス</TableCell>
               {['支払ID','日付','見積ID','請求ID','支払日','計上日','支払名','負担部署','勘定科目','金額','取引先']
                 .map((h,idx)=>
                   <TableCell key={h} sx={paymentTableCellSx[idx]}>{h}</TableCell>
@@ -167,6 +175,9 @@ const PaymentTab = () => {
             {pagedPayments.map((p, index) => (
               <TableRow key={p.paymentId} hover style={{ cursor: 'pointer' }} onClick={() => handleRowClick(p)}>
                 <TableCell sx={{ width: 48, textAlign: 'center' }}>{page * rowsPerPage + index + 1}</TableCell>
+                <TableCell sx={{ width: 80, textAlign: 'center' }}>
+                  <Chip label={getStatus(p).label} color={getStatus(p).color} size="small" />
+                </TableCell>
                 <TableCell sx={paymentTableCellSx[0]}>{p.paymentId}</TableCell>
                 <TableCell sx={paymentTableCellSx[1]}>{p.date}</TableCell>
                 <TableCell sx={paymentTableCellSx[2]}>{p.estimateId}</TableCell>
