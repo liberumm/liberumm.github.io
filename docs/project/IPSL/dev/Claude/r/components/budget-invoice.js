@@ -71,6 +71,13 @@ const InvoiceTab = () => {
   const [page, setPage] = React.useState(0);
   const rowsPerPage = 20;
 
+  // ステータス判定（例: 支払済/未支払）
+  function getStatus(i) {
+    // サンプル: 金額が50万以上なら「支払済」、未満なら「未支払」
+    if (i.amount >= 500000) return { label: '支払済', color: 'success' };
+    return { label: '未支払', color: 'default' };
+  }
+
   // ページネーション用データ
   const pagedInvoices = React.useMemo(() => {
     return invoices.slice(page * rowsPerPage, page * rowsPerPage + rowsPerPage);
@@ -123,6 +130,7 @@ const InvoiceTab = () => {
           <MaterialUI.TableHead>
             <MaterialUI.TableRow>
               <MaterialUI.TableCell sx={{ width: 48, textAlign: 'center' }}>No.</MaterialUI.TableCell>
+              <MaterialUI.TableCell sx={{ width: 80, textAlign: 'center' }}>ステータス</MaterialUI.TableCell>
               {['請求ID','日付','見積ID','支払日','請求名','負担部署','勘定科目','金額','取引先','取引先請求ID']
                 .map((h,idx)=>
                   <MaterialUI.TableCell key={h} sx={invoiceTableCellSx[idx]}>{h}</MaterialUI.TableCell>
@@ -133,6 +141,9 @@ const InvoiceTab = () => {
             {pagedInvoices.map((i, index) => (
               <MaterialUI.TableRow key={i.invoiceId} hover>
                 <MaterialUI.TableCell sx={{ width: 48, textAlign: 'center' }}>{page * rowsPerPage + index + 1}</MaterialUI.TableCell>
+                <MaterialUI.TableCell sx={{ width: 80, textAlign: 'center' }}>
+                  <MaterialUI.Chip label={getStatus(i).label} color={getStatus(i).color} size="small" />
+                </MaterialUI.TableCell>
                 <MaterialUI.TableCell sx={invoiceTableCellSx[0]}>{i.invoiceId}</MaterialUI.TableCell>
                 <MaterialUI.TableCell sx={invoiceTableCellSx[1]}>{i.date}</MaterialUI.TableCell>
                 <MaterialUI.TableCell sx={invoiceTableCellSx[2]}>{i.estimateId}</MaterialUI.TableCell>
