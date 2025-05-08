@@ -75,6 +75,61 @@ const BudgetList = () => {
   const [groupOpen, setGroupOpen] = React.useState(false);
   const [groupRows, setGroupRows] = React.useState([]);
 
+  const [page, setPage] = React.useState(0);
+  const rowsPerPage = 20;
+
+  // 追加：CSVエクスポート用関数
+  const exportCSV = () => {
+    let csv = "";
+    if(viewMode==='DETAIL'){
+      csv = DETAIL_HEADERS.join(",") + "\n";
+      filtered.forEach((r, idx) => {
+        const row = [
+          idx+1,
+          fmtRatio(r.posted+r.prepaid, r.budget),
+          `${r.startDate}～${r.endDate}`,
+          r.id,
+          r.name,
+          r.account,
+          r.posting,
+          r.department,
+          r.burdenDept,
+          r.pattern,
+          r.projectId,
+          r.insideAnnual ? '内' : '外',
+          r.budget,
+          r.prepaid,
+          r.posted
+        ].join(",");
+        csv += row + "\n";
+      });
+    } else {
+      csv = TOTAL_HEADERS.join(",") + "\n";
+      totalData.forEach((g, idx) => {
+        const row = [
+          idx+1,
+          fmtRatio(g.posted+g.prepaid, g.budget),
+          g.periodLabel,
+          g.posting,
+          g.department,
+          g.burdenDept,
+          g.insideAnnual ? '内' : '外',
+          g.budget,
+          g.prepaid,
+          g.posted
+        ].join(",");
+        csv += row + "\n";
+      });
+    }
+    const encodedUri = encodeURI("data:text/csv;charset=utf-8," + csv);
+    const link = document.createElement("a");
+    link.setAttribute("href", encodedUri);
+    link.setAttribute("download", "予算一覧.csv");
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+  };
+
   /* ========== 抽出 ========== */
   const filtered = rows.filter(r =>
     (!departmentFilter || r.department === departmentFilter) &&
@@ -111,6 +166,20 @@ const BudgetList = () => {
     });
     return Array.from(map.values());
   }, [filtered]);
+
+  /* ========== ページネーション用データ ========== */
+  const pagedFiltered = React.useMemo(() => {
+    return filtered.slice(page * rowsPerPage, page * rowsPerPage + rowsPerPage);
+  }, [filtered, page]);
+
+  const pagedTotalData = React.useMemo(() => {
+    return totalData.slice(page * rowsPerPage, page * rowsPerPage + rowsPerPage);
+  }, [totalData, page]);
+
+  /* ========== 件数表示 ========== */
+  const totalCount = viewMode === 'DETAIL' ? filtered.length : totalData.length;
+  const startIdx = totalCount === 0 ? 0 : page * rowsPerPage + 1;
+  const endIdx = Math.min((page + 1) * rowsPerPage, totalCount);
 
   /* ========== ヘッダー定義 ========== */
   const DETAIL_HEADERS = [
@@ -177,8 +246,12 @@ const BudgetList = () => {
   return (
     <Paper sx={{ p: 2 }}>
       <Typography variant="h6" gutterBottom>予算一覧</Typography>
-
-      {/* フィルター＆ビュー切替え */}
+      {/* 追加：エクスポートボタン（フィルター行の上部） */}
+      <Box sx={{ mb: 2 }}>
+        <Button variant="contained" size="small" onClick={exportCSV}>
+          エクスポート
+        </Button>
+      </Box>
       <Box sx={{ display:'flex', flexWrap:'wrap', gap:1, mb:2 }}>
         <FormControl size="small" sx={{ minWidth:120 }}>
           <InputLabel>部署</InputLabel>
@@ -216,6 +289,11 @@ const BudgetList = () => {
         </Button>
       </Box>
 
+      {/* 件数表示 */}
+      <Box sx={{ mb: 1, fontSize: 14, color: '#555' }}>
+        {startIdx} ～ {endIdx} 件を表示 ({totalCount} 件中)
+      </Box>
+
       {/* メインテーブル */}
       <TableContainer sx={{
         maxHeight:440, overflowX:'auto',
@@ -239,14 +317,14 @@ const BudgetList = () => {
           </TableHead>
           <TableBody>
             {viewMode==='DETAIL'
-              ? filtered.map((r,idx)=>(
+              ? pagedFiltered.map((r,idx)=>(
                   <TableRow
                     key={r.id}
                     hover
                     sx={{ cursor:'pointer' }}
                     onClick={()=>handleRowClickDetail(r)}
                   >
-                    <TableCell align="center">{idx+1}</TableCell>
+                    <TableCell align="center">{page * rowsPerPage + idx + 1}</TableCell>
                     <TableCell align="center">{fmtRatio(r.posted+r.prepaid, r.budget)}</TableCell>
                     <TableCell align="center">{`${r.startDate}～${r.endDate}`}</TableCell>
                     <TableCell align="center">{r.id}</TableCell>
@@ -263,14 +341,14 @@ const BudgetList = () => {
                     <TableCell align="right">{fmtYen(r.posted)}</TableCell>
                   </TableRow>
                 ))
-              : totalData.map((g,idx)=>(
+              : pagedTotalData.map((g,idx)=>(
                   <TableRow
                     key={idx}
                     hover
                     sx={{ cursor:'pointer' }}
                     onClick={()=>handleRowClickTotal(g)}
                   >
-                    <TableCell align="center">{idx+1}</TableCell>
+                    <TableCell align="center">{page * rowsPerPage + idx + 1}</TableCell>
                     <TableCell align="center">{fmtRatio(g.posted+g.prepaid, g.budget)}</TableCell>
                     <TableCell align="center">{g.periodLabel}</TableCell>
                     <TableCell align="center">{g.posting}</TableCell>
@@ -286,6 +364,33 @@ const BudgetList = () => {
           </TableBody>
         </Table>
       </TableContainer>
+
+      {/* ページネーション */}
+      <Box sx={{ display: 'flex', justifyContent: 'flex-end', alignItems: 'center', mt: 1 }}>
+        <Button
+          size="small"
+          onClick={() => setPage(0)}
+          disabled={page === 0}
+        >{"<<"}</Button>
+        <Button
+          size="small"
+          onClick={() => setPage(p => Math.max(0, p - 1))}
+          disabled={page === 0}
+        >{"<"}</Button>
+        <Box sx={{ mx: 1, fontSize: 14 }}>
+          {page + 1} / {Math.max(1, Math.ceil(totalCount / rowsPerPage))}
+        </Box>
+        <Button
+          size="small"
+          onClick={() => setPage(p => Math.min(Math.ceil(totalCount / rowsPerPage) - 1, p + 1))}
+          disabled={page >= Math.ceil(totalCount / rowsPerPage) - 1}
+        >{">"}</Button>
+        <Button
+          size="small"
+          onClick={() => setPage(Math.max(0, Math.ceil(totalCount / rowsPerPage) - 1))}
+          disabled={page >= Math.ceil(totalCount / rowsPerPage) - 1}
+        >{">>"}</Button>
+      </Box>
 
       {/* 新規作成モーダル */}
       <Dialog open={addOpen} onClose={()=>setAddOpen(false)} maxWidth="md" fullWidth>

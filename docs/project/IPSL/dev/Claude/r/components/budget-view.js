@@ -13,7 +13,8 @@ const {
   TableCell,
   TableContainer,
   Avatar,
-  LinearProgress
+  LinearProgress,
+  Button
 } = MaterialUI;
 
 // フラット＆ライトトーンの配色設定
@@ -212,8 +213,61 @@ const DashboardTabTable = () => {
   };
   const periodCount = months.length;
 
+  // 追加：CSVエクスポート用関数
+  const exportCSV = () => {
+    let csv = "部署,項目,期間合計," + months.join(",") + "\n";
+    departments.forEach(dept => {
+      const d = dummyData[dept];
+      const totals = {
+        budget:   d.budget   * periodCount,
+        invoice:  d.invoice  * periodCount,
+        payment:  d.payment  * periodCount,
+        recorded: d.recorded * periodCount
+      };
+      const budgetProg = d.budget > 0
+          ? (d.recorded / d.budget * 100).toFixed(1)
+          : '-';
+      const payProg = d.invoice > 0
+          ? (d.payment / d.invoice * 100).toFixed(1)
+          : '-';
+      const rows = [
+        ["予算",     d.budget.toLocaleString(),   totals.budget.toLocaleString()],
+        ["請求",     d.invoice.toLocaleString(),  totals.invoice.toLocaleString()],
+        ["支払",     d.payment.toLocaleString(),  totals.payment.toLocaleString()],
+        ["計上",     d.recorded.toLocaleString(), totals.recorded.toLocaleString()],
+        ["予算進捗", budgetProg,                   budgetProg],
+        ["支払進捗", payProg,                      payProg]
+      ];
+      rows.forEach((arr, idx) => {
+        let line = (idx === 0 ? dept : "") + "," + arr.join(",");
+        months.forEach(() => {
+          if(arr[0]==="予算") line += "," + d.budget.toLocaleString();
+          else if(arr[0]==="請求") line += "," + d.invoice.toLocaleString();
+          else if(arr[0]==="支払") line += "," + d.payment.toLocaleString();
+          else if(arr[0]==="計上") line += "," + d.recorded.toLocaleString();
+          else if(arr[0]==="予算進捗") line += "," + budgetProg;
+          else if(arr[0]==="支払進捗") line += "," + payProg;
+        });
+        csv += line + "\n";
+      });
+    });
+    const encodedUri = encodeURI("data:text/csv;charset=utf-8," + csv);
+    const link = document.createElement("a");
+    link.setAttribute("href", encodedUri);
+    link.setAttribute("download", "予実一覧.csv");
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+  };
+
   return (
     <Paper sx={{ p: 1 }}>
+      {/* 追加：エクスポートボタン */}
+      <Box sx={{ textAlign: "right", mb: 1 }}>
+        <Button variant="contained" size="small" onClick={exportCSV}>
+          エクスポート
+        </Button>
+      </Box>
       <Typography variant="h6" gutterBottom sx={{ mb: 1 }}>
         予実一覧（12か月：各月6行/部）
       </Typography>

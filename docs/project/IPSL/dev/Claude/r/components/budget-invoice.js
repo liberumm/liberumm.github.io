@@ -68,7 +68,17 @@ const InvoiceTab = () => {
     { invoiceId: 'I001', date: '2024-06-05', estimateId: 'E001', paymentDate: '2024-06-10', invoiceName: '什器請求A', department: '店舗開発部', account: '資産', amount: 800000, vendor: '○○建設', vendorInvoiceId: 'VI001-001' },
     { invoiceId: 'I002', date: '2024-06-13', estimateId: 'E002', paymentDate: '2024-06-18', invoiceName: '工事請求', department: 'サイト開発部', account: '工事費', amount: 300000, vendor: '△△設備', vendorInvoiceId: 'VI002-001' }
   ]);
-  
+  const [page, setPage] = React.useState(0);
+  const rowsPerPage = 20;
+
+  // ページネーション用データ
+  const pagedInvoices = React.useMemo(() => {
+    return invoices.slice(page * rowsPerPage, page * rowsPerPage + rowsPerPage);
+  }, [invoices, page]);
+  const totalCount = invoices.length;
+  const startIdx = totalCount === 0 ? 0 : page * rowsPerPage + 1;
+  const endIdx = Math.min((page + 1) * rowsPerPage, totalCount);
+
   const exportCSV = () => {
     let csvContent = "data:text/csv;charset=utf-8,No.,請求ID,日付,見積ID,支払日,請求名,負担部署,勘定科目,金額,取引先,取引先請求ID\n";
     invoices.forEach((i, index) => {
@@ -104,6 +114,10 @@ const InvoiceTab = () => {
       <MaterialUI.Button variant="contained" size="small" onClick={exportCSV} sx={{ mb: 1 }}>
         エクスポート
       </MaterialUI.Button>
+      {/* 件数表示 */}
+      <Box sx={{ mb: 1, fontSize: 14, color: '#555' }}>
+        {startIdx} ～ {endIdx} 件を表示 ({totalCount} 件中)
+      </Box>
       <MaterialUI.TableContainer sx={{ maxHeight: 440, overflowX: 'auto', ...tableSx }}>
         <MaterialUI.Table size="small" stickyHeader>
           <MaterialUI.TableHead>
@@ -116,9 +130,9 @@ const InvoiceTab = () => {
             </MaterialUI.TableRow>
           </MaterialUI.TableHead>
           <MaterialUI.TableBody>
-            {invoices.map((i, index) => (
+            {pagedInvoices.map((i, index) => (
               <MaterialUI.TableRow key={i.invoiceId} hover>
-                <MaterialUI.TableCell sx={{ width: 48, textAlign: 'center' }}>{index + 1}</MaterialUI.TableCell>
+                <MaterialUI.TableCell sx={{ width: 48, textAlign: 'center' }}>{page * rowsPerPage + index + 1}</MaterialUI.TableCell>
                 <MaterialUI.TableCell sx={invoiceTableCellSx[0]}>{i.invoiceId}</MaterialUI.TableCell>
                 <MaterialUI.TableCell sx={invoiceTableCellSx[1]}>{i.date}</MaterialUI.TableCell>
                 <MaterialUI.TableCell sx={invoiceTableCellSx[2]}>{i.estimateId}</MaterialUI.TableCell>
@@ -134,6 +148,32 @@ const InvoiceTab = () => {
           </MaterialUI.TableBody>
         </MaterialUI.Table>
       </MaterialUI.TableContainer>
+      {/* ページネーション */}
+      <Box sx={{ display: 'flex', justifyContent: 'flex-end', alignItems: 'center', mt: 1 }}>
+        <MaterialUI.Button
+          size="small"
+          onClick={() => setPage(0)}
+          disabled={page === 0}
+        >{"<<"}</MaterialUI.Button>
+        <MaterialUI.Button
+          size="small"
+          onClick={() => setPage(p => Math.max(0, p - 1))}
+          disabled={page === 0}
+        >{"<"}</MaterialUI.Button>
+        <Box sx={{ mx: 1, fontSize: 14 }}>
+          {page + 1} / {Math.max(1, Math.ceil(totalCount / rowsPerPage))}
+        </Box>
+        <MaterialUI.Button
+          size="small"
+          onClick={() => setPage(p => Math.min(Math.ceil(totalCount / rowsPerPage) - 1, p + 1))}
+          disabled={page >= Math.ceil(totalCount / rowsPerPage) - 1}
+        >{">"}</MaterialUI.Button>
+        <MaterialUI.Button
+          size="small"
+          onClick={() => setPage(Math.max(0, Math.ceil(totalCount / rowsPerPage) - 1))}
+          disabled={page >= Math.ceil(totalCount / rowsPerPage) - 1}
+        >{">>"}</MaterialUI.Button>
+      </Box>
     </MaterialUI.Paper>
   );
 };

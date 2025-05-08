@@ -335,6 +335,17 @@ const ProjectTab = () => {
     {width: 110, textAlign:'right'}  // 支払合計
   ];
 
+  const [page, setPage] = React.useState(0);
+  const rowsPerPage = 20;
+
+  // ページネーション用データ
+  const pagedFiltered = React.useMemo(() => {
+    return filtered.slice(page * rowsPerPage, page * rowsPerPage + rowsPerPage);
+  }, [filtered, page]);
+  const totalCount = filtered.length;
+  const startIdx = totalCount === 0 ? 0 : page * rowsPerPage + 1;
+  const endIdx = Math.min((page + 1) * rowsPerPage, totalCount);
+
   return (
     <Paper sx={{p:2, background:'#ffffff', borderRadius:3, boxShadow:'0 2px 8px #e3eafc'}}>
       <Typography variant="h6" gutterBottom sx={{fontWeight:700, color:'#1976d2', letterSpacing:1, mb:2}}>
@@ -371,6 +382,10 @@ const ProjectTab = () => {
         </Button>
       </Box>
 
+      <Box sx={{ mb: 1, fontSize: 14, color: '#555' }}>
+        {startIdx} ～ {endIdx} 件を表示 ({totalCount} 件中)
+      </Box>
+
       {/* ---------- 一覧テーブル ---------- */}
       <TableContainer sx={{maxHeight:440,overflowX:'auto', ...tableSx}}>
         <Table size="small" stickyHeader>
@@ -383,9 +398,9 @@ const ProjectTab = () => {
             </TableRow>
           </TableHead>
           <TableBody>
-            {filtered.map((e,i)=>(
+            {pagedFiltered.map((e,i)=>(
               <TableRow key={e.id} hover sx={{cursor:'pointer', transition:'background 0.2s'}} onClick={()=>handleRowClick(e)}>
-                <TableCell sx={projectTableCellSx[0]}>{i+1}</TableCell>
+                <TableCell sx={projectTableCellSx[0]}>{page * rowsPerPage + i + 1}</TableCell>
                 <TableCell sx={projectTableCellSx[1]}>
                   <Chip label={getStatus(e).label} color={getStatus(e).color} size="small" sx={{fontWeight:600}}/>
                 </TableCell>
@@ -404,6 +419,33 @@ const ProjectTab = () => {
           </TableBody>
         </Table>
       </TableContainer>
+
+      {/* ページネーション */}
+      <Box sx={{ display: 'flex', justifyContent: 'flex-end', alignItems: 'center', mt: 1 }}>
+        <Button
+          size="small"
+          onClick={() => setPage(0)}
+          disabled={page === 0}
+        >{"<<"}</Button>
+        <Button
+          size="small"
+          onClick={() => setPage(p => Math.max(0, p - 1))}
+          disabled={page === 0}
+        >{"<"}</Button>
+        <Box sx={{ mx: 1, fontSize: 14 }}>
+          {page + 1} / {Math.max(1, Math.ceil(totalCount / rowsPerPage))}
+        </Box>
+        <Button
+          size="small"
+          onClick={() => setPage(p => Math.min(Math.ceil(totalCount / rowsPerPage) - 1, p + 1))}
+          disabled={page >= Math.ceil(totalCount / rowsPerPage) - 1}
+        >{">"}</Button>
+        <Button
+          size="small"
+          onClick={() => setPage(Math.max(0, Math.ceil(totalCount / rowsPerPage) - 1))}
+          disabled={page >= Math.ceil(totalCount / rowsPerPage) - 1}
+        >{">>"}</Button>
+      </Box>
 
       {/* ---------- 詳細モーダル ---------- */}
       <Dialog open={!!selected} onClose={handleDialogClose} maxWidth="lg" fullWidth>
