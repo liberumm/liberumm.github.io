@@ -1,13 +1,90 @@
+const tableSx = {
+  borderRadius: 2,
+  boxShadow: 1,
+  border: '1px solid #b0bec5',
+  mb: 2,
+  background: '#fff',
+  '& table': {
+    borderCollapse: 'separate',
+    borderSpacing: 0
+  },
+  '& th, & td': {
+    borderRight: '1px solid #b0bec5'
+  },
+  '& th:last-of-type, & td:last-of-type': {
+    borderRight: 'none'
+  },
+  '& .MuiTableHead-root th': {
+    background: '#e3eafc',
+    fontWeight: 'bold',
+    fontSize: 15,
+    borderBottom: '2px solid #90caf9',
+    color: '#1a237e',
+    letterSpacing: 0.5,
+    padding: '8px 12px',
+    position: 'sticky',
+    top: 0,
+    zIndex: 2,
+    textAlign: 'center'
+  },
+  '& .MuiTableBody-root td': {
+    background: '#fff',
+    fontSize: 13,
+    borderBottom: '1px solid #b0bec5',
+    borderRight: '1px solid #b0bec5',
+    padding: '7px 10px'
+  },
+  '& .MuiTableRow-root:nth-of-type(even) td': {
+    background: '#f6f9fc'
+  },
+  '& .MuiTableRow-root:hover td': {
+    background: '#e3f2fd'
+  },
+  '& .amount-cell': {
+    color: '#1976d2',
+    fontWeight: 700,
+    textAlign: 'right'
+  },
+  '& .MuiTableCell-root': {
+    padding: '6px 10px'
+  }
+};
+const invoiceTableCellSx = [
+  {width: 100, textAlign: 'center'}, // 請求ID
+  {width: 100, textAlign: 'center'}, // 日付
+  {width: 100, textAlign: 'center'}, // 見積ID
+  {width: 100, textAlign: 'center'}, // 支払日
+  {width: 160, textAlign: 'center'}, // 請求名
+  {width: 120, textAlign: 'center'}, // 負担部署
+  {width: 110, textAlign: 'center'}, // 勘定科目
+  {width: 110, textAlign:'right'}, // 金額
+  {width: 140, textAlign: 'center'}, // 取引先
+  {width: 120, textAlign: 'center'}  // 取引先請求ID
+];
+
 const InvoiceTab = () => {
   const [invoices] = React.useState([
-    { id: 'I001', vendor: '○○建設', date: '2024-06-05', amount: 800000, department: '店舗開発部' },
-    { id: 'I002', vendor: '△△設備', date: '2024-06-13', amount: 300000, department: 'サイト開発部' }
+    // 案件詳細の列構成に合わせてサンプルデータも拡張
+    { invoiceId: 'I001', date: '2024-06-05', estimateId: 'E001', paymentDate: '2024-06-10', invoiceName: '什器請求A', department: '店舗開発部', account: '資産', amount: 800000, vendor: '○○建設', vendorInvoiceId: 'VI001-001' },
+    { invoiceId: 'I002', date: '2024-06-13', estimateId: 'E002', paymentDate: '2024-06-18', invoiceName: '工事請求', department: 'サイト開発部', account: '工事費', amount: 300000, vendor: '△△設備', vendorInvoiceId: 'VI002-001' }
   ]);
   
   const exportCSV = () => {
-    let csvContent = "data:text/csv;charset=utf-8,No.,日付,業者,金額,部署\n";
+    let csvContent = "data:text/csv;charset=utf-8,No.,請求ID,日付,見積ID,支払日,請求名,負担部署,勘定科目,金額,取引先,取引先請求ID\n";
     invoices.forEach((i, index) => {
-      const row = [index + 1, i.date, i.vendor, i.amount, i.department].join(",");
+      const row = [
+        index + 1,
+        i.invoiceId,
+        i.date,
+        i.estimateId,
+        i.paymentDate,
+        i.invoiceName,
+        i.department,
+        i.account,
+        i.amount,
+        i.vendor,
+        i.vendorInvoiceId
+      ].join(",");
       csvContent += row + "\n";
     });
     const encodedUri = encodeURI(csvContent);
@@ -27,25 +104,31 @@ const InvoiceTab = () => {
       <MaterialUI.Button variant="contained" size="small" onClick={exportCSV} sx={{ mb: 1 }}>
         エクスポート
       </MaterialUI.Button>
-      <MaterialUI.TableContainer sx={{ overflowX: 'auto' }}>
-        <MaterialUI.Table size="small">
+      <MaterialUI.TableContainer sx={{ maxHeight: 440, overflowX: 'auto', ...tableSx }}>
+        <MaterialUI.Table size="small" stickyHeader>
           <MaterialUI.TableHead>
             <MaterialUI.TableRow>
-              <MaterialUI.TableCell sx={{ fontWeight: 700 }}>No.</MaterialUI.TableCell>
-              <MaterialUI.TableCell sx={{ fontWeight: 700 }}>日付</MaterialUI.TableCell>
-              <MaterialUI.TableCell sx={{ fontWeight: 700 }}>業者</MaterialUI.TableCell>
-              <MaterialUI.TableCell sx={{ fontWeight: 700 }}>金額</MaterialUI.TableCell>
-              <MaterialUI.TableCell sx={{ fontWeight: 700 }}>部署</MaterialUI.TableCell>
+              <MaterialUI.TableCell sx={{ width: 48, textAlign: 'center' }}>No.</MaterialUI.TableCell>
+              {['請求ID','日付','見積ID','支払日','請求名','負担部署','勘定科目','金額','取引先','取引先請求ID']
+                .map((h,idx)=>
+                  <MaterialUI.TableCell key={h} sx={invoiceTableCellSx[idx]}>{h}</MaterialUI.TableCell>
+                )}
             </MaterialUI.TableRow>
           </MaterialUI.TableHead>
           <MaterialUI.TableBody>
             {invoices.map((i, index) => (
-              <MaterialUI.TableRow key={i.id} hover>
-                <MaterialUI.TableCell>{index + 1}</MaterialUI.TableCell>
-                <MaterialUI.TableCell>{i.date}</MaterialUI.TableCell>
-                <MaterialUI.TableCell>{i.vendor}</MaterialUI.TableCell>
-                <MaterialUI.TableCell>{i.amount.toLocaleString()}</MaterialUI.TableCell>
-                <MaterialUI.TableCell>{i.department}</MaterialUI.TableCell>
+              <MaterialUI.TableRow key={i.invoiceId} hover>
+                <MaterialUI.TableCell sx={{ width: 48, textAlign: 'center' }}>{index + 1}</MaterialUI.TableCell>
+                <MaterialUI.TableCell sx={invoiceTableCellSx[0]}>{i.invoiceId}</MaterialUI.TableCell>
+                <MaterialUI.TableCell sx={invoiceTableCellSx[1]}>{i.date}</MaterialUI.TableCell>
+                <MaterialUI.TableCell sx={invoiceTableCellSx[2]}>{i.estimateId}</MaterialUI.TableCell>
+                <MaterialUI.TableCell sx={invoiceTableCellSx[3]}>{i.paymentDate}</MaterialUI.TableCell>
+                <MaterialUI.TableCell sx={invoiceTableCellSx[4]}>{i.invoiceName}</MaterialUI.TableCell>
+                <MaterialUI.TableCell sx={invoiceTableCellSx[5]}>{i.department}</MaterialUI.TableCell>
+                <MaterialUI.TableCell sx={invoiceTableCellSx[6]}>{i.account}</MaterialUI.TableCell>
+                <MaterialUI.TableCell sx={invoiceTableCellSx[7]} className="amount-cell">{i.amount.toLocaleString()}</MaterialUI.TableCell>
+                <MaterialUI.TableCell sx={invoiceTableCellSx[8]}>{i.vendor}</MaterialUI.TableCell>
+                <MaterialUI.TableCell sx={invoiceTableCellSx[9]}>{i.vendorInvoiceId}</MaterialUI.TableCell>
               </MaterialUI.TableRow>
             ))}
           </MaterialUI.TableBody>
