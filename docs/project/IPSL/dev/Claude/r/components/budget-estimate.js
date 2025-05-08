@@ -1,13 +1,86 @@
+const tableSx = {
+  borderRadius: 2,
+  boxShadow: 1,
+  border: '1px solid #b0bec5',
+  mb: 2,
+  background: '#fff',
+  '& table': {
+    borderCollapse: 'separate',
+    borderSpacing: 0
+  },
+  '& th, & td': {
+    borderRight: '1px solid #b0bec5'
+  },
+  '& th:last-of-type, & td:last-of-type': {
+    borderRight: 'none'
+  },
+  '& .MuiTableHead-root th': {
+    background: '#e3eafc',
+    fontWeight: 'bold',
+    fontSize: 15,
+    borderBottom: '2px solid #90caf9',
+    color: '#1a237e',
+    letterSpacing: 0.5,
+    padding: '8px 12px',
+    position: 'sticky',
+    top: 0,
+    zIndex: 2,
+    textAlign: 'center'
+  },
+  '& .MuiTableBody-root td': {
+    background: '#fff',
+    fontSize: 13,
+    borderBottom: '1px solid #b0bec5',
+    borderRight: '1px solid #b0bec5',
+    padding: '7px 10px'
+  },
+  '& .MuiTableRow-root:nth-of-type(even) td': {
+    background: '#f6f9fc'
+  },
+  '& .MuiTableRow-root:hover td': {
+    background: '#e3f2fd'
+  },
+  '& .amount-cell': {
+    color: '#1976d2',
+    fontWeight: 700,
+    textAlign: 'right'
+  },
+  '& .MuiTableCell-root': {
+    padding: '6px 10px'
+  }
+};
+const estimateTableCellSx = [
+  {width: 100, textAlign: 'center'}, // 見積ID
+  {width: 100, textAlign: 'center'}, // 日付
+  {width: 160, textAlign: 'center'}, // 見積名
+  {width: 120, textAlign: 'center'}, // 負担部署
+  {width: 110, textAlign: 'center'}, // 勘定科目
+  {width: 110, textAlign:'right'}, // 金額
+  {width: 140, textAlign: 'center'}, // 取引先
+  {width: 120, textAlign: 'center'}  // 取引先見積ID
+];
+
 const EstimateTab = () => {
   const [estimates] = React.useState([
-    { id: 'E001', vendor: '○○建設', date: '2024-06-03', amount: 800000, department: '店舗開発部' },
-    { id: 'E002', vendor: '△△設備', date: '2024-06-11', amount: 300000, department: 'サイト開発部' }
+    // 案件詳細の列構成に合わせてサンプルデータも拡張
+    { estimateId: 'E001', date: '2024-06-03', estimateName: '什器購入見積A', department: '店舗開発部', account: '資産', amount: 800000, vendor: '○○建設', vendorEstimateId: 'VE001-001' },
+    { estimateId: 'E002', date: '2024-06-11', estimateName: '工事見積', department: 'サイト開発部', account: '工事費', amount: 300000, vendor: '△△設備', vendorEstimateId: 'VE002-001' }
   ]);
   
   const exportCSV = () => {
-    let csvContent = "data:text/csv;charset=utf-8,No.,日付,業者,金額,部署\n";
+    let csvContent = "data:text/csv;charset=utf-8,No.,見積ID,日付,見積名,負担部署,勘定科目,金額,取引先,取引先見積ID\n";
     estimates.forEach((e, index) => {
-      const row = [index + 1, e.date, e.vendor, e.amount, e.department].join(",");
+      const row = [
+        index + 1,
+        e.estimateId,
+        e.date,
+        e.estimateName,
+        e.department,
+        e.account,
+        e.amount,
+        e.vendor,
+        e.vendorEstimateId
+      ].join(",");
       csvContent += row + "\n";
     });
     const encodedUri = encodeURI(csvContent);
@@ -27,25 +100,29 @@ const EstimateTab = () => {
       <MaterialUI.Button variant="contained" size="small" onClick={exportCSV} sx={{ mb: 1 }}>
         エクスポート
       </MaterialUI.Button>
-      <MaterialUI.TableContainer sx={{ overflowX: 'auto' }}>
-        <MaterialUI.Table size="small">
+      <MaterialUI.TableContainer sx={{ maxHeight: 440, overflowX: 'auto', ...tableSx }}>
+        <MaterialUI.Table size="small" stickyHeader>
           <MaterialUI.TableHead>
             <MaterialUI.TableRow>
-              <MaterialUI.TableCell sx={{ fontWeight: 700 }}>No.</MaterialUI.TableCell>
-              <MaterialUI.TableCell sx={{ fontWeight: 700 }}>日付</MaterialUI.TableCell>
-              <MaterialUI.TableCell sx={{ fontWeight: 700 }}>業者</MaterialUI.TableCell>
-              <MaterialUI.TableCell sx={{ fontWeight: 700 }}>金額</MaterialUI.TableCell>
-              <MaterialUI.TableCell sx={{ fontWeight: 700 }}>部署</MaterialUI.TableCell>
+              <MaterialUI.TableCell sx={{ width: 48, textAlign: 'center' }}>No.</MaterialUI.TableCell>
+              {['見積ID','日付','見積名','負担部署','勘定科目','金額','取引先','取引先見積ID']
+                .map((h,idx)=>
+                  <MaterialUI.TableCell key={h} sx={estimateTableCellSx[idx]}>{h}</MaterialUI.TableCell>
+                )}
             </MaterialUI.TableRow>
           </MaterialUI.TableHead>
           <MaterialUI.TableBody>
             {estimates.map((e, index) => (
-              <MaterialUI.TableRow key={e.id} hover>
-                <MaterialUI.TableCell>{index + 1}</MaterialUI.TableCell>
-                <MaterialUI.TableCell>{e.date}</MaterialUI.TableCell>
-                <MaterialUI.TableCell>{e.vendor}</MaterialUI.TableCell>
-                <MaterialUI.TableCell>{e.amount.toLocaleString()}</MaterialUI.TableCell>
-                <MaterialUI.TableCell>{e.department}</MaterialUI.TableCell>
+              <MaterialUI.TableRow key={e.estimateId} hover>
+                <MaterialUI.TableCell sx={{ width: 48, textAlign: 'center' }}>{index + 1}</MaterialUI.TableCell>
+                <MaterialUI.TableCell sx={estimateTableCellSx[0]}>{e.estimateId}</MaterialUI.TableCell>
+                <MaterialUI.TableCell sx={estimateTableCellSx[1]}>{e.date}</MaterialUI.TableCell>
+                <MaterialUI.TableCell sx={estimateTableCellSx[2]}>{e.estimateName}</MaterialUI.TableCell>
+                <MaterialUI.TableCell sx={estimateTableCellSx[3]}>{e.department}</MaterialUI.TableCell>
+                <MaterialUI.TableCell sx={estimateTableCellSx[4]}>{e.account}</MaterialUI.TableCell>
+                <MaterialUI.TableCell sx={estimateTableCellSx[5]} className="amount-cell">{e.amount.toLocaleString()}</MaterialUI.TableCell>
+                <MaterialUI.TableCell sx={estimateTableCellSx[6]}>{e.vendor}</MaterialUI.TableCell>
+                <MaterialUI.TableCell sx={estimateTableCellSx[7]}>{e.vendorEstimateId}</MaterialUI.TableCell>
               </MaterialUI.TableRow>
             ))}
           </MaterialUI.TableBody>
