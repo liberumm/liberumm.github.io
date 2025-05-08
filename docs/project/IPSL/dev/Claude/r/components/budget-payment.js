@@ -1,4 +1,4 @@
-const { Paper, Typography, Table, TableHead, TableRow, TableCell, TableBody, TableContainer, Button, Chip, Dialog, DialogTitle, DialogContent, DialogActions, TextField, Select, MenuItem, FormControl, InputLabel } = MaterialUI;
+const { Paper, Typography, Table, TableHead, TableRow, TableCell, TableBody, TableContainer, Button, Chip, Dialog, DialogTitle, DialogContent, DialogActions, TextField, Select, MenuItem, FormControl, InputLabel, Box } = MaterialUI;
 
 const paymentStatusList = [
   { value: "advance", label: "前払い金", color: "warning" },
@@ -80,6 +80,17 @@ const PaymentTab = () => {
   const [selected, setSelected] = React.useState(null);
   const [edit, setEdit] = React.useState(null);
 
+  const [page, setPage] = React.useState(0);
+  const rowsPerPage = 20;
+
+  // ページネーション用データ
+  const pagedPayments = React.useMemo(() => {
+    return payments.slice(page * rowsPerPage, page * rowsPerPage + rowsPerPage);
+  }, [payments, page]);
+  const totalCount = payments.length;
+  const startIdx = totalCount === 0 ? 0 : page * rowsPerPage + 1;
+  const endIdx = Math.min((page + 1) * rowsPerPage, totalCount);
+
   const handleRowClick = (p) => {
     setSelected(p);
     setEdit({ ...p });
@@ -137,6 +148,10 @@ const PaymentTab = () => {
       <Button variant="contained" size="small" onClick={exportCSV} sx={{ mb: 1 }}>
         エクスポート
       </Button>
+      {/* 件数表示 */}
+      <Box sx={{ mb: 1, fontSize: 14, color: '#555' }}>
+        {startIdx} ～ {endIdx} 件を表示 ({totalCount} 件中)
+      </Box>
       <TableContainer sx={{ maxHeight: 440, overflowX: 'auto', ...tableSx }}>
         <Table size="small" stickyHeader>
           <TableHead>
@@ -149,9 +164,9 @@ const PaymentTab = () => {
             </TableRow>
           </TableHead>
           <TableBody>
-            {payments.map((p, index) => (
+            {pagedPayments.map((p, index) => (
               <TableRow key={p.paymentId} hover style={{ cursor: 'pointer' }} onClick={() => handleRowClick(p)}>
-                <TableCell sx={{ width: 48, textAlign: 'center' }}>{index + 1}</TableCell>
+                <TableCell sx={{ width: 48, textAlign: 'center' }}>{page * rowsPerPage + index + 1}</TableCell>
                 <TableCell sx={paymentTableCellSx[0]}>{p.paymentId}</TableCell>
                 <TableCell sx={paymentTableCellSx[1]}>{p.date}</TableCell>
                 <TableCell sx={paymentTableCellSx[2]}>{p.estimateId}</TableCell>
@@ -168,7 +183,32 @@ const PaymentTab = () => {
           </TableBody>
         </Table>
       </TableContainer>
-
+      {/* ページネーション */}
+      <Box sx={{ display: 'flex', justifyContent: 'flex-end', alignItems: 'center', mt: 1 }}>
+        <Button
+          size="small"
+          onClick={() => setPage(0)}
+          disabled={page === 0}
+        >{"<<"}</Button>
+        <Button
+          size="small"
+          onClick={() => setPage(p => Math.max(0, p - 1))}
+          disabled={page === 0}
+        >{"<"}</Button>
+        <Box sx={{ mx: 1, fontSize: 14 }}>
+          {page + 1} / {Math.max(1, Math.ceil(totalCount / rowsPerPage))}
+        </Box>
+        <Button
+          size="small"
+          onClick={() => setPage(p => Math.min(Math.ceil(totalCount / rowsPerPage) - 1, p + 1))}
+          disabled={page >= Math.ceil(totalCount / rowsPerPage) - 1}
+        >{">"}</Button>
+        <Button
+          size="small"
+          onClick={() => setPage(Math.max(0, Math.ceil(totalCount / rowsPerPage) - 1))}
+          disabled={page >= Math.ceil(totalCount / rowsPerPage) - 1}
+        >{">>"}</Button>
+      </Box>
       {/* 編集ダイアログ */}
       <Dialog open={!!selected} onClose={handleDialogClose} maxWidth="xs" fullWidth>
         <DialogTitle>支払詳細・編集</DialogTitle>
