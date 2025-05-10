@@ -1,0 +1,242 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <title>CSV マッピングプレビュー＆本取込み</title>
+  <script src="https://cdn.jsdelivr.net/npm/papaparse@5.4.1/papaparse.min.js"></script>
+  <style>
+    body { font-family: sans-serif; margin: 20px; }
+    table { border-collapse: collapse; width: 100%; margin-bottom: 10px; }
+    th, td { border: 1px solid #ccc; padding: 6px; text-align: center; }
+    button { padding: 6px 12px; margin: 4px 4px 4px 0; }
+    /* モーダル */
+    .modal {
+      display: none; position: fixed; z-index: 1000;
+      left: 0; top: 0; width: 100%; height: 100%;
+      background-color: rgba(0,0,0,0.5); overflow: auto;
+    }
+    .modal-content {
+      background: #fff; margin: 5% auto; padding: 20px;
+      border-radius: 4px; width: 90%; max-width: 900px;
+      position: relative;
+    }
+    .close {
+      position: absolute; top: 10px; right: 15px;
+      font-size: 24px; cursor: pointer;
+    }
+    .hidden { display: none; }
+    select, input[type="text"] { width: 100%; box-sizing: border-box; }
+    .mapping-table th, .mapping-table td { padding: 4px; }
+    .preview-table th, .preview-table td { padding: 4px; }
+  </style>
+</head>
+<body>
+
+  <h1>基本レイアウト テーブル</h1>
+  <table id="mainTable">
+    <thead><tr id="mainHeader"></tr></thead>
+    <tbody></tbody>
+  </table>
+  <button id="openModalBtn">インポート</button>
+  <button id="exportBtn">エクスポート</button>
+
+  <!-- モーダル -->
+  <div id="importModal" class="modal">
+    <div class="modal-content">
+      <span class="close">&times;</span>
+      <h2>CSV 取込みプレビュー＆マッピング</h2>
+
+      <!-- ステップ 1: CSV 選択 -->
+      <div>
+        <label><strong>1. CSV ファイル選択</strong></label><br>
+        <input type="file" id="csvFileInput" accept=".csv">
+      </div>
+
+      <!-- プレビュー: ヘッダー＋サンプル行 -->
+      <div id="csvPreview" class="hidden">
+        <h3>CSV プレビュー（ヘッダー行とサンプル）</h3>
+        <table class="preview-table">
+          <thead><tr id="previewHeader"></tr></thead>
+          <tbody><tr id="previewSample"></tr></tbody>
+        </table>
+      </div>
+
+      <!-- ステップ 2: マッピング設定 -->
+      <div id="mappingArea" class="hidden">
+        <h3>2. 基本レイアウトとのマッピング</h3>
+        <table class="mapping-table">
+          <thead><tr><th>基本フィールド</th><th>CSV ヘッダー選択</th><th>サンプル値</th></tr></thead>
+          <tbody id="mappingBody"></tbody>
+        </table>
+      </div>
+
+      <!-- 本取込み・取消 -->
+      <div id="actionsArea" class="hidden">
+        <button id="confirmImportBtn">本取込み</button>
+        <button id="cancelImportBtn">取消</button>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    // ── 定義 ──
+    const baseFields = ["商品コード","商品名","数量","価格","日付"];
+    let csvHeaders = [];     // ["ヘッダー1","ヘッダー2",...]
+    let csvSample = {};      // {ヘッダー1: 値, ...}
+
+    // メインテーブル ヘッダー生成
+    const mainHeader = document.getElementById("mainHeader");
+    baseFields.forEach(f=>{
+      const th = document.createElement("th");
+      th.textContent = f;
+      mainHeader.appendChild(th);
+    });
+
+    // テンプレート保存用（必要なら拡張）
+    function loadTemplates(){ return []; }
+    function saveTemplates(t){}
+
+    // ── モーダル要素 ──
+    const modal    = document.getElementById("importModal");
+    const openBtn  = document.getElementById("openModalBtn");
+    const closeBtn = document.querySelector(".close");
+    const csvInput = document.getElementById("csvFileInput");
+    const previewDiv = document.getElementById("csvPreview");
+    const previewHdr = document.getElementById("previewHeader");
+    const previewSmp = document.getElementById("previewSample");
+    const mappingDiv = document.getElementById("mappingArea");
+    const mappingBody= document.getElementById("mappingBody");
+    const actionsDiv = document.getElementById("actionsArea");
+    const confirmBtn= document.getElementById("confirmImportBtn");
+    const cancelBtn = document.getElementById("cancelImportBtn");
+
+    // 開閉制御
+    openBtn.onclick   = ()=>{ modal.style.display="block"; resetModal(); };
+    closeBtn.onclick  = ()=>{ modal.style.display="none"; };
+    window.onclick    = e=>{ if(e.target===modal) modal.style.display="none"; };
+
+    function resetModal(){
+      csvInput.value = "";
+      previewDiv.classList.add("hidden");
+      mappingDiv.classList.add("hidden");
+      actionsDiv.classList.add("hidden");
+      previewHdr.innerHTML = "";
+      previewSmp.innerHTML = "";
+      mappingBody.innerHTML = "";
+    }
+
+    // ── CSV 選択後：ヘッダー＋サンプル取得 ──
+    csvInput.onchange = ()=>{
+      const file = csvInput.files[0];
+      if(!file) return;
+      Papa.parse(file, {
+        header: true,
+        preview: 1,  // 最初のデータ行のみ取得
+        skipEmptyLines: true,
+        complete: results => {
+          csvHeaders = results.meta.fields;        // ヘッダー配列
+          csvSample  = results.data[0] || {};      // 最初の行のオブジェクト
+          buildCsvPreview();
+          buildMappingTable();
+          previewDiv.classList.remove("hidden");
+          mappingDiv.classList.remove("hidden");
+          actionsDiv.classList.remove("hidden");
+        },
+        error: err=> alert("CSV 読み込みエラー："+ err.message)
+      });
+    };
+
+    // プレビュー部作成
+    function buildCsvPreview(){
+      previewHdr.innerHTML = "";
+      previewSmp.innerHTML = "";
+      csvHeaders.forEach(h=>{
+        const th = document.createElement("th"); th.textContent = h;
+        const td = document.createElement("td"); td.textContent  = csvSample[h] || "";
+        previewHdr.appendChild(th);
+        previewSmp.appendChild(td);
+      });
+    }
+
+    // マッピングテーブル作成
+    function buildMappingTable(){
+      mappingBody.innerHTML = "";
+      baseFields.forEach(field=>{
+        const tr = document.createElement("tr");
+        // 基本フィールド名
+        const td1 = document.createElement("td");
+        td1.textContent = field;
+        // マッピング用 select
+        const td2 = document.createElement("td");
+        const sel = document.createElement("select");
+        const emptyOpt = document.createElement("option"); emptyOpt.value=""; emptyOpt.textContent="(未設定)";
+        sel.appendChild(emptyOpt);
+        csvHeaders.forEach(h=>{
+          const opt = document.createElement("option"); opt.value=h; opt.textContent=h;
+          sel.appendChild(opt);
+        });
+        td2.appendChild(sel);
+        // 選択中ヘッダーのサンプル値
+        const td3 = document.createElement("td");
+        td3.textContent = "";
+        // セレクト変更時にサンプル値更新
+        sel.onchange = ()=> {
+          td3.textContent = csvSample[sel.value] || "";
+        };
+        tr.appendChild(td1);
+        tr.appendChild(td2);
+        tr.appendChild(td3);
+        mappingBody.appendChild(tr);
+      });
+    }
+
+    // ── 本取込み／取消 ──
+    confirmBtn.onclick = ()=>{
+      const mainTbody = document.querySelector("#mainTable tbody");
+      document.querySelectorAll("#mappingBody tr").forEach(tr=>{
+        const sel = tr.querySelector("select");
+        const key = sel.value;
+        // 未設定は飛ばす
+        if(!key) return;
+        const newTr = document.createElement("tr");
+        baseFields.forEach(field=>{
+          const td = document.createElement("td");
+          // field に対応するセレクトを再検索
+          const mapSel = Array.from(mappingBody.querySelectorAll("tr"))
+            .find(r=> r.children[0].textContent === field )
+            .querySelector("select");
+          const mapped = mapSel.value;
+          td.textContent = mapped ? csvSample[mapped] || "" : "";
+          newTr.appendChild(td);
+        });
+        mainTbody.appendChild(newTr);
+      });
+      modal.style.display = "none";
+    };
+
+    cancelBtn.onclick = ()=>{
+      // 何もしないでプレビュー・マッピング破棄
+      resetModal();
+    };
+
+    // ── エクスポート ──
+    document.getElementById("exportBtn").onclick = ()=>{
+      const data = [];
+      document.querySelectorAll("#mainTable tbody tr").forEach(tr=>{
+        const obj = {};
+        baseFields.forEach((f,i)=> obj[f] = tr.children[i].textContent);
+        data.push(obj);
+      });
+      if(data.length===0){ alert("エクスポートデータがありません"); return; }
+      const csv = Papa.unparse({ fields: baseFields, data });
+      const blob = new Blob([csv],{type:"text/csv;charset=utf-8;"} );
+      const url  = URL.createObjectURL(blob);
+      const a    = document.createElement("a");
+      a.href     = url;
+      a.download = "base_table.csv";
+      a.click();
+      URL.revokeObjectURL(url);
+    };
+  </script>
+</body>
+</html>
