@@ -2,241 +2,388 @@
 <html lang="ja">
 <head>
   <meta charset="UTF-8">
-  <title>CSV マッピングプレビュー＆本取込み</title>
-  <script src="https://cdn.jsdelivr.net/npm/papaparse@5.4.1/papaparse.min.js"></script>
+  <title>CSV インポート／マッピング React＋MUI</title>
+
+  <!-- CDN -->
+  <script src="https://cdn.jsdelivr.net/npm/react@18/umd/react.production.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/react-dom@18/umd/react-dom.production.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@mui/material@5.15.14/umd/material-ui.production.min.js"></script>
+  <script src="https://unpkg.com/react-beautiful-dnd@13.1.0/dist/react-beautiful-dnd.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.2/babel.min.js"></script>
+  <script src="https://unpkg.com/xlsx/dist/xlsx.full.min.js"></script>
+
+  <!-- Roboto / Icons -->
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Roboto:300,400,500,700&display=swap" />
+  <link rel="stylesheet" href="https://fonts.googleapis.com/icon?family=Material+Icons" />
+
   <style>
-    body { font-family: sans-serif; margin: 20px; }
-    table { border-collapse: collapse; width: 100%; margin-bottom: 10px; }
-    th, td { border: 1px solid #ccc; padding: 6px; text-align: center; }
-    button { padding: 6px 12px; margin: 4px 4px 4px 0; }
-    /* モーダル */
-    .modal {
-      display: none; position: fixed; z-index: 1000;
-      left: 0; top: 0; width: 100%; height: 100%;
-      background-color: rgba(0,0,0,0.5); overflow: auto;
+    body { margin: 0; padding: 20px; font-family: Roboto, sans-serif; }
+    #root { max-width: 1200px; margin: auto; }
+    .droppableBox {
+      min-height: 40px;
+      padding: 8px;
+      border: 1px dashed #ccc;
+      border-radius: 4px;
+      background: #fafafa;
     }
-    .modal-content {
-      background: #fff; margin: 5% auto; padding: 20px;
-      border-radius: 4px; width: 90%; max-width: 900px;
-      position: relative;
+    .draggableItem {
+      padding: 4px 8px;
+      margin-bottom: 4px;
+      background: #e0e0e0;
+      border-radius: 4px;
+      cursor: grab;
     }
-    .close {
-      position: absolute; top: 10px; right: 15px;
-      font-size: 24px; cursor: pointer;
-    }
-    .hidden { display: none; }
-    select, input[type="text"] { width: 100%; box-sizing: border-box; }
-    .mapping-table th, .mapping-table td { padding: 4px; }
-    .preview-table th, .preview-table td { padding: 4px; }
   </style>
 </head>
 <body>
+  <div id="root"></div>
 
-  <h1>基本レイアウト テーブル</h1>
-  <table id="mainTable">
-    <thead><tr id="mainHeader"></tr></thead>
-    <tbody></tbody>
-  </table>
-  <button id="openModalBtn">インポート</button>
-  <button id="exportBtn">エクスポート</button>
+  <script type="text/babel">
+    const {
+      Button, Dialog, DialogTitle, DialogContent, DialogActions,
+      Table, TableBody, TableCell, TableContainer, TableHead, TableRow, Paper,
+      Typography, Box, Grid
+    } = MaterialUI;
+    const { DragDropContext, Droppable, Draggable } = ReactBeautifulDnd;
 
-  <!-- モーダル -->
-  <div id="importModal" class="modal">
-    <div class="modal-content">
-      <span class="close">&times;</span>
-      <h2>CSV 取込みプレビュー＆マッピング</h2>
-
-      <!-- ステップ 1: CSV 選択 -->
-      <div>
-        <label><strong>1. CSV ファイル選択</strong></label><br>
-        <input type="file" id="csvFileInput" accept=".csv">
-      </div>
-
-      <!-- プレビュー: ヘッダー＋サンプル行 -->
-      <div id="csvPreview" class="hidden">
-        <h3>CSV プレビュー（ヘッダー行とサンプル）</h3>
-        <table class="preview-table">
-          <thead><tr id="previewHeader"></tr></thead>
-          <tbody><tr id="previewSample"></tr></tbody>
-        </table>
-      </div>
-
-      <!-- ステップ 2: マッピング設定 -->
-      <div id="mappingArea" class="hidden">
-        <h3>2. 基本レイアウトとのマッピング</h3>
-        <table class="mapping-table">
-          <thead><tr><th>基本フィールド</th><th>CSV ヘッダー選択</th><th>サンプル値</th></tr></thead>
-          <tbody id="mappingBody"></tbody>
-        </table>
-      </div>
-
-      <!-- 本取込み・取消 -->
-      <div id="actionsArea" class="hidden">
-        <button id="confirmImportBtn">本取込み</button>
-        <button id="cancelImportBtn">取消</button>
-      </div>
-    </div>
-  </div>
-
-  <script>
-    // ── 定義 ──
     const baseFields = ["商品コード","商品名","数量","価格","日付"];
-    let csvHeaders = [];     // ["ヘッダー1","ヘッダー2",...]
-    let csvSample = {};      // {ヘッダー1: 値, ...}
 
-    // メインテーブル ヘッダー生成
-    const mainHeader = document.getElementById("mainHeader");
-    baseFields.forEach(f=>{
-      const th = document.createElement("th");
-      th.textContent = f;
-      mainHeader.appendChild(th);
-    });
+    function App() {
+      const [mainData, setMainData] = React.useState([]);
+      const [open, setOpen] = React.useState(false);
 
-    // テンプレート保存用（必要なら拡張）
-    function loadTemplates(){ return []; }
-    function saveTemplates(t){}
+      const handleImport = rows => {
+        setMainData(prev => [...prev, ...rows]);
+      };
 
-    // ── モーダル要素 ──
-    const modal    = document.getElementById("importModal");
-    const openBtn  = document.getElementById("openModalBtn");
-    const closeBtn = document.querySelector(".close");
-    const csvInput = document.getElementById("csvFileInput");
-    const previewDiv = document.getElementById("csvPreview");
-    const previewHdr = document.getElementById("previewHeader");
-    const previewSmp = document.getElementById("previewSample");
-    const mappingDiv = document.getElementById("mappingArea");
-    const mappingBody= document.getElementById("mappingBody");
-    const actionsDiv = document.getElementById("actionsArea");
-    const confirmBtn= document.getElementById("confirmImportBtn");
-    const cancelBtn = document.getElementById("cancelImportBtn");
+      const handleExport = () => {
+        if (mainData.length === 0) {
+          alert("エクスポートするデータがありません");
+          return;
+        }
+        // ワークブック生成
+        const ws = XLSX.utils.json_to_sheet(mainData, { header: baseFields });
+        const csv = XLSX.utils.sheet_to_csv(ws);
+        const blob = new Blob([csv], { type: "text/csv;charset=utf-8;" });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        a.href = url;
+        a.download = "base_table.csv";
+        a.click();
+        URL.revokeObjectURL(url);
+      };
 
-    // 開閉制御
-    openBtn.onclick   = ()=>{ modal.style.display="block"; resetModal(); };
-    closeBtn.onclick  = ()=>{ modal.style.display="none"; };
-    window.onclick    = e=>{ if(e.target===modal) modal.style.display="none"; };
+      return (
+        <Box>
+          <Typography variant="h4" gutterBottom>基本レイアウト テーブル</Typography>
+          <TableContainer component={Paper} sx={{ mb: 2 }}>
+            <Table size="small">
+              <TableHead>
+                <TableRow>
+                  {baseFields.map(f => <TableCell key={f}>{f}</TableCell>)}
+                </TableRow>
+              </TableHead>
+              <TableBody>
+                {mainData.map((row, idx) => (
+                  <TableRow key={idx}>
+                    {baseFields.map(f => <TableCell key={f}>{row[f]}</TableCell>)}
+                  </TableRow>
+                ))}
+              </TableBody>
+            </Table>
+          </TableContainer>
+          <Button variant="contained" onClick={() => setOpen(true)} sx={{ mr: 1 }}>
+            インポート
+          </Button>
+          <Button variant="outlined" onClick={handleExport}>
+            エクスポート
+          </Button>
 
-    function resetModal(){
-      csvInput.value = "";
-      previewDiv.classList.add("hidden");
-      mappingDiv.classList.add("hidden");
-      actionsDiv.classList.add("hidden");
-      previewHdr.innerHTML = "";
-      previewSmp.innerHTML = "";
-      mappingBody.innerHTML = "";
+          <ImportDialog
+            open={open}
+            onClose={() => setOpen(false)}
+            onConfirm={handleImport}
+          />
+        </Box>
+      );
     }
 
-    // ── CSV 選択後：ヘッダー＋サンプル取得 ──
-    csvInput.onchange = ()=>{
-      const file = csvInput.files[0];
-      if(!file) return;
-      Papa.parse(file, {
-        header: true,
-        preview: 1,  // 最初のデータ行のみ取得
-        skipEmptyLines: true,
-        complete: results => {
-          csvHeaders = results.meta.fields;        // ヘッダー配列
-          csvSample  = results.data[0] || {};      // 最初の行のオブジェクト
-          buildCsvPreview();
-          buildMappingTable();
-          previewDiv.classList.remove("hidden");
-          mappingDiv.classList.remove("hidden");
-          actionsDiv.classList.remove("hidden");
-        },
-        error: err=> alert("CSV 読み込みエラー："+ err.message)
-      });
-    };
+    function ImportDialog({ open, onClose, onConfirm }) {
+      const [file, setFile] = React.useState(null);
+      const [csvHeaders, setCsvHeaders] = React.useState([]);
+      const [csvSample, setCsvSample] = React.useState({});
+      const [mapping, setMapping] = React.useState({});
+      const [unassigned, setUnassigned] = React.useState([]);
+      const [staging, setStaging] = React.useState(null);
 
-    // プレビュー部作成
-    function buildCsvPreview(){
-      previewHdr.innerHTML = "";
-      previewSmp.innerHTML = "";
-      csvHeaders.forEach(h=>{
-        const th = document.createElement("th"); th.textContent = h;
-        const td = document.createElement("td"); td.textContent  = csvSample[h] || "";
-        previewHdr.appendChild(th);
-        previewSmp.appendChild(td);
-      });
-    }
-
-    // マッピングテーブル作成
-    function buildMappingTable(){
-      mappingBody.innerHTML = "";
-      baseFields.forEach(field=>{
-        const tr = document.createElement("tr");
-        // 基本フィールド名
-        const td1 = document.createElement("td");
-        td1.textContent = field;
-        // マッピング用 select
-        const td2 = document.createElement("td");
-        const sel = document.createElement("select");
-        const emptyOpt = document.createElement("option"); emptyOpt.value=""; emptyOpt.textContent="(未設定)";
-        sel.appendChild(emptyOpt);
-        csvHeaders.forEach(h=>{
-          const opt = document.createElement("option"); opt.value=h; opt.textContent=h;
-          sel.appendChild(opt);
-        });
-        td2.appendChild(sel);
-        // 選択中ヘッダーのサンプル値
-        const td3 = document.createElement("td");
-        td3.textContent = "";
-        // セレクト変更時にサンプル値更新
-        sel.onchange = ()=> {
-          td3.textContent = csvSample[sel.value] || "";
+      // CSVプレビュー（ヘッダー＋サンプル行）取得
+      const handleFile = e => {
+        const f = e.target.files[0];
+        if (!f) return;
+        setFile(f);
+        const reader = new FileReader();
+        reader.onload = ev => {
+          const wb = XLSX.read(ev.target.result, { type: 'binary' });
+          const ws = wb.Sheets[wb.SheetNames[0]];
+          const arr = XLSX.utils.sheet_to_json(ws, { header: 1, defval: "" });
+          const [hdr, sample] = arr;
+          setCsvHeaders(hdr);
+          const sampleObj = {};
+          hdr.forEach((h,i) => sampleObj[h] = sample[i]);
+          setCsvSample(sampleObj);
+          // 初期マッピング・未割当
+          const initMap = {};
+          baseFields.forEach(f => initMap[f] = null);
+          setMapping(initMap);
+          setUnassigned([...hdr]);
+          setStaging(null);
         };
-        tr.appendChild(td1);
-        tr.appendChild(td2);
-        tr.appendChild(td3);
-        mappingBody.appendChild(tr);
-      });
+        reader.readAsBinaryString(f);
+      };
+
+      // DnD 終了時
+      const onDragEnd = result => {
+        const { source, destination, draggableId } = result;
+        if (!destination) return;
+        const srcId = source.droppableId;
+        const dstId = destination.droppableId;
+        // dragging among unassigned headers
+        if (srcId === 'unassigned' && dstId === 'unassigned') {
+          const items = Array.from(unassigned);
+          items.splice(source.index, 1);
+          items.splice(destination.index, 0, draggableId);
+          setUnassigned(items);
+          return;
+        }
+        // ヘッダー → マッピング
+        if (srcId === 'unassigned' && baseFields.includes(dstId)) {
+          // 割当
+          const prev = mapping[dstId];
+          const newUn = unassigned.filter(h => h !== draggableId);
+          // もし prev があれば戻す
+          if (prev) newUn.push(prev);
+          setUnassigned(newUn);
+          setMapping({ ...mapping, [dstId]: draggableId });
+        }
+        // マッピング → アンアサイン
+        if (baseFields.includes(srcId) && dstId === 'unassigned') {
+          const hdr = mapping[srcId];
+          if (!hdr) return;
+          const newUn2 = Array.from(unassigned);
+          newUn2.splice(destination.index, 0, hdr);
+          setUnassigned(newUn2);
+          setMapping({ ...mapping, [srcId]: null });
+        }
+        // マッピング間の交換
+        if (baseFields.includes(srcId) && baseFields.includes(dstId)) {
+          const srcHdr = mapping[srcId];
+          const dstHdr = mapping[dstId];
+          const newMap = { ...mapping };
+          newMap[srcId] = dstHdr;
+          newMap[dstId] = srcHdr;
+          setMapping(newMap);
+        }
+      };
+
+      // プレビュー（全行変換）
+      const handlePreview = () => {
+        if (!file) { alert("CSVを選択してください"); return; }
+        // 読み込み
+        const reader = new FileReader();
+        reader.onload = ev => {
+          const wb = XLSX.read(ev.target.result, { type: 'binary' });
+          const ws = wb.Sheets[wb.SheetNames[0]];
+          // ヘッダー行をスキップしてオブジェクト化
+          const json = XLSX.utils.sheet_to_json(ws, {
+            header: csvHeaders,
+            range: 1,
+            defval: ""
+          });
+          // マッピング適用
+          const conv = json.map(row => {
+            const out = {};
+            baseFields.forEach(f => {
+              const key = mapping[f];
+              out[f] = key ? row[key] : "";
+            });
+            return out;
+          });
+          setStaging(conv);
+        };
+        reader.readAsBinaryString(file);
+      };
+
+      // 本取込み
+      const handleConfirm = () => {
+        onConfirm(staging);
+        resetAll();
+        onClose();
+      };
+      const handleCancel = () => {
+        setStaging(null);
+      };
+
+      const resetAll = () => {
+        setFile(null);
+        setCsvHeaders([]);
+        setCsvSample({});
+        setMapping({});
+        setUnassigned([]);
+        setStaging(null);
+      };
+
+      return (
+        <Dialog fullWidth maxWidth="lg" open={open} onClose={onClose}>
+          <DialogTitle>CSVインポート＆マッピング</DialogTitle>
+          <DialogContent>
+            <Box mb={2}>
+              <Typography variant="subtitle1"><strong>1. CSVファイル選択</strong></Typography>
+              <input type="file" accept=".csv" onChange={handleFile} />
+            </Box>
+
+            {csvHeaders.length > 0 && (
+              <>
+                <Box mb={2}>
+                  <Typography variant="subtitle1"><strong>2. ヘッダー＆サンプルプレビュー</strong></Typography>
+                  <TableContainer component={Paper} variant="outlined" sx={{ mb: 1 }}>
+                    <Table size="small">
+                      <TableHead>
+                        <TableRow>
+                          {csvHeaders.map(h => <TableCell key={h}>{h}</TableCell>)}
+                        </TableRow>
+                      </TableHead>
+                      <TableBody>
+                        <TableRow>
+                          {csvHeaders.map(h => <TableCell key={h}>{csvSample[h]}</TableCell>)}
+                        </TableRow>
+                      </TableBody>
+                    </Table>
+                  </TableContainer>
+                </Box>
+
+                <Box mb={2}>
+                  <Typography variant="subtitle1"><strong>3. マッピング（ドラッグ＆ドロップ）</strong></Typography>
+                  <DragDropContext onDragEnd={onDragEnd}>
+                    <Grid container spacing={2}>
+                      <Grid item xs={5}>
+                        <Typography>未割当ヘッダー</Typography>
+                        <Droppable droppableId="unassigned">
+                          {provided => (
+                            <Box
+                              ref={provided.innerRef}
+                              {...provided.droppableProps}
+                              className="droppableBox"
+                            >
+                              {unassigned.map((h, idx) => (
+                                <Draggable key={h} draggableId={h} index={idx}>
+                                  {prov => (
+                                    <Box
+                                      ref={prov.innerRef}
+                                      {...prov.draggableProps}
+                                      {...prov.dragHandleProps}
+                                      className="draggableItem"
+                                    >
+                                      {h}
+                                    </Box>
+                                  )}
+                                </Draggable>
+                              ))}
+                              {provided.placeholder}
+                            </Box>
+                          )}
+                        </Droppable>
+                      </Grid>
+                      <Grid item xs={7}>
+                        <Typography>基本フィールド割当先</Typography>
+                        <Grid container spacing={1}>
+                          {baseFields.map(field => (
+                            <Grid item xs={6} key={field}>
+                              <Typography variant="body2">{field}</Typography>
+                              <Droppable droppableId={field}>
+                                {prov => (
+                                  <Box
+                                    ref={prov.innerRef}
+                                    {...prov.droppableProps}
+                                    className="droppableBox"
+                                  >
+                                    {mapping[field] && (
+                                      <Draggable
+                                        key={mapping[field]}
+                                        draggableId={mapping[field]}
+                                        index={0}
+                                      >
+                                        {p => (
+                                          <Box
+                                            ref={p.innerRef}
+                                            {...p.draggableProps}
+                                            {...p.dragHandleProps}
+                                            className="draggableItem"
+                                          >
+                                            {mapping[field]}
+                                          </Box>
+                                        )}
+                                      </Draggable>
+                                    )}
+                                    {prov.placeholder}
+                                  </Box>
+                                )}
+                              </Droppable>
+                              <Typography variant="caption">
+                                サンプル: {mapping[field] ? csvSample[mapping[field]] : "—"}
+                              </Typography>
+                            </Grid>
+                          ))}
+                        </Grid>
+                      </Grid>
+                    </Grid>
+                  </DragDropContext>
+                </Box>
+
+                <Box mb={2}>
+                  <Button variant="contained" onClick={handlePreview} disabled={!file}>
+                    プレビュー（全行変換）
+                  </Button>
+                </Box>
+              </>
+            )}
+
+            {staging && (
+              <Box mb={2}>
+                <Typography variant="subtitle1"><strong>4. 取込みプレビュー</strong></Typography>
+                <TableContainer component={Paper} variant="outlined" sx={{ maxHeight: 300 }}>
+                  <Table size="small" stickyHeader>
+                    <TableHead>
+                      <TableRow>
+                        {baseFields.map(f => <TableCell key={f}>{f}</TableCell>)}
+                      </TableRow>
+                    </TableHead>
+                    <TableBody>
+                      {staging.map((row, i) => (
+                        <TableRow key={i}>
+                          {baseFields.map(f => <TableCell key={f}>{row[f]}</TableCell>)}
+                        </TableRow>
+                      ))}
+                    </TableBody>
+                  </Table>
+                </TableContainer>
+              </Box>
+            )}
+
+          </DialogContent>
+          <DialogActions>
+            {staging && (
+              <>
+                <Button onClick={handleCancel}>取消</Button>
+                <Button variant="contained" onClick={handleConfirm}>本取込み</Button>
+              </>
+            )}
+            <Button onClick={onClose}>閉じる</Button>
+          </DialogActions>
+        </Dialog>
+      );
     }
 
-    // ── 本取込み／取消 ──
-    confirmBtn.onclick = ()=>{
-      const mainTbody = document.querySelector("#mainTable tbody");
-      document.querySelectorAll("#mappingBody tr").forEach(tr=>{
-        const sel = tr.querySelector("select");
-        const key = sel.value;
-        // 未設定は飛ばす
-        if(!key) return;
-        const newTr = document.createElement("tr");
-        baseFields.forEach(field=>{
-          const td = document.createElement("td");
-          // field に対応するセレクトを再検索
-          const mapSel = Array.from(mappingBody.querySelectorAll("tr"))
-            .find(r=> r.children[0].textContent === field )
-            .querySelector("select");
-          const mapped = mapSel.value;
-          td.textContent = mapped ? csvSample[mapped] || "" : "";
-          newTr.appendChild(td);
-        });
-        mainTbody.appendChild(newTr);
-      });
-      modal.style.display = "none";
-    };
-
-    cancelBtn.onclick = ()=>{
-      // 何もしないでプレビュー・マッピング破棄
-      resetModal();
-    };
-
-    // ── エクスポート ──
-    document.getElementById("exportBtn").onclick = ()=>{
-      const data = [];
-      document.querySelectorAll("#mainTable tbody tr").forEach(tr=>{
-        const obj = {};
-        baseFields.forEach((f,i)=> obj[f] = tr.children[i].textContent);
-        data.push(obj);
-      });
-      if(data.length===0){ alert("エクスポートデータがありません"); return; }
-      const csv = Papa.unparse({ fields: baseFields, data });
-      const blob = new Blob([csv],{type:"text/csv;charset=utf-8;"} );
-      const url  = URL.createObjectURL(blob);
-      const a    = document.createElement("a");
-      a.href     = url;
-      a.download = "base_table.csv";
-      a.click();
-      URL.revokeObjectURL(url);
-    };
+    ReactDOM.createRoot(document.getElementById('root')).render(<App />);
   </script>
 </body>
 </html>
