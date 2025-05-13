@@ -1,0 +1,511 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8" />
+  <title>CSV マッピング定義・インポート・エクスポート（デモ用）</title>
+
+  <!-- ===== CDN ===== -->
+  <script src="https://cdn.jsdelivr.net/npm/react@18/umd/react.production.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/react-dom@18/umd/react-dom.production.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@mui/material@5.15.14/umd/material-ui.production.min.js"></script>
+  <script src="https://unpkg.com/react-beautiful-dnd@13.1.0/dist/react-beautiful-dnd.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.2/babel.min.js"></script>
+  <script src="https://unpkg.com/xlsx/dist/xlsx.full.min.js"></script>
+
+  <!-- Roboto / Icons -->
+  <link rel="stylesheet"
+        href="https://fonts.googleapis.com/css?family=Roboto:300,400,500,700&display=swap" />
+  <link rel="stylesheet"
+        href="https://fonts.googleapis.com/icon?family=Material+Icons" />
+
+  <style>
+    body { margin: 0; padding: 16px; font-family: Roboto, sans-serif; }
+    #root { max-width: 1200px; margin: auto; }
+
+    .droppableBox {
+      min-height: 44px; padding: 8px;
+      border: 1px dashed #ccc; border-radius: 4px;
+      background: #fafafa; overflow-x: auto;
+    }
+    .draggableItem {
+      padding: 4px 8px; margin-bottom: 4px;
+      background: #e0e0e0; border-radius: 4px;
+      cursor: grab; user-select: none;
+    }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+
+  <script type="text/babel">
+  const {
+    Container, Tabs, Tab, Box, Button, Typography,
+    Grid, TextField, Table, TableHead, TableRow, TableCell,
+    TableBody, TableContainer, Paper, MenuItem, Select,
+    FormControl, InputLabel
+  } = MaterialUI;
+  const { DragDropContext, Droppable, Draggable } = ReactBeautifulDnd;
+
+  const BASE_FIELDS = ["商品コード","商品名","数量","価格","日付"];
+  const STORAGE_KEY = "csvMappingTemplates_v1_demo";
+
+  // サンプル CSV データ
+  const SAMPLE_CSV = {
+    "日本語ヘッダー": `商品コード,商品名,数量,価格,日付
+A001,りんご,10,120,2025-05-01`,
+    "Englishヘッダー": `code,name,qty,price,date
+B001,Apple,15,110,2025-05-03`,
+    "ランダム順": `price,date,itemCode,itemName,quantity
+200,2025-05-05,C001,オレンジ,12`
+  };
+  const DEFAULT_TEMPLATES = [
+    { name: "JapaneseHeader", mapping: {
+      "商品コード":"商品コード","商品名":"商品名","数量":"数量","価格":"価格","日付":"日付" } },
+    { name: "EnglishHeader", mapping: {
+      "商品コード":"code","商品名":"name","数量":"qty","価格":"price","日付":"date" } },
+    { name: "ShuffledHeader", mapping: {
+      "商品コード":"itemCode","商品名":"itemName","数量":"quantity","価格":"price","日付":"date" } }
+  ];
+  if(!localStorage.getItem(STORAGE_KEY)) {
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(DEFAULT_TEMPLATES));
+  }
+
+  function csvTo2D(text) {
+    const wb = XLSX.read(text, { type: "string" });
+    const ws = wb.Sheets[wb.SheetNames[0]];
+    return XLSX.utils.sheet_to_json(ws, { header:1, defval:"" });
+  }
+
+  function App() {
+    const [tab, setTab] = React.useState(0);
+    const [mainData, setMainData] = React.useState([]);
+
+    const handleImport = rows => setMainData(prev => [...prev, ...rows]);
+    const handleExport = () => {
+      if(!mainData.length) return alert("エクスポート対象がありません");
+      const ws  = XLSX.utils.json_to_sheet(mainData, { header: BASE_FIELDS });
+      const csv = XLSX.utils.sheet_to_csv(ws);
+      const blob= new Blob([csv], { type:"text/csv;charset=utf-8;" });
+      const url = URL.createObjectURL(blob);
+      const a   = document.createElement("a");
+      a.href = url; a.download = "base_table.csv"; a.click();
+      URL.revokeObjectURL(url);
+    };
+
+    return (
+      <Container maxWidth="lg">
+        <Tabs
+          value={tab}
+          onChange={(e,v)=>setTab(v)}
+          variant="fullWidth"
+          sx={{ mb:2 }}
+        >
+          <Tab label="マッピング定義" />
+          <Tab label="インポート" />
+          <Tab label="エクスポート" />
+        </Tabs>
+
+        {tab===0 && <MappingDefinition />}
+        {tab===1 && <ImportPanel onImport={handleImport} />}
+        {tab===2 && (
+          <Box textAlign="center" mt={4}>
+            <Button variant="contained" onClick={handleExport}>
+              CSV をダウンロード
+            </Button>
+          </Box>
+        )}
+
+        {mainData.length>0 && tab!==2 && (
+          <Box mt={4}>
+            <Typography variant="h6" gutterBottom>最新 5 行プレビュー</Typography>
+            <TableContainer component={Paper} sx={{ overflowX:"auto" }}>
+              <Table size="small">
+                <TableHead>
+                  <TableRow>
+                    {BASE_FIELDS.map(f => <TableCell key={f}>{f}</TableCell>)}
+                  </TableRow>
+                </TableHead>
+                <TableBody>
+                  {mainData.slice(-5).map((r,i)=>(
+                    <TableRow key={i}>
+                      {BASE_FIELDS.map(f=> <TableCell key={f}>{r[f]}</TableCell>)}
+                    </TableRow>
+                  ))}
+                </TableBody>
+              </Table>
+            </TableContainer>
+          </Box>
+        )}
+      </Container>
+    );
+  }
+
+  function MappingDefinition(){
+    const [templates, setTemplates] = React.useState(
+      () => JSON.parse(localStorage.getItem(STORAGE_KEY))
+    );
+    const [tplName, setTplName] = React.useState("");
+    const [csvHeaders, setCsvHeaders] = React.useState([]);
+    const [csvSample, setCsvSample] = React.useState({});
+    const [mapping, setMapping] = React.useState({});
+    const [unassigned, setUnassigned] = React.useState([]);
+    const [sampleKey, setSampleKey] = React.useState("");
+
+    const createNew = () => {
+      const n = prompt("テンプレート名");
+      if(n) setTplName(n);
+    };
+    const saveTpl = () => {
+      if(!tplName) return alert("テンプレート名を入力してください");
+      const next = templates.filter(t=>t.name!==tplName)
+        .concat({ name:tplName, mapping });
+      setTemplates(next);
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(next));
+      alert("保存しました");
+    };
+    const deleteTpl = () => {
+      if(!tplName) return;
+      if(!confirm("削除しますか？")) return;
+      const next = templates.filter(t=>t.name!==tplName);
+      setTemplates(next);
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(next));
+      setTplName(""); setCsvHeaders([]); setMapping({}); setUnassigned([]); setSampleKey("");
+    };
+
+    const loadPreview = arr => {
+      const hdr = arr[0]||[];
+      const sample = {}; hdr.forEach((h,i)=> sample[h] = (arr[1]||[])[i]||"");
+      setCsvHeaders(hdr); setCsvSample(sample);
+      // 初期 mapping
+      const init = {};
+      BASE_FIELDS.forEach(f=> init[f] = null);
+      setMapping(init);
+      setUnassigned(hdr);
+    };
+
+    const handleSample = key => {
+      setSampleKey(key); setCsvHeaders([]); setMapping({}); setUnassigned([]);
+      if(!key) return;
+      const arr = csvTo2D(SAMPLE_CSV[key]);
+      loadPreview(arr);
+    };
+    const handleFile = e => {
+      const f = e.target.files[0]; if(!f) return;
+      setSampleKey("");
+      const reader = new FileReader();
+      reader.onload = ev => {
+        const arr = csvTo2D(ev.target.result);
+        loadPreview(arr);
+      };
+      reader.readAsText(f,"utf-8");
+    };
+
+    const onDragEnd = res => {
+      const { source, destination, draggableId } = res;
+      if(!destination) return;
+      const src = source.droppableId, dst = destination.droppableId;
+      if(src==="unassigned" && dst==="unassigned"){
+        const items=[...unassigned];
+        items.splice(source.index,1);
+        items.splice(destination.index,0,draggableId);
+        setUnassigned(items);
+        return;
+      }
+      if(src==="unassigned" && BASE_FIELDS.includes(dst)){
+        const prev = mapping[dst];
+        const nextUn = unassigned.filter(h=>h!==draggableId);
+        if(prev) nextUn.push(prev);
+        setUnassigned(nextUn);
+        setMapping({...mapping,[dst]:draggableId});
+        return;
+      }
+      if(BASE_FIELDS.includes(src) && dst==="unassigned"){
+        const hdr = mapping[src]; if(!hdr) return;
+        const nextUn=[...unassigned];
+        nextUn.splice(destination.index,0,hdr);
+        setUnassigned(nextUn);
+        setMapping({...mapping,[src]:null});
+        return;
+      }
+      if(BASE_FIELDS.includes(src) && BASE_FIELDS.includes(dst)){
+        const a=mapping[src], b=mapping[dst];
+        setMapping({...mapping,[src]:b,[dst]:a});
+      }
+    };
+
+    // 変換データ（サンプル行）
+    const convertedSample = BASE_FIELDS.map(f => {
+      const key = mapping[f];
+      return key ? csvSample[key] || "" : "";
+    });
+
+    return (
+      <Box>
+        {/* テンプレート操作 */}
+        <Grid container spacing={2}>
+          <Grid item xs={12} md={5}>
+            <TextField
+              label="テンプレート名"
+              value={tplName}
+              onChange={e=>setTplName(e.target.value)}
+              fullWidth
+            />
+          </Grid>
+          <Grid item xs={12} md={7} container alignItems="center" spacing={1}>
+            <Grid item><Button onClick={createNew}>＋ 新規</Button></Grid>
+            <Grid item><Button color="error" onClick={deleteTpl}>🗑️ 削除</Button></Grid>
+            <Grid item><Button variant="contained" onClick={saveTpl}>保存</Button></Grid>
+          </Grid>
+        </Grid>
+
+        {/* サンプル CSV 選択 */}
+        <Box mt={3}>
+          <FormControl fullWidth>
+            <InputLabel>デモサンプル</InputLabel>
+            <Select
+              value={sampleKey}
+              label="デモサンプル"
+              onChange={e=>handleSample(e.target.value)}
+            >
+              <MenuItem value="">（ファイルを使う）</MenuItem>
+              {Object.keys(SAMPLE_CSV).map(k=>
+                <MenuItem key={k} value={k}>{k}</MenuItem>
+              )}
+            </Select>
+          </FormControl>
+          <Box mt={2}><input type="file" accept=".csv" onChange={handleFile} /></Box>
+        </Box>
+
+        {/* ヘッダー & サンプル */}
+        {csvHeaders.length>0 && (
+          <Box mt={3}>
+            <Typography variant="subtitle1">ヘッダー & サンプル</Typography>
+            <TableContainer component={Paper} sx={{overflowX:"auto", mb:2}}>
+              <Table size="small">
+                <TableHead>
+                  <TableRow>
+                    {csvHeaders.map(h=><TableCell key={h}>{h}</TableCell>)}
+                  </TableRow>
+                </TableHead>
+                <TableBody>
+                  <TableRow>
+                    {csvHeaders.map(h=><TableCell key={h}>{csvSample[h]}</TableCell>)}
+                  </TableRow>
+                </TableBody>
+              </Table>
+            </TableContainer>
+
+            {/* 変換データ */}
+            <Typography variant="subtitle1">変換データ</Typography>
+            <TableContainer component={Paper} sx={{overflowX:"auto", mb:2}}>
+              <Table size="small">
+                <TableHead>
+                  <TableRow>
+                    {BASE_FIELDS.map(f=><TableCell key={f}>{f}</TableCell>)}
+                  </TableRow>
+                </TableHead>
+                <TableBody>
+                  <TableRow>
+                    {convertedSample.map((v,i)=>
+                      <TableCell key={i}>{v}</TableCell>
+                    )}
+                  </TableRow>
+                </TableBody>
+              </Table>
+            </TableContainer>
+
+            {/* マッピング */}
+            <Typography variant="subtitle1">ドラッグ & ドロップでマッピング</Typography>
+            <DragDropContext onDragEnd={onDragEnd}>
+              <Grid container spacing={2}>
+                <Grid item xs={12} md={4}>
+                  <Typography>未割当ヘッダー</Typography>
+                  <Droppable droppableId="unassigned">
+                    {prov=>(
+                      <Box ref={prov.innerRef} {...prov.droppableProps} className="droppableBox">
+                        {unassigned.map((h,i)=>(
+                          <Draggable key={h} draggableId={h} index={i}>
+                            {p=>(
+                              <Box
+                                ref={p.innerRef}
+                                {...p.draggableProps}
+                                {...p.dragHandleProps}
+                                className="draggableItem"
+                              >{h}</Box>
+                            )}
+                          </Draggable>
+                        ))}
+                        {prov.placeholder}
+                      </Box>
+                    )}
+                  </Droppable>
+                </Grid>
+                <Grid item xs={12} md={8}>
+                  <Typography>基本レイアウト</Typography>
+                  <Grid container spacing={1}>
+                    {BASE_FIELDS.map(fld=>(
+                      <Grid item xs={6} key={fld}>
+                        <Typography variant="body2">{fld}</Typography>
+                        <Droppable droppableId={fld}>
+                          {prov=>(
+                            <Box ref={prov.innerRef} {...prov.droppableProps} className="droppableBox">
+                              {mapping[fld] && (
+                                <Draggable
+                                  key={mapping[fld]}
+                                  draggableId={mapping[fld]}
+                                  index={0}
+                                >
+                                  {p=>(
+                                    <Box
+                                      ref={p.innerRef}
+                                      {...p.draggableProps}
+                                      {...p.dragHandleProps}
+                                      className="draggableItem"
+                                    >{mapping[fld]}</Box>
+                                  )}
+                                </Draggable>
+                              )}
+                              {prov.placeholder}
+                            </Box>
+                          )}
+                        </Droppable>
+                        <Typography variant="caption">
+                          サンプル: {mapping[fld] ? csvSample[mapping[fld]] : "—"}
+                        </Typography>
+                      </Grid>
+                    ))}
+                  </Grid>
+                </Grid>
+              </Grid>
+            </DragDropContext>
+          </Box>
+        )}
+      </Box>
+    );
+  }
+
+  function ImportPanel({ onImport }) {
+    const [templates] = React.useState(
+      () => JSON.parse(localStorage.getItem(STORAGE_KEY))
+    );
+    const [tplName, setTplName] = React.useState("");
+    const [sampleKey, setSampleKey] = React.useState("");
+    const [file, setFile] = React.useState(null);
+    const [preview, setPreview] = React.useState(null);
+
+    const loadRows = text => {
+      const arr = csvTo2D(text);
+      const headers = arr[0]||[];
+      const idx = {}; headers.forEach((h,i)=>idx[h]=i);
+      const tpl = templates.find(t=>t.name===tplName);
+      if(!tpl) return [];
+      return arr.slice(1).map(r=>{
+        const out = {};
+        BASE_FIELDS.forEach(f=>{
+          const src = tpl.mapping[f];
+          out[f] = src && idx[src]!=null ? r[idx[src]] : "";
+        });
+        return out;
+      });
+    };
+
+    const handleSample = e => {
+      const key = e.target.value;
+      setSampleKey(key); setFile(null); setPreview(null);
+      if(!key) return;
+      setPreview(loadRows(SAMPLE_CSV[key]));
+    };
+    const handleFile = e => {
+      const f = e.target.files[0]; if(!f) return;
+      setSampleKey(""); setFile(f); setPreview(null);
+    };
+    const doPreview = () => {
+      if(!tplName) return alert("マッピングタイプを選択してください");
+      if(sampleKey) { setPreview(loadRows(SAMPLE_CSV[sampleKey])); return; }
+      if(!file) return alert("ファイルを選択してください");
+      const reader = new FileReader();
+      reader.onload = ev => setPreview(loadRows(ev.target.result));
+      reader.readAsText(file,"utf-8");
+    };
+    const confirm = () => {
+      onImport(preview);
+      setPreview(null); setFile(null); setSampleKey("");
+    };
+
+    return (
+      <Box>
+        <FormControl fullWidth sx={{ mb:2 }}>
+          <InputLabel>マッピングタイプ</InputLabel>
+          <Select
+            value={tplName}
+            label="マッピングタイプ"
+            onChange={e=>setTplName(e.target.value)}
+          >
+            {templates.map(t=>(
+              <MenuItem key={t.name} value={t.name}>{t.name}</MenuItem>
+            ))}
+          </Select>
+        </FormControl>
+
+        <FormControl fullWidth sx={{ mb:2 }}>
+          <InputLabel>デモサンプル</InputLabel>
+          <Select
+            value={sampleKey}
+            label="デモサンプル"
+            onChange={handleSample}
+          >
+            <MenuItem value="">（ファイルを使う）</MenuItem>
+            {Object.keys(SAMPLE_CSV).map(k=>(
+              <MenuItem key={k} value={k}>{k}</MenuItem>
+            ))}
+          </Select>
+        </FormControl>
+
+        <Box mb={2}>
+          <input type="file" accept=".csv" onChange={handleFile} />
+        </Box>
+
+        <Button variant="contained" onClick={doPreview}>プレビュー</Button>
+
+        {/* プレビューエリアは常に表示 */}
+        <Box mt={3}>
+          <Typography variant="subtitle1" gutterBottom>取込みプレビュー</Typography>
+          {preview ? (
+            <TableContainer component={Paper} sx={{ maxHeight:300, overflow:"auto" }}>
+              <Table size="small" stickyHeader>
+                <TableHead>
+                  <TableRow>
+                    {BASE_FIELDS.map(f=><TableCell key={f}>{f}</TableCell>)}
+                  </TableRow>
+                </TableHead>
+                <TableBody>
+                  {preview.map((r,i)=>(
+                    <TableRow key={i}>
+                      {BASE_FIELDS.map(f=><TableCell key={f}>{r[f]}</TableCell>)}
+                    </TableRow>
+                  ))}
+                </TableBody>
+              </Table>
+            </TableContainer>
+          ) : (
+            <Typography variant="body2" color="textSecondary">
+              プレビュー結果がここに表示されます
+            </Typography>
+          )}
+          {preview && (
+            <Box mt={2}>
+              <Button onClick={()=>setPreview(null)}>取消</Button>
+              <Button variant="contained" sx={{ ml:1 }} onClick={confirm}>
+                本取込み
+              </Button>
+            </Box>
+          )}
+        </Box>
+      </Box>
+    );
+  }
+
+  ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+  </script>
+</body>
+</html>

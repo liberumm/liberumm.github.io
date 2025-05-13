@@ -1,0 +1,848 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8" />
+  <title>CSV 管理ツール（履歴リスト対応・フル機能版）</title>
+
+  <!-- ====== CDN 読み込み ====== -->
+  <script src="https://cdn.jsdelivr.net/npm/react@18/umd/react.production.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/react-dom@18/umd/react-dom.production.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@mui/material@5.15.14/umd/material-ui.production.min.js"></script>
+  <script src="https://unpkg.com/react-beautiful-dnd@13.1.0/dist/react-beautiful-dnd.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.2/babel.min.js"></script>
+  <script src="https://unpkg.com/xlsx/dist/xlsx.full.min.js"></script>
+
+  <!-- Roboto / Icons -->
+  <link rel="stylesheet"
+        href="https://fonts.googleapis.com/css?family=Roboto:300,400,500,700&display=swap" />
+  <link rel="stylesheet"
+        href="https://fonts.googleapis.com/icon?family=Material+Icons" />
+
+  <style>
+    body { margin: 0; padding: 16px; font-family: Roboto, sans-serif; }
+    #root { max-width: 1200px; margin: auto; }
+    .MuiDialog-root { z-index: 1300; }
+    .droppableBox {
+      position: unset !important;
+      margin: 8px 0;
+      min-height: 44px;
+      padding: 8px;
+      border: 1px dashed #ccc;
+      border-radius: 4px;
+      background: #fafafa;
+    }
+    .draggableItem {
+      position: relative;
+      z-index: 2;
+      padding: 4px 8px;
+      margin-bottom: 4px;
+      background: #e0e0e0;
+      border-radius: 4px;
+      cursor: grab;
+      user-select: none;
+    }
+    .draggingItem {
+      z-index: 1400 !important;
+      position: fixed !important;
+    }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+
+  <script type="text/babel">
+  const {
+    Container, Box, Button, Typography,
+    Table, TableHead, TableRow, TableCell, TableBody,
+    TableContainer, Paper,
+    Dialog, DialogTitle, DialogContent, DialogActions,
+    Grid, TextField, FormControl, InputLabel, Select, MenuItem,
+    useTheme, useMediaQuery
+  } = MaterialUI;
+  const { DragDropContext, Droppable, Draggable } = ReactBeautifulDnd;
+
+  // 共通定数
+  const BASE_FIELDS   = ["商品コード","商品名","数量","価格","日付"];
+  const STORAGE_KEY   = "csvMappingTemplates_v1_demo";
+  const SAMPLE_CSV    = {
+    "日本語ヘッダー": `商品コード,商品名,数量,価格,日付
+A001,りんご,10,120,2025-05-01
+A002,みかん,15,100,2025-05-02
+A003,バナナ,8,150,2025-05-03`,
+    "Englishヘッダー": `code,name,qty,price,date
+B001,Apple,15,110,2025-05-03
+B002,Orange,20,90,2025-05-04
+B003,Banana,12,140,2025-05-05`,
+    "ランダム順": `price,date,itemCode,itemName,quantity
+200,2025-05-05,C001,オレンジ,12
+180,2025-05-06,C002,りんご,8
+220,2025-05-07,C003,バナナ,15`,
+    "特殊文字入り": `商品CD,商品 名,個数,単価(円),処理日
+D001,りんご (赤),5,200,2025/05/08
+D002,オレンジ(輸入),10,180,2025/05/09
+D003,バナナ（大）,6,250,2025/05/10`
+  };
+  const DEFAULT_TEMPLATES = [
+    { name: "JapaneseHeader",
+      mapping: { "商品コード":"商品コード","商品名":"商品名","数量":"数量","価格":"価格","日付":"日付" } },
+    { name: "EnglishHeader",
+      mapping: { "商品コード":"code","商品名":"name","数量":"qty","価格":"price","日付":"date" } },
+    { name: "ShuffledHeader",
+      mapping: { "商品コード":"itemCode","商品名":"itemName","数量":"quantity","価格":"price","日付":"date" } }
+  ];
+  if (!localStorage.getItem(STORAGE_KEY)) {
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(DEFAULT_TEMPLATES));
+  }
+
+  // CSV→2次元配列変換ユーティリティ
+  function csvTo2D(text) {
+    const wb = XLSX.read(text, { type: "string" });
+    const ws = wb.Sheets[wb.SheetNames[0]];
+    return XLSX.utils.sheet_to_json(ws, { header: 1, defval: "" });
+  }
+
+  // メイン App
+  function App() {
+    const [mainData,    setMainData]    = React.useState([]);
+    const [historyList, setHistoryList] = React.useState([]); // 履歴リスト
+    const [openMapping, setOpenMapping] = React.useState(false);
+    const [openImport,  setOpenImport]  = React.useState(false);
+    const [openExport,  setOpenExport]  = React.useState(false);
+    const [openHistory, setOpenHistory] = React.useState(false);
+    const [previewRows, setPreviewRows] = React.useState(null); // 履歴プレビュー用
+    const [message, setMessage] = React.useState(""); // 通知用
+    const [confirm, setConfirm] = React.useState(null); // 確認用 {msg, onOk}
+
+    // --- 既存のalert/confirmを置換 ---
+    // インポート確定時
+    const handleImported = rows => {
+      if (!rows?.length) return;
+      const snapshot = {
+        id: Date.now(),
+        timestamp: new Date(),
+        prevData: JSON.parse(JSON.stringify(mainData)),
+        importedData: JSON.parse(JSON.stringify(rows)),
+        deleted: false
+      };
+      setHistoryList(prev => [...prev, snapshot]);
+      setMainData(prev => [...prev, ...JSON.parse(JSON.stringify(rows))]);
+      setOpenImport(false);
+      setMessage("インポートが完了しました");
+    };
+
+    // エクスポート確定
+    const handleExportConfirm = () => {
+      if (!mainData.length) {
+        setMessage("エクスポート対象がありません");
+        return;
+      }
+      const ws  = XLSX.utils.json_to_sheet(mainData, { header: BASE_FIELDS });
+      const csv = XLSX.utils.sheet_to_csv(ws);
+      const blob= new Blob([csv], { type:"text/csv;charset=utf-8;" });
+      const url = URL.createObjectURL(blob);
+      const a   = document.createElement("a");
+      a.href = url; a.download = "base_table.csv"; a.click();
+      URL.revokeObjectURL(url);
+      setOpenExport(false);
+      setMessage("エクスポートが完了しました");
+    };
+
+    // 履歴から復活
+    const handleRestore = id => {
+      const entry = historyList.find(e => e.id === id);
+      if (!entry || !entry.deleted) return;
+      setMainData(prev => [...prev, ...JSON.parse(JSON.stringify(entry.importedData))]);
+      setHistoryList(prev => prev.map(e =>
+        e.id === id ? { ...e, deleted: false } : e
+      ));
+      setOpenHistory(false);
+      setMessage("データを復活しました");
+    };
+
+    // 履歴削除
+    const handleDeleteHistory = id => {
+      const entry = historyList.find(e => e.id === id);
+      if (!entry || entry.deleted) return;
+      setConfirm({
+        msg: "この履歴で追加されたデータを削除しますか？",
+        onOk: () => {
+          setMainData(prev => {
+            let result = [...prev];
+            entry.importedData.forEach(imp => {
+              const idx = result.findIndex(row =>
+                BASE_FIELDS.every(f => row[f] === imp[f])
+              );
+              if (idx !== -1) result.splice(idx, 1);
+            });
+            return result;
+          });
+          setHistoryList(prev => prev.map(e =>
+            e.id === id ? { ...e, deleted: true } : e
+          ));
+          setConfirm(null);
+          setMessage("データを削除しました");
+        }
+      });
+    };
+
+    return (
+      <Container maxWidth="lg">
+        <Box mb={2} display="flex" flexWrap="wrap" gap={1}>
+          <Button variant="outlined" onClick={()=>setOpenMapping(true)}>
+            マッピング定義
+          </Button>
+          <Button variant="outlined" onClick={()=>setOpenImport(true)}>
+            インポート
+          </Button>
+          <Button variant="outlined" onClick={()=>setOpenExport(true)}>
+            エクスポート
+          </Button>
+          <Button variant="outlined" onClick={()=>setOpenHistory(true)}>
+            履歴一覧
+          </Button>
+        </Box>
+
+        <TableContainer component={Paper} sx={{ overflowX:'auto' }}>
+          <Table size="small">
+            <TableHead>
+              <TableRow>
+                {BASE_FIELDS.map(f => <TableCell key={f}>{f}</TableCell>)}
+              </TableRow>
+            </TableHead>
+            <TableBody>
+              {mainData.length > 0 ? mainData.map((row,i)=>(
+                <TableRow key={i}>
+                  {BASE_FIELDS.map(f=> <TableCell key={f}>{row[f]}</TableCell>)}
+                </TableRow>
+              )) : (
+                <TableRow>
+                  <TableCell colSpan={BASE_FIELDS.length} align="center">
+                    データがありません
+                  </TableCell>
+                </TableRow>
+              )}
+            </TableBody>
+          </Table>
+        </TableContainer>
+
+        <MappingDialog
+          open={openMapping}
+          onClose={()=>setOpenMapping(false)}
+        />
+        <ImportDialog
+          open={openImport}
+          onClose={()=>setOpenImport(false)}
+          onConfirm={handleImported}
+        />
+        <ExportDialog
+          open={openExport}
+          onClose={()=>setOpenExport(false)}
+          onConfirm={handleExportConfirm}
+          rowCount={mainData.length}
+        />
+        <HistoryDialog
+          open={openHistory}
+          onClose={()=>setOpenHistory(false)}
+          historyList={historyList}
+          onRestore={handleRestore}
+          onDelete={handleDeleteHistory}
+          onPreview={setPreviewRows}
+        />
+        {previewRows && (
+          <Dialog open onClose={()=>setPreviewRows(null)} maxWidth="md" fullWidth>
+            <DialogTitle>追加データプレビュー</DialogTitle>
+            <DialogContent dividers>
+              <TableContainer component={Paper} sx={{ maxHeight:300, overflow:"auto" }}>
+                <Table size="small" stickyHeader>
+                  <TableHead>
+                    <TableRow>
+                      {BASE_FIELDS.map(f=> <TableCell key={f}>{f}</TableCell>)}
+                    </TableRow>
+                  </TableHead>
+                  <TableBody>
+                    {previewRows.map((r,i)=>(
+                      <TableRow key={i}>
+                        {BASE_FIELDS.map(f=> <TableCell key={f}>{r[f]}</TableCell>)}
+                      </TableRow>
+                    ))}
+                  </TableBody>
+                </Table>
+              </TableContainer>
+            </DialogContent>
+            <DialogActions>
+              <Button onClick={()=>setPreviewRows(null)}>閉じる</Button>
+            </DialogActions>
+          </Dialog>
+        )}
+        {/* メッセージ表示 */}
+        <Dialog open={!!message} onClose={()=>setMessage("")}>
+          <DialogTitle>お知らせ</DialogTitle>
+          <DialogContent>
+            <Typography>{message}</Typography>
+          </DialogContent>
+          <DialogActions>
+            <Button onClick={()=>setMessage("")}>OK</Button>
+          </DialogActions>
+        </Dialog>
+        {/* 確認ダイアログ */}
+        <Dialog open={!!confirm} onClose={()=>setConfirm(null)}>
+          <DialogTitle>確認</DialogTitle>
+          <DialogContent>
+            <Typography>{confirm?.msg}</Typography>
+          </DialogContent>
+          <DialogActions>
+            <Button onClick={()=>setConfirm(null)}>キャンセル</Button>
+            <Button variant="contained" color="primary" onClick={()=>{
+              confirm.onOk();
+            }}>OK</Button>
+          </DialogActions>
+        </Dialog>
+      </Container>
+    );
+  }
+
+  // MappingDialog（完全版）
+  function MappingDialog({ open, onClose }) {
+    const theme      = useTheme();
+    const fullScreen = useMediaQuery(theme.breakpoints.down('sm'));
+
+    const [templates, setTemplates] = React.useState(
+      () => JSON.parse(localStorage.getItem(STORAGE_KEY))
+    );
+    const [tplName,   setTplName]   = React.useState("");
+    const [csvHeaders, setCsvHeaders] = React.useState([]);
+    const [csvSample,  setCsvSample]  = React.useState({});
+    const [mapping,    setMapping]    = React.useState({});
+    const [unassigned, setUnassigned] = React.useState([]);
+    const [sampleKey,  setSampleKey]  = React.useState("");
+    const [message, setMessage] = React.useState("");
+    const [confirm, setConfirm] = React.useState(null);
+
+    // プレビュー初期化
+    const initPreview = arr => {
+      const hdr = arr[0] || [];
+      const sample = {};
+      hdr.forEach((h,i)=> sample[h] = (arr[1]||[])[i] || "");
+      setCsvHeaders(hdr);
+      setCsvSample(sample);
+      const initMap = {};
+      BASE_FIELDS.forEach(f=> initMap[f] = null);
+      setMapping(initMap);
+      setUnassigned(hdr);
+    };
+
+    // デモサンプル選択
+    const handleSample = key => {
+      setSampleKey(key);
+      setCsvHeaders([]); setMapping({}); setUnassigned([]);
+      if (key) initPreview(csvTo2D(SAMPLE_CSV[key]));
+    };
+    // ファイルアップロード
+    const handleFile = e => {
+      const f = e.target.files[0];
+      if (!f) return;
+      setSampleKey("");
+      const reader = new FileReader();
+      reader.onload = ev => initPreview(csvTo2D(ev.target.result));
+      reader.readAsText(f,"utf-8");
+    };
+
+    // DnD 完了時
+    const onDragEnd = res => {
+      const { source, destination, draggableId } = res;
+      if (!destination) return;
+      const src = source.droppableId, dst = destination.droppableId;
+
+      // 未割当 → 未割当（並び替え）
+      if (src==="unassigned" && dst==="unassigned") {
+        const items=[...unassigned];
+        items.splice(source.index,1);
+        items.splice(destination.index,0,draggableId);
+        setUnassigned(items);
+        return;
+      }
+      // 未割当 → フィールド（割当）
+      if (src==="unassigned" && BASE_FIELDS.includes(dst)) {
+        const prev = mapping[dst];
+        const nextUn = unassigned.filter(h=>h!==draggableId);
+        if (prev) nextUn.push(prev);
+        setUnassigned(nextUn);
+        setMapping({...mapping, [dst]:draggableId});
+        return;
+      }
+      // フィールド → 未割当（解除）
+      if (BASE_FIELDS.includes(src) && dst==="unassigned") {
+        const hdr = mapping[src];
+        if (!hdr) return;
+        const nextUn=[...unassigned];
+        nextUn.splice(destination.index,0,hdr);
+        setUnassigned(nextUn);
+        setMapping({...mapping, [src]:null});
+        return;
+      }
+      // フィールド ↔ フィールド（入れ替え）
+      if (BASE_FIELDS.includes(src) && BASE_FIELDS.includes(dst)) {
+        const a = mapping[src], b = mapping[dst];
+        setMapping({...mapping, [src]:b, [dst]:a});
+      }
+    };
+
+    // 保存・削除
+    const saveTpl = () => {
+      if (!tplName) {
+        setMessage("テンプレート名を入力してください");
+        return;
+      }
+      const next = templates.filter(t=>t.name!==tplName)
+                            .concat({ name:tplName, mapping });
+      setTemplates(next);
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(next));
+      setMessage("保存しました");
+    };
+    const deleteTpl = () => {
+      if (!tplName) return;
+      setConfirm({
+        msg: "削除しますか？",
+        onOk: () => {
+          const next = templates.filter(t=>t.name!==tplName);
+          setTemplates(next);
+          localStorage.setItem(STORAGE_KEY, JSON.stringify(next));
+          setTplName("");
+          setCsvHeaders([]); setMapping({}); setUnassigned([]); setSampleKey("");
+          setConfirm(null);
+          setMessage("削除しました");
+        }
+      });
+    };
+
+    return (
+      <Dialog
+        fullScreen={fullScreen}
+        fullWidth maxWidth="lg"
+        open={open} onClose={onClose}
+      >
+        <DialogTitle>マッピング定義</DialogTitle>
+        <DialogContent
+          dividers
+          sx={{ overflow:"visible", position:"relative", zIndex:1 }}
+        >
+          <Grid container spacing={2}>
+            <Grid item xs={12} md={5}>
+              <TextField
+                label="テンプレート名"
+                value={tplName}
+                onChange={e=>setTplName(e.target.value)}
+                fullWidth
+              />
+            </Grid>
+            <Grid item xs={12} md={7} container alignItems="center" spacing={1}>
+              <Grid item>
+                <Button onClick={()=>{
+                  const n = prompt("新しいテンプレート名");
+                  if (n) setTplName(n);
+                }}>＋ 新規</Button>
+              </Grid>
+              <Grid item>
+                <Button color="error" onClick={deleteTpl}>🗑️ 削除</Button>
+              </Grid>
+              <Grid item>
+                <Button variant="contained" onClick={saveTpl}>保存</Button>
+              </Grid>
+            </Grid>
+          </Grid>
+
+          <Box mt={3}>
+            <FormControl fullWidth>
+              <InputLabel>デモサンプル</InputLabel>
+              <Select
+                value={sampleKey}
+                label="デモサンプル"
+                onChange={e=>handleSample(e.target.value)}
+              >
+                <MenuItem value="">（ファイルを使用）</MenuItem>
+                {Object.keys(SAMPLE_CSV).map(k=>
+                  <MenuItem key={k} value={k}>{k}</MenuItem>
+                )}
+              </Select>
+            </FormControl>
+            <Box mt={2}>
+              <input type="file" accept=".csv" onChange={handleFile} />
+            </Box>
+          </Box>
+
+          {csvHeaders.length > 0 && (
+            <Box mt={3}>
+              <Typography variant="subtitle1">ヘッダー & サンプル</Typography>
+              <TableContainer component={Paper} sx={{ overflowX:'auto', mb:2 }}>
+                <Table size="small">
+                  <TableHead>
+                    <TableRow>
+                      {csvHeaders.map(h=> <TableCell key={h}>{h}</TableCell>)}
+                    </TableRow>
+                  </TableHead>
+                  <TableBody>
+                    <TableRow>
+                      {csvHeaders.map(h=><TableCell key={h}>{csvSample[h]}</TableCell>)}
+                    </TableRow>
+                  </TableBody>
+                </Table>
+              </TableContainer>
+
+              <Typography variant="subtitle1">変換データ</Typography>
+              <TableContainer component={Paper} sx={{ overflowX:'auto', mb:2 }}>
+                <Table size="small">
+                  <TableHead>
+                    <TableRow>
+                      {BASE_FIELDS.map(f=> <TableCell key={f}>{f}</TableCell>)}
+                    </TableRow>
+                  </TableHead>
+                  <TableBody>
+                    <TableRow>
+                      {BASE_FIELDS.map(f=>{
+                        const k = mapping[f];
+                        return <TableCell key={f}>{k ? csvSample[k] : ""}</TableCell>;
+                      })}
+                    </TableRow>
+                  </TableBody>
+                </Table>
+              </TableContainer>
+
+              <Typography variant="subtitle1">ドラッグ & ドロップでマッピング</Typography>
+              <DragDropContext onDragEnd={onDragEnd}>
+                <Grid container spacing={2}>
+                  <Grid item xs={12} md={4}>
+                    <Typography>未割当ヘッダー</Typography>
+                    <Droppable droppableId="unassigned">
+                      {prov=>(
+                        <Box ref={prov.innerRef} {...prov.droppableProps} className="droppableBox">
+                          {unassigned.map((h,i)=>(
+                            <Draggable key={h} draggableId={h} index={i}>
+                              {(provDr,snapshot)=>(
+                                <Box
+                                  ref={provDr.innerRef}
+                                  {...provDr.draggableProps}
+                                  {...provDr.dragHandleProps}
+                                  className={`draggableItem ${snapshot.isDragging?'draggingItem':''}`}
+                                  style={provDr.draggableProps.style}
+                                >
+                                  {h}
+                                </Box>
+                              )}
+                            </Draggable>
+                          ))}
+                          {prov.placeholder}
+                        </Box>
+                      )}
+                    </Droppable>
+                  </Grid>
+                  <Grid item xs={12} md={8}>
+                    <Typography>基本レイアウト</Typography>
+                    <Grid container spacing={1}>
+                      {BASE_FIELDS.map(fld=>(
+                        <Grid item xs={6} key={fld}>
+                          <Typography variant="body2">{fld}</Typography>
+                          <Droppable droppableId={fld}>
+                            {prov=>(
+                              <Box ref={prov.innerRef} {...prov.droppableProps} className="droppableBox">
+                                {mapping[fld] && (
+                                  <Draggable key={mapping[fld]} draggableId={mapping[fld]} index={0}>
+                                    {(provDr,snapshot)=>(
+                                      <Box
+                                        ref={provDr.innerRef}
+                                        {...provDr.draggableProps}
+                                        {...provDr.dragHandleProps}
+                                        className={`draggableItem ${snapshot.isDragging?'draggingItem':''}`}
+                                        style={provDr.draggableProps.style}
+                                      >
+                                        {mapping[fld]}
+                                      </Box>
+                                    )}
+                                  </Draggable>
+                                )}
+                                {prov.placeholder}
+                              </Box>
+                            )}
+                          </Droppable>
+                          <Typography variant="caption">
+                            サンプル: {mapping[fld] ? csvSample[mapping[fld]] : "—"}
+                          </Typography>
+                        </Grid>
+                      ))}
+                    </Grid>
+                  </Grid>
+                </Grid>
+              </DragDropContext>
+            </Box>
+          )}
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={onClose}>閉じる</Button>
+        </DialogActions>
+        {/* メッセージ表示 */}
+        <Dialog open={!!message} onClose={()=>setMessage("")}>
+          <DialogTitle>お知らせ</DialogTitle>
+          <DialogContent>
+            <Typography>{message}</Typography>
+          </DialogContent>
+          <DialogActions>
+            <Button onClick={()=>setMessage("")}>OK</Button>
+          </DialogActions>
+        </Dialog>
+        {/* 確認ダイアログ */}
+        <Dialog open={!!confirm} onClose={()=>setConfirm(null)}>
+          <DialogTitle>確認</DialogTitle>
+          <DialogContent>
+            <Typography>{confirm?.msg}</Typography>
+          </DialogContent>
+          <DialogActions>
+            <Button onClick={()=>setConfirm(null)}>キャンセル</Button>
+            <Button variant="contained" color="primary" onClick={()=>{
+              confirm.onOk();
+            }}>OK</Button>
+          </DialogActions>
+        </Dialog>
+      </Dialog>
+    );
+  }
+
+  // ImportDialog（完全版）
+  function ImportDialog({ open, onClose, onConfirm }) {
+    const theme      = useTheme();
+    const fullScreen = useMediaQuery(theme.breakpoints.down('sm'));
+
+    const [templates] = React.useState(
+      () => JSON.parse(localStorage.getItem(STORAGE_KEY))
+    );
+    const [tplName,    setTplName]   = React.useState("");
+    const [sampleKey,  setSampleKey] = React.useState("");
+    const [file,       setFile]      = React.useState(null);
+    const [preview,    setPreview]   = React.useState(null);
+    const [message, setMessage] = React.useState("");
+
+    // CSV → 内部形式
+    const loadRows = text => {
+      const arr = csvTo2D(text);
+      const hdr = arr[0] || [];
+      const idx = {}; hdr.forEach((h,i)=> idx[h] = i);
+      const tpl = templates.find(t=> t.name === tplName);
+      if (!tpl) return [];
+      return arr.slice(1).map(r=>{
+        const obj = {};
+        BASE_FIELDS.forEach(f=>{
+          const src = tpl.mapping[f];
+          obj[f] = (src && idx[src] != null) ? r[idx[src]] : "";
+        });
+        return obj;
+      });
+    };
+
+    const handleSample = e => {
+      const key = e.target.value;
+      setSampleKey(key);
+      setFile(null);
+      if (!key) return setPreview(null);
+      setPreview(loadRows(SAMPLE_CSV[key]));
+    };
+    const handleFile = e => {
+      const f = e.target.files[0];
+      if (!f) return;
+      setSampleKey(""); setPreview(null); setFile(f);
+    };
+    const doPreview = () => {
+      if (!tplName) {
+        setMessage("マッピングタイプを選択してください");
+        return;
+      }
+      if (sampleKey) return setPreview(loadRows(SAMPLE_CSV[sampleKey]));
+      if (!file) {
+        setMessage("ファイルを選択してください");
+        return;
+      }
+      const reader = new FileReader();
+      reader.onload = ev => setPreview(loadRows(ev.target.result));
+      reader.readAsText(file,"utf-8");
+    };
+    const handleConfirm = () => {
+      onConfirm(preview);
+    };
+
+    return (
+      <Dialog
+        fullScreen={fullScreen}
+        fullWidth maxWidth="md"
+        open={open} onClose={onClose}
+      >
+        <DialogTitle>インポート</DialogTitle>
+        <DialogContent dividers>
+          <FormControl fullWidth sx={{ mb:2 }}>
+            <InputLabel>マッピングタイプ</InputLabel>
+            <Select
+              value={tplName}
+              label="マッピングタイプ"
+              onChange={e=>setTplName(e.target.value)}
+            >
+              {templates.map(t=>(
+                <MenuItem key={t.name} value={t.name}>{t.name}</MenuItem>
+              ))}
+            </Select>
+          </FormControl>
+          <FormControl fullWidth sx={{ mb:2 }}>
+            <InputLabel>デモサンプル</InputLabel>
+            <Select
+              value={sampleKey}
+              label="デモサンプル"
+              onChange={handleSample}
+            >
+              <MenuItem value="">（ファイルを使う）</MenuItem>
+              {Object.keys(SAMPLE_CSV).map(k=>(
+                <MenuItem key={k} value={k}>{k}</MenuItem>
+              ))}
+            </Select>
+          </FormControl>
+          <Box mb={2}>
+            <input type="file" accept=".csv" onChange={handleFile} />
+          </Box>
+          <Button variant="contained" onClick={doPreview}>
+            プレビュー
+          </Button>
+          <Box mt={3}>
+            <Typography variant="subtitle1" gutterBottom>
+              取込みプレビュー
+            </Typography>
+            {preview ? (
+              <TableContainer component={Paper}
+                              sx={{ maxHeight:300, overflow:"auto" }}>
+                <Table size="small" stickyHeader>
+                  <TableHead>
+                    <TableRow>
+                      {BASE_FIELDS.map(f=> <TableCell key={f}>{f}</TableCell>)}
+                    </TableRow>
+                  </TableHead>
+                  <TableBody>
+                    {preview.map((r,i)=>(
+                      <TableRow key={i}>
+                        {BASE_FIELDS.map(f=> <TableCell key={f}>{r[f]}</TableCell>)}
+                      </TableRow>
+                    ))}
+                  </TableBody>
+                </Table>
+              </TableContainer>
+            ) : (
+              <Typography variant="body2" color="textSecondary">
+                プレビュー結果がここに表示されます
+              </Typography>
+            )}
+          </Box>
+        </DialogContent>
+        <DialogActions>
+          {preview && <Button onClick={()=>setPreview(null)}>取消</Button>}
+          {preview && <Button variant="contained" onClick={handleConfirm}>本取込み</Button>}
+          <Button onClick={onClose}>閉じる</Button>
+        </DialogActions>
+        {/* メッセージ表示 */}
+        <Dialog open={!!message} onClose={()=>setMessage("")}>
+          <DialogTitle>お知らせ</DialogTitle>
+          <DialogContent>
+            <Typography>{message}</Typography>
+          </DialogContent>
+          <DialogActions>
+            <Button onClick={()=>setMessage("")}>OK</Button>
+          </DialogActions>
+        </Dialog>
+      </Dialog>
+    );
+  }
+
+  // ExportDialog
+  function ExportDialog({ open, onClose, onConfirm, rowCount }) {
+    const theme      = useTheme();
+    const fullScreen = useMediaQuery(theme.breakpoints.down('sm'));
+    return (
+      <Dialog fullScreen={fullScreen} open={open} onClose={onClose}>
+        <DialogTitle>エクスポート</DialogTitle>
+        <DialogContent dividers>
+          <Typography>
+            現在の基本テーブルには <strong>{rowCount}</strong> 行があります。
+          </Typography>
+          <Typography>
+            CSV ファイルとしてダウンロードしますか？
+          </Typography>
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={onClose}>キャンセル</Button>
+          <Button variant="contained" onClick={onConfirm}>ダウンロード</Button>
+        </DialogActions>
+      </Dialog>
+    );
+  }
+
+  // HistoryDialog
+  function HistoryDialog({ open, onClose, historyList, onRestore, onDelete, onPreview }) {
+    const theme      = useTheme();
+    const fullScreen = useMediaQuery(theme.breakpoints.down('sm'));
+    return (
+      <Dialog fullScreen={fullScreen} open={open} onClose={onClose}>
+        <DialogTitle>インポート履歴一覧</DialogTitle>
+        <DialogContent dividers>
+          {historyList.length === 0 ? (
+            <Typography>履歴がありません。</Typography>
+          ) : (
+            <TableContainer component={Paper}>
+              <Table size="small">
+                <TableHead>
+                  <TableRow>
+                    <TableCell>No.</TableCell>
+                    <TableCell>日時</TableCell>
+                    <TableCell>追加行数</TableCell>
+                    <TableCell align="center">操作</TableCell>
+                  </TableRow>
+                </TableHead>
+                <TableBody>
+                  {historyList.map((e, idx) => (
+                    <TableRow
+                      key={e.id}
+                      sx={{
+                        opacity: e.deleted ? 0.5 : 1,
+                        textDecoration: e.deleted ? 'line-through' : 'none',
+                        cursor: 'pointer'
+                      }}
+                      onClick={() => onPreview && onPreview(e.importedData)}
+                    >
+                      <TableCell>{idx + 1}</TableCell>
+                      <TableCell>{e.timestamp.toLocaleString()}</TableCell>
+                      <TableCell>{e.importedData ? e.importedData.length : 0}</TableCell>
+                      <TableCell align="center" onClick={ev => ev.stopPropagation()}>
+                        <Button
+                          size="small"
+                          disabled={!e.deleted}
+                          onClick={()=>onRestore(e.id)}
+                        >
+                          復活
+                        </Button>
+                        <Button
+                          size="small"
+                          color="error"
+                          disabled={e.deleted}
+                          onClick={()=>onDelete(e.id)}
+                        >
+                          削除
+                        </Button>
+                      </TableCell>
+                    </TableRow>
+                  ))}
+                </TableBody>
+              </Table>
+            </TableContainer>
+          )}
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={onClose}>閉じる</Button>
+        </DialogActions>
+      </Dialog>
+    );
+  }
+
+  ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+  </script>
+</body>
+</html>
