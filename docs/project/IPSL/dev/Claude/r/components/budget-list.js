@@ -47,7 +47,8 @@ const emptyForm = {
   insideAnnual: true,
   budget: '',
   prepaid: '',
-  posted: ''
+  posted: '',
+  assigneeDepartment: '' // 担当部署追加
 };
 
 /* ---- コンポーネント ---- */
@@ -99,7 +100,8 @@ const BudgetList = () => {
           r.insideAnnual ? '内' : '外',
           r.budget,
           r.prepaid,
-          r.posted
+          r.posted,
+          r.assigneeDepartment || ""
         ].join(",");
         csv += row + "\n";
       });
@@ -116,7 +118,8 @@ const BudgetList = () => {
           g.insideAnnual ? '内' : '外',
           g.budget,
           g.prepaid,
-          g.posted
+          g.posted,
+          "" // 集計には担当部署なし
         ].join(",");
         csv += row + "\n";
       });
@@ -186,11 +189,11 @@ const BudgetList = () => {
     'No','進捗','期間','予算ID','予算名','勘定科目',
     '計上方法','部署','負担部署','配分パターン',
     '企画ID','年度予算内外',
-    '予算金額','前払金額(未計上)','計上金額'
+    '予算金額','前払金額(未計上)','計上金額','担当部署' // 担当部署追加
   ];
   const TOTAL_HEADERS = [
     'No','進捗','期間','計上方法','部署','負担部署',
-    '年度予算内外','予算金額','前払金額(未計上)','計上金額'
+    '年度予算内外','予算金額','前払金額(未計上)','計上金額','担当部署' // 担当部署追加
   ];
 
   /* ========== 行クリック ========== */
@@ -339,6 +342,7 @@ const BudgetList = () => {
                     <TableCell align="right">{fmtYen(r.budget)}</TableCell>
                     <TableCell align="right">{fmtYen(r.prepaid)}</TableCell>
                     <TableCell align="right">{fmtYen(r.posted)}</TableCell>
+                    <TableCell align="center">{r.assigneeDepartment||"-"}</TableCell>
                   </TableRow>
                 ))
               : pagedTotalData.map((g,idx)=>(
@@ -358,6 +362,7 @@ const BudgetList = () => {
                     <TableCell align="right">{fmtYen(g.budget)}</TableCell>
                     <TableCell align="right">{fmtYen(g.prepaid)}</TableCell>
                     <TableCell align="right">{fmtYen(g.posted)}</TableCell>
+                    <TableCell align="center"></TableCell>
                   </TableRow>
                 ))
             }
@@ -508,6 +513,12 @@ const BudgetList = () => {
               onChange={e=>handleAddChange('posted', e.target.value)}
               fullWidth
             />
+            <TextField
+              label="担当部署"
+              value={addForm.assigneeDepartment||""}
+              onChange={e=>handleAddChange('assigneeDepartment', e.target.value)}
+              fullWidth
+            />
           </Box>
         </DialogContent>
         <DialogActions>
@@ -632,6 +643,12 @@ const BudgetList = () => {
               onChange={e=>handleEditChange('posted', e.target.value)}
               fullWidth
             />
+            <TextField
+              label="担当部署"
+              value={editForm.assigneeDepartment||""}
+              onChange={e=>handleEditChange('assigneeDepartment', e.target.value)}
+              fullWidth
+            />
           </Box>
         </DialogContent>
         <DialogActions>
@@ -687,6 +704,7 @@ const BudgetList = () => {
                     <TableCell align="right">{fmtYen(r.budget)}</TableCell>
                     <TableCell align="right">{fmtYen(r.prepaid)}</TableCell>
                     <TableCell align="right">{fmtYen(r.posted)}</TableCell>
+                    <TableCell align="center">{r.assigneeDepartment||"-"}</TableCell>
                   </TableRow>
                 ))}
               </TableBody>
