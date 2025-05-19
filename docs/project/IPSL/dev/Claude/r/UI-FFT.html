@@ -1,0 +1,272 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <title>FFTデモ with React & MUI</title>
+  <!-- Google Fonts -->
+  <link rel="stylesheet"
+        href="https://fonts.googleapis.com/css2?family=Roboto:wght@300;400;500;700&display=swap">
+  <!-- React & ReactDOM -->
+  <script src="https://cdn.jsdelivr.net/npm/react@18.2.0/umd/react.production.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/react-dom@18.2.0/umd/react-dom.production.min.js"></script>
+  <!-- Babel for JSX -->
+  <script src="https://cdn.jsdelivr.net/npm/@babel/standalone@7.23.8/babel.min.js"></script>
+  <!-- Emotion (required by MUI) -->
+  <script src="https://cdn.jsdelivr.net/npm/@emotion/react@11.11.3/dist/emotion-react.umd.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@emotion/styled@11.11.0/dist/emotion-styled.umd.min.js"></script>
+  <!-- MUI -->
+  <script src="https://cdn.jsdelivr.net/npm/@mui/material@5.15.3/umd/material-ui.production.min.js"></script>
+  <!-- Chart.js -->
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+  <style>
+    body { font-family: 'Roboto', sans-serif; margin: 16px; }
+    #root { max-width: 900px; margin: auto; }
+    canvas { width: 100% !important; height: 300px !important; }
+    .toggle-group { margin-right: 1rem; }
+    table { width: 100%; margin-top: 1rem; }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+  <script type="text/babel">
+    const { useState, useRef, useEffect } = React;
+    const {
+      Box, Button, FormControl, InputLabel, Select, MenuItem, Typography,
+      Table, TableBody, TableCell, TableContainer, TableHead, TableRow, Paper,
+      ToggleButton, ToggleButtonGroup
+    } = MaterialUI;
+
+    // 定数
+    const DAYS = 365;
+    const NUM_STORES = 5;
+    const KEEP_COMPONENTS = 20;
+    const monthLengths = [31,28,31,30,31,30,31,31,30,31,30,31];
+    const monthNames = ['1月','2月','3月','4月','5月','6月','7月','8月','9月','10月','11月','12月'];
+
+    // --- FFT関数群 ---
+    function dft(input) {
+      const N = input.length;
+      const out = new Array(N);
+      for (let k = 0; k < N; k++) {
+        let re = 0, im = 0;
+        for (let n = 0; n < N; n++) {
+          const ang = 2 * Math.PI * k * n / N;
+          re +=  input[n] * Math.cos(ang);
+          im += -input[n] * Math.sin(ang);
+        }
+        out[k] = { re, im };
+      }
+      return out;
+    }
+    function compressDFT(spec, K) {
+      const mags = spec.map((c,i) => ({ i, mag: Math.hypot(c.re, c.im) }));
+      mags.sort((a, b) => b.mag - a.mag);
+      const keep = new Set(mags.slice(0, K).map(x => x.i));
+      return spec.map((c, i) => keep.has(i) ? c : { re: 0, im: 0 });
+    }
+    function idft(freqs) {
+      const N = freqs.length;
+      const out = new Array(N);
+      for (let n = 0; n < N; n++) {
+        let sumRe = 0;
+        for (let k = 0; k < N; k++) {
+          const ang = 2 * Math.PI * k * n / N;
+          sumRe += freqs[k].re * Math.cos(ang) - freqs[k].im * Math.sin(ang);
+        }
+        out[n] = sumRe / N;
+      }
+      return out;
+    }
+
+    // サンプルデータ生成
+    function generateSampleData(numStores) {
+      const stores = {};
+      for (let i = 1; i <= numStores; i++) {
+        const id = `Store${i}`;
+        const arr = Array.from({ length: DAYS }, (_, d) =>
+          100 + 20 * Math.sin(2 * Math.PI * d / 30 + Math.random() * 2 * Math.PI)
+                + 10 * Math.sin(2 * Math.PI * d / 7 + Math.random() * 2 * Math.PI)
+                + Math.random() * 5
+        );
+        stores[id] = arr;
+      }
+      return stores;
+    }
+
+    function App() {
+      const [storesData, setStoresData] = useState({});
+      const [reconData, setReconData]   = useState({});
+      const [storeIds, setStoreIds]     = useState([]);
+      const [viewMode, setViewMode]     = useState('all');
+      const [selectedStore, setSelectedStore] = useState('');
+      const [unit, setUnit]             = useState('day');
+      const chartRef                   = useRef(null);
+      const chartInstance              = useRef(null);
+
+      const handleGenerate = () => {
+        const data = generateSampleData(NUM_STORES);
+        const recon = {};
+        Object.entries(data).forEach(([id, arr]) => {
+          const spec = dft(arr);
+          const comp = compressDFT(spec, KEEP_COMPONENTS);
+          recon[id] = idft(comp);
+        });
+        setStoresData(data);
+        setReconData(recon);
+        const ids = Object.keys(data);
+        setStoreIds(ids);
+        setSelectedStore(ids[0] || '');
+      };
+
+      // データ取得＆集計
+      const getDisplay = () => {
+        const keys = Object.keys(storesData);
+        if (keys.length === 0) return null;
+        if (viewMode === 'store' && (!storesData[selectedStore] || !reconData[selectedStore])) {
+          return null;
+        }
+        let combinedActual, combinedRecon;
+        if (viewMode === 'all') {
+          combinedActual = Object.values(storesData)
+            .reduce((a, b) => a.map((v, i) => v + b[i]));
+          combinedRecon = Object.values(reconData)
+            .reduce((a, b) => a.map((v, i) => v + b[i]));
+        } else {
+          combinedActual = storesData[selectedStore];
+          combinedRecon = reconData[selectedStore];
+        }
+        if (unit === 'day') {
+          return {
+            labels: Array.from({ length: DAYS }, (_, i) => `${i + 1}日`),
+            actual: combinedActual,
+            recon: combinedRecon
+          };
+        } else {
+          const actualM = [];
+          const reconM = [];
+          let idx = 0;
+          monthLengths.forEach((len, m) => {
+            actualM.push(
+              combinedActual.slice(idx, idx + len).reduce((s, v) => s + v, 0)
+            );
+            reconM.push(
+              combinedRecon.slice(idx, idx + len).reduce((s, v) => s + v, 0)
+            );
+            idx += len;
+          });
+          return {
+            labels: monthNames,
+            actual: actualM,
+            recon: reconM
+          };
+        }
+      };
+
+      // チャート描画
+      useEffect(() => {
+        const data = getDisplay();
+        if (!data) return;
+        if (chartInstance.current) chartInstance.current.destroy();
+        const ctx = chartRef.current.getContext('2d');
+        chartInstance.current = new Chart(ctx, {
+          type: 'line',
+          data: {
+            labels: data.labels,
+            datasets: [
+              { label: '実データ', data: data.actual, borderColor: 'blue', fill: false },
+              { label: '再構成', data: data.recon, borderColor: 'red', fill: false }
+            ]
+          },
+          options: {
+            responsive: true,
+            plugins: { legend: { position: 'top' } },
+            scales: {
+              x: { title: { display: true, text: unit === 'day' ? '日' : '月' } },
+              y: { title: { display: true, text: '売上' } }
+            }
+          }
+        });
+      }, [viewMode, selectedStore, unit, storesData, reconData]);
+
+      const disp = getDisplay();
+
+      return (
+        <Box>
+          <Typography variant="h4" gutterBottom>
+            FFTデモ：集計・店舗別・単位切替
+          </Typography>
+          <Box display="flex" alignItems="center" flexWrap="wrap" mb={2}>
+            <Button variant="contained" onClick={handleGenerate} sx={{ mr: 2 }}>
+              デモデータ生成
+            </Button>
+            <ToggleButtonGroup
+              value={viewMode}
+              exclusive
+              onChange={(_, v) => v && setViewMode(v)}
+              size="small"
+              sx={{ mr: 2 }}
+            >
+              <ToggleButton value="all">合算</ToggleButton>
+              <ToggleButton value="store">店舗別</ToggleButton>
+            </ToggleButtonGroup>
+            {viewMode === 'store' && (
+              <FormControl sx={{ minWidth: 120, mr: 2 }} size="small">
+                <InputLabel>店舗</InputLabel>
+                <Select
+                  value={selectedStore}
+                  label="店舗"
+                  onChange={e => setSelectedStore(e.target.value)}
+                >
+                  {storeIds.map(id => (
+                    <MenuItem key={id} value={id}>
+                      {id}
+                    </MenuItem>
+                  ))}
+                </Select>
+              </FormControl>
+            )}
+            <ToggleButtonGroup
+              value={unit}
+              exclusive
+              onChange={(_, v) => v && setUnit(v)}
+              size="small"
+            >
+              <ToggleButton value="day">日</ToggleButton>
+              <ToggleButton value="month">月</ToggleButton>
+            </ToggleButtonGroup>
+          </Box>
+          <canvas ref={chartRef}></canvas>
+          {disp && (
+            <TableContainer component={Paper} sx={{ mt: 2 }}>
+              <Table size="small">
+                <TableHead>
+                  <TableRow>
+                    <TableCell>{unit === 'day' ? '日' : '月'}</TableCell>
+                    <TableCell align="right">実データ</TableCell>
+                    <TableCell align="right">再構成</TableCell>
+                  </TableRow>
+                </TableHead>
+                <TableBody>
+                  {disp.labels.map((lab, i) => (
+                    <TableRow key={i}>
+                      <TableCell>{lab}</TableCell>
+                      <TableCell align="right">
+                        {disp.actual[i].toFixed(2)}
+                      </TableCell>
+                      <TableCell align="right">
+                        {disp.recon[i].toFixed(2)}
+                      </TableCell>
+                    </TableRow>
+                  ))}
+                </TableBody>
+              </Table>
+            </TableContainer>
+          )}
+        </Box>
+      );
+    }
+
+    ReactDOM.render(<App />, document.getElementById('root'));
+  </script>
+</body>
+</html>
