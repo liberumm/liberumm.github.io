@@ -1,0 +1,1177 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <title>4 Hub Mock – Core Only</title>
+
+  <!-- ===== CDN ===== -->
+  <link rel="stylesheet"
+        href="https://fonts.googleapis.com/css2?family=Roboto:wght@300;400;500;700&display=swap">
+  <script src="https://cdn.jsdelivr.net/npm/react@18.2.0/umd/react.production.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/react-dom@18.2.0/umd/react-dom.production.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@babel/standalone@7.23.8/babel.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@emotion/react@11.11.3/dist/emotion-react.umd.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@emotion/styled@11.11.0/dist/emotion-styled.umd.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@mui/material@5.15.3/umd/material-ui.production.min.js"></script>
+
+  <style>
+    body { margin:0; font-family:'Roboto',sans-serif; background:#fafafa; }
+    .tbl-wrap { max-height:360px; overflow:auto; }
+    table { width:100%; border-collapse:collapse; }
+    th, td { border:1px solid #ccc; padding:4px 8px; font-size:0.8rem; }
+    th { position:sticky; top:0; background:#eceff1; }
+    .heat { display:grid; grid-template-columns:repeat(5,1fr); gap:2px; }
+    .cell { height:36px; display:flex; align-items:center; justify-content:center;
+            font-size:0.75rem; color:#fff; }
+    .bar-row { display:flex; align-items:center; gap:4px; margin-bottom:4px; }
+    .bar { height:12px; background:#1976d2; opacity:.75; }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+
+  <script type="text/babel">
+    const { useState } = React;
+    const {
+      CssBaseline, AppBar, Toolbar, IconButton, Typography, Button,
+      Box, Drawer, List, ListItemButton, ListItemText,
+      Tabs, Tab, Chip, Container, Grid, Card, CardContent,
+      Paper, Slider, LinearProgress, Stack,
+      Select, MenuItem, Badge, Collapse
+    } = MaterialUI;
+
+    /* ---- ダミーデータ & 計算 ---- */
+    const BASE = { revenue:1200000, profit:300000, loss:50000 };
+    const W = { costIn:1.2, markDown:-1.5, markUp:2.0, displayQty:0.8, headCount:0.5 };
+    // calcFをここで定義
+    const calcF = d => {
+      const inc = Object.entries(d).reduce((s,[k,v])=>s+v*W[k],0)*1000;
+      const rev = BASE.revenue + inc;
+      return { revenue:rev, profit:rev*0.25, loss:rev*0.04 };
+    };
+    // メトリクス定義を拡張
+    const METRICS = [
+      { key: 'Revenue',    jp: '売上',     en: 'Revenue',     role: '経営成果' },
+      { key: 'Profit',     jp: '利益',     en: 'Profit',      role: '収益性' },
+      { key: 'Loss',       jp: 'ロス',     en: 'Loss',        role: '損失' },
+      { key: 'Cost-in',    jp: '値入',     en: 'Cost-in',     role: '原価要因' },
+      { key: 'Mark-down',  jp: '値下',     en: 'Mark-down',   role: '割引要因' },
+      { key: 'Mark-up',    jp: '値上',     en: 'Mark-up',     role: '価格上げ要因' },
+      { key: 'DisplayQty', jp: '陳列量',   en: 'Display Qty', role: '売場投入量' },
+      { key: 'Head-count', jp: '人数',     en: 'Head-count',  role: '客数／人員' }
+    ];
+    // サンプルデータ生成: 各日付ごとに全メトリックを生成
+    const gen = () => {
+      const drv = Object.fromEntries(Object.keys(W).map(k=>[k,Math.floor(Math.random()*101)]));
+      const kpi = calcF(drv);
+      // 10日分の日付
+      const dates = Array.from({length:10}).map((_,i)=>`5/${i+1}`);
+      // 各日付×各メトリック
+      const rows = [];
+      dates.forEach(date => {
+        METRICS.forEach(m => {
+          const r = Math.random();
+          let is_actual=0, is_derived=0, is_imputed=0;
+          if(r<0.6) is_actual=1;
+          else if(r<0.8) is_derived=1;
+          else is_imputed=1;
+          rows.push({
+            date,
+            metric: m.key,
+            value: Math.floor(Math.random()*1200)+100,
+            is_actual, is_derived, is_imputed
+          });
+        });
+      });
+      return { drv, kpi, rows };
+    };
+
+    /* ---- 共通 KPI カード ---- */
+    const KpiCard = ({ title, value, base }) => {
+      const diff = ((value-base)/base*100).toFixed(1);
+      return (
+        <Card sx={{ textAlign:'center' }}>
+          <CardContent>
+            <Typography variant="subtitle1">{title}</Typography>
+            <Typography variant="h6">{value.toLocaleString()} 円</Typography>
+            <Chip size="small" label={`${diff}%`} color={diff>=0?'primary':'secondary'} sx={{ mt:1 }}/>
+          </CardContent>
+        </Card>
+      );
+    };
+    const KpiGrid = ({ kpi }) => {
+      const vals = [kpi.revenue, kpi.profit, kpi.loss];
+      const titles = ['売上','利益','ロス'];
+      return (
+        <Grid container spacing={2}>
+          {titles.map((t,i)=>(
+            <Grid item xs={12} sm={4} key={t}>
+              <KpiCard title={t} value={vals[i]} base={BASE[t.toLowerCase()]} />
+            </Grid>
+          ))}
+        </Grid>
+      );
+    };
+
+    /* ---- A Actual Hub ---- */
+    // METRIC_LABELSも拡張
+    const METRIC_LABELS = {
+      Revenue:    { jp: "売上",     en: "Revenue",     role: "経営成果" },
+      Profit:     { jp: "利益",     en: "Profit",      role: "収益性" },
+      Loss:       { jp: "ロス",     en: "Loss",        role: "損失" },
+      "Cost-in":  { jp: "値入",     en: "Cost-in",     role: "原価要因" },
+      "Mark-down":{ jp: "値下",     en: "Mark-down",   role: "割引要因" },
+      "Mark-up":  { jp: "値上",     en: "Mark-up",     role: "価格上げ要因" },
+      DisplayQty: { jp: "陳列量",   en: "Display Qty", role: "売場投入量" },
+      "Head-count":{jp: "人数",     en: "Head-count",  role: "客数／人員" }
+    };
+
+    const Actual = ({ rows }) => {
+      const [filter, setFilter] = useState('');
+      const [showOnlyActual, setShowOnlyActual] = useState(false);
+      const [showOnlyMissing, setShowOnlyMissing] = useState(false);
+      const [sort, setSort] = useState({ key: 'date', asc: true });
+      // 粒度変換
+      const [granularity, setGranularity] = useState('日');
+      // バージョン履歴
+      const [version, setVersion] = useState('v1.0');
+      const versions = ['v1.0', 'v0.9', 'v0.8'];
+      // 監査履歴ダミー
+      const auditLogs = [
+        { ts: '2024-06-01 02:10', msg: 'データ取込・ETL完了', user: 'system' },
+        { ts: '2024-06-01 02:12', msg: 'S-欠測→派生生成', user: 'system' },
+        { ts: '2024-06-01 02:13', msg: 'I-欠測→補完推定', user: 'system' }
+      ];
+
+      // 粒度変換ダミー
+      const granularityOptions = ['年', '月', '週', '日', '時間'];
+
+      // 日付一覧
+      const dates = Array.from(new Set(rows.map(r=>r.date))).sort((a,b)=>{
+        // 日付順ソート
+        const [am,ad]=a.split('/').map(Number), [bm,bd]=b.split('/').map(Number);
+        return am!==bm ? am-bm : ad-bd;
+      });
+
+      // メトリック一覧
+      const metrics = METRICS.map(m=>m.key);
+
+      // 日付ごとに {date, metrics:{Revenue:{}, Profit:{}, ...}} の形に変換
+      const dateRows = dates.map(date => {
+        const metricMap = {};
+        metrics.forEach(m => {
+          const found = rows.find(r=>r.date===date && r.metric===m);
+          metricMap[m] = found || {};
+        });
+        return { date, metrics: metricMap };
+      });
+
+      // フィルタ・欠測/実績のみ
+      const filteredDateRows = dateRows.filter(row => {
+        if (filter && !row.date.includes(filter)) return false;
+        if (showOnlyActual) {
+          // すべてのメトリックが実績のみ
+          return metrics.every(m => row.metrics[m]?.is_actual);
+        }
+        if (showOnlyMissing) {
+          // いずれかのメトリックが派生or補完
+          return metrics.some(m => row.metrics[m]?.is_derived || row.metrics[m]?.is_imputed);
+        }
+        return true;
+      });
+
+      // ソート
+      const sortedDateRows = [...filteredDateRows].sort((a,b)=>{
+        if(sort.key==='date'){
+          const [am,ad]=a.date.split('/').map(Number), [bm,bd]=b.date.split('/').map(Number);
+          return sort.asc ? (am!==bm?am-bm:ad-bd) : (am!==bm?bm-am:bd-ad);
+        }
+        // メトリック値でソート
+        const m = sort.key;
+        const av = a.metrics[m]?.value ?? 0, bv = b.metrics[m]?.value ?? 0;
+        return sort.asc ? av-bv : bv-av;
+      });
+
+      // データ品質集計
+      let actualCount=0, derivedCount=0, imputCount=0, totalCount=0;
+      rows.forEach(r=>{
+        if(r.is_actual) actualCount++;
+        if(r.is_derived) derivedCount++;
+        if(r.is_imputed) imputCount++;
+        totalCount++;
+      });
+
+      // 欠測タイプ自動判定（MET準拠）表示
+      const getMissingType = r => {
+        if (r.is_actual) return '';
+        if (r.is_derived) return 'S-欠測';
+        if (r.is_imputed) return 'I-欠測';
+        return '';
+      };
+
+      // データエクスポート
+      const exportCSV = () => {
+        let csv = ['date,'+metrics.map(m=>`${METRIC_LABELS[m].jp}値,${METRIC_LABELS[m].jp}実績,${METRIC_LABELS[m].jp}派生,${METRIC_LABELS[m].jp}補完`).join(',')].join('');
+        csv += '\n';
+        sortedDateRows.forEach(row=>{
+          const line = [row.date];
+          metrics.forEach(m=>{
+            const r = row.metrics[m]||{};
+            line.push(r.value??'');
+            line.push(r.is_actual?'○':'');
+            line.push(r.is_derived?'○':'');
+            line.push(r.is_imputed?'○':'');
+          });
+          csv += line.join(',')+'\n';
+        });
+        const blob = new Blob([csv], {type:'text/csv'});
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url; a.download = 'actual_data_matrix.csv';
+        a.click();
+        URL.revokeObjectURL(url);
+      };
+
+      // カラムラベル
+      const colLabels = metrics.map(m=>({
+        key: m,
+        jp: METRIC_LABELS[m].jp,
+        en: METRIC_LABELS[m].en,
+        role: METRIC_LABELS[m].role
+      }));
+
+      return (
+        <Container maxWidth="xl" sx={{ py:4 }}>
+          <Typography variant="h6" gutterBottom>
+            A. 実績データ管理基盤
+            <Typography variant="caption" sx={{ml:2}}>
+              データ取込・8メトリック・欠測タイプ自動判定(MET)・派生/補完・粒度変換・バージョン/監査履歴
+            </Typography>
+          </Typography>
+          <Paper sx={{ p:2, mb:2 }}>
+            <Grid container spacing={2} alignItems="center">
+              <Grid item xs={12} sm={6} md={3}>
+                <Stack direction="row" spacing={1} flexWrap="wrap">
+                  <Chip label={`完全実績 ${actualCount}`} color="success"/>
+                  <Chip label={`派生 ${derivedCount}`} color="info"/>
+                  <Chip label={`補完 ${imputCount}`} color="warning"/>
+                  <Chip label={`総件数 ${totalCount}`} variant="outlined"/>
+                </Stack>
+              </Grid>
+              <Grid item xs={12} sm={6} md={3}>
+                <Stack direction="row" spacing={1} flexWrap="wrap">
+                  <Button size="small" variant={showOnlyActual?"contained":"outlined"}
+                    onClick={()=>setShowOnlyActual(v=>!v)}>
+                    実績のみ
+                  </Button>
+                  <Button size="small" variant={showOnlyMissing?"contained":"outlined"}
+                    onClick={()=>setShowOnlyMissing(v=>!v)}>
+                    欠測/補完のみ
+                  </Button>
+                </Stack>
+              </Grid>
+              <Grid item xs={12} sm={6} md={3}>
+                <Stack direction="row" spacing={1} alignItems="center">
+                  <Typography variant="caption" sx={{mr:1}}>粒度:</Typography>
+                  <Select size="small" value={granularity} onChange={e=>setGranularity(e.target.value)}>
+                    {granularityOptions.map(g=><MenuItem key={g} value={g}>{g}</MenuItem>)}
+                  </Select>
+                  <Typography variant="caption" sx={{ml:2}}>バージョン:</Typography>
+                  <Select size="small" value={version} onChange={e=>setVersion(e.target.value)}>
+                    {versions.map(v=><MenuItem key={v} value={v}>{v}</MenuItem>)}
+                  </Select>
+                </Stack>
+              </Grid>
+              <Grid item xs={12} sm={6} md={3} sx={{textAlign:{xs:'left', md:'right'}, mt:{xs:1, md:0}}}>
+                <Button size="small" variant="outlined" onClick={exportCSV}>CSVエクスポート</Button>
+              </Grid>
+            </Grid>
+          </Paper>
+          <Paper className="tbl-wrap" sx={{ mb:2, position:'relative' }}>
+            <table>
+              <thead>
+                <tr>
+                  <th style={{position:'sticky', left:0, background:'#eceff1', zIndex:2}}>日付</th>
+                  {colLabels.map(col=>(
+                    <th key={col.key+'_val'}>
+                      <span
+                        style={{cursor:'pointer', userSelect:'none'}}
+                        onClick={()=>setSort(s=>({key: col.key, asc: s.key===col.key ? !s.asc : true}))}
+                      >
+                        {col.jp}値{sort.key===col.key ? (sort.asc?' ▲':' ▼') : ''}
+                      </span>
+                    </th>
+                  ))}
+                  {colLabels.map(col=><th key={col.key+'_status'}>{col.jp}判定</th>)}
+                  {colLabels.map(col=><th key={col.key+'_missing'}>欠測タイプ</th>)}
+                </tr>
+              </thead>
+              <tbody>
+                {sortedDateRows.map(row=>(
+                  <tr key={row.date}>
+                    <td style={{position:'sticky', left:0, background:'#fff', zIndex:1}}>{row.date}</td>
+                    {metrics.map(m=>{
+                      const r = row.metrics[m]||{};
+                      let bg = '';
+                      if(r.is_derived) bg='#e3f2fd';
+                      else if(r.is_imputed) bg='#fff8e1';
+                      else if(r.is_actual) bg='#e8f5e9';
+                      return (
+                        <td key={m+'_val'} style={{background:bg}}>
+                          {r.value ?? ''}
+                        </td>
+                      );
+                    })}
+                    {metrics.map(m=>{
+                      const r = row.metrics[m]||{};
+                      let txt = '';
+                      let color = '';
+                      if(r.is_actual) { txt = '実績'; color = '#388e3c'; }
+                      else if(r.is_derived) { txt = '派生'; color = '#1976d2'; }
+                      else if(r.is_imputed) { txt = '補完'; color = '#fbc02d'; }
+                      return (
+                        <td key={m+'_status'}>
+                          {txt && (
+                            <span style={{
+                              display:'inline-block',
+                              minWidth:32,
+                              padding:'0 6px',
+                              borderRadius:8,
+                              background:color,
+                              color:'#fff',
+                              fontSize:'0.8em',
+                              textAlign:'center'
+                            }}>{txt}</span>
+                          )}
+                        </td>
+                      );
+                    })}
+                    {metrics.map(m=>{
+                      const r = row.metrics[m]||{};
+                      return (
+                        <td key={m+'_missing'}>
+                          {getMissingType(r)}
+                        </td>
+                      );
+                    })}
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </Paper>
+          <Paper sx={{ p:2, mb:2 }}>
+            <Typography variant="subtitle2" gutterBottom>監査履歴</Typography>
+            <Box sx={{maxHeight:120, overflowY:'auto'}}>
+              <table style={{width:'100%', fontSize:'0.9em'}}>
+                <thead>
+                  <tr>
+                    <th>日時</th>
+                    <th>操作内容</th>
+                    <th>ユーザー</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {auditLogs.map((log,i)=>(
+                    <tr key={i}>
+                      <td>{log.ts}</td>
+                      <td>{log.msg}</td>
+                      <td>{log.user}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </Box>
+          </Paper>
+          <Paper sx={{ p:2 }}>
+            <Typography variant="subtitle2" gutterBottom>データソース・処理履歴</Typography>
+            <ul style={{margin:0, paddingLeft:20, fontSize:'0.9rem'}}>
+              <li>ETL処理: 2024-06-01 02:00 (自動取込)</li>
+              <li>欠測判定: S(システム), I(インプット)自動判定済</li>
+              <li>派生生成: ルールA/B適用</li>
+              <li>補完推定: 線形補間法</li>
+              <li>最終更新: 2024-06-01 02:10</li>
+            </ul>
+          </Paper>
+        </Container>
+      );
+    };
+
+    /* ---- B Insight Engine ---- */
+    // 8軸定義
+    const INSIGHT_AXES = [
+      { key: 'Area', jp: '地理エリア', sample: ['東', '西', '南', '北'] },
+      { key: 'ProductClass', jp: '商品分類', sample: ['A', 'B', 'C'] },
+      { key: 'Purpose', jp: '目的', sample: ['家庭', '業務', '趣味'] },
+      { key: 'PriceBand', jp: '価格帯', sample: ['高級', '中位', '廉価'] },
+      { key: 'Promotion', jp: '販促', sample: ['P1', 'P2', 'P3'] },
+      { key: 'Weather', jp: '天候', sample: ['晴', '雨', '曇'] },
+      { key: 'TimeSeries', jp: '時系列', sample: ['AM', 'PM', '夜'] },
+      { key: 'AgeBand', jp: '年齢帯', sample: ['10代', '20代', '30代', '40代', '50代'] }
+    ];
+
+    // サンプルデータ生成
+    function genInsightData() {
+      // 軸ごとにサンプル値を1つずつランダムに選ぶ
+      const randomPick = arr => arr[Math.floor(Math.random()*arr.length)];
+      // 100件分
+      return Array.from({length:100}).map((_,i)=>{
+        const row = {};
+        INSIGHT_AXES.forEach(ax=>{
+          row[ax.key] = randomPick(ax.sample);
+        });
+        // KPI値
+        row.Revenue = Math.floor(Math.random()*100000)+10000;
+        row.DisplayQty = Math.floor(Math.random()*1000)+100;
+        row.Profit = Math.floor(Math.random()*20000)+2000;
+        row.Loss = Math.floor(Math.random()*3000);
+        // 洞察用特徴量
+        row.WeatherIdx = row.Weather==='晴'?1:row.Weather==='雨'?0.7:0.9;
+        row.PromoFlag = row.Promotion==='P1'?1:0;
+        row.AgeDummy = row.AgeBand==='10代'?1:0;
+        return row;
+      });
+    }
+
+    // KPI作成例
+    function calcShelfEfficiency(row) {
+      return row.DisplayQty ? (row.Revenue/row.DisplayQty).toFixed(1) : '-';
+    }
+
+    // セグメント化（k-means風ダミー）
+    function segmentKMeans(rows, k=3) {
+      // Revenueで単純クラスタ分け
+      const sorted = [...rows].sort((a,b)=>a.Revenue-b.Revenue);
+      const n = Math.floor(sorted.length/k);
+      sorted.forEach((r,i)=>{
+        r.Segment = i<n ? 'Low' : i<2*n ? 'Mid' : 'High';
+      });
+      return sorted;
+    }
+
+    const Insight = () => {
+      // 8軸クロスピボット
+      const [axisX, setAxisX] = useState('Area');
+      const [axisY, setAxisY] = useState('ProductClass');
+      const [drill, setDrill] = useState(null);
+      const [data, setData] = useState(()=>segmentKMeans(genInsightData()));
+      const [kpi, setKpi] = useState('Revenue');
+      const [showFeature, setShowFeature] = useState(false);
+
+      // ピボットテーブル生成
+      const xVals = [...new Set(data.map(r=>r[axisX]))];
+      const yVals = [...new Set(data.map(r=>r[axisY]))];
+
+      // ピボット値
+      const getCell = (x, y) => {
+        const rows = data.filter(r=>r[axisX]===x && r[axisY]===y && (!drill || Object.entries(drill).every(([k,v])=>r[k]===v)));
+        if (!rows.length) return { value: '-', rows: [] };
+        let v = 0;
+        if (kpi==='ShelfEfficiency') v = calcShelfEfficiency(rows[0]);
+        else v = Math.round(rows.reduce((s,r)=>s+(r[kpi]||0),0)/rows.length);
+        return { value: v, rows };
+      };
+
+      // ドリルダウン
+      const handleDrill = (x, y) => {
+        setDrill({ [axisX]: x, [axisY]: y });
+      };
+
+      // KPI候補
+      const kpiOptions = [
+        { key: 'Revenue', label: '売上' },
+        { key: 'Profit', label: '利益' },
+        { key: 'Loss', label: 'ロス' },
+        { key: 'ShelfEfficiency', label: '棚効率(売上÷陳列量)' }
+      ];
+
+      // セグメント候補
+      const segmentOptions = ['Low','Mid','High'];
+
+      return (
+        <Container maxWidth="xl" sx={{ py:4 }}>
+          <Typography variant="h6" gutterBottom>
+            B. Insight Engine <Typography variant="caption" sx={{ml:2}}>8軸クロスピボット・ドリルダウン・KPI/特徴量・セグメント化</Typography>
+          </Typography>
+          <Paper sx={{ p:2, mb:2 }}>
+            <Stack direction={{xs:'column',sm:'row'}} spacing={2} alignItems="center">
+              <Typography variant="subtitle2">X軸:</Typography>
+              <Select size="small" value={axisX} onChange={e=>setAxisX(e.target.value)}>
+                {INSIGHT_AXES.map(ax=><MenuItem key={ax.key} value={ax.key}>{ax.jp}</MenuItem>)}
+              </Select>
+              <Typography variant="subtitle2">Y軸:</Typography>
+              <Select size="small" value={axisY} onChange={e=>setAxisY(e.target.value)}>
+                {INSIGHT_AXES.map(ax=><MenuItem key={ax.key} value={ax.key}>{ax.jp}</MenuItem>)}
+              </Select>
+              <Typography variant="subtitle2">KPI:</Typography>
+              <Select size="small" value={kpi} onChange={e=>setKpi(e.target.value)}>
+                {kpiOptions.map(opt=><MenuItem key={opt.key} value={opt.key}>{opt.label}</MenuItem>)}
+              </Select>
+              <Button size="small" variant={showFeature?"contained":"outlined"} onClick={()=>setShowFeature(v=>!v)}>
+                特徴量表示
+              </Button>
+            </Stack>
+          </Paper>
+          <Paper sx={{ p:2, mb:2 }}>
+            <Typography variant="subtitle2" gutterBottom>8軸クロスピボット</Typography>
+            <Box sx={{overflowX:'auto'}}>
+              <table style={{minWidth:600}}>
+                <thead>
+                  <tr>
+                    <th>{INSIGHT_AXES.find(ax=>ax.key===axisY).jp}＼{INSIGHT_AXES.find(ax=>ax.key===axisX).jp}</th>
+                    {xVals.map(x=><th key={x}>{x}</th>)}
+                  </tr>
+                </thead>
+                <tbody>
+                  {yVals.map(y=>(
+                    <tr key={y}>
+                      <td>{y}</td>
+                      {xVals.map(x=>{
+                        const cell = getCell(x,y);
+                        return (
+                          <td key={x} style={{cursor:'pointer', background:cell.value==='-'?'#f5f5f5':'#e3f2fd'}}
+                              onClick={()=>handleDrill(x,y)}>
+                            {cell.value}
+                          </td>
+                        );
+                      })}
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </Box>
+            {drill && (
+              <Box sx={{mt:2}}>
+                <Typography variant="subtitle2" gutterBottom>
+                  ドリルダウン: {axisX}={drill[axisX]}, {axisY}={drill[axisY]}
+                  <Button size="small" sx={{ml:2}} onClick={()=>setDrill(null)}>戻る</Button>
+                </Typography>
+                <Box sx={{overflowX:'auto'}}>
+                  <table style={{minWidth:600}}>
+                    <thead>
+                      <tr>
+                        {INSIGHT_AXES.map(ax=><th key={ax.key}>{ax.jp}</th>)}
+                        <th>売上</th><th>利益</th><th>ロス</th><th>棚効率</th>
+                        <th>セグメント</th>
+                        {showFeature && (<>
+                          <th>天候指数</th>
+                          <th>販促フラグ</th>
+                          <th>年齢ダミー</th>
+                        </>)}
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {data.filter(r=>
+                        r[axisX]===drill[axisX] && r[axisY]===drill[axisY]
+                      ).map((r,i)=>(
+                        <tr key={i}>
+                          {INSIGHT_AXES.map(ax=><td key={ax.key}>{r[ax.key]}</td>)}
+                          <td>{r.Revenue}</td>
+                          <td>{r.Profit}</td>
+                          <td>{r.Loss}</td>
+                          <td>{calcShelfEfficiency(r)}</td>
+                          <td>{r.Segment}</td>
+                          {showFeature && (<>
+                            <td>{r.WeatherIdx}</td>
+                            <td>{r.PromoFlag}</td>
+                            <td>{r.AgeDummy}</td>
+                          </>)}
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </Box>
+              </Box>
+            )}
+          </Paper>
+          <Paper sx={{ p:2 }}>
+            <Typography variant="subtitle2" gutterBottom>セグメント分布</Typography>
+            <Stack direction="row" spacing={2}>
+              {segmentOptions.map(seg=>{
+                const cnt = data.filter(r=>r.Segment===seg).length;
+                return <Chip key={seg} label={`${seg} (${cnt})`} color="info" />;
+              })}
+            </Stack>
+          </Paper>
+        </Container>
+      );
+    };
+
+    /* ---- C Forecast Hub ---- */
+    // 予測表示単位の定義
+    const FORECAST_MODES = [
+      {
+        key: 'year',
+        label: '年モード',
+        desc: '月度別・14か月',
+        getLabels: () => {
+          // 直近2月から14か月分
+          const now = new Date();
+          let y = now.getFullYear(), m = now.getMonth() + 1;
+          const labels = [];
+          for(let i=0;i<14;i++){
+            labels.push(`${y}/${m}`);
+            m++;
+            if(m>12){ m=1; y++; }
+          }
+          return labels;
+        }
+      },
+      {
+        key: 'month',
+        label: '月モード',
+        desc: '日別・31日間',
+        getLabels: () => Array.from({length:31}).map((_,i)=>`${i+1}日`)
+      },
+      {
+        key: 'week',
+        label: '週モード',
+        desc: '曜日・時間別（7日×24h）',
+        getLabels: () => {
+          const days = ['月','火','水','木','金','土','日'];
+          const hours = Array.from({length:24}).map((_,i)=>`${i}時`);
+          // 2次元: days x hours
+          return days.map(d=>hours.map(h=>`${d}${h}`));
+        }
+      }
+    ];
+
+    const Forecast = ({ drv, kpi, setDrv }) => {
+      const [mode, setMode] = useState('year');
+      // 精度評価サンプル
+      const [accuracy, setAccuracy] = useState({
+        MAPE: 4.2,
+        RMSE: 32000,
+        lastUpdate: '2024-06-01 02:00'
+      });
+      // ローリング再学習ダミー
+      const [retrainStatus, setRetrainStatus] = useState('idle');
+      const handleRetrain = () => {
+        setRetrainStatus('running');
+        setTimeout(()=>{
+          setAccuracy(a=>({...a, MAPE: (3+Math.random()*2).toFixed(2), RMSE: Math.round(30000+Math.random()*5000), lastUpdate: new Date().toLocaleString()}));
+          setRetrainStatus('done');
+          setTimeout(()=>setRetrainStatus('idle'), 1500);
+        }, 1200);
+      };
+
+      // サンプル予測データ生成
+      const getForecastData = () => {
+        if(mode==='year'){
+          const labels = FORECAST_MODES[0].getLabels();
+          return labels.map((label,i)=>({
+            label,
+            revenue: 1200000 + Math.round(50000*Math.sin(i/2)+Math.random()*30000),
+            profit:  300000 + Math.round(10000*Math.cos(i/2)+Math.random()*8000),
+            loss:    50000 + Math.round(3000*Math.sin(i/3)+Math.random()*2000)
+          }));
+        }
+        if(mode==='month'){
+          const labels = FORECAST_MODES[1].getLabels();
+          return labels.map((label,i)=>({
+            label,
+            revenue: 40000 + Math.round(5000*Math.sin(i/4)+Math.random()*2000),
+            profit:  10000 + Math.round(2000*Math.cos(i/4)+Math.random()*1000),
+            loss:    2000 + Math.round(500*Math.sin(i/5)+Math.random()*300)
+          }));
+        }
+        if(mode==='week'){
+          const labels2d = FORECAST_MODES[2].getLabels();
+          return labels2d.map((row,di)=>row.map((label,hi)=>({
+            label,
+            revenue: 6000 + Math.round(1000*Math.sin(di+hi/4)+Math.random()*400),
+            profit:  1500 + Math.round(300*Math.cos(di+hi/6)+Math.random()*150),
+            loss:    300 + Math.round(80*Math.sin(di+hi/8)+Math.random()*40)
+          })));
+        }
+        return [];
+      };
+      const forecastData = getForecastData();
+
+      return (
+        <Container maxWidth="xl" sx={{ py:4 }}>
+          <Typography variant="h6" gutterBottom>
+            C. 未来生成基盤 <Typography variant="caption" sx={{ml:2}}>多変量重回帰＋時系列モデル・シナリオ予測・ローリング再学習・精度評価</Typography>
+          </Typography>
+          <Paper sx={{ p:2, mb:2 }}>
+            <Stack direction={{xs:'column',sm:'row'}} spacing={2} alignItems="center">
+              <Typography variant="subtitle2" sx={{mr:2}}>表示単位:</Typography>
+              <Stack direction="row" spacing={1}>
+                {FORECAST_MODES.map(m=>(
+                  <Button
+                    key={m.key}
+                    variant={mode===m.key?'contained':'outlined'}
+                    onClick={()=>setMode(m.key)}
+                  >
+                    {m.label}
+                  </Button>
+                ))}
+              </Stack>
+              <Typography variant="caption" sx={{ml:2}}>
+                {FORECAST_MODES.find(m=>m.key===mode)?.desc}
+              </Typography>
+            </Stack>
+          </Paper>
+          <Grid container spacing={2}>
+            <Grid item xs={12} md={4}>
+              <Paper sx={{ p:2, mb:2 }}>
+                <Typography variant="subtitle2" gutterBottom>Drivers（変動シナリオ）</Typography>
+                <Stack spacing={2} sx={{ mt:2 }}>
+                  {Object.entries(drv).map(([key,val])=>(
+                    <Box key={key}>
+                      <Stack direction="row" spacing={1} alignItems="center">
+                        <Typography variant="caption" sx={{ width:80 }}>{key}</Typography>
+                        <Slider size="small" value={val}
+                          onChange={(_,v)=>setDrv(p=>({...p,[key]:v}))}
+                          sx={{ flex:1 }} />
+                        <Badge badgeContent={val} color="primary"/>
+                      </Stack>
+                    </Box>
+                  ))}
+                </Stack>
+              </Paper>
+              <Paper sx={{ p:2, mb:2 }}>
+                <Typography variant="subtitle2" gutterBottom>モデル学習・再学習</Typography>
+                <Stack direction="row" spacing={2} alignItems="center">
+                  <Button
+                    variant="contained"
+                    color="primary"
+                    disabled={retrainStatus==='running'}
+                    onClick={handleRetrain}
+                  >
+                    {retrainStatus==='running' ? '再学習中...' : 'ローリング再学習'}
+                  </Button>
+                  <Typography variant="caption" sx={{ml:1}}>
+                    新実績到着時に自動再学習
+                  </Typography>
+                </Stack>
+                <Typography variant="caption" sx={{mt:1, display:'block'}}>
+                  最終学習: {accuracy.lastUpdate}
+                </Typography>
+              </Paper>
+              <Paper sx={{ p:2 }}>
+                <Typography variant="subtitle2" gutterBottom>精度評価</Typography>
+                <Stack direction="row" spacing={2}>
+                  <Chip label={`MAPE: ${accuracy.MAPE}%`} color="info"/>
+                  <Chip label={`RMSE: ${accuracy.RMSE.toLocaleString()}`} color="info"/>
+                </Stack>
+                <Typography variant="caption" sx={{mt:1, display:'block'}}>
+                  ※ MAPE: 平均絶対パーセント誤差 / RMSE: 二乗平均平方根誤差
+                </Typography>
+              </Paper>
+            </Grid>
+            <Grid item xs={12} md={8}>
+              <Box sx={{ mt:2 }}><KpiGrid kpi={kpi}/></Box>
+              <Paper sx={{ p:2 }}>
+                <Typography variant="subtitle2">Outcome予測（Driverシナリオ反映）</Typography>
+                {/* 年モード: 月度別14か月 */}
+                {mode==='year' && (
+                  <Box sx={{overflowX:'auto'}}>
+                    <table style={{minWidth:600}}>
+                      <thead>
+                        <tr>
+                          <th>月度</th>
+                          <th>売上</th>
+                          <th>利益</th>
+                          <th>ロス</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {forecastData.map((d,i)=>(
+                          <tr key={d.label}>
+                            <td>{d.label}</td>
+                            <td>{d.revenue.toLocaleString()}</td>
+                            <td>{d.profit.toLocaleString()}</td>
+                            <td>{d.loss.toLocaleString()}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </Box>
+                )}
+                {/* 月モード: 日別31日 */}
+                {mode==='month' && (
+                  <Box sx={{overflowX:'auto'}}>
+                    <table style={{minWidth:600}}>
+                      <thead>
+                        <tr>
+                          <th>日付</th>
+                          <th>売上</th>
+                          <th>利益</th>
+                          <th>ロス</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {forecastData.map((d,i)=>(
+                          <tr key={d.label}>
+                            <td>{d.label}</td>
+                            <td>{d.revenue.toLocaleString()}</td>
+                            <td>{d.profit.toLocaleString()}</td>
+                            <td>{d.loss.toLocaleString()}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </Box>
+                )}
+                {/* 週モード: 7日×24時間 */}
+                {mode==='week' && (
+                  <Box sx={{overflowX:'auto'}}>
+                    <table style={{minWidth:900}}>
+                      <thead>
+                        <tr>
+                          <th>時＼曜日</th>
+                          {['月','火','水','木','金','土','日'].map((d,di)=><th key={di}>{d}</th>)}
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {Array.from({length:24}).map((_,hi)=>(
+                          <tr key={hi}>
+                            <td>{hi}時</td>
+                            {forecastData.map((row,di)=>(
+                              <td key={di}>
+                                <div style={{fontSize:'0.9em'}}>売上:{row[hi].revenue}</div>
+                                <div style={{fontSize:'0.8em',color:'#388e3c'}}>利:{row[hi].profit}</div>
+                                <div style={{fontSize:'0.8em',color:'#d32f2f'}}>ロ:{row[hi].loss}</div>
+                              </td>
+                            ))}
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </Box>
+                )}
+              </Paper>
+            </Grid>
+          </Grid>
+        </Container>
+      );
+    };
+
+    /* ---- D Variance Hub ---- */
+    // 8軸ドライバー
+    const DRIVER_AXES = [
+      { key: 'Cost-in', jp: '値入' },
+      { key: 'Mark-down', jp: '値下' },
+      { key: 'Mark-up', jp: '値上' },
+      { key: 'DisplayQty', jp: '陳列量' },
+      { key: 'Head-count', jp: '人数' },
+      { key: 'Revenue', jp: '売上' },
+      { key: 'Profit', jp: '利益' },
+      { key: 'Loss', jp: 'ロス' }
+    ];
+
+    // 表示単位
+    const VARIANCE_MODES = [
+      {
+        key: 'year',
+        label: '年モード',
+        desc: '月度別・14か月',
+        getLabels: () => {
+          const now = new Date();
+          let y = now.getFullYear(), m = now.getMonth() + 1;
+          const labels = [];
+          for(let i=0;i<14;i++){
+            labels.push(`${y}/${m}`);
+            m++;
+            if(m>12){ m=1; y++; }
+          }
+          return labels;
+        }
+      },
+      {
+        key: 'month',
+        label: '月モード',
+        desc: '日別・31日間',
+        getLabels: () => Array.from({length:31}).map((_,i)=>`${i+1}日`)
+      },
+      {
+        key: 'week',
+        label: '週モード',
+        desc: '曜日・時間別（7日×24h）',
+        getLabels: () => {
+          const days = ['月','火','水','木','金','土','日'];
+          const hours = Array.from({length:24}).map((_,i)=>`${i}時`);
+          return days.map(d=>hours.map(h=>`${d}${h}`));
+        }
+      }
+    ];
+
+    // サンプルデータ生成（年・月・週モード対応）
+    function genVarianceData(mode='year') {
+      if(mode==='year'){
+        const months = VARIANCE_MODES[0].getLabels();
+        return months.map(m=>{
+          const target = 1200000 + Math.round(Math.random()*100000);
+          const actual = target + Math.round((Math.random()-0.5)*120000);
+          const forecast = target + Math.round((Math.random()-0.5)*90000);
+          const drivers = DRIVER_AXES.map(ax=>{
+            const v = Math.round((Math.random()-0.5)*20000);
+            return { key: ax.key, jp: ax.jp, value: v };
+          });
+          const alerts = [];
+          if((actual-target)/target < -0.1) alerts.push('売上乖離大');
+          if(drivers.find(d=>d.key==='Loss' && d.value>10000)) alerts.push('ロス過多');
+          if(drivers.find(d=>d.key==='Head-count' && d.value<-5000)) alerts.push('人数不足');
+          return { label: m, target, actual, forecast, drivers, alerts };
+        });
+      }
+      if(mode==='month'){
+        const days = VARIANCE_MODES[1].getLabels();
+        return days.map(d=>{
+          const target = 40000 + Math.round(Math.random()*5000);
+          const actual = target + Math.round((Math.random()-0.5)*8000);
+          const forecast = target + Math.round((Math.random()-0.5)*6000);
+          const drivers = DRIVER_AXES.map(ax=>{
+            const v = Math.round((Math.random()-0.5)*3000);
+            return { key: ax.key, jp: ax.jp, value: v };
+          });
+          const alerts = [];
+          if((actual-target)/target < -0.1) alerts.push('売上乖離大');
+          if(drivers.find(d=>d.key==='Loss' && d.value>1000)) alerts.push('ロス過多');
+          if(drivers.find(d=>d.key==='Head-count' && d.value<-500)) alerts.push('人数不足');
+          return { label: d, target, actual, forecast, drivers, alerts };
+        });
+      }
+      if(mode==='week'){
+        const labels2d = VARIANCE_MODES[2].getLabels();
+        return labels2d.map((row,di)=>row.map((label,hi)=>{
+          const target = 6000 + Math.round(Math.random()*800);
+          const actual = target + Math.round((Math.random()-0.5)*1200);
+          const forecast = target + Math.round((Math.random()-0.5)*900);
+          const drivers = DRIVER_AXES.map(ax=>{
+            const v = Math.round((Math.random()-0.5)*500);
+            return { key: ax.key, jp: ax.jp, value: v };
+          });
+          const alerts = [];
+          if((actual-target)/target < -0.1) alerts.push('売上乖離大');
+          if(drivers.find(d=>d.key==='Loss' && d.value>200)) alerts.push('ロス過多');
+          if(drivers.find(d=>d.key==='Head-count' && d.value<-100)) alerts.push('人数不足');
+          return { label, target, actual, forecast, drivers, alerts };
+        }));
+      }
+      return [];
+    }
+
+    const Variance = () => {
+      const [mode, setMode] = useState('year');
+      const [data, setData] = useState(()=>genVarianceData('year'));
+      const [selectedIdx, setSelectedIdx] = useState(0);
+
+      // モード切替時データ再生成
+      React.useEffect(()=>{
+        setData(genVarianceData(mode));
+        setSelectedIdx(0);
+      },[mode]);
+
+      // 年・月は1次元、週は2次元
+      const isWeek = mode==='week';
+      const selected = isWeek
+        ? (()=>{ // 週モード: 選択インデックスを[di,hi]で管理
+            const [di,hi] = Array.isArray(selectedIdx)?selectedIdx:[0,0];
+            return data[di]?.[hi] || data[0]?.[0];
+          })()
+        : data[selectedIdx] || data[0];
+
+      // レポート・APIダミー
+      const handleExport = type => {
+        alert(`${type}エクスポート(API呼び出し想定)`);
+      };
+
+      return (
+        <Container maxWidth="xl" sx={{ py:4 }}>
+          <Typography variant="h6" gutterBottom>
+            D. 予実管理基盤 <Typography variant="caption" sx={{ml:2}}>時系列・要因分解・アラート・レポート/API</Typography>
+          </Typography>
+          <Paper sx={{ p:2, mb:2 }}>
+            <Stack direction="row" spacing={2} alignItems="center">
+              <Typography variant="subtitle2">表示単位:</Typography>
+              <Stack direction="row" spacing={1}>
+                {VARIANCE_MODES.map(m=>(
+                  <Button
+                    key={m.key}
+                    variant={mode===m.key?'contained':'outlined'}
+                    onClick={()=>setMode(m.key)}
+                  >
+                    {m.label}
+                  </Button>
+                ))}
+              </Stack>
+              <Typography variant="caption" sx={{ml:2}}>
+                {VARIANCE_MODES.find(m=>m.key===mode)?.desc}
+              </Typography>
+            </Stack>
+          </Paper>
+          {/* 時系列推移 */}
+          <Paper sx={{ p:2, mb:2 }}>
+            <Typography variant="subtitle2" gutterBottom>Outcome 目標 vs 実績／予測</Typography>
+            <Box sx={{overflowX:'auto'}}>
+              {isWeek ? (
+                <table style={{minWidth:900}}>
+                  <thead>
+                    <tr>
+                      <th>時＼曜日</th>
+                      {['月','火','水','木','金','土','日'].map((d,di)=><th key={di}>{d}</th>)}
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {Array.from({length:24}).map((_,hi)=>(
+                      <tr key={hi}>
+                        <td>{hi}時</td>
+                        {data.map((row,di)=>(
+                          <td key={di}
+                            style={{background: selectedIdx[0]===di && selectedIdx[1]===hi ? '#e3f2fd' : ''}}
+                            onClick={()=>setSelectedIdx([di,hi])}
+                          >
+                            <div>目:{row[hi].target}</div>
+                            <div>実:{row[hi].actual}</div>
+                            <div>予:{row[hi].forecast}</div>
+                            <div style={{fontSize:'0.8em',color:'#d32f2f'}}>{row[hi].alerts.join(',')}</div>
+                          </td>
+                        ))}
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              ) : (
+                <table style={{minWidth:600}}>
+                  <thead>
+                    <tr>
+                      <th>{mode==='year'?'月度':'日付'}</th>
+                      <th>目標</th>
+                      <th>実績</th>
+                      <th>予測</th>
+                      <th>乖離(実績-目標)</th>
+                      <th>乖離率</th>
+                      <th>アラート</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {data.map((d,i)=>(
+                      <tr key={d.label} style={{background:i===selectedIdx?'#e3f2fd':''}}>
+                        <td>
+                          <Button size="small" onClick={()=>setSelectedIdx(i)} variant={i===selectedIdx?'contained':'text'}>
+                            {d.label}
+                          </Button>
+                        </td>
+                        <td>{d.target.toLocaleString()}</td>
+                        <td>{d.actual.toLocaleString()}</td>
+                        <td>{d.forecast.toLocaleString()}</td>
+                        <td style={{color: d.actual-d.target<0?'#d32f2f':'#388e3c'}}>
+                          {(d.actual-d.target).toLocaleString()}
+                        </td>
+                        <td style={{color: d.actual-d.target<0?'#d32f2f':'#388e3c'}}>
+                          {((d.actual-d.target)/d.target*100).toFixed(1)}%
+                        </td>
+                        <td>
+                          {d.alerts.map(a=>
+                            <Chip key={a} label={a} color="warning" size="small" sx={{mr:0.5}}/>
+                          )}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              )}
+            </Box>
+          </Paper>
+          {/* 要因分解 */}
+          <Paper sx={{ p:2, mb:2 }}>
+            <Typography variant="subtitle2" gutterBottom>
+              Driver 要因分解（8軸ツリー）: {selected?.label}
+            </Typography>
+            <Grid container spacing={2}>
+              {selected?.drivers?.map(d=>(
+                <Grid item xs={6} sm={3} key={d.key}>
+                  <Paper sx={{p:1, textAlign:'center', bgcolor:d.value<0?'#fff8e1':'#e3f2fd'}}>
+                    <Typography variant="caption">{d.jp}</Typography>
+                    <Typography variant="body2" sx={{fontWeight:'bold', color:d.value<0?'#d32f2f':'#1976d2'}}>
+                      {d.value>0?'+':''}{d.value.toLocaleString()}
+                    </Typography>
+                  </Paper>
+                </Grid>
+              ))}
+            </Grid>
+          </Paper>
+          {/* アラート通知 */}
+          <Paper sx={{ p:2, mb:2 }}>
+            <Typography variant="subtitle2" gutterBottom>アラート通知</Typography>
+            {selected?.alerts?.length === 0
+              ? <Typography variant="body2" color="success.main">アラートなし</Typography>
+              : selected?.alerts?.map(a=>
+                  <Chip key={a} label={a} color="warning" size="medium" sx={{mr:1, mb:1}}/>
+                )
+            }
+          </Paper>
+          {/* レポート & API */}
+          <Paper sx={{ p:2 }}>
+            <Typography variant="subtitle2" gutterBottom>レポート & API</Typography>
+            <Stack direction="row" spacing={2}>
+              <Button variant="outlined" onClick={()=>handleExport('CSV')}>CSV</Button>
+              <Button variant="outlined" onClick={()=>handleExport('Excel')}>Excel</Button>
+              <Button variant="outlined" onClick={()=>handleExport('PDF')}>PDF</Button>
+              <Button variant="outlined" onClick={()=>handleExport('REST API')}>REST API</Button>
+              <Button variant="outlined" onClick={()=>handleExport('GraphQL')}>GraphQL</Button>
+            </Stack>
+          </Paper>
+        </Container>
+      );
+    };
+
+    /* ---- Navigation & App ---- */
+    function App(){
+      const [tab, setTab] = useState(0);
+      const [pack, setPack] = useState(()=>gen());
+      const mobile = window.matchMedia("(max-width:600px)").matches;
+      const [open, setOpen] = useState(false);
+      const tabs = ['Actual','Insight','Forecast','Variance'];
+
+      const setDrivers = fn => setPack(p=>{
+        const nd = typeof fn==='function'?fn(p.drv):fn;
+        return { ...p, drv:nd, kpi:calcF(nd) };
+      });
+
+      return (
+        <>
+          <CssBaseline/>
+          <AppBar position="static">
+            <Toolbar>
+              {mobile && (
+                <IconButton color="inherit" edge="start" onClick={()=>setOpen(true)}>
+                  ☰
+                </IconButton>
+              )}
+              <Typography sx={{ flex:1 }} variant="h6">4 Hub Mock</Typography>
+              <Button color="inherit" onClick={()=>setPack(gen())}>サンプル再生成</Button>
+            </Toolbar>
+            {!mobile && (
+              <Tabs value={tab} onChange={(_,v)=>setTab(v)}>
+                {tabs.map(l=><Tab key={l} label={l}/>)}
+              </Tabs>
+            )}
+          </AppBar>
+
+          {mobile && (
+            <Drawer open={open} onClose={()=>setOpen(false)}>
+              <List>
+                {tabs.map((l,i)=>(
+                  <ListItemButton key={l} selected={tab===i}
+                    onClick={()=>{ setTab(i); setOpen(false); }}>
+                    <ListItemText primary={l}/>
+                  </ListItemButton>
+                ))}
+              </List>
+            </Drawer>
+          )}
+
+          {tab===0 && <Actual rows={pack.rows}/>}
+          {tab===1 && <Insight/>}
+          {tab===2 && <Forecast drv={pack.drv} kpi={pack.kpi} setDrv={setDrivers}/>}
+          {tab===3 && <Variance/>}
+        </>
+      );
+    }
+
+    ReactDOM.createRoot(document.getElementById('root')).render(<App/>);
+  </script>
+</body>
+</html>
