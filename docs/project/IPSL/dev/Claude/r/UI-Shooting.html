@@ -1,0 +1,257 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<title>Cyber Scroll Shooter – Definitive</title>
+<style>
+  html,body{margin:0;overflow:hidden;background:#000;font-family:monospace;color:#00ffff;}
+  canvas{display:block;background:#111;}
+  .panel{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);
+         background:rgba(0,0,64,.85);border:2px solid #00ffff;padding:30px 50px;border-radius:10px;
+         box-shadow:0 0 20px #00ffff;text-align:center;z-index:10;}
+  .panel h1{margin:0 0 20px;font-size:32px;text-shadow:0 0 10px #00ffff;}
+  .panel button{background:#000;border:1px solid #00ffff;color:#00ffff;padding:10px 30px;font-size:22px;cursor:pointer;box-shadow:0 0 10px #00ffff;}
+  #hud{position:absolute;top:10px;left:10px;font-size:18px;z-index:5;text-shadow:0 0 8px #00ffff;line-height:1.4;}
+  #score{position:absolute;top:10px;right:20px;font-size:24px;z-index:5;text-shadow:0 0 8px #00ffff;}
+  #hpbar{position:absolute;top:50px;left:10px;width:200px;height:12px;border:1px solid #00ffff;z-index:6;}
+  #hpfill{height:100%;background:#00ff7a;}
+</style>
+</head>
+<body>
+<div id="menu" class="panel"><h1>⚡ CYBER&nbsp;SCROLL&nbsp;SHOOTER ⚡</h1><button id="startBtn">▶ START</button></div>
+<div id="result" class="panel" style="display:none"><h1 id="resText"></h1><button id="retryBtn">↻ RETRY</button></div>
+<div id="hud"></div><div id="score">Score : 0</div>
+<div id="hpbar"><div id="hpfill"></div></div>
+<canvas id="game" width="960" height="600"></canvas>
+
+<script>
+/* ──────────────────────────────────────
+   📌  基本定義
+────────────────────────────────────── */
+const cv=document.getElementById('game'),ctx=cv.getContext('2d');
+const W=cv.width,H=cv.height;
+const SEG_W=40, SEG_RANGE=3000, ENEMY_INT=1000, MAX_V=12;
+
+let scrollX=0, keys={}, score=0, playing=false, gameOver=false, enemyTimer=null;
+let high=Number(localStorage.getItem('cshooter-hi'))||0;
+
+/* HUD DOM */
+const hud=document.getElementById('hud'),scoreEl=document.getElementById('score');
+const hpbar=document.getElementById('hpfill');
+
+/* 色/乱数ユーティリティ */
+const NEON=['#00ffea','#ff36ff','#ff3366','#ffe600','#00ff7a'];
+const rNeon=()=>NEON[Math.floor(Math.random()*NEON.length)];
+const R=(a,b)=>a+Math.random()*(b-a);
+
+/* ──────────────────────────────────────
+   📌  プレイヤー
+────────────────────────────────────── */
+const player={
+  x:0,y:H/2,vx:0,vy:0,dir:1,w:60,h:28,acc:.6,fric:1,weapon:'laser',
+  hp:100
+};
+
+/* ──────────────────────────────────────
+   📌  スター・ワールド・地形
+────────────────────────────────────── */
+const stars=[];
+function makeStars(){
+  stars.length=0;
+  for(let l=0;l<3;l++){                // 3レイヤ
+    for(let i=0;i<70;i++){
+      stars.push({x:R(-W,W),y:R(0,H),size:l+1,layer:l+1});
+    }
+  }
+}
+
+const terrain={}, ground=[];
+function makeWorld(){
+  Object.keys(terrain).forEach(k=>delete terrain[k]); ground.length=0;
+  for(let i=-SEG_RANGE;i<=SEG_RANGE;i++){
+    const y=H*.85+Math.random()*H*.10; terrain[i]=y;
+    if(Math.random()<.08){
+      ground.push({type:['person','animal','building'][Math.floor(Math.random()*3)],
+                   x:i*SEG_W,y,size:R(20,50),color:rNeon()});
+    }
+  }
+}
+const getY=i=>terrain[i]??(terrain[i]=H*.85+Math.random()*H*.10);
+
+/* ──────────────────────────────────────
+   📌  エンティティ
+────────────────────────────────────── */
+const enemies=[], bullets=[], explosions=[], thrusters=[];
+
+/* 敵生成：左右ランダム */
+function spawnEnemy(){
+  const side=Math.random()<.5?-1:1,y=R(0,H*.72);
+  enemies.push({x:scrollX+side*(W+100),y,w:40,h:40,
+                vx:(side===1?-1:1)*R(.4,1),shape:['square','circle','triangle'][Math.random()*3|0],color:rNeon()});
+}
+
+/* ──────────────────────────────────────
+   📌  パーティクル
+────────────────────────────────────── */
+function boom(x,y,c,n=32){for(let i=n;i--;)explosions.push({x,y,vx:Math.cos(i)*R(1,4),vy:Math.sin(i)*R(1,4),life:40,color:c});}
+function flame(x,y,c,k=2){for(let i=k;i--;)thrusters.push({x:x+R(-2,2),y:y+R(-2,2),vx:R(-1,-.3),vy:R(-.3,.3),life:20,color:c});}
+
+/* ──────────────────────────────────────
+   📌  入力
+────────────────────────────────────── */
+window.addEventListener('keydown',e=>{
+  keys[e.key]=true;
+  if(e.key==='q'||e.key==='Q')player.weapon=player.weapon==='laser'?'missile':'laser';
+  if(e.key===' '&&playing&&!gameOver)fire();
+});
+window.addEventListener('keyup',e=>keys[e.key]=false);
+
+/* ──────────────────────────────────────
+   📌  発射
+────────────────────────────────────── */
+function fire(){
+  if(player.weapon==='laser'){
+    bullets.push({type:'laser',x:player.dir===1?player.x+player.w:player.x-10,
+                  y:player.y+player.h/2-2,vx:12*player.dir,w:12,h:4,color:'#ffff00'});
+  }else{
+    bullets.push({type:'missile',x:player.dir===1?player.x+player.w:player.x-14,
+                  y:player.y+player.h/2-4,vx:8*player.dir,vy:0,speed:6,w:14,h:6,color:'#ff8800'});
+  }
+}
+
+/* ──────────────────────────────────────
+   📌  更新
+────────────────────────────────────── */
+function upPlayer(){
+  const ax=(keys.ArrowRight?player.acc:0)+(keys.ArrowLeft?-player.acc:0);
+  const ay=(keys.ArrowDown? player.acc:0)+(keys.ArrowUp ?-player.acc:0);
+  if(keys.ArrowRight)player.dir=1; if(keys.ArrowLeft)player.dir=-1;
+  player.vx=Math.max(-MAX_V,Math.min(MAX_V,player.vx+ax));
+  player.vy=Math.max(-MAX_V,Math.min(MAX_V,player.vy+ay));
+  player.x+=player.vx; player.y+=player.vy;
+  player.y=Math.max(0,Math.min(H-player.h,player.y));
+  scrollX=player.x-W/2;                              // 中央固定カメラ
+  flame(player.dir===1?player.x-10:player.x+player.w+10,player.y+player.h/2,'#00ccff');
+}
+function upStars(){stars.forEach(s=>{s.x-=player.vx*.2*(s.layer/3); if(s.x-scrollX<-100)s.x+=W+200; if(s.x-scrollX>W+100)s.x-=W+200;});}
+function upBullets(){
+  for(let i=bullets.length-1;i>=0;i--){
+    const b=bullets[i];
+    if(b.type==='laser')b.x+=b.vx;
+    else{
+      if(enemies.length){
+        let tgt=enemies[0],dmin=1e9;
+        enemies.forEach(e=>{const d=(e.x-b.x)**2+(e.y-b.y)**2;if(d<dmin){dmin=d;tgt=e;}});
+        const a=Math.atan2(tgt.y-b.y,tgt.x-b.x); b.vx=Math.cos(a)*b.speed; b.vy=Math.sin(a)*b.speed;
+      }
+      b.x+=b.vx; b.y+=b.vy;
+    }
+    if(Math.abs(b.x-scrollX)>W+200||b.y<-200||b.y>H+200)bullets.splice(i,1);
+  }
+}
+function upEnemies(){
+  for(let i=enemies.length-1;i>=0;i--){
+    const e=enemies[i]; e.x+=e.vx;
+    flame(e.vx<0?e.x+e.w+4:e.x-4,e.y+e.h/2,'#ff6600',1);
+    if(Math.abs(e.x-scrollX)>W+200)enemies.splice(i,1);
+  }
+}
+function upPart(arr,g=0){for(let i=arr.length-1;i>=0;i--){
+  const p=arr[i]; p.x+=p.vx; p.y+=p.vy; p.vy+=g; if(--p.life<=0)arr.splice(i,1);}}
+
+/* ──────────────────────────────────────
+   📌  衝突
+────────────────────────────────────── */
+function hit(a,b){return a.x<b.x+b.w&&a.x+a.w>b.x&&a.y<b.y+b.h&&a.y+a.h>b.y;}
+function collide(){
+  enemies.forEach(e=>{
+    if(hit(player,e)){boom(player.x,player.y,'#ff3300'); enemies.splice(enemies.indexOf(e),1);
+      player.hp-=40; hpbar.style.width=player.hp*2+'px'; if(player.hp<=0)end();}
+  });
+  for(let bi=bullets.length-1;bi>=0;bi--){
+    const b=bullets[bi];
+    for(let ei=enemies.length-1;ei>=0;ei--){
+      const e=enemies[ei];
+      if(hit(b,e)){boom(e.x+e.w/2,e.y+e.h/2,e.color); bullets.splice(bi,1); enemies.splice(ei,1);
+        score+=100; scoreEl.textContent=`Score : ${score}`; break;}
+    }
+  }
+}
+
+/* ──────────────────────────────────────
+   📌  描画
+────────────────────────────────────── */
+function draw(){
+  ctx.clearRect(0,0,W,H);
+  /* 背景星 */
+  stars.forEach(s=>{ctx.fillStyle=['#022','#033','#055'][s.layer-1]; ctx.fillRect(s.x-scrollX,s.y,s.size,s.size);});
+  /* 地形 */
+  ctx.fillStyle='#222'; ctx.beginPath(); ctx.moveTo(0,H);
+  const s=Math.floor(scrollX/SEG_W)-1, e=s+Math.ceil(W/SEG_W)+2;
+  for(let i=s;i<=e;i++)ctx.lineTo(i*SEG_W-scrollX,getY(i));
+  ctx.lineTo(W,H); ctx.closePath(); ctx.fill();
+  /* 地上物 */
+  ground.forEach(o=>{const sx=o.x-scrollX;if(Math.abs(sx)>W+140)return;ctx.fillStyle=o.color;
+    if(o.type==='person'){ctx.fillRect(sx-3,o.y-o.size,6,o.size); ctx.beginPath();ctx.arc(sx,o.y-o.size-5,4,0,6.28);ctx.fill();}
+    else if(o.type==='animal'){ctx.fillRect(sx-o.size/2,o.y-o.size/2,o.size,o.size/2); ctx.fillRect(sx-o.size/4,o.y-o.size,o.size/2,o.size/2);}
+    else{ctx.fillRect(sx-o.size/2,o.y-o.size,o.size,o.size); ctx.fillStyle='#111';ctx.fillRect(sx-o.size/8,o.y-o.size+o.size/4,o.size/4,o.size/4);}});
+  /* スラスター */
+  thrusters.forEach(p=>{ctx.globalAlpha=p.life/20;ctx.fillStyle=p.color;ctx.beginPath();ctx.arc(p.x-scrollX,p.y,3,0,6.28);ctx.fill();});ctx.globalAlpha=1;
+  /* 弾 */
+  bullets.forEach(b=>{ctx.fillStyle=b.color;ctx.fillRect(b.x-scrollX,b.y,b.w,b.h);});
+  /* 敵 */
+  enemies.forEach(e=>{const sx=e.x-scrollX;ctx.fillStyle=e.color;
+    if(e.shape==='square')ctx.fillRect(sx,e.y,e.w,e.h);
+    else if(e.shape==='circle'){ctx.beginPath();ctx.arc(sx+e.w/2,e.y+e.h/2,e.w/2,0,6.28);ctx.fill();}
+    else{ctx.beginPath();ctx.moveTo(sx,e.y+e.h/2);ctx.lineTo(sx+e.w,e.y);ctx.lineTo(sx+e.w,e.y+e.h);ctx.closePath();ctx.fill();}});
+  /* プレイヤー (F-16) */
+  ctx.save();ctx.translate(W/2,player.y);ctx.scale(player.dir,1);ctx.fillStyle='#00ffff';
+  ctx.beginPath();ctx.moveTo(0,player.h*.5);ctx.lineTo(player.w*.65,0);ctx.lineTo(player.w,0);
+  ctx.lineTo(player.w*.75,player.h*.5);ctx.lineTo(player.w,player.h);ctx.lineTo(player.w*.65,player.h);ctx.closePath();ctx.fill();
+  ctx.fillRect(player.w*.25,-player.h*.2,player.w*.4,player.h*.4);ctx.fillRect(player.w*.25,player.h*.8,player.w*.4,player.h*.4);
+  ctx.fillRect(player.w*.55,-player.h*.6,player.w*.1,player.h*.6);ctx.restore();
+  /* 爆発 */
+  explosions.forEach(p=>{ctx.globalAlpha=p.life/40;ctx.fillStyle=p.color;ctx.beginPath();ctx.arc(p.x-scrollX,p.y,4,0,6.28);ctx.fill();});ctx.globalAlpha=1;
+}
+
+/* ──────────────────────────────────────
+   📌  ループ
+────────────────────────────────────── */
+function loop(){
+  if(!playing)return;
+  if(!gameOver){
+    upPlayer(); upStars(); upBullets(); upEnemies();
+    upPart(thrusters,.05); upPart(explosions,0); collide();
+  }
+  draw();
+  hud.innerHTML=`X&nbsp;:&nbsp;${Math.floor(player.x)}<br>Weapon&nbsp;:&nbsp;${player.weapon.toUpperCase()}<br>HI&nbsp;:&nbsp;${high}`;
+  requestAnimationFrame(loop);
+}
+
+/* ──────────────────────────────────────
+   📌  制御
+────────────────────────────────────── */
+function start(){
+  document.getElementById('menu').style.display='none';document.getElementById('result').style.display='none';
+  Object.assign(player,{x:0,y:H/2,vx:0,vy:0,dir:1,weapon:'laser',hp:100});hpbar.style.width='200px';
+  stars.length=enemies.length=bullets.length=explosions.length=thrusters.length=0; score=0; scoreEl.textContent='Score : 0';
+  scrollX=0; gameOver=false; makeStars(); makeWorld();
+  playing=true; clearInterval(enemyTimer); enemyTimer=setInterval(spawnEnemy,ENEMY_INT); loop();
+}
+function end(){
+  gameOver=true; clearInterval(enemyTimer);
+  if(score>high){high=score; localStorage.setItem('cshooter-hi',high);}
+  setTimeout(()=>{playing=false;document.getElementById('resText').textContent=`GAME OVER\nScore : ${score}`;document.getElementById('result').style.display='block';},800);
+}
+
+/* ──────────────────────────────────────
+   📌  イベント
+────────────────────────────────────── */
+document.getElementById('startBtn').onclick=start;
+document.getElementById('retryBtn').onclick=start;
+
+/* 初期背景生成 */
+makeStars(); makeWorld();
+</script>
+</body>
+</html>
