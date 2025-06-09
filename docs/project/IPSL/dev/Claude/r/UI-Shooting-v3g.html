@@ -217,7 +217,6 @@
   
   <canvas id="game"></canvas>
   
-  <!-- タッチコントロール -->
   <div id="touchControls">
     <div id="moveStick" class="control-area"></div>
     <div id="fireButton" class="control-area">🔥</div>
@@ -457,9 +456,9 @@ function setupTouchControls() {
     e.preventDefault();
   }
   
-  moveStick.addEventListener('touchstart', handleMoveStart);
+  moveStick.addEventListener('touchstart', handleMoveStart, { passive: false });
   moveStick.addEventListener('mousedown', handleMoveStart);
-  document.addEventListener('touchmove', handleMoveMove);
+  document.addEventListener('touchmove', handleMoveMove, { passive: false });
   document.addEventListener('mousemove', handleMoveMove);
   document.addEventListener('touchend', handleMoveEnd);
   document.addEventListener('mouseup', handleMoveEnd);
@@ -630,12 +629,12 @@ function updateBullets() {
       if (b.fuel > 0) {
         // ターゲット追尾
         if (enemies.length > 0) {
-          let target = enemies[0];
+          let target = null;
           let minDist = Infinity;
           
           enemies.forEach(e => {
             const dist = Math.sqrt((e.x - b.x) ** 2 + (e.y - b.y) ** 2);
-            if (dist < minDist && dist < 300) {
+            if (dist < minDist && dist < 400) {
               minDist = dist;
               target = e;
             }
@@ -644,7 +643,11 @@ function updateBullets() {
           if (target) {
             const angle = Math.atan2(target.y - b.y, target.x - b.x);
             const currentAngle = Math.atan2(b.vy, b.vx);
-            const angleDiff = angle - currentAngle;
+            let angleDiff = angle - currentAngle;
+
+            // 角度を-PIからPIの範囲に正規化
+            while (angleDiff > Math.PI) angleDiff -= Math.PI * 2;
+            while (angleDiff < -Math.PI) angleDiff += Math.PI * 2;
             
             // 角度補正（急激な転回を防ぐ）
             const turnRate = 0.1;
@@ -668,6 +671,7 @@ function updateBullets() {
     // 境界チェック
     if (Math.abs(b.x - scrollX) > W + 300 || b.y < -100 || b.y > H + 100) {
       bullets.splice(i, 1);
+      continue;
     }
     
     // 地形との衝突判定
@@ -691,7 +695,7 @@ function updateEnemies() {
       const dy = player.y - e.y;
       const dist = Math.sqrt(dx * dx + dy * dy);
       
-      if (dist < 400) {
+      if (dist < 500) {
         bullets.push({
           type: 'enemy',
           x: e.x + e.w / 2,
@@ -718,16 +722,16 @@ function updateEnemies() {
     const groundY = getTerrainY(e.x) - e.h;
     if (e.y > groundY) {
       e.y = groundY;
-      e.vy = Math.min(0, e.vy);
+      e.vy = -e.vy * 0.3; // 少し跳ね返る
       // 地面衝突時の爆発エフェクト
-      if (Math.abs(e.vy) > 2) {
+      if (Math.abs(e.vy) > 1) {
         createExplosion(e.x + e.w/2, e.y + e.h/2, e.color, 0.8);
         enemies.splice(i, 1);
         continue;
       }
     }
     
-    e.rotation += 0.05;
+    e.rotation += e.vx * 0.02;
     
     // スラスターエフェクト
     if (Math.random() < 0.3) {
@@ -787,14 +791,14 @@ function getTerrainY(x) {
 function checkCollisions() {
   // プレイヤーと敵の衝突
   enemies.forEach((e, ei) => {
-    if (isColliding(player, e)) {
+    if (isColliding(player, {x: e.x-scrollX+W/2, y: e.y, w: e.w, h: e.h})) {
       createExplosion(e.x + e.w/2, e.y + e.h/2, e.color, 1.5);
       enemies.splice(ei, 1);
       
       player.hp -= 25;
       updateHPBar();
       
-      if (player.hp <= 0) {
+      if (player.hp <= 0 && !gameOver) {
         gameOver = true;
         endGame();
       }
@@ -819,7 +823,7 @@ function checkCollisions() {
         }
         
         bullets.splice(bi, 1);
-        break;
+        break; // 1発の弾が複数の敵に当たるのを防ぐ
       }
     }
   }
@@ -829,14 +833,14 @@ function checkCollisions() {
     const b = bullets[bi];
     if (b.type !== 'enemy') continue;
     
-    if (isColliding(b, player)) {
+    if (isColliding(b, {x: player.x, y: player.y, w: player.w, h: player.h})) {
       createExplosion(b.x, b.y, b.color, 0.8);
       bullets.splice(bi, 1);
       
       player.hp -= 15;
       updateHPBar();
       
-      if (player.hp <= 0) {
+      if (player.hp <= 0 && !gameOver) {
         gameOver = true;
         endGame();
       }
@@ -853,7 +857,9 @@ function isColliding(a, b) {
 
 function updateHPBar() {
   const percentage = Math.max(0, player.hp / player.maxHp);
-  hpbar.style.width = (percentage * 200) + 'px';
+  hpbar.style.width = percentage * 100 + '%';
+  // 色をHP残量に応じて変える
+  hpbar.style.background = `linear-gradient(90deg, #ff0000, #ffff00 ${percentage * 100}%, #00ff00)`;
 }
 
 function updateScore() {
@@ -874,13 +880,11 @@ function drawBackground() {
   
   // 星の描画（改良）
   stars.forEach(s => {
-    const screenX = s.x - scrollX;
+    const screenX = s.x - scrollX * (s.layer / 4);
     if (screenX < -50 || screenX > W + 50) return;
     
     const alpha = s.brightness * (0.5 + 0.5 * Math.sin(s.twinkle));
-    const colors = ['#024', '#035', '#046', '#057'];
-    ctx.fillStyle = colors[s.layer - 1];
-    ctx.globalAlpha = alpha;
+    ctx.fillStyle = `rgba(200, 220, 255, ${alpha})`;
     
     if (s.size > 2) {
       ctx.beginPath();
@@ -890,7 +894,6 @@ function drawBackground() {
       ctx.fillRect(screenX, s.y, s.size, s.size);
     }
   });
-  ctx.globalAlpha = 1;
 }
 
 function drawTerrain() {
@@ -917,8 +920,8 @@ function drawTerrain() {
   
   // 地形のアウトライン
   ctx.strokeStyle = '#00ffff';
-  ctx.lineWidth = 1;
-  ctx.globalAlpha = 0.3;
+  ctx.lineWidth = 1.5;
+  ctx.globalAlpha = 0.4;
   ctx.beginPath();
   for (let i = startSeg; i <= endSeg; i++) {
     if (i === startSeg) {
@@ -934,7 +937,7 @@ function drawTerrain() {
 function drawGroundObjects() {
   ground.forEach(obj => {
     const screenX = obj.x - scrollX;
-    if (Math.abs(screenX) > W + 200) return;
+    if (screenX < -100 || screenX > W + 100) return;
     
     obj.animation += 0.02;
     const pulse = 0.8 + 0.2 * Math.sin(obj.animation);
@@ -944,57 +947,37 @@ function drawGroundObjects() {
     
     switch (obj.type) {
       case 'person':
-        // 人型
         ctx.fillRect(screenX - 3, obj.y - obj.size, 6, obj.size * 0.8);
         ctx.beginPath();
-        ctx.arc(screenX, obj.y - obj.size - 8, 5, 0, Math.PI * 2);
+        ctx.arc(screenX, obj.y - obj.size, 5, 0, Math.PI * 2);
         ctx.fill();
         break;
-        
-      case 'animal':
-        // 動物型
-        ctx.fillRect(screenX - obj.size/3, obj.y - obj.size/2, obj.size*0.6, obj.size/3);
-        ctx.fillRect(screenX - obj.size/4, obj.y - obj.size*0.8, obj.size/2, obj.size/3);
-        break;
-        
       case 'building':
-        // 建物
         ctx.fillRect(screenX - obj.size/2, obj.y - obj.size, obj.size, obj.size);
-        ctx.fillStyle = '#444';
-        for (let w = 0; w < 3; w++) {
-          for (let h = 0; h < 4; h++) {
-            ctx.fillRect(screenX - obj.size/2 + w*obj.size/4, 
-                        obj.y - obj.size + h*obj.size/5, 
-                        obj.size/8, obj.size/8);
-          }
-        }
         break;
-        
       case 'tree':
-        // 木
-        ctx.fillRect(screenX - 2, obj.y - obj.size*0.3, 4, obj.size*0.3);
+        ctx.fillRect(screenX - 2, obj.y - obj.size, 4, obj.size);
         ctx.beginPath();
-        ctx.arc(screenX, obj.y - obj.size*0.6, obj.size*0.3, 0, Math.PI * 2);
+        ctx.arc(screenX, obj.y - obj.size, obj.size*0.6, 0, Math.PI * 2);
         ctx.fill();
         break;
-        
       case 'crystal':
-        // クリスタル
         ctx.save();
         ctx.translate(screenX, obj.y - obj.size/2);
         ctx.rotate(obj.animation);
         ctx.beginPath();
         for (let i = 0; i < 6; i++) {
           const angle = (i / 6) * Math.PI * 2;
-          const x = Math.cos(angle) * obj.size/3;
-          const y = Math.sin(angle) * obj.size/3;
-          if (i === 0) ctx.moveTo(x, y);
-          else ctx.lineTo(x, y);
+          const x = Math.cos(angle) * obj.size/2;
+          const y = Math.sin(angle) * obj.size/2;
+          ctx.lineTo(x, y);
         }
         ctx.closePath();
         ctx.fill();
         ctx.restore();
         break;
+      default:
+        ctx.fillRect(screenX-obj.size/2, obj.y-obj.size, obj.size, obj.size);
     }
   });
   ctx.globalAlpha = 1;
@@ -1002,44 +985,33 @@ function drawGroundObjects() {
 
 function drawPlayer() {
   ctx.save();
+  // プレイヤーは画面中央に固定して描画
   ctx.translate(W/2, player.y + player.h/2);
   ctx.scale(player.dir, 1);
   
-  // メインボディ（改良されたF-16デザイン）
+  // メインボディ
   const gradient = ctx.createLinearGradient(-player.w/2, -player.h/2, player.w/2, player.h/2);
-  gradient.addColorStop(0, '#00ffff');
-  gradient.addColorStop(0.5, '#0088ff');
+  gradient.addColorStop(0, '#88ffff');
+  gradient.addColorStop(0.5, '#00aaff');
   gradient.addColorStop(1, '#0066cc');
-  
   ctx.fillStyle = gradient;
+
   ctx.beginPath();
-  // より流線型の機体
-  ctx.moveTo(-player.w/2, 0);
-  ctx.quadraticCurveTo(-player.w/3, -player.h/2, player.w/4, -player.h/3);
-  ctx.quadraticCurveTo(player.w/2, -player.h/4, player.w/2, 0);
-  ctx.quadraticCurveTo(player.w/2, player.h/4, player.w/4, player.h/3);
-  ctx.quadraticCurveTo(-player.w/3, player.h/2, -player.w/2, 0);
+  ctx.moveTo(-player.w * 0.5, 0); // Tail center
+  ctx.lineTo(-player.w * 0.3, -player.h * 0.5); // Top-left tail
+  ctx.lineTo(player.w * 0.5, -player.h * 0.2); // Top-right nose
+  ctx.lineTo(player.w * 0.5, player.h * 0.2); // Bottom-right nose
+  ctx.lineTo(-player.w * 0.3, player.h * 0.5); // Bottom-left tail
   ctx.closePath();
   ctx.fill();
-  
+
   // コックピット
-  ctx.fillStyle = '#88ffff';
+  ctx.fillStyle = '#000033';
   ctx.beginPath();
-  ctx.ellipse(-player.w/6, 0, player.w/6, player.h/6, 0, 0, Math.PI * 2);
-  ctx.fill();
-  
-  // 主翼
-  ctx.fillStyle = '#0088cc';
-  ctx.fillRect(-player.w/4, -player.h*0.7, player.w/2, player.h/8);
-  ctx.fillRect(-player.w/4, player.h*0.6, player.w/2, player.h/8);
-  
-  // 尾翼
-  ctx.fillRect(player.w/3, -player.h*0.4, player.w/8, player.h*0.8);
-  
-  // エンジン排気口
-  ctx.fillStyle = '#ff6600';
-  ctx.beginPath();
-  ctx.arc(-player.w/2, 0, player.h/8, 0, Math.PI * 2);
+  ctx.moveTo(player.w*0.1, 0);
+  ctx.lineTo(player.w*0.4, -player.h*0.15);
+  ctx.lineTo(player.w*0.4, player.h*0.15);
+  ctx.closePath();
   ctx.fill();
   
   ctx.restore();
@@ -1048,45 +1020,31 @@ function drawPlayer() {
 function drawEnemies() {
   enemies.forEach(e => {
     const screenX = e.x - scrollX;
-    if (Math.abs(screenX) > W + 100) return;
+    if (screenX < -e.w || screenX > W) return;
     
     ctx.save();
     ctx.translate(screenX + e.w/2, e.y + e.h/2);
     ctx.rotate(e.rotation);
     
-    // HPに応じた色調整
     const hpRatio = e.hp / e.maxHp;
-    const alpha = 0.7 + 0.3 * hpRatio;
-    ctx.globalAlpha = alpha;
+    ctx.globalAlpha = 0.7 + 0.3 * hpRatio;
+    ctx.fillStyle = e.color;
     
-    // タイプ別デザイン
     if (e.type === 'bomber') {
-      // 大型爆撃機
-      ctx.fillStyle = e.color;
       ctx.fillRect(-e.w/2, -e.h/2, e.w, e.h);
-      ctx.fillRect(-e.w/3, -e.h*0.7, e.w*0.6, e.h/4);
-      ctx.fillRect(-e.w/3, e.h*0.5, e.w*0.6, e.h/4);
     } else if (e.type === 'fighter') {
-      // 戦闘機
-      ctx.fillStyle = e.color;
       ctx.beginPath();
       ctx.moveTo(e.w/2, 0);
-      ctx.lineTo(-e.w/2, -e.h/3);
+      ctx.lineTo(-e.w/2, -e.h/2);
       ctx.lineTo(-e.w/3, 0);
-      ctx.lineTo(-e.w/2, e.h/3);
+      ctx.lineTo(-e.w/2, e.h/2);
       ctx.closePath();
       ctx.fill();
-    } else {
-      // インターセプター
-      ctx.fillStyle = e.color;
+    } else { // interceptor
       ctx.beginPath();
-      for (let i = 0; i < 3; i++) {
-        const angle = (i / 3) * Math.PI * 2;
-        const x = Math.cos(angle) * e.w/3;
-        const y = Math.sin(angle) * e.h/3;
-        if (i === 0) ctx.moveTo(x, y);
-        else ctx.lineTo(x, y);
-      }
+      ctx.moveTo(e.w/2, 0);
+      ctx.lineTo(-e.w/2, -e.h/2);
+      ctx.lineTo(-e.w/2, e.h/2);
       ctx.closePath();
       ctx.fill();
     }
@@ -1099,69 +1057,46 @@ function drawEnemies() {
 function drawBullets() {
   bullets.forEach(b => {
     const screenX = b.x - scrollX;
-    if (Math.abs(screenX) > W + 100) return;
+    if (screenX < -b.w || screenX > W) return;
     
-    // トレイル描画
     if (b.trail.length > 1) {
       ctx.strokeStyle = b.color;
-      ctx.globalAlpha = 0.3;
-      ctx.lineWidth = 2;
+      ctx.globalAlpha = 0.5;
+      ctx.lineWidth = b.h / 2;
       ctx.beginPath();
-      b.trail.forEach((point, i) => {
-        const trailX = point.x - scrollX;
-        if (i === 0) ctx.moveTo(trailX, point.y);
-        else ctx.lineTo(trailX, point.y);
+      b.trail.forEach((p, i) => {
+        const trailX = p.x - scrollX;
+        if (i === 0) ctx.moveTo(trailX, p.y);
+        else ctx.lineTo(trailX, p.y);
       });
       ctx.stroke();
       ctx.globalAlpha = 1;
     }
     
-    // 弾の本体
     ctx.fillStyle = b.color;
+    ctx.shadowColor = b.color;
+    ctx.shadowBlur = 10;
     
     if (b.type === 'missile') {
-      // ミサイル
       ctx.save();
       ctx.translate(screenX + b.w/2, b.y + b.h/2);
       ctx.rotate(Math.atan2(b.vy, b.vx));
-      
-      const gradient = ctx.createLinearGradient(-b.w/2, 0, b.w/2, 0);
-      gradient.addColorStop(0, '#ff4400');
-      gradient.addColorStop(1, '#ff8800');
-      ctx.fillStyle = gradient;
-      
       ctx.fillRect(-b.w/2, -b.h/2, b.w, b.h);
-      ctx.fillStyle = '#ffaa00';
-      ctx.beginPath();
-      ctx.moveTo(b.w/2, 0);
-      ctx.lineTo(b.w/3, -b.h/3);
-      ctx.lineTo(b.w/3, b.h/3);
-      ctx.closePath();
-      ctx.fill();
-      
       ctx.restore();
     } else {
-      // レーザー/敵弾
-      const gradient = ctx.createLinearGradient(screenX, b.y, screenX + b.w, b.y + b.h);
-      gradient.addColorStop(0, b.color);
-      gradient.addColorStop(1, b.color + '88');
-      ctx.fillStyle = gradient;
       ctx.fillRect(screenX, b.y, b.w, b.h);
-      
-      // グロー効果
-      ctx.shadowColor = b.color;
-      ctx.shadowBlur = 10;
-      ctx.fillRect(screenX, b.y, b.w, b.h);
-      ctx.shadowBlur = 0;
     }
+    
+    ctx.shadowBlur = 0;
   });
 }
 
 function drawParticles() {
+  ctx.globalCompositeOperation = 'lighter';
   // 爆発パーティクル
   explosions.forEach(p => {
     const screenX = p.x - scrollX;
-    if (Math.abs(screenX) > W + 100) return;
+    if (screenX < -10 || screenX > W + 10) return;
     
     const alpha = p.life / p.maxLife;
     ctx.globalAlpha = alpha;
@@ -1175,7 +1110,7 @@ function drawParticles() {
   // スラスターパーティクル
   thrusters.forEach(p => {
     const screenX = p.x - scrollX;
-    if (Math.abs(screenX) > W + 100) return;
+    if (screenX < -10 || screenX > W + 10) return;
     
     const alpha = p.life / p.maxLife;
     ctx.globalAlpha = alpha * 0.8;
@@ -1186,6 +1121,7 @@ function drawParticles() {
     ctx.fill();
   });
   
+  ctx.globalCompositeOperation = 'source-over';
   ctx.globalAlpha = 1;
 }
 
@@ -1195,6 +1131,7 @@ function draw() {
   drawBackground();
   drawTerrain();
   drawGroundObjects();
+  
   drawParticles();
   drawBullets();
   drawEnemies();
@@ -1266,45 +1203,31 @@ function startGame() {
   clearInterval(enemyTimer);
   enemyTimer = setInterval(spawnEnemy, ENEMY_INT);
   
+  // アニメーションループを開始
   gameLoop();
 }
 
 function endGame() {
+  playing = false;
   clearInterval(enemyTimer);
-  
+
   // ハイスコア更新
   if (score > high) {
     high = score;
     localStorage.setItem('cshooter-hi', high);
   }
-  
-  // 爆発エフェクト
-  createExplosion(W/2, player.y + player.h/2, '#ff3300', 2);
-  
-  setTimeout(() => {
-    playing = false;
-    document.getElementById('resText').innerHTML = `
-      <div style="color: #ff3366;">MISSION FAILED</div>
-      <div style="font-size: 0.8em; margin-top: 10px;">Score: ${score}</div>
-      ${score === high ? '<div style="color: #00ff00; font-size: 0.7em;">NEW HIGH SCORE!</div>' : ''}
-    `;
-    document.getElementById('result').style.display = 'block';
-  }, 1000);
+
+  // 結果表示
+  document.getElementById('resText').textContent = `FINAL SCORE: ${score}`;
+  document.getElementById('result').style.display = 'block';
 }
 
-/* ──────────────────────────────────────
-   📌  イベントリスナー
-────────────────────────────────────── */
-document.getElementById('startBtn').onclick = startGame;
-document.getElementById('retryBtn').onclick = startGame;
-
-// 初期化
+// --- 初期化 ---
+// ボタンのイベントリスナーを設定
+document.getElementById('startBtn').addEventListener('click', startGame);
+document.getElementById('retryBtn').addEventListener('click', startGame);
+// タッチコントロールをセットアップ
 setupTouchControls();
-makeStars();
-makeWorld();
-
-// レスポンシブ対応のための初期描画
-draw();
 </script>
 </body>
-</html> 
+</html>
