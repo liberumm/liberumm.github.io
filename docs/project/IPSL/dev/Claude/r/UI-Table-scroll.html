@@ -34,13 +34,21 @@
     /* スクロールバー：sticky にして、テーブル領域に来たら上部に固定 */
     .scrollbar-wrapper {
       position: sticky;
-      top: 0;
+      top: 48px;
       z-index: 1200;
       overflow-x: auto;
       overflow-y: hidden;
       height: 16px;
       background: #f5f5f5;
       scrollbar-gutter: stable;
+    }
+    /* テーブルヘッダー：sticky にして、テーブル領域に来たら上部に固定 */
+    .table-header-wrapper {
+      position: sticky;
+      top: 64px;
+      z-index: 1100;
+      background: #f5f5f5;
+      overflow-x: hidden;
     }
     .scrollbar-wrapper::-webkit-scrollbar {
       height: 16px;
@@ -56,6 +64,14 @@
       margin-top: 8px;
       display: flex;
       justify-content: flex-end;
+    }
+    .tabs-wrapper {
+      position: sticky;
+      top: 0;
+      z-index: 1300;
+      background: #f5f5f5;
+      border-bottom: 1px solid #e0e0e0;
+      height: 48px;
     }
   </style>
 </head>
@@ -77,7 +93,11 @@
       InputAdornment,
       Chip,
       TableContainer,
-      alpha
+      alpha,
+      Tabs,
+      Tab,
+      Checkbox,
+      IconButton
     } = MaterialUI;
     const { useState, useMemo, useCallback, useRef, useEffect } = React;
 
@@ -91,26 +111,9 @@
 
     // スクロールバー高さ分だけヘッダーを下げる
     const SCROLLBAR_HEIGHT = 16;
-    const HEADER_TOP = SCROLLBAR_HEIGHT;
+    const HEADER_TOP = 0;
 
     // ─── Sticky Header Cells ───────────────────────────────
-    const StickyFirstHeaderCell = styled(TableCell)(({ theme }) => ({
-      position: 'sticky',
-      top: HEADER_TOP,
-      left: 0,
-      backgroundColor: theme.palette.primary.main,
-      color: theme.palette.primary.contrastText,
-      zIndex: theme.zIndex.appBar + 2,
-      whiteSpace: 'nowrap',
-      fontWeight: 600,
-      borderRight: `2px solid ${theme.palette.divider}`,
-      '&::after': {
-        content: '""',
-        position: 'absolute',
-        right: 0, top: 0, bottom: 0, width: 4,
-        background: `linear-gradient(to right, ${alpha(theme.palette.common.black,0.1)}, transparent)`,
-      }
-    }));
     const StickyHeaderCell = styled(TableCell)(({ theme }) => ({
       position: 'sticky',
       top: HEADER_TOP,
@@ -120,22 +123,8 @@
       whiteSpace: 'nowrap',
       fontWeight: 600,
       borderBottom: `2px solid ${theme.palette.primary.dark}`,
-    }));
-    const StickyFirstBodyCell = styled(TableCell)(({ theme }) => ({
-      position: 'sticky',
-      left: 0,
-      backgroundColor: alpha(theme.palette.background.paper, 0.95),
-      backdropFilter: 'blur(10px)',
-      zIndex: theme.zIndex.appBar,
-      whiteSpace: 'nowrap',
-      fontWeight: 500,
       borderRight: `1px solid ${theme.palette.divider}`,
-      '&::after': {
-        content: '""',
-        position: 'absolute',
-        right: 0, top: 0, bottom: 0, width: 4,
-        background: `linear-gradient(to right, ${alpha(theme.palette.common.black,0.05)}, transparent)`,
-      }
+      padding: theme.spacing(1),
     }));
     const StyledTableRow = styled(TableRow)(({ theme }) => ({
       '&:nth-of-type(odd)': { backgroundColor: alpha(theme.palette.primary.main, 0.02) },
@@ -145,12 +134,24 @@
       },
       transition: 'background-color 0.2s ease',
     }));
+
+    const StyledTableCell = styled(TableCell)(({ theme }) => ({
+      borderRight: `1px solid ${theme.palette.divider}`,
+      padding: theme.spacing(1),
+    }));
     // テーブル本体はページ縦スクロールで伸縮
     const StyledTableContainer = styled(TableContainer)(() => ({
       width: '100%',
-      overflowX: 'hidden',
+      overflowX: 'auto',
       overflowY: 'visible',
       boxShadow: '0px 2px 4px rgba(0,0,0,0.1)',
+    }));
+
+    // ヘッダー用のテーブルコンテナ
+    const HeaderTableContainer = styled('div')(() => ({
+      width: '100%',
+      overflowX: 'hidden',
+      overflowY: 'hidden',
     }));
 
     // ─── ダミーデータ生成 ───────────────────────────────────
@@ -198,11 +199,18 @@
       const [filterText, setFilterText] = useState('');
       const [page, setPage] = useState(0);
       const [rowsPerPage, setRowsPerPage] = useState(15);
+      const [selectedTab, setSelectedTab] = useState(0);
+      const [selectedRows, setSelectedRows] = useState(new Set());
       const data = useMemo(generateSampleData, []);
       const scrollbarRef = useRef(null);
       const tableRef = useRef(null);
+      
+      const statusTabs = ['全て', '進行中', '完了', '保留', '計画中'];
 
       const headers = [
+        { key:'checkbox',  label:'', width:50 },
+        { key:'actions',   label:'操作', width:80 },
+        { key:'displayNo', label:'No', width:60 },
         { key:'name',      label:'プロジェクト名', width:200 },
         { key:'category',  label:'カテゴリ',     width:120 },
         { key:'status',    label:'ステータス',   width:120 },
@@ -217,36 +225,71 @@
       const minWidth = headers.reduce((sum,h)=> sum + h.width, 0);
 
       // フィルタ＆ページング
-      const filtered = useMemo(() =>
-        filterText
-          ? data.filter(r =>
-              Object.values(r).some(v =>
-                v.toString().toLowerCase().includes(filterText.toLowerCase())
-              )
+      const filtered = useMemo(() => {
+        let result = data;
+        
+        // ステータスフィルタ
+        if (selectedTab > 0) {
+          const targetStatus = statusTabs[selectedTab];
+          result = result.filter(r => r.status === targetStatus);
+        }
+        
+        // テキストフィルタ
+        if (filterText) {
+          result = result.filter(r =>
+            Object.values(r).some(v =>
+              v.toString().toLowerCase().includes(filterText.toLowerCase())
             )
-          : data
-      , [data, filterText]);
+          );
+        }
+        
+        return result;
+      }, [data, filterText, selectedTab, statusTabs]);
       const handleFilter = useCallback(e => { setFilterText(e.target.value); setPage(0); }, []);
       const handlePage   = useCallback((_,np)=> setPage(np), []);
       const handleRPP    = useCallback(e=> { setRowsPerPage(+e.target.value); setPage(0); }, []);
+      const handleTabChange = useCallback((_, newValue) => { setSelectedTab(newValue); setPage(0); }, []);
+      const handleSelectAll = useCallback(e => {
+        if (e.target.checked) {
+          setSelectedRows(new Set(display.map(row => row.id)));
+        } else {
+          setSelectedRows(new Set());
+        }
+      }, [display]);
+      const handleRowSelect = useCallback((id) => {
+        const newSelected = new Set(selectedRows);
+        if (newSelected.has(id)) {
+          newSelected.delete(id);
+        } else {
+          newSelected.add(id);
+        }
+        setSelectedRows(newSelected);
+      }, [selectedRows]);
       const display = useMemo(()=>{
         const start = page * rowsPerPage;
         return filtered.slice(start, start + rowsPerPage);
       },[filtered, page, rowsPerPage]);
 
-      // スクロールバーと実際のテーブルの同期
+      // スクロールバー、ヘッダー、テーブル本体の同期
+      const headerRef = useRef(null);
+      
       useEffect(() => {
         const scrollbarElement = scrollbarRef.current;
         const tableElement = tableRef.current;
+        const headerElement = headerRef.current;
         
-        if (!scrollbarElement || !tableElement) return;
+        if (!scrollbarElement || !tableElement || !headerElement) return;
 
         const handleScrollbarScroll = () => {
-          tableElement.scrollLeft = scrollbarElement.scrollLeft;
+          const scrollLeft = scrollbarElement.scrollLeft;
+          tableElement.scrollLeft = scrollLeft;
+          headerElement.scrollLeft = scrollLeft;
         };
 
         const handleTableScroll = () => {
-          scrollbarElement.scrollLeft = tableElement.scrollLeft;
+          const scrollLeft = tableElement.scrollLeft;
+          scrollbarElement.scrollLeft = scrollLeft;
+          headerElement.scrollLeft = scrollLeft;
         };
 
         scrollbarElement.addEventListener('scroll', handleScrollbarScroll);
@@ -275,9 +318,7 @@
                 fullWidth
                 value={filterText}
                 onChange={handleFilter}
-                placeholder="プロジェクト名、カテゴリ、担当者等で検索..."
-                variant="outlined"
-                size="small"
+                placeholder="プロジェクト名、カテゴリ、ステータスなどで検索..."
                 InputProps={{
                   startAdornment: (
                     <InputAdornment position="start">
@@ -289,76 +330,85 @@
             </SearchContainer>
           </div>
 
-          {/* テーブル本体＋上部スクロールバー */}
+          {/* テーブル部分 */}
           <div className="table-wrapper">
-            {/* sticky スクロールバー */}
-            <div className="scrollbar-wrapper" ref={scrollbarRef}>
-              <div style={{ width: minWidth, height: 1 }} />
+            {/* タブエリア */}
+            <div className="tabs-wrapper">
+              <Tabs value={selectedTab} onChange={handleTabChange} variant="scrollable" scrollButtons="auto">
+                {statusTabs.map((status, index) => (
+                  <Tab key={index} label={status} />
+                ))}
+              </Tabs>
             </div>
-            {/* sticky ヘッダー付きテーブル */}
-            <StyledTableContainer ref={tableRef} sx={{ overflowX: 'auto' }}>
-              <Table sx={{ minWidth }} size="small">
-                <TableHead>
-                  <TableRow>
-                    <StickyFirstHeaderCell sx={{ width: headers[0].width }}>
-                      <span className="material-icons" style={{ marginRight:8 }}>
-                        folder
-                      </span>
-                      {headers[0].label}
-                    </StickyFirstHeaderCell>
-                    {headers.slice(1).map(h=>(
-                      <StickyHeaderCell key={h.key} sx={{ width:h.width }}>
-                        {h.label}
-                      </StickyHeaderCell>
-                    ))}
-                  </TableRow>
-                </TableHead>
+            
+            {/* 上部スクロールバー */}
+            <div className="scrollbar-wrapper" ref={scrollbarRef}>
+              <div style={{ width: minWidth, height: 1 }}></div>
+            </div>
+
+            {/* テーブルヘッダー */}
+            <div className="table-header-wrapper">
+              <HeaderTableContainer ref={headerRef}>
+                <Table size="small" style={{ minWidth, tableLayout: 'fixed' }}>
+                  <TableHead>
+                    <TableRow>
+                      {headers.map(h => (
+                        <StickyHeaderCell key={h.key} style={{ width: h.width }}>
+                          {h.key === 'checkbox' ? (
+                            <Checkbox
+                              checked={selectedRows.size === display.length && display.length > 0}
+                              indeterminate={selectedRows.size > 0 && selectedRows.size < display.length}
+                              onChange={handleSelectAll}
+                              size="small"
+                              sx={{ color: 'white' }}
+                            />
+                          ) : h.label}
+                        </StickyHeaderCell>
+                      ))}
+                    </TableRow>
+                  </TableHead>
+                </Table>
+              </HeaderTableContainer>
+            </div>
+
+            {/* テーブル本体 */}
+            <StyledTableContainer ref={tableRef}>
+              <Table size="small" style={{ minWidth, tableLayout: 'fixed' }}>
                 <TableBody>
-                  {display.map(row=>(
+                  {display.map((row, index) => (
                     <StyledTableRow key={row.id}>
-                      <StickyFirstBodyCell sx={{ width: headers[0].width }}>
-                        <Typography variant="body2" fontWeight={500}>
-                          {row.name}
-                        </Typography>
-                      </StickyFirstBodyCell>
-                      <TableCell sx={{ width: headers[1].width }}>
-                        <Chip 
-                          label={row.category} 
-                          size="small" 
-                          color="primary" 
-                          variant="outlined"
+                      <StyledTableCell style={{ width: headers[0].width }}>
+                        <Checkbox
+                          checked={selectedRows.has(row.id)}
+                          onChange={() => handleRowSelect(row.id)}
+                          size="small"
                         />
-                      </TableCell>
-                      <TableCell sx={{ width: headers[2].width }}>
+                      </StyledTableCell>
+                      <StyledTableCell style={{ width: headers[1].width }}>
+                        <IconButton size="small" title="編集">
+                          <span className="material-icons" style={{fontSize:16}}>edit</span>
+                        </IconButton>
+                        <IconButton size="small" title="削除">
+                          <span className="material-icons" style={{fontSize:16}}>delete</span>
+                        </IconButton>
+                      </StyledTableCell>
+                      <StyledTableCell style={{ width: headers[2].width }}>
+                        {page * rowsPerPage + index + 1}
+                      </StyledTableCell>
+                      <StyledTableCell style={{ width: headers[3].width }}>{row.name}</StyledTableCell>
+                      <StyledTableCell style={{ width: headers[4].width }}>{row.category}</StyledTableCell>
+                      <StyledTableCell style={{ width: headers[5].width }}>
                         <StatusChip status={row.status} />
-                      </TableCell>
-                      <TableCell sx={{ width: headers[3].width }}>
+                      </StyledTableCell>
+                      <StyledTableCell style={{ width: headers[6].width }}>
                         <PriorityChip priority={row.priority} />
-                      </TableCell>
-                      <TableCell sx={{ width: headers[4].width }}>
-                        {row.startDate}
-                      </TableCell>
-                      <TableCell sx={{ width: headers[5].width }}>
-                        {row.endDate}
-                      </TableCell>
-                      <TableCell sx={{ width: headers[6].width }}>
-                        <Typography variant="body2" color="primary">
-                          {row.progress}
-                        </Typography>
-                      </TableCell>
-                      <TableCell sx={{ width: headers[7].width }}>
-                        <Typography variant="body2" fontWeight={500}>
-                          {row.budget}
-                        </Typography>
-                      </TableCell>
-                      <TableCell sx={{ width: headers[8].width }}>
-                        {row.manager}
-                      </TableCell>
-                      <TableCell sx={{ width: headers[9].width }}>
-                        <Typography variant="body2" color="text.secondary">
-                          {row.description}
-                        </Typography>
-                      </TableCell>
+                      </StyledTableCell>
+                      <StyledTableCell style={{ width: headers[7].width }}>{row.startDate}</StyledTableCell>
+                      <StyledTableCell style={{ width: headers[8].width }}>{row.endDate}</StyledTableCell>
+                      <StyledTableCell style={{ width: headers[9].width }}>{row.progress}</StyledTableCell>
+                      <StyledTableCell style={{ width: headers[10].width }}>{row.budget}</StyledTableCell>
+                      <StyledTableCell style={{ width: headers[11].width }}>{row.manager}</StyledTableCell>
+                      <StyledTableCell style={{ width: headers[12].width }}>{row.description}</StyledTableCell>
                     </StyledTableRow>
                   ))}
                 </TableBody>
@@ -375,19 +425,16 @@
               onPageChange={handlePage}
               rowsPerPage={rowsPerPage}
               onRowsPerPageChange={handleRPP}
-              rowsPerPageOptions={[10,15,25,50,100]}
-              labelRowsPerPage="表示行数:"
-              labelDisplayedRows={({ from, to, count }) =>
-                `${from}-${to} / ${count!==-1?count:to}件`
-              }
-              sx={{ borderTop:`1px solid ${theme.palette.divider}`, backgroundColor: alpha(theme.palette.primary.main,0.02) }}
+              rowsPerPageOptions={[10,15,25,50]}
+              labelRowsPerPage="表示件数:"
+              labelDisplayedRows={({ from, to, count }) => `${from}-${to} / ${count}`}
             />
           </div>
         </>
       );
     }
 
-    ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+    ReactDOM.render(<App />, document.getElementById('root'));
   </script>
 </body>
 </html>
