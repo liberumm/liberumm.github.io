@@ -1,0 +1,960 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <title>Full Features: Double Flicks, Snap Lock, Multiple Draggable Overlay Windows with URL Bars</title>
+  <script src="https://unpkg.com/@mediapipe/hands/hands.js"></script>
+  <script src="https://unpkg.com/@mediapipe/drawing_utils/drawing_utils.js"></script>
+  <script src="https://unpkg.com/@mediapipe/camera_utils/camera_utils.js"></script>
+  <style>
+    /* 全体設定：基本的に前回までと同様 */
+    html, body {
+      margin: 0; padding: 0; height: 100%; width: 100%; background-color: #000;
+      position: relative; overflow: hidden; font-family: Arial, sans-serif;
+      cursor: none; /* デフォルトでcursor:none; overlayWindow上で自動的にcursor:auto; */
+    }
+
+    #canvasContainer {
+      position: relative; width: 100%; height: 100%;
+      display: flex; justify-content: center; align-items: center; overflow: hidden;
+    }
+
+    video.input_video {
+      position: absolute; top: 0; left: 0; width: 100%; height: 100%;
+      object-fit: cover; background-color: #000; transform: scaleX(-1); transition: transform 0.3s ease;
+    }
+
+    video.input_video.mirrored {
+      transform: scaleX(-1);
+    }
+
+    canvas.output_canvas {
+      position: absolute; top: 0; left: 0; width: 100%; height: 100%;
+      pointer-events: none; background: transparent; transform: scaleX(-1);
+      transition: transform 0.3s ease;
+    }
+
+    canvas.output_canvas.mirrored {
+      transform: scaleX(-1);
+    }
+
+    #infoContainer {
+      position: absolute; top: 10px; left: 50%; transform: translateX(-50%);
+      display: flex; flex-direction: column; align-items: center; gap: 5px; z-index: 100;
+    }
+
+    #fpsDisplay, #cameraResolution, #canvasSize {
+      color: white; font-size: 16px; background-color: rgba(0,0,0,0.5);
+      padding: 5px 10px; border-radius: 5px;
+    }
+
+    #buttonContainer {
+      position: absolute; bottom: 20px; left: 50%; transform: translateX(-50%);
+      display: flex; gap: 20px; z-index: 100;
+    }
+
+    #menuButton, #startButton, #flipButton {
+      padding: 10px 20px; font-size: 16px; border: none;
+      background-color: rgba(0,123,255,0.9); color: white; border-radius: 5px;
+      cursor: pointer; opacity: 0.9; box-shadow: 0 2px 5px rgba(0,0,0,0.3); transition: opacity 0.3s;
+    }
+
+    #menuButton:hover, #startButton:hover, #flipButton:hover {
+      opacity: 1;
+    }
+
+    #settingsWindow {
+      position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%);
+      background-color: rgba(255,255,255,0.95); padding: 20px; border-radius: 10px; display: none;
+      z-index: 200; box-shadow: 0 4px 8px rgba(0,0,0,0.2); max-width: 300px; width: 90%;
+    }
+
+    #settingsWindow h2 {
+      margin-top: 0; font-size: 20px; text-align: center;
+    }
+
+    #settingsWindow label {
+      display: block; margin-bottom: 10px; font-size: 14px;
+    }
+
+    #settingsWindow input[type="range"],
+    #settingsWindow input[type="number"],
+    #settingsWindow select {
+      width: 100%; margin-top: 5px;
+    }
+
+    #settingsWindow button {
+      margin-top: 15px; padding: 8px 12px; font-size: 14px; border: none;
+      background-color: #28A745; color: white; border-radius: 5px; cursor: pointer;
+      width: 100%; box-shadow: 0 2px 5px rgba(0,0,0,0.3); transition: background-color 0.3s;
+    }
+
+    #settingsWindow button:last-child {
+      background-color: #DC3545; margin-top: 10px;
+    }
+
+    #settingsWindow button:hover {
+      background-color: #218838;
+    }
+
+    #settingsWindow button:last-child:hover {
+      background-color: #C82333;
+    }
+
+    #errorMessage {
+      position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%);
+      background-color: rgba(255,0,0,0.8); color: white; padding: 20px; border-radius: 10px;
+      display: none; z-index: 300; text-align: center; max-width: 80%; font-size: 16px;
+    }
+
+    #customCursor {
+      position: fixed; top: 50%; left: 50%; width: 20px; height: 20px;
+      background-color: rgba(255,255,255,0.8); border: 2px solid #FF5722; border-radius: 50%;
+      pointer-events: none; transform: translate(-50%, -50%); z-index: 400;
+      transition: transform 0.1s ease-out;
+    }
+
+    #snapTimerDisplay {
+      position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%);
+      background: rgba(0,0,0,0.5); color: #fff; font-size: 12px;
+      padding: 2px 5px; border-radius: 3px; display: none;
+    }
+
+    #contextMenu {
+      position: fixed; background-color: rgba(255,255,255,0.95);
+      border: 1px solid #ccc; border-radius: 5px; padding: 10px;
+      box-shadow: 0 4px 8px rgba(0,0,0,0.2); display: none; z-index: 350;
+    }
+
+    #contextMenu p {
+      margin: 0 0 10px 0; font-size: 16px; color: #333;
+    }
+
+    #contextMenu input[type="text"] {
+      width: 100%; margin-bottom: 10px; padding: 5px; font-size: 14px;
+      border: 1px solid #ccc; border-radius: 3px;
+    }
+
+    #contextMenu button {
+      padding: 5px 10px; font-size: 14px; border: none;
+      background-color: #28A745; color: white; border-radius: 3px; cursor: pointer;
+      margin-top: 5px; width: 100%; transition: background-color 0.3s;
+    }
+
+    #contextMenu button:hover {
+      background-color: #218838;
+    }
+
+    /* overlayWindow: 複数生成可能, ドラッグ可能, overlayWindow内ではcursor:auto; */
+    .overlayWindow {
+      position: fixed; 
+      top: 100px; 
+      left: 100px; 
+      width: 400px; 
+      height: 300px; 
+      background-color: rgba(255,255,255,0.95);
+      border: 1px solid #ccc; 
+      border-radius: 5px; 
+      box-shadow: 0 4px 8px rgba(0,0,0,0.2);
+      z-index: 351; 
+      display: flex; 
+      flex-direction: column;
+      pointer-events: auto; /* overlayWindow上ではクリック可能 */
+      cursor: auto; /* overlayWindow上では標準カーソル表示 */
+    }
+
+    .overlayHeader {
+      background-color: #f0f0f0; 
+      padding: 5px; 
+      display: flex; 
+      gap: 5px;
+      align-items: center;
+      border-bottom: 1px solid #ccc;
+      cursor: move; /* ヘッダーでドラッグ */
+      user-select: none;
+    }
+
+    .overlayHeader input[type="text"] {
+      flex: 1;
+      font-size: 14px;
+      padding: 3px;
+      border: 1px solid #ccc;
+      border-radius: 3px;
+    }
+
+    .overlayHeader button {
+      background-color: #28A745; 
+      color: white; 
+      border: none; 
+      padding: 5px 10px; 
+      border-radius: 3px;
+      font-size: 14px; 
+      cursor: none;
+    }
+    .overlayHeader button:hover {
+      background-color: #218838;
+    }
+
+    .overlayIframeContainer {
+      flex: 1;
+      overflow: hidden;
+    }
+
+    .overlayIframeContainer iframe {
+      width: 100%; 
+      height: 100%; 
+      border: none;
+    }
+
+    .overlayFooter {
+      border-top: 1px solid #ccc;
+      background-color: #f0f0f0;
+      text-align: right;
+      padding: 5px;
+    }
+
+    .overlayFooter button {
+      background-color: #DC3545; 
+      color: white; 
+      border: none; 
+      padding: 5px 10px; 
+      border-radius: 3px; 
+      font-size: 14px; 
+      cursor: pointer;
+    }
+
+    .overlayFooter button:hover {
+      background-color: #C82333;
+    }
+
+    @media (max-width: 600px) {
+      .overlayWindow {
+        width: 90%;
+        height: 50%;
+        top: 50px;
+        left: 20px;
+      }
+    }
+
+    .snap {
+      animation: snapEffect 0.3s forwards;
+    }
+
+    @keyframes snapEffect {
+      from { transform: translate(-50%, -50%) scale(1); }
+      to { transform: translate(-50%, -50%) scale(1.2); }
+    }
+  </style>
+</head>
+<body>
+  <div id="canvasContainer">
+    <video class="input_video mirrored" playsinline autoplay muted></video>
+    <canvas class="output_canvas mirrored"></canvas>
+    <div id="customCursor">
+      <div id="snapTimerDisplay"></div>
+    </div>
+    <div id="contextMenu">
+      <p>コンテキストメニュー</p>
+      <input type="text" id="urlInput" value="https://www.google.com" placeholder="URLを入力">
+      <button id="openUrlButton">開く</button>
+      <button id="closeContextMenu">閉じる</button>
+    </div>
+    <div id="infoContainer">
+      <div id="fpsDisplay">FPS: 0</div>
+      <div id="cameraResolution">解像度: 1280×720</div>
+      <div id="canvasSize">キャンバス: 1280×720</div>
+    </div>
+    <div id="buttonContainer">
+      <button id="menuButton">設定</button>
+      <button id="startButton">カメラ開始</button>
+      <button id="flipButton">左右反転</button>
+    </div>
+    <div id="errorMessage">エラーが発生しました。</div>
+    <div id="settingsWindow">
+      <h2>設定</h2>
+      <label>
+        解像度:
+        <select id="resolutionSelect">
+          <option value="640x480">640×480</option>
+          <option value="1280x720" selected>1280×720</option>
+          <option value="1920x1080">1920×1080</option>
+        </select>
+      </label>
+      <label>
+        フレームレート:
+        <input type="number" id="frameRate" min="1" max="60" value="30">
+      </label>
+      <label>
+        モデルの複雑さ:
+        <select id="modelComplexity">
+          <option value="0">0 (高速)</option>
+          <option value="1" selected>1 (標準)</option>
+          <option value="2">2 (高精度)</option>
+        </select>
+      </label>
+      <label>
+        検出の信頼度: <span id="detectionConfidenceValue">0.5</span>
+        <input type="range" id="detectionConfidence" min="0" max="1" step="0.01" value="0.5">
+      </label>
+      <label>
+        トラッキングの信頼度: <span id="trackingConfidenceValue">0.5</span>
+        <input type="range" id="trackingConfidence" min="0" max="1" step="0.01" value="0.5">
+      </label>
+      <label>
+        検出する手の数:
+        <select id="handCountSelect">
+          <option value="1">1</option>
+          <option value="2" selected>2</option>
+        </select>
+      </label>
+      <label>
+        左右反転:
+        <input type="checkbox" id="mirrorToggle" checked>
+      </label>
+      <label>
+        スナップタイマー(秒):
+        <input type="number" id="snapTimerInput" min="1" value="4">
+      </label>
+      <button id="applySettings">適用</button>
+      <button id="closeSettings">閉じる</button>
+    </div>
+  </div>
+
+  <script>
+    // 上記ですべての変数・要素定義、スタイルは完了
+    // 以下スクリプトでHands初期化、onResults、フリック・スナップ・ロック・ドラッグ処理など。
+
+    let videoWidth = 1280;
+    let videoHeight = 720;
+    let frameRate = 30;
+    let maxNumHands = 2;
+    let modelComplexity = 1;
+    let minDetectionConfidence = 0.5;
+    let minTrackingConfidence = 0.5;
+    let isMirrored = true;
+
+    const videoElement = document.querySelector('.input_video');
+    const canvasElement = document.querySelector('.output_canvas');
+    const canvasCtx = canvasElement.getContext('2d');
+    const fpsDisplay = document.getElementById('fpsDisplay');
+    const cameraResolutionDisplay = document.getElementById('cameraResolution');
+    const canvasSizeDisplay = document.getElementById('canvasSize');
+    const errorMessage = document.getElementById('errorMessage');
+    const menuButton = document.getElementById('menuButton');
+    const startButton = document.getElementById('startButton');
+    const flipButton = document.getElementById('flipButton');
+    const settingsWindow = document.getElementById('settingsWindow');
+    const closeSettings = document.getElementById('closeSettings');
+    const applySettings = document.getElementById('applySettings');
+    const detectionConfidenceSlider = document.getElementById('detectionConfidence');
+    const detectionConfidenceValue = document.getElementById('detectionConfidenceValue');
+    const trackingConfidenceSlider = document.getElementById('trackingConfidence');
+    const trackingConfidenceValue = document.getElementById('trackingConfidenceValue');
+    const mirrorToggle = document.getElementById('mirrorToggle');
+    const snapTimerInput = document.getElementById('snapTimerInput');
+    const customCursor = document.getElementById('customCursor');
+    const snapTimerDisplay = document.getElementById('snapTimerDisplay');
+    const contextMenu = document.getElementById('contextMenu');
+    const closeContextMenuButton = document.getElementById('closeContextMenu');
+    const urlInput = document.getElementById('urlInput');
+    const openUrlButton = document.getElementById('openUrlButton');
+
+    let fps = 0;
+    let frames = 0;
+    let startTime = Date.now();
+    let hands;
+    let camera = null;
+
+    const clickThreshold = 40;
+    const clickTimeWindow = 300;
+
+    const snapDistance = 100;
+    let snappedElement = null;
+    let snapClickTimer = null;
+    let snapClickDelay = 4000; 
+
+    const flickThresholdY = 70; 
+    const downFlickThresholdY = 50;
+    let lastFlickTime = 0;
+    let flickCount = 0;
+    let lastDownFlickTime = 0;
+    let downFlickCount = 0;
+    let flickTimeWindow = 350; 
+    let downFlickTimeWindow = 500; 
+    let snapLocked = false;
+    let snapLockTimer = null;
+    const snapLockDuration = 2000;
+
+    const defaultSnapDistance = 100; // 通常のsnapDistance
+    let temporarySnapDistance = defaultSnapDistance; // 一時的に変更可能なsnapDistance
+    const snapLockExtensionDuration = 2000; // snapDistance拡張の持続時間
+
+    const handStates = {
+      'Left': { previousY: null, startClickPos: null },
+      'Right': { previousY: null, startClickPos: null }
+    };
+
+    function averageFingerPositions(positions) {
+      let avgX = 0;
+      let avgY = 0;
+      positions.forEach(pos => {
+        avgX += pos.x;
+        avgY += pos.y;
+      });
+      avgX /= positions.length;
+      avgY /= positions.length;
+      return {x: avgX, y: avgY};
+    }
+
+    function lockSnap() {
+      snapLocked = true;
+
+      // snapDistanceを一時的に広げる
+      temporarySnapDistance = defaultSnapDistance * 2; // 例: 距離を2倍に
+
+      if (snapLockTimer) clearTimeout(snapLockTimer);
+      snapLockTimer = setTimeout(() => {
+        snapLocked = false;
+        snapLockTimer = null;
+
+        // snapDistanceを元に戻す
+        temporarySnapDistance = defaultSnapDistance;
+      }, snapLockDuration);
+    }
+
+    function unlockSnap() {
+      snapLocked = false;
+      if (snapLockTimer) {
+        clearTimeout(snapLockTimer);
+        snapLockTimer = null;
+      }
+      // snapDistanceを元に戻す
+      temporarySnapDistance = defaultSnapDistance;
+    }
+
+    function triggerClickAtPosition(x, y) {
+      let mappedX = (x / videoWidth) * window.innerWidth;
+      let mappedY = (y / videoHeight) * window.innerHeight;
+
+      if (isMirrored) {
+        mappedX = window.innerWidth - mappedX;
+      }
+
+      const element = document.elementFromPoint(mappedX, mappedY);
+      if (element) {
+        element.click();
+      }
+    }
+
+    function triggerClickOnSnapElement() {
+      if (snappedElement) {
+        snappedElement.click();
+      }
+      unlockSnap();
+    }
+
+    function showContextMenu(x, y) {
+      contextMenu.style.left = `${x}px`;
+      contextMenu.style.top = `${y}px`;
+      contextMenu.style.display = 'block';
+
+      const menuWidth = contextMenu.offsetWidth || 200;
+      const menuHeight = contextMenu.offsetHeight || 100;
+      let adjustedX = x;
+      let adjustedY = y;
+
+      if (x + menuWidth > window.innerWidth) {
+        adjustedX = window.innerWidth - menuWidth - 10;
+      }
+      if (y + menuHeight > window.innerHeight) {
+        adjustedY = window.innerHeight - menuHeight - 10;
+      }
+
+      contextMenu.style.left = `${adjustedX}px`;
+      contextMenu.style.top = `${adjustedY}px`;
+    }
+
+    function openContextMenuAtFinger(fx, fy) {
+      let mappedX = (fx / videoWidth) * window.innerWidth;
+      let mappedY = (fy / videoHeight) * window.innerHeight;
+      if (isMirrored) {
+        mappedX = window.innerWidth - mappedX;
+      }
+      if (contextMenu.style.display !== 'block') {
+        showContextMenu(mappedX, mappedY);
+      }
+    }
+
+    function showError(message) {
+      errorMessage.innerText = message;
+      errorMessage.style.display = 'block';
+      setTimeout(() => {
+        errorMessage.style.display = 'none';
+      }, 5000);
+    }
+
+    function initializeHands() {
+      hands = new Hands({
+        locateFile: (file) => {
+          return `https://unpkg.com/@mediapipe/hands/${file}`;
+        }
+      });
+
+      hands.setOptions({
+        maxNumHands: maxNumHands,
+        modelComplexity: modelComplexity,
+        minDetectionConfidence: minDetectionConfidence,
+        minTrackingConfidence: minTrackingConfidence
+      });
+
+      hands.onResults(onResults);
+    }
+
+    function startCamera() {
+      if (camera) {
+        camera.stop();
+      }
+
+      camera = new Camera(videoElement, {
+        onFrame: async () => {
+          try {
+            await hands.send({image: videoElement});
+          } catch (error) {
+            console.error("Error sending frame to MediaPipe Hands:", error);
+            showError("MediaPipe Hands処理中にエラーが発生しました: " + error);
+          }
+        },
+        width: videoWidth,
+        height: videoHeight,
+        frameRate: frameRate
+      });
+
+      camera.start().then(() => {
+        canvasElement.width = videoWidth;
+        canvasElement.height = videoHeight;
+      }).catch(err => {
+        console.error("カメラ開始失敗:", err);
+        showError(`カメラ開始失敗: ${err.message}`);
+      });
+    }
+
+    // overlayWindow生成処理：ドラッグ対応
+    function createOverlayWindow(url) {
+      const overlay = document.createElement('div');
+      overlay.className = 'overlayWindow';
+
+      const header = document.createElement('div');
+      header.className = 'overlayHeader';
+
+      const urlBar = document.createElement('input');
+      urlBar.type = 'text';
+      urlBar.value = url;
+
+      const reloadButton = document.createElement('button');
+      reloadButton.textContent = '更新';
+      reloadButton.onclick = () => {
+        iframe.src = urlBar.value;
+      };
+
+      header.appendChild(urlBar);
+      header.appendChild(reloadButton);
+
+      const iframeContainer = document.createElement('div');
+      iframeContainer.className = 'overlayIframeContainer';
+      const iframe = document.createElement('iframe');
+      iframe.src = url;
+      iframeContainer.appendChild(iframe);
+
+      const footer = document.createElement('div');
+      footer.className = 'overlayFooter';
+      const closeBtn = document.createElement('button');
+      closeBtn.textContent = '閉じる';
+      closeBtn.onclick = () => {
+        document.body.removeChild(overlay);
+      };
+      footer.appendChild(closeBtn);
+
+      overlay.appendChild(header);
+      overlay.appendChild(iframeContainer);
+      overlay.appendChild(footer);
+
+      document.body.appendChild(overlay);
+
+      // ドラッグ移動ロジック
+      let isDragging = false;
+      let dragOffsetX = 0;
+      let dragOffsetY = 0;
+
+      header.addEventListener('mousedown', (e) => {
+        isDragging = true;
+        dragOffsetX = e.clientX - overlay.offsetLeft;
+        dragOffsetY = e.clientY - overlay.offsetTop;
+        document.addEventListener('mousemove', onMouseMove);
+        document.addEventListener('mouseup', onMouseUp);
+      });
+
+      function onMouseMove(e) {
+        if (!isDragging) return;
+        let newLeft = e.clientX - dragOffsetX;
+        let newTop = e.clientY - dragOffsetY;
+        // 画面外にはみ出しを防ぐ処理必要なら追加
+        overlay.style.left = `${newLeft}px`;
+        overlay.style.top = `${newTop}px`;
+      }
+
+      function onMouseUp(e) {
+        isDragging = false;
+        document.removeEventListener('mousemove', onMouseMove);
+        document.removeEventListener('mouseup', onMouseUp);
+      }
+    }
+
+    function applySnap(x, y) {
+      const clickableElements = document.querySelectorAll('button, [onclick], a[href], input[type="button"], input[type="submit"]');
+      let closestElement = null;
+      let minDistance = Infinity;
+
+      clickableElements.forEach(element => {
+        const rect = element.getBoundingClientRect();
+        const elemX = rect.left + rect.width / 2;
+        const elemY = rect.top + rect.height / 2;
+
+        const distance = Math.hypot(x - elemX, y - elemY);
+        if (distance < minDistance && distance <= temporarySnapDistance) { // 一時的なsnapDistanceを使用
+          minDistance = distance;
+          closestElement = element;
+        }
+      });
+
+      if (closestElement) {
+        const rect = closestElement.getBoundingClientRect();
+        const snapX = rect.left + rect.width / 2;
+        const snapY = rect.top + rect.height / 2;
+
+        return { snapped: true, element: closestElement, x: snapX, y: snapY };
+      }
+
+      return { snapped: false, element: null, x: x, y: y };
+    }
+
+    function onResults(results) {
+      try {
+        frames++;
+        const currentTime = Date.now();
+        if (currentTime - startTime >= 1000) {
+          fps = frames;
+          frames = 0;
+          startTime = currentTime;
+          fpsDisplay.innerText = `FPS: ${fps}`;
+        }
+
+        canvasCtx.save();
+        canvasCtx.clearRect(0, 0, canvasElement.width, canvasElement.height);
+
+        let fingerPositions = [];
+
+        if (results.multiHandLandmarks && results.multiHandedness) {
+          for (let index = 0; index < results.multiHandLandmarks.length; index++) {
+            const classification = results.multiHandedness[index];
+            const handedness = classification.label;
+            const landmarks = results.multiHandLandmarks[index];
+
+            drawConnectors(canvasCtx, landmarks, HAND_CONNECTIONS,
+              {color: handedness === 'Right' ? '#00FF00' : '#FF0000', lineWidth: 2});
+            drawLandmarks(canvasCtx, landmarks,
+              {color: handedness === 'Right' ? '#00FF00' : '#FF0000', lineWidth: 1});
+
+            const indexFingerTip = landmarks[8];
+            let fingerX = indexFingerTip.x * videoWidth;
+            let fingerY = indexFingerTip.y * videoHeight;
+            fingerPositions.push({x: fingerX, y: fingerY});
+
+            // フリック検出（ダブルアップでメニュー、ダブルダウンで即時クリック）
+            const state = handStates[handedness];
+            if (state.previousY !== null) {
+              const deltaY = state.previousY - fingerY;
+              // アップフリック
+              if (deltaY > flickThresholdY) {
+                const now = Date.now();
+                if (now - lastFlickTime < flickTimeWindow) {
+                  flickCount++;
+                  if (flickCount >= 2) {
+                    // ダブルアップフリック
+                    if (fingerPositions.length > 0) {
+                      const avgPos = averageFingerPositions(fingerPositions);
+                      openContextMenuAtFinger(avgPos.x, avgPos.y);
+                    }
+                    flickCount = 0;
+                  }
+                } else {
+                  flickCount = 1;
+                }
+                lastFlickTime = now;
+              }
+
+              // ダウンフリック
+              if (deltaY < -downFlickThresholdY) {
+                const now = Date.now();
+                const currentDownWindow = (downFlickCount === 1) ? downFlickTimeWindow : flickTimeWindow;
+                if (now - lastDownFlickTime < currentDownWindow) {
+                  downFlickCount++;
+                  if (downFlickCount >= 2) {
+                    // ダブルダウンフリック
+                    if (snapClickTimer && snappedElement) {
+                      if (snapClickTimer.timer) {
+                        clearTimeout(snapClickTimer.timer);
+                      }
+                      triggerClickOnSnapElement();
+                      snapClickTimer = null;
+                    }
+                    downFlickCount = 0;
+                    unlockSnap();
+                  } else {
+                    lockSnap();
+                  }
+                } else {
+                  downFlickCount = 1;
+                  lockSnap();
+                }
+                lastDownFlickTime = now;
+              }
+            }
+            state.previousY = fingerY;
+          }
+        }
+
+        canvasSizeDisplay.innerText = `キャンバス: ${canvasElement.width}×${canvasElement.height}`;
+
+        if (isMirrored) {
+          canvasCtx.scale(-1, 1);
+          canvasCtx.translate(-canvasElement.width, 0);
+        }
+
+        canvasCtx.restore();
+
+        // スナップ処理
+        if (fingerPositions.length > 0) {
+          const avgPos = averageFingerPositions(fingerPositions);
+          let mappedX = (avgPos.x / videoWidth) * window.innerWidth;
+          let mappedY = (avgPos.y / videoHeight) * window.innerHeight;
+          if (isMirrored) {
+            mappedX = window.innerWidth - mappedX;
+          }
+
+          const snapResult = applySnap(mappedX, mappedY);
+          if (snapResult.snapped) {
+            snappedElement = snapResult.element;
+            mappedX = snapResult.x;
+            mappedY = snapResult.y;
+
+            customCursor.classList.add('snap');
+            setTimeout(() => {
+              customCursor.classList.remove('snap');
+            }, 300);
+
+            if (!snapLocked && snapClickTimer && snapClickTimer.element !== snappedElement) {
+              if (snapClickTimer.timer) {
+                clearTimeout(snapClickTimer.timer);
+              }
+              snapClickTimer = null;
+            }
+
+            if (!snapClickTimer) {
+              snapClickTimer = {
+                timer: setTimeout(() => {
+                  triggerClickOnSnapElement();
+                  snapClickTimer = null;
+                }, snapClickDelay),
+                element: snappedElement,
+                start: Date.now()
+              };
+            }
+
+            customCursor.style.left = `${mappedX}px`;
+            customCursor.style.top = `${mappedY}px`;
+          } else {
+            if (!snapLocked) {
+              snappedElement = null;
+              if (snapClickTimer) {
+                if (snapClickTimer.timer) {
+                  clearTimeout(snapClickTimer.timer);
+                }
+                snapClickTimer = null;
+              }
+              customCursor.style.left = `${mappedX}px`;
+              customCursor.style.top = `${mappedY}px`;
+            } else {
+              customCursor.style.left = `${mappedX}px`;
+              customCursor.style.top = `${mappedY}px`;
+            }
+          }
+        }
+
+        if (snapClickTimer) {
+          snapTimerDisplay.style.display = 'block';
+          const elapsed = Date.now() - snapClickTimer.start;
+          const remaining = (snapClickDelay - elapsed) / 1000;
+          snapTimerDisplay.textContent = `${remaining.toFixed(1)}s`;
+        } else {
+          snapTimerDisplay.style.display = 'none';
+        }
+
+      } catch (err) {
+        console.error("Error in onResults:", err);
+        showError("onResults内でエラーが発生しました: " + err.message);
+      }
+    }
+
+    menuButton.addEventListener('click', () => {
+      settingsWindow.style.display = 'block';
+    });
+
+    closeSettings.addEventListener('click', () => {
+      settingsWindow.style.display = 'none';
+    });
+
+    applySettings.addEventListener('click', () => {
+      const resolution = document.getElementById('resolutionSelect').value;
+      [videoWidth, videoHeight] = resolution.split('x').map(Number);
+      modelComplexity = parseInt(document.getElementById('modelComplexity').value);
+      frameRate = parseInt(document.getElementById('frameRate').value);
+      minDetectionConfidence = parseFloat(detectionConfidenceSlider.value);
+      minTrackingConfidence = parseFloat(trackingConfidenceSlider.value);
+      maxNumHands = parseInt(document.getElementById('handCountSelect').value);
+      isMirrored = mirrorToggle.checked;
+
+      const newSnapTimeSec = parseFloat(snapTimerInput.value);
+      if (!isNaN(newSnapTimeSec) && newSnapTimeSec > 0) {
+        snapClickDelay = newSnapTimeSec * 1000;
+      } else {
+        snapClickDelay = 4000;
+      }
+
+      detectionConfidenceValue.innerText = minDetectionConfidence;
+      trackingConfidenceValue.innerText = minTrackingConfidence;
+
+      hands.setOptions({
+        maxNumHands: maxNumHands,
+        modelComplexity: modelComplexity,
+        minDetectionConfidence: minDetectionConfidence,
+        minTrackingConfidence: minTrackingConfidence
+      });
+
+      canvasElement.width = videoWidth;
+      canvasElement.height = videoHeight;
+
+      if (isMirrored) {
+        videoElement.classList.add('mirrored');
+        canvasElement.classList.add('mirrored');
+      } else {
+        videoElement.classList.remove('mirrored');
+        canvasElement.classList.remove('mirrored');
+      }
+
+      cameraResolutionDisplay.innerText = `解像度: ${videoWidth}×${videoHeight}`;
+      startCamera();
+
+      settingsWindow.style.display = 'none';
+      fps = 0; frames = 0; startTime = Date.now();
+      fpsDisplay.innerText = `FPS: 0`;
+      contextMenu.style.display = 'none';
+    });
+
+    flipButton.addEventListener('click', () => {
+      isMirrored = !isMirrored;
+      if (isMirrored) {
+        videoElement.classList.add('mirrored');
+        canvasElement.classList.add('mirrored');
+      } else {
+        videoElement.classList.remove('mirrored');
+        canvasElement.classList.remove('mirrored');
+      }
+      mirrorToggle.checked = isMirrored;
+    });
+
+    closeContextMenuButton.addEventListener('click', () => {
+      contextMenu.style.display = 'none';
+    });
+
+    openUrlButton.addEventListener('click', () => {
+      const url = urlInput.value.trim();
+      if (url) {
+        createOverlayWindow(url);
+      }
+      contextMenu.style.display = 'none';
+    });
+
+    startButton.addEventListener('click', () => {
+      initializeHands();
+      startCamera();
+      startButton.style.display = 'none';
+    });
+
+    window.addEventListener('resize', () => {
+      const currentLeft = parseFloat(customCursor.style.left);
+      const currentTop = parseFloat(customCursor.style.top);
+      const newLeft = Math.max(0, Math.min(window.innerWidth, currentLeft));
+      const newTop = Math.max(0, Math.min(window.innerHeight, currentTop));
+      customCursor.style.left = `${newLeft}px`;
+      customCursor.style.top = `${newTop}px`;
+
+      if (contextMenu.style.display === 'block') {
+        const menuWidth = contextMenu.offsetWidth || 200;
+        const menuHeight = contextMenu.offsetHeight || 100;
+        let menuLeft = parseFloat(contextMenu.style.left);
+        let menuTop = parseFloat(contextMenu.style.top);
+
+        menuLeft = Math.min(menuLeft, window.innerWidth - menuWidth - 10);
+        menuTop = Math.min(menuTop, window.innerHeight - menuHeight - 10);
+
+        contextMenu.style.left = `${menuLeft}px`;
+        contextMenu.style.top = `${menuTop}px`;
+      }
+
+      cameraResolutionDisplay.innerText = `解像度: ${videoWidth}×${videoHeight}`;
+      canvasSizeDisplay.innerText = `キャンバス: ${canvasElement.width}×${canvasElement.height}`;
+    });
+
+    window.addEventListener('load', () => {
+      cameraResolutionDisplay.innerText = `解像度: ${videoWidth}×${videoHeight}`;
+      canvasSizeDisplay.innerText = `キャンバス: ${canvasElement.width}×${canvasElement.height}`;
+    });
+
+    window.addEventListener('mousemove', (e) => {
+      // overlayWindow上にいるか判定
+      let overOverlay = false;
+      let elem = document.elementFromPoint(e.clientX, e.clientY);
+      if (elem) {
+        // overlayWindowまたはその子要素上ならtrue
+        if (elem.closest('.overlayWindow')) {
+          overOverlay = true;
+        }
+      }
+
+      if (overOverlay) {
+        // overlayWindow上では通常カーソル表示
+        customCursor.style.display = 'block';
+        document.body.style.cursor = 'none';
+      } else {
+        // overlayWindow外ではcustomCursor表示
+        customCursor.style.display = 'block';
+        document.body.style.cursor = 'none';
+      }
+
+      customCursor.style.left = `${e.clientX}px`;
+      customCursor.style.top = `${e.clientY}px`;
+
+      // snapLockedがfalseの場合のみスナップ解除
+      if (!snapLocked && snapClickTimer) {
+        if (snapClickTimer.timer) {
+          clearTimeout(snapClickTimer.timer);
+        }
+        snapClickTimer = null;
+        snappedElement = null;
+        snapTimerDisplay.style.display = 'none';
+      }
+    });
+
+  </script>
+</body>
+</html>

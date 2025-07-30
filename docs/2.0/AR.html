@@ -1,0 +1,717 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8" />
+  <title>
+    A-Frame 物理演算サンプル - スナップ切り替え、High Drop Destruction機能、キューブ生成・破壊機能、リセット機能、初期キューブ生成機能
+  </title>
+
+  <!-- A-Frameライブラリ -->
+  <script src="https://aframe.io/releases/1.6.0/aframe.min.js"></script>
+
+  <!-- A-Frame Physics System -->
+  <script src="https://cdn.jsdelivr.net/gh/c-frame/aframe-physics-system@v4.2.2/dist/aframe-physics-system.min.js"></script>
+
+  <!-- ★ 爆発エフェクト用: A-Frame Particle System Component を追加 -->
+  <script src="https://unpkg.com/aframe-particle-system-component@1.1.3/dist/aframe-particle-system-component.min.js"></script>
+
+  <style>
+    body { margin: 0; overflow: hidden; }
+    a-scene { width: 100vw; height: 100vh; }
+
+    /* オーバーレイボタンのスタイリング */
+    .overlay-button {
+      position: absolute;
+      left: 20px;
+      width: 220px;
+      height: 50px;
+      background-color: rgba(255, 255, 255, 0.8);
+      border: 2px solid #000;
+      border-radius: 8px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      cursor: pointer;
+      user-select: none;
+      font-family: Arial, sans-serif;
+      z-index: 1000;
+      margin-bottom: 10px;
+    }
+    #snap-button { top: 20px; }
+    #high-drop-button { top: 80px; }
+    #destroy-all-button { top: 140px; }
+    #generate-cube-button { top: 200px; }
+    #fragment-behavior-button { top: 260px; }
+    #generate-initial-button { top: 320px; }
+    #reset-button { top: 380px; }
+
+    .overlay-button:hover { background-color: rgba(200, 200, 200, 0.8); }
+
+    .button-text,
+    .high-drop-button-text,
+    .destroy-all-button-text,
+    .generate-cube-button-text,
+    .fragment-behavior-button-text,
+    .generate-initial-button-text,
+    .reset-button-text {
+      pointer-events: none;
+      font-size: 16px;
+      color: #000;
+    }
+
+    /* モバイル調整 */
+    @media (max-width: 600px) {
+      .overlay-button { width: 180px; height: 40px; left: 10px; }
+      #high-drop-button { top: 60px; }
+      #destroy-all-button { top: 100px; }
+      #generate-cube-button { top: 140px; }
+      #fragment-behavior-button { top: 180px; }
+      #generate-initial-button { top: 220px; }
+      #reset-button { top: 260px; }
+      .button-text,
+      .high-drop-button-text,
+      .destroy-all-button-text,
+      .generate-cube-button-text,
+      .fragment-behavior-button-text,
+      .generate-initial-button-text,
+      .reset-button-text { font-size: 14px; }
+    }
+  </style>
+
+  <script>
+    // ★ ログ用の簡易ヘルパ（デバッグトグルを付けたい場合に備えて）
+    const DBG = {
+      enabled: true,
+      log: (...args) => { if (DBG.enabled) console.log('[A-Frame Sample]', ...args); },
+      warn: (...args) => console.warn('[A-Frame Sample]', ...args),
+      err:  (...args) => console.error('[A-Frame Sample]', ...args),
+    };
+
+    // state-manager: スナップ/モード状態を集中管理
+    AFRAME.registerComponent('state-manager', {
+      schema: {
+        autoSnap: { type: 'boolean', default: true },
+        highDropDestructionMode: { type: 'number', default: 1 }, // 0: Always, 1: Conditional, 2: Never
+        fragmentBehavior: { type: 'number', default: 0 }         // 0: Disappear, 1: Remain
+      },
+      init: function () {
+        const el = this.el;
+
+        el.sceneEl.addEventListener('snap-toggle', (e) => {
+          this.data.autoSnap = e.detail.isAutoSnap;
+          DBG.log(`スナップモード => ${this.data.autoSnap ? 'ON' : 'OFF'}`);
+        });
+
+        el.sceneEl.addEventListener('high-drop-toggle', (e) => {
+          this.data.highDropDestructionMode = e.detail.mode;
+          const modeNames = ['Always Destroy', 'Conditional Destroy', 'Never Destroy'];
+          DBG.log(`High Drop Destruction => ${modeNames[this.data.highDropDestructionMode]}`);
+        });
+
+        el.sceneEl.addEventListener('fragment-behavior-toggle', (e) => {
+          this.data.fragmentBehavior = e.detail.behavior;
+          const behaviorNames = ['Fragments Disappear', 'Fragments Remain'];
+          DBG.log(`Fragment Behavior => ${behaviorNames[this.data.fragmentBehavior]}`);
+        });
+
+        el.sceneEl.addEventListener('reset-scene', () => {
+          this.data.autoSnap = true;
+          this.data.highDropDestructionMode = 1;
+          this.data.fragmentBehavior = 0;
+          DBG.log('シーン状態をデフォルトにリセット');
+        });
+      }
+    });
+
+    // breakable: 衝突速度/落下モードに応じて破壊
+    AFRAME.registerComponent('breakable', {
+      schema: { threshold: { type: 'number', default: 5 } },
+      init: function () {
+        const el = this.el;
+        const sceneEl = el.sceneEl;
+
+        const attachCollide = () => {
+          if (!el.body) { DBG.warn('breakable: body 未生成'); return; }
+          // Cannon(ES) の body に直接 collide ハンドラを追加
+          el.body.addEventListener('collide', (e) => {
+            try {
+              const collision = e.contact;
+              const impactVelocity =
+                typeof collision.getImpactVelocityAlongNormal === 'function'
+                  ? collision.getImpactVelocityAlongNormal()
+                  : 0;
+
+              DBG.log(`ID: ${el.id || el.object3D.uuid}, 衝突速度: ${impactVelocity}`);
+
+              const stateManager = sceneEl.components['state-manager'];
+              const mode = stateManager ? stateManager.data.highDropDestructionMode : 1;
+
+              if (mode === 0) { // Always
+                DBG.log(`破壊（Always）: ${el.id || el.object3D.uuid}`);
+                this.createExplosion(el.object3D.position, el.getAttribute('color'));
+                setTimeout(() => { if (el.parentNode) el.parentNode.removeChild(el); }, 0);
+
+              } else if (mode === 1) { // Conditional
+                const highDrop = el.getAttribute('data-high-drop') === 'true';
+                if (impactVelocity > this.data.threshold || highDrop) {
+                  DBG.log(`破壊（Conditional）: ${el.id || el.object3D.uuid}`);
+                  this.createExplosion(el.object3D.position, el.getAttribute('color'));
+                  setTimeout(() => { if (el.parentNode) el.parentNode.removeChild(el); }, 0);
+                }
+
+              } else {
+                DBG.log(`破壊せず（Never）: ${el.id || el.object3D.uuid}`);
+              }
+            } catch (err) {
+              DBG.err('breakable.collide 処理中エラー:', err);
+            }
+          });
+        };
+
+        // ★ body がまだ無い場合に備えて body-loaded を待つ
+        if (el.body) attachCollide();
+        else el.addEventListener('body-loaded', attachCollide);
+      },
+
+      createExplosion: function (position, originalColor) {
+        const scene = this.el.sceneEl;
+        const stateManager = scene.components['state-manager'];
+        const fragmentBehavior = stateManager ? stateManager.data.fragmentBehavior : 0;
+
+        // ★ フラグメント生成（消滅 or 残存）
+        createFragmentExplosion(scene, position, fragmentBehavior === 0, originalColor);
+
+        // ★ 粒子エフェクト（エンティティに position、コンポーネントは string）
+        const explosion = document.createElement('a-entity');
+        explosion.setAttribute('position', `${position.x} ${position.y} ${position.z}`);
+        explosion.setAttribute(
+          'particle-system',
+          'preset: dust; color: #FF0000, #FFA500, #FFFF00; size: 0.1; particleCount: 200; opacity: 0.7'
+        );
+        scene.appendChild(explosion);
+
+        setTimeout(() => { if (explosion.parentNode) scene.removeChild(explosion); }, 1000);
+      }
+    });
+
+    // ★ フラグメント生成（velocity は body-loaded 後にセット）
+    function createFragmentExplosion(scene, position, fragmentsDisappear, originalColor) {
+      const fragmentCount = 10;
+      const fragmentSize = 0.2;
+
+      for (let i = 0; i < fragmentCount; i++) {
+        const fragment = document.createElement('a-box');
+
+        const offset = new THREE.Vector3(
+          (Math.random() - 0.5) * 0.2,
+          (Math.random() - 0.5) * 0.2,
+          (Math.random() - 0.5) * 0.2
+        );
+
+        fragment.setAttribute('position', `${position.x + offset.x} ${position.y + offset.y} ${position.z + offset.z}`);
+        fragment.setAttribute('depth', fragmentSize);
+        fragment.setAttribute('height', fragmentSize);
+        fragment.setAttribute('width', fragmentSize);
+        fragment.setAttribute('color', originalColor || '#FFFFFF');
+
+        // ★ フェード用に transparent を明示
+        fragment.setAttribute('material', 'transparent: true; opacity: 1');
+
+        fragment.setAttribute('dynamic-body', 'mass: 0.1');
+        fragment.classList.add('fragment');
+
+        // ★ body 生成後に初速・回転を付与
+        fragment.addEventListener('body-loaded', () => {
+          try {
+            const vx = (Math.random() - 0.5) * 5;
+            const vy = Math.random() * 5;
+            const vz = (Math.random() - 0.5) * 5;
+            fragment.body.velocity.set(vx, vy, vz);
+            fragment.body.angularVelocity.set(
+              (Math.random() - 0.5) * 10,
+              (Math.random() - 0.5) * 10,
+              (Math.random() - 0.5) * 10
+            );
+          } catch (err) {
+            DBG.err('fragment 初速設定エラー:', err);
+          }
+        });
+
+        // 消えるモードではフェードして削除
+        if (fragmentsDisappear) {
+          fragment.setAttribute('animation__fade', {
+            property: 'material.opacity',
+            to: 0,
+            dur: 2000,
+            easing: 'linear',
+            loop: false
+          });
+          fragment.addEventListener('animationcomplete__fade', () => {
+            if (fragment.parentNode) fragment.parentNode.removeChild(fragment);
+          });
+        }
+        scene.appendChild(fragment);
+      }
+    }
+
+    // 高所自由落下監視
+    AFRAME.registerComponent('free-fall-monitor', {
+      schema: {
+        heightThreshold: { type: 'number', default: 4 },
+        minVelocity: { type: 'number', default: 0.1 }
+      },
+      init: function () {
+        this.initialY = this.el.object3D.position.y;
+        this.falling = false;
+      },
+      tick: function () {
+        const body = this.el.body;
+        if (!body) return;
+
+        const stateManager = this.el.sceneEl.components['state-manager'];
+        const mode = stateManager ? stateManager.data.highDropDestructionMode : 1;
+
+        const y = this.el.object3D.position.y;
+        const vy = body.velocity.y;
+
+        if (mode === 0) {
+          if (!this.falling) {
+            this.falling = true;
+            DBG.log(`自由落下（Always）: ${this.el.id || this.el.object3D.uuid}`);
+          }
+        } else if (mode === 1) {
+          if (y < this.initialY - this.data.heightThreshold && vy < -this.data.minVelocity) {
+            if (!this.falling) {
+              this.falling = true;
+              this.el.setAttribute('data-high-drop', 'true');
+              DBG.log(`高所落下フラグ付与（Conditional）: ${this.el.id || this.el.object3D.uuid}`);
+            }
+          } else if (this.falling) {
+            this.falling = false;
+            this.el.removeAttribute('data-high-drop');
+            DBG.log(`高所落下フラグ解除（Conditional）: ${this.el.id || this.el.object3D.uuid}`);
+          }
+        } else {
+          if (this.falling) {
+            this.falling = false;
+            this.el.removeAttribute('data-high-drop');
+            DBG.log(`自由落下解除（Never）: ${this.el.id || this.el.object3D.uuid}`);
+          }
+        }
+      }
+    });
+
+    // ダブルクリックで掴んでドラッグ
+    AFRAME.registerComponent('double-click-drag', {
+      schema: { enabled: { default: true } },
+      init: function () {
+        this.grabbedEl = null;
+        this.raycaster = new THREE.Raycaster();
+        this.mouse = new THREE.Vector2();
+        this.camera = this.el.sceneEl.camera;
+        this.canvas = this.el.sceneEl.canvas;
+        this.isDragging = false;
+        this.shiftPressed = false;
+        this.dropStartHeight = 0;
+        this.originalColorBackup = null; // ★ 元色保持
+
+        // 視覚インジケーター
+        this.indicator = document.createElement('a-box');
+        this.indicator.setAttribute('position', '0 0 0');
+        this.indicator.setAttribute('depth', '1.1');
+        this.indicator.setAttribute('height', '1.1');
+        this.indicator.setAttribute('width', '1.1');
+        this.indicator.setAttribute('color', '#00FF00');
+        this.indicator.setAttribute('opacity', '0.5');
+        this.indicator.setAttribute('visible', 'false');
+        this.el.sceneEl.appendChild(this.indicator);
+
+        // ハンドラ束縛
+        this.onDblClick = this.onDblClick.bind(this);
+        this.onMouseMove = this.onMouseMove.bind(this);
+        this.onMouseUp = this.onMouseUp.bind(this);
+        this.onKeyDown = this.onKeyDown.bind(this);
+        this.onKeyUp = this.onKeyUp.bind(this);
+
+        const bindCanvasEvents = () => {
+          this.canvas.addEventListener('dblclick', this.onDblClick);
+          this.canvas.addEventListener('mousemove', this.onMouseMove);
+          this.canvas.addEventListener('mouseup', this.onMouseUp);
+        };
+
+        if (this.canvas) bindCanvasEvents();
+        else this.el.sceneEl.addEventListener('renderstart', () => {
+          this.canvas = this.el.sceneEl.canvas;
+          bindCanvasEvents();
+        });
+
+        document.addEventListener('keydown', this.onKeyDown);
+        document.addEventListener('keyup', this.onKeyUp);
+      },
+      remove: function () {
+        if (this.canvas) {
+          this.canvas.removeEventListener('dblclick', this.onDblClick);
+          this.canvas.removeEventListener('mousemove', this.onMouseMove);
+          this.canvas.removeEventListener('mouseup', this.onMouseUp);
+        }
+        document.removeEventListener('keydown', this.onKeyDown);
+        document.removeEventListener('keyup', this.onKeyUp);
+        if (this.indicator && this.indicator.parentNode) {
+          this.indicator.parentNode.removeChild(this.indicator);
+        }
+      },
+      onKeyDown: function (event) {
+        if (event.key === 'Shift') {
+          this.shiftPressed = true;
+          DBG.log('Shift 押下');
+          if (this.grabbedEl && this.grabbedEl.body && window.CANNON) {
+            // ★ 衝突レスポンス無効 & キネマティック化
+            this.grabbedEl.body.collisionResponse = false;
+            this.grabbedEl.body.type = CANNON.Body.KINEMATIC; // ★ 正しい定数
+            DBG.log('衝突無効 & KINEMATIC へ');
+          }
+        }
+      },
+      onKeyUp: function (event) {
+        if (event.key === 'Shift') {
+          this.shiftPressed = false;
+          DBG.log('Shift 解放');
+          if (this.grabbedEl && this.grabbedEl.body && window.CANNON) {
+            this.grabbedEl.body.collisionResponse = true;
+            this.grabbedEl.body.type = CANNON.Body.DYNAMIC; // ★ 正しい定数
+            DBG.log('衝突有効 & DYNAMIC へ');
+          }
+        }
+      },
+      onDblClick: function (event) {
+        if (!this.data.enabled) return;
+        DBG.log('ダブルクリック');
+
+        // 2D -> NDC
+        const rect = this.canvas.getBoundingClientRect();
+        this.mouse.x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
+        this.mouse.y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
+
+        this.raycaster.setFromCamera(this.mouse, this.camera);
+
+        // 物理対象のみをレイキャスト
+        const targetObjects = [];
+        this.el.sceneEl.object3D.traverse((obj) => {
+          if (obj.el && (obj.el.components['dynamic-body'] || obj.el.components['static-body'])) {
+            targetObjects.push(obj);
+          }
+        });
+
+        const intersected = this.raycaster.intersectObjects(targetObjects, true);
+        if (intersected.length === 0) return;
+
+        const pickedEl = intersected[0].object.el;
+        if (!pickedEl || !pickedEl.components['dynamic-body']) return;
+
+        // 掴む
+        this.grabbedEl = pickedEl;
+        this.dropStartHeight = pickedEl.object3D.position.y;
+        DBG.log(`掴み開始。dropStartHeight=${this.dropStartHeight}`);
+
+        // 元色バックアップ & ハイライト
+        this.originalColorBackup = pickedEl.getAttribute('color');
+        pickedEl.setAttribute('color', '#FFD700');
+
+        if (pickedEl.body) pickedEl.body.sleep();
+
+        if (this.shiftPressed && pickedEl.body && window.CANNON) {
+          pickedEl.body.collisionResponse = false;
+          pickedEl.body.type = CANNON.Body.KINEMATIC; // ★
+        }
+
+        this.isDragging = true;
+      },
+      onMouseMove: function (event) {
+        if (!this.grabbedEl || !this.isDragging) return;
+
+        const rect = this.canvas.getBoundingClientRect();
+        this.mouse.x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
+        this.mouse.y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
+
+        this.raycaster.setFromCamera(this.mouse, this.camera);
+
+        const grabbedPos = this.grabbedEl.object3D.position.clone();
+        const plane = new THREE.Plane(new THREE.Vector3(0, 1, 0), -grabbedPos.y);
+        const intersectPoint = new THREE.Vector3();
+        this.raycaster.ray.intersectPlane(plane, intersectPoint);
+        if (!intersectPoint) return;
+
+        let yPos = grabbedPos.y;
+        let targetEl = null;
+
+        const sceneEl = this.el.sceneEl;
+        const stateManager = sceneEl.components['state-manager'];
+
+        if (this.shiftPressed) {
+          let maxY = 0;
+          const grabbedBox = new THREE.Box3().setFromObject(this.grabbedEl.object3D);
+          const grabbedSize = new THREE.Vector3();
+          grabbedBox.getSize(grabbedSize);
+          const halfHeight = grabbedSize.y / 2;
+
+          sceneEl.object3D.traverse((obj) => {
+            if (obj.el && obj.el !== this.grabbedEl && (obj.el.components['dynamic-body'] || obj.el.components['static-body'])) {
+              const otherBox = new THREE.Box3().setFromObject(obj.el.object3D);
+              const xOverlap = grabbedBox.min.x <= otherBox.max.x && grabbedBox.max.x >= otherBox.min.x;
+              const zOverlap = grabbedBox.min.z <= otherBox.max.z && grabbedBox.max.z >= otherBox.min.z;
+
+              if (xOverlap && zOverlap) {
+                if (otherBox.max.y > maxY) {
+                  maxY = otherBox.max.y;
+                  targetEl = obj.el;
+                }
+              }
+            }
+          });
+
+          yPos = maxY + halfHeight + 0.1;
+
+          const minY = halfHeight + 0.2; // 地面 y=0 を少し上
+          yPos = Math.max(yPos, minY);
+
+          if (stateManager && stateManager.data.autoSnap) {
+            const grid = 1;
+            intersectPoint.x = Math.round(intersectPoint.x / grid) * grid;
+            intersectPoint.z = Math.round(intersectPoint.z / grid) * grid;
+          }
+
+          if (targetEl) {
+            const targetPos = targetEl.object3D.position.clone();
+            this.indicator.setAttribute('position', `${targetPos.x} ${maxY + halfHeight + 0.1} ${targetPos.z}`);
+            this.indicator.setAttribute('visible', 'true');
+          } else {
+            this.indicator.setAttribute('visible', 'false');
+          }
+        } else {
+          this.indicator.setAttribute('visible', 'false');
+        }
+
+        // 物理ボディのワープ（速度/角速度リセット）
+        const body = this.grabbedEl.body;
+        if (body) {
+          body.position.set(intersectPoint.x, yPos, intersectPoint.z);
+          body.velocity.set(0, 0, 0);
+          body.angularVelocity.set(0, 0, 0);
+        }
+      },
+      onMouseUp: function () {
+        if (!this.grabbedEl || !this.isDragging) return;
+
+        const sceneEl = this.el.sceneEl;
+        const stateManager = sceneEl.components['state-manager'];
+        const mode = stateManager ? stateManager.data.highDropDestructionMode : 1;
+
+        if (this.shiftPressed && this.grabbedEl.body && window.CANNON) {
+          this.grabbedEl.body.collisionResponse = true;
+          this.grabbedEl.body.type = CANNON.Body.DYNAMIC; // ★
+        }
+
+        if (this.grabbedEl.body) this.grabbedEl.body.wakeUp();
+
+        // ★ 元色に戻す
+        const restore = this.originalColorBackup || '#4CC3D9';
+        this.grabbedEl.setAttribute('color', restore);
+        this.originalColorBackup = null;
+
+        this.indicator.setAttribute('visible', 'false');
+
+        if (mode === 0) {
+          this.grabbedEl.setAttribute('data-high-drop', 'true');
+          DBG.log('高落下フラグ付与（Always）');
+        } else if (mode === 1) {
+          if (this.dropStartHeight >= 4) {
+            this.grabbedEl.setAttribute('data-high-drop', 'true');
+            DBG.log('高落下フラグ付与（Conditional）');
+          } else {
+            this.grabbedEl.removeAttribute('data-high-drop');
+            DBG.log('高落下フラグ解除（Conditional）');
+          }
+        } else {
+          this.grabbedEl.removeAttribute('data-high-drop');
+          DBG.log('高落下フラグ解除（Never）');
+        }
+
+        DBG.log('ドロップ完了');
+        this.grabbedEl = null;
+        this.isDragging = false;
+        this.dropStartHeight = 0;
+      }
+    });
+
+    // DOM 準備完了後の UI バインド
+    document.addEventListener('DOMContentLoaded', () => {
+      const sceneEl = document.querySelector('a-scene');
+
+      // 初期25キューブ生成
+      function generateInitialCubes() {
+        const existing = sceneEl.querySelectorAll('.cube');
+        existing.forEach(c => { if (c.parentNode) c.parentNode.removeChild(c); });
+
+        const colors = ['#4CC3D9', '#EF2D5E', '#7BC8A4', '#FFC65D', '#FF6347', '#32CD32', '#8A2BE2', '#FFD700', '#00CED1'];
+        let idx = 0, spacing = 2;
+
+        for (let i = 0; i < 5; i++) {
+          for (let j = 0; j < 5; j++) {
+            const box = document.createElement('a-box');
+            box.setAttribute('position', `${(i - 2) * spacing} 1 ${(j - 2) * spacing}`);
+            box.setAttribute('depth', '1');
+            box.setAttribute('height', '1');
+            box.setAttribute('width', '1');
+            box.setAttribute('color', colors[idx % colors.length]);
+            box.setAttribute('dynamic-body', '');
+            box.setAttribute('breakable', 'threshold: 5');
+            box.setAttribute('free-fall-monitor', 'heightThreshold: 4; minVelocity: 0.1');
+            box.classList.add('cube');
+            box.setAttribute('id', `initial-cube-${Date.now()}-${i}-${j}`);
+            sceneEl.appendChild(box);
+            idx++;
+          }
+        }
+        DBG.log('初期25キューブ生成完了');
+      }
+
+      // 初期生成
+      generateInitialCubes();
+
+      // Snap
+      const snapButton = document.getElementById('snap-button');
+      let isAutoSnap = true;
+      snapButton.addEventListener('click', () => {
+        isAutoSnap = !isAutoSnap;
+        snapButton.querySelector('.button-text').textContent = `Snap: ${isAutoSnap ? 'ON' : 'OFF'}`;
+        sceneEl.emit('snap-toggle', { isAutoSnap });
+      });
+
+      // High Drop Destruction
+      const highDropButton = document.getElementById('high-drop-button');
+      let highDropMode = 1; // 0:Always 1:Conditional 2:Never
+      highDropButton.addEventListener('click', () => {
+        highDropMode = (highDropMode + 1) % 3;
+        const labels = ['Always Destroy', 'Conditional Destroy', 'Never Destroy'];
+        highDropButton.querySelector('.high-drop-button-text').textContent =
+          `High Drop Destruction: ${labels[highDropMode]}`;
+        sceneEl.emit('high-drop-toggle', { mode: highDropMode });
+      });
+
+      // Destroy All
+      const destroyAllButton = document.getElementById('destroy-all-button');
+      destroyAllButton.addEventListener('click', () => {
+        const cubes = sceneEl.querySelectorAll('.cube');
+        cubes.forEach(cube => {
+          if (cube.components['breakable']) {
+            cube.components['breakable'].createExplosion(cube.object3D.position, cube.getAttribute('color'));
+            setTimeout(() => { if (cube.parentNode) cube.parentNode.removeChild(cube); }, 0);
+          }
+        });
+      });
+
+      // Generate Cube
+      const generateCubeButton = document.getElementById('generate-cube-button');
+      generateCubeButton.addEventListener('click', () => {
+        const colors = ['#4CC3D9', '#EF2D5E', '#7BC8A4', '#FFC65D', '#FF6347', '#32CD32', '#8A2BE2', '#FFD700', '#00CED1'];
+        const color = colors[Math.floor(Math.random() * colors.length)];
+        const x = (Math.random() * 10) - 5;
+        const y = (Math.random() * 5) + 5;
+        const z = (Math.random() * 10) - 5;
+
+        const box = document.createElement('a-box');
+        box.setAttribute('position', `${x} ${y} ${z}`);
+        box.setAttribute('depth', '1');
+        box.setAttribute('height', '1');
+        box.setAttribute('width', '1');
+        box.setAttribute('color', color);
+        box.setAttribute('dynamic-body', '');
+        box.setAttribute('breakable', 'threshold: 5');
+        box.setAttribute('free-fall-monitor', 'heightThreshold: 4; minVelocity: 0.1');
+        box.classList.add('cube');
+        box.setAttribute('id', `cube-${Date.now()}`);
+        sceneEl.appendChild(box);
+        DBG.log(`新規キューブ生成: ${box.id || box.object3D.uuid}`);
+      });
+
+      // Fragment Behavior
+      const fragmentBehaviorButton = document.getElementById('fragment-behavior-button');
+      let fragmentBehaviorMode = 0;
+      fragmentBehaviorButton.addEventListener('click', () => {
+        fragmentBehaviorMode = (fragmentBehaviorMode + 1) % 2;
+        const labels = ['Fragments Disappear', 'Fragments Remain'];
+        fragmentBehaviorButton.querySelector('.fragment-behavior-button-text').textContent =
+          `Fragment Behavior: ${labels[fragmentBehaviorMode]}`;
+        sceneEl.emit('fragment-behavior-toggle', { behavior: fragmentBehaviorMode });
+      });
+
+      // Generate Initial 25 Cubes
+      const generateInitialButton = document.getElementById('generate-initial-button');
+      generateInitialButton.addEventListener('click', generateInitialCubes);
+
+      // Reset
+      const resetButton = document.getElementById('reset-button');
+      resetButton.addEventListener('click', () => {
+        // キューブ削除
+        sceneEl.querySelectorAll('.cube').forEach(c => { if (c.parentNode) c.parentNode.removeChild(c); });
+        // フラグメント削除
+        sceneEl.querySelectorAll('.fragment').forEach(f => { if (f.parentNode) f.parentNode.removeChild(f); });
+
+        // 状態リセット通知
+        sceneEl.emit('reset-scene');
+
+        // ラベル初期化
+        document.querySelector('#snap-button .button-text').textContent = 'Snap: ON';
+        document.querySelector('#high-drop-button .high-drop-button-text').textContent =
+          'High Drop Destruction: Conditional Destroy';
+        document.querySelector('#fragment-behavior-button .fragment-behavior-button-text').textContent =
+          'Fragment Behavior: Fragments Disappear';
+
+        // 内部状態
+        highDropMode = 1;
+        fragmentBehaviorMode = 0;
+
+        // 初期キューブの再生成は任意
+        // generateInitialCubes();
+
+        DBG.log('シーンをリセット');
+      });
+    });
+  </script>
+</head>
+
+<body>
+  <!-- オーバーレイボタン群 -->
+  <div id="snap-button" class="overlay-button"><span class="button-text">Snap: ON</span></div>
+  <div id="high-drop-button" class="overlay-button">
+    <span class="high-drop-button-text">High Drop Destruction: Conditional Destroy</span>
+  </div>
+  <div id="destroy-all-button" class="overlay-button"><span class="destroy-all-button-text">Destroy All Cubes</span></div>
+  <div id="generate-cube-button" class="overlay-button"><span class="generate-cube-button-text">Generate Cube</span></div>
+  <div id="fragment-behavior-button" class="overlay-button">
+    <span class="fragment-behavior-button-text">Fragment Behavior: Fragments Disappear</span>
+  </div>
+  <div id="generate-initial-button" class="overlay-button">
+    <span class="generate-initial-button-text">Generate Initial 25 Cubes</span>
+  </div>
+  <div id="reset-button" class="overlay-button"><span class="reset-button-text">Reset Scene</span></div>
+
+  <!-- ★ debug は重い場合があるので必要に応じて false に -->
+  <a-scene physics="debug: true; gravity: -9.8" state-manager double-click-drag>
+    <!-- 地面 -->
+    <a-plane position="0 0 0" rotation="-90 0 0" width="20" height="20" color="#7BC8A4" static-body></a-plane>
+
+    <!-- 静的スロープ -->
+    <a-box position="5 0.25 0" rotation="-30 0 0" width="10" height="0.5" depth="5" color="#FFC65D" static-body></a-box>
+
+    <!-- カメラ -->
+    <a-entity position="0 5 10">
+      <a-camera></a-camera>
+    </a-entity>
+
+    <!-- 照明 -->
+    <a-entity light="type: ambient; color: #445451"></a-entity>
+    <a-entity light="type: directional; color: #ffffff; intensity: 0.5" position="1 1 0"></a-entity>
+  </a-scene>
+</body>
+</html>

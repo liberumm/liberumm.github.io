@@ -1,0 +1,540 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8" />
+  <title>Hand Gesture UI Pro</title>
+  <!-- MediaPipe Hands -->
+  <script src="https://unpkg.com/@mediapipe/hands/hands.js"></script>
+  <script src="https://unpkg.com/@mediapipe/drawing_utils/drawing_utils.js"></script>
+  <script src="https://unpkg.com/@mediapipe/camera_utils/camera_utils.js"></script>
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <style>
+    html, body { margin:0; padding:0; width:100vw; height:100vh; background:#18191a; color:#fff; font-family:system-ui,Arial,sans-serif; }
+    body { overflow:hidden; }
+    #canvasContainer { position:relative; width:100vw; height:100vh; overflow:hidden; }
+    video.input_video, canvas.output_canvas {
+      position:absolute; top:0; left:0; width:100vw; height:100vh; object-fit:cover; pointer-events:none; opacity:0.55;
+    }
+    .mirrored { transform:scaleX(-1);}
+    canvas.output_canvas { pointer-events:none; }
+    #customCursor {
+      position:fixed; width:20px; height:20px; border:2.2px solid #F90; background:rgba(255,255,255,0.9);
+      border-radius:50%; pointer-events:none; z-index:400; transition:transform 0.12s, border-color .22s;
+    }
+    #customCursor.snap { animation: snapEffect .2s linear; border-color: #23e623; }
+    @keyframes snapEffect { from { transform:scale(1);} to { transform:scale(1.22);} }
+    #snapTimerDisplay { position:absolute; left:50%; top:100%; transform:translate(-50%,5px); background:rgba(0,0,0,.5); color:#fff;
+      font-size:11px; padding:1.5px 6px; border-radius:3px; display:none;}
+    #infoContainer { position:absolute; top:13px; left:50%; transform:translateX(-50%); z-index:200; display:flex; gap:13px;}
+    #infoContainer > div { background:rgba(25,25,25,.73); padding:3px 12px; border-radius:8px; font-size:13px; }
+    #buttonContainer { position:absolute; bottom:23px; left:50%; transform:translateX(-50%); display:flex; gap:14px; z-index:220;}
+    #buttonContainer button {
+      font-size:15px; padding:10px 20px; border:none; border-radius:7px;
+      background:linear-gradient(90deg,#1976d2 50%,#67e8f9 100%); color:#fff; box-shadow:0 2px 6px rgba(0,0,0,.13);
+      cursor:pointer; transition:filter .12s,box-shadow .12s;
+    }
+    #buttonContainer button:hover { filter:brightness(1.07);}
+    /* --- Modal --- */
+    .modalBg { position:fixed; z-index:210; top:0; left:0; width:100vw; height:100vh; background:rgba(0,0,0,0.40); display:none;}
+    #settingsWindow {
+      position:fixed; left:50%; top:50%; transform:translate(-50%,-50%);
+      background:#23272a; color:#fff; border-radius:12px; box-shadow:0 4px 22px rgba(0,0,0,.23);
+      min-width:310px; max-width:96vw; width:350px; padding:20px; display:none; z-index:220;
+      border:1.5px solid #fff3;
+    }
+    #settingsWindow h2 { font-size:18px; margin-bottom:12px; }
+    #settingsWindow label { display:block; margin-bottom:10px; font-size:13px;}
+    #settingsWindow input, #settingsWindow select { margin-top:2px;}
+    .settingsActions { display:flex; justify-content:flex-end; gap:8px; margin-top:16px;}
+    .settingsActions button { padding:8px 14px; border-radius:6px; font-size:15px;}
+    #applySettings { background:#22b84a;}
+    #closeSettings { background:#db3030;}
+    #errorMessage {
+      position:fixed; left:50%; top:16%; transform:translateX(-50%);
+      background:#e63a3a; color:#fff; padding:15px 26px; border-radius:9px;
+      font-size:15px; box-shadow:0 5px 22px rgba(0,0,0,.22); display:none; z-index:999;
+    }
+    /* --- Overlay (iframe) --- */
+    .overlayWindow { position:fixed; top:120px; left:100px; width:400px; height:340px; background:#fff; color:#222; border-radius:9px;
+      border:1.5px solid #aaa; z-index:250; box-shadow:0 4px 14px rgba(30,30,30,.22); display:flex; flex-direction:column;}
+    .overlayHeader { background:#f7f7fa; border-bottom:1px solid #ddd; padding:8px 11px; font-size:15px; display:flex; align-items:center; gap:10px;
+      border-radius:9px 9px 0 0; cursor:move; user-select:none;}
+    .overlayHeader input[type="text"] { flex:1; padding:6px 7px; border-radius:5px; font-size:13px;}
+    .overlayHeader button { background:#1877f2; color:#fff; border:none; padding:7px 13px; border-radius:5px; font-size:13px;}
+    .overlayHeader button:hover { filter:brightness(1.08);}
+    .overlayIframeContainer { flex:1; overflow:hidden; position:relative; }
+    .overlayIframeContainer iframe { width:100%; height:100%; border:none; background:#f6f8fc;}
+    .overlayFooter { border-top:1px solid #ddd; background:#f0f0f0; text-align:right; padding:7px;}
+    .overlayFooter button { background:#db3030; color:#fff; border:none; border-radius:5px; font-size:13px; padding:7px 14px;}
+    .overlayNotice { background:#fff3cd; color:#664d03; border:1px solid #ffecb5; padding:8px 10px; font-size:13px; margin:0 8px;}
+    /* --- Guide (UX) --- */
+    #gestureGuide {
+      position:fixed; bottom:87px; left:50%; transform:translateX(-50%);
+      background:rgba(28,28,30,.97); color:#fff; border-radius:11px; padding:17px 22px 11px 22px;
+      box-shadow:0 2px 17px rgba(0,0,0,0.14); font-size:15px; z-index:600; max-width:90vw; display:none;
+      transition:opacity .2s; opacity:1;
+    }
+    #gestureGuide .closeGuide { background:#1976d2; color:#fff; border:none; border-radius:5px; font-size:14px; padding:5px 13px; float:right;}
+    #gestureGuide .closeGuide:hover { filter:brightness(1.09);}
+    @media (max-width:600px){
+      .overlayWindow { width:94vw; height:56vw; left:3vw;}
+      #settingsWindow { width:97vw; }
+    }
+  </style>
+</head>
+<body>
+  <div id="canvasContainer">
+    <video class="input_video mirrored" playsinline autoplay muted></video>
+    <canvas class="output_canvas mirrored"></canvas>
+    <div id="customCursor"><div id="snapTimerDisplay"></div></div>
+    <div id="infoContainer">
+      <div id="fpsDisplay">FPS: 0</div>
+      <div id="cameraResolution">解像度: 1280×720</div>
+      <div id="canvasSize">キャンバス: 1280×720</div>
+    </div>
+    <div id="buttonContainer">
+      <button id="menuButton">⚙️ 設定</button>
+      <button id="startButton">カメラ開始</button>
+      <button id="guideButton">💡使い方</button>
+    </div>
+    <div id="errorMessage"></div>
+    <div class="modalBg" id="modalBg"></div>
+    <div id="settingsWindow">
+      <h2>設定</h2>
+      <label>解像度: <select id="resolutionSelect">
+        <option value="640x480">640×480</option>
+        <option value="1280x720" selected>1280×720</option>
+        <option value="1920x1080">1920×1080</option>
+      </select></label>
+      <label>フレームレート: <input type="number" id="frameRate" min="10" max="60" value="30"/></label>
+      <label>モデルの複雑さ: <select id="modelComplexity">
+        <option value="0">0 (高速)</option>
+        <option value="1" selected>1 (標準)</option>
+        <option value="2">2 (高精度)</option>
+      </select></label>
+      <label>検出の信頼度: <input type="range" id="detectionConfidence" min="0" max="1" step="0.01" value="0.5"/></label>
+      <label>トラッキングの信頼度: <input type="range" id="trackingConfidence" min="0" max="1" step="0.01" value="0.5"/></label>
+      <label>検出する手の数: <select id="handCountSelect">
+        <option value="1">1</option>
+        <option value="2" selected>2</option>
+      </select></label>
+      <label>左右反転: <input type="checkbox" id="mirrorToggle" checked /></label>
+      <label>スナップタイマー(秒): <input type="number" id="snapTimerInput" min="1" value="4" /></label>
+      <div class="settingsActions">
+        <button id="applySettings">適用</button>
+        <button id="closeSettings">閉じる</button>
+      </div>
+    </div>
+    <div id="gestureGuide">
+      <button class="closeGuide">✕</button>
+      <b>🖐️ 操作ガイド</b><br>
+      <ul style="margin:6px 0 0 0; padding-left:18px;">
+        <li>指でカーソル操作、要素に近づくとスナップ</li>
+        <li>グーでクリック、チョキでウィンドウ/メニュー閉じ</li>
+        <li>グーでウィンドウのヘッダーを掴んでドラッグ移動</li>
+        <li>ツイストでWebサイト埋め込み（iframe）</li>
+      </ul>
+    </div>
+  </div>
+  <script>
+    // ========== 状態管理 ==========
+    let videoWidth=1280, videoHeight=720, frameRate=30;
+    let maxNumHands=2, modelComplexity=1, minDetectionConfidence=0.5, minTrackingConfidence=0.5;
+    let isMirrored=true, camera=null, hands=null;
+    let fps=0, frames=0, startTime=Date.now();
+    let snappedElement=null, snapClickTimer=null, snapClickDelay=4000;
+    let guideVisible = false;
+
+    // DOM
+    const videoElement=document.querySelector('.input_video');
+    const canvasElement=document.querySelector('.output_canvas');
+    const ctx=canvasElement.getContext('2d');
+    const fpsDisplay=document.getElementById('fpsDisplay');
+    const cameraResolutionDisplay=document.getElementById('cameraResolution');
+    const canvasSizeDisplay=document.getElementById('canvasSize');
+    const errorMessage=document.getElementById('errorMessage');
+    const menuButton=document.getElementById('menuButton');
+    const startButton=document.getElementById('startButton');
+    const guideButton=document.getElementById('guideButton');
+    const settingsWindow=document.getElementById('settingsWindow');
+    const closeSettings=document.getElementById('closeSettings');
+    const applySettings=document.getElementById('applySettings');
+    const detectionConfidenceSlider=document.getElementById('detectionConfidence');
+    const trackingConfidenceSlider=document.getElementById('trackingConfidence');
+    const mirrorToggle=document.getElementById('mirrorToggle');
+    const snapTimerInput=document.getElementById('snapTimerInput');
+    const customCursor=document.getElementById('customCursor');
+    const snapTimerDisplay=document.getElementById('snapTimerDisplay');
+    const modalBg=document.getElementById('modalBg');
+    const gestureGuide=document.getElementById('gestureGuide');
+    const closeGuide=document.querySelector('#gestureGuide .closeGuide');
+
+    // ========== Utility ==========
+    function showError(msg){ errorMessage.innerText=msg; errorMessage.style.display='block'; setTimeout(()=>{errorMessage.style.display='none';},5000);}
+    function showGuide(show=true){ gestureGuide.style.display=show?'block':'none'; guideVisible = show; }
+    function closeAllModals(){ settingsWindow.style.display='none'; modalBg.style.display='none'; showGuide(false);}
+    function saveSettings(){ // ローカルストレージに保存
+      const s={
+        videoWidth,videoHeight,frameRate,maxNumHands,modelComplexity,minDetectionConfidence,minTrackingConfidence,isMirrored,snapClickDelay
+      };
+      localStorage.setItem('hands_ui_settings',JSON.stringify(s));
+    }
+    function loadSettings(){
+      try {
+        const s = JSON.parse(localStorage.getItem('hands_ui_settings'));
+        if(s){
+          videoWidth=s.videoWidth||1280; videoHeight=s.videoHeight||720; frameRate=s.frameRate||30;
+          maxNumHands=s.maxNumHands||2; modelComplexity=s.modelComplexity||1;
+          minDetectionConfidence=s.minDetectionConfidence||0.5; minTrackingConfidence=s.minTrackingConfidence||0.5;
+          isMirrored=s.isMirrored!==undefined?s.isMirrored:true; snapClickDelay=s.snapClickDelay||4000;
+        }
+      }catch{}
+    }
+
+    // ========== ジェスチャー設定 ==========
+    const handStates={
+      'Left': { twistEma:0, twistStreak:0, lastTwist:0, fistStreak:0, lastFist:0, prevPalm:null,
+                chokiArmAt:null, lastChoki:0, lastGap:null, lastGapTs:0,
+                grabActive:false, grabbedEl:null, grabOffsetX:0, grabOffsetY:0,
+                scrollActive:false, scrollTarget:null, scrollLastY:0 },
+      'Right':{ twistEma:0, twistStreak:0, lastTwist:0, fistStreak:0, lastFist:0, prevPalm:null,
+                chokiArmAt:null, lastChoki:0, lastGap:null, lastGapTs:0,
+                grabActive:false, grabbedEl:null, grabOffsetX:0, grabOffsetY:0,
+                scrollActive:false, scrollTarget:null, scrollLastY:0 }
+    };
+    const FIST = { requiredStreak:3, cooldownMs:700 };
+    const TWIST = { emaAlpha:0.5, enterThreshold:0.34, exitThreshold:0.22, requiredStreak:5, cooldownMs:1000, minOpenFingers:3, maxPalmMovePx:24 };
+    const CHOKI_DYNAMIC = { extendMargin:0.03, armGapPx:80, fireGapPx:28, minDropPx:35, maxWindowMs:800, cooldownMs:1200, requireRingPinkyFolded:true, minCloseSpeedPxPerSec:250 };
+    const GRAB_SCROLL = { gain: 2.5 };
+    const SCROLLBAR_WIDTH = 14;
+
+    // ========== ジェスチャー判定 ==========
+    function isExtended(lm, tip, pip, margin=0){ return (lm[tip].y + margin) < lm[pip].y; }
+    function isFolded (lm, tip, pip, margin=0){ return (lm[tip].y) > (lm[pip].y + margin); }
+    function countExtendedFingers(lm){ let c=0; if(isExtended(lm,8,6,0.02)) c++; if(isExtended(lm,12,10,0.02)) c++; if(isExtended(lm,16,14,0.02)) c++; if(isExtended(lm,20,18,0.02)) c++; return c; }
+    function detectFist(lm){ const m=0.02; return isFolded(lm,8,6,m)&&isFolded(lm,12,10,m)&&isFolded(lm,16,14,m)&&isFolded(lm,20,18,m); }
+    function palmCenter(lm){ const ids=[0,5,9,13,17]; let sx=0,sy=0; ids.forEach(i=>{ sx+=lm[i].x*videoWidth; sy+=lm[i].y*videoHeight; }); return {x:sx/ids.length, y:sy/ids.length}; }
+    function twistScore(lm){ const a=lm[5], b=lm[17]; const dz=(a.z-b.z); const dx=(a.x-b.x), dy=(a.y-b.y); return dz/(Math.hypot(dx,dy)+1e-6); }
+    function mapToScreen(nx,ny){ let x=(nx/videoWidth)*window.innerWidth, y=(ny/videoHeight)*window.innerHeight; if(isMirrored) x=window.innerWidth-x; return {x,y}; }
+
+    // ========== スナップ機能 ==========
+    function applySnap(x,y){
+      // 1) 通常のクリック可能要素
+      const clickable=document.querySelectorAll('button,[onclick],a[href],input[type="button"],input[type="submit"],[role="button"]');
+      let closestEl=null, minD=Infinity, snapX=x, snapY=y;
+      clickable.forEach(el=>{
+        const r=el.getBoundingClientRect();
+        const cx=r.left+r.width/2, cy=r.top+r.height/2;
+        const d=Math.hypot(x-cx,y-cy);
+        if(d<minD && d<=100){ minD=d; closestEl=el; snapX=cx; snapY=cy; }
+      });
+      if(closestEl){ return { snapped:true, element:closestEl, x:snapX, y:snapY }; }
+      return { snapped:false, element:null, x, y };
+    }
+    function triggerClickOnSnapElement(){ if(snappedElement) snappedElement.click(); }
+
+    // ========== オーバーレイ作成 ==========
+    function normalizeUrl(input){
+      let url=(input||'').trim(); if(!url) return null;
+      if(!/^https?:\/\//i.test(url)) url='https://'+url;
+      url=url.replace(/^http:\/\//i,'https://'); try{ new URL(url); return url; }catch{ return null; }
+    }
+    function toEmbeddable(url){
+      try{
+        const u=new URL(url); const host=u.hostname.replace(/^www\./,'');
+        if(host==='youtube.com'||host==='youtu.be'||host==='m.youtube.com'){
+          let id=null;
+          if(host==='youtu.be') id=u.pathname.split('/')[1];
+          else if(u.pathname==='/watch') id=u.searchParams.get('v');
+          else if(u.pathname.startsWith('/shorts/')) id=u.pathname.split('/')[2]||u.pathname.split('/')[1];
+          if(id) return `https://www.youtube.com/embed/${id}?rel=0`;
+        }
+        return url;
+      }catch{ return url; }
+    }
+    function createOverlayWindow(rawUrl){
+      const normalized=normalizeUrl(rawUrl); if(!normalized){ showError('URLが不正です。例: https://example.com'); return; }
+      const finalUrl=toEmbeddable(normalized);
+      const overlay=document.createElement('div'); overlay.className='overlayWindow';
+      const header=document.createElement('div'); header.className='overlayHeader';
+      const urlBar=document.createElement('input'); urlBar.type='text'; urlBar.value=normalized;
+      const reloadButton=document.createElement('button'); reloadButton.textContent='更新';
+      const notice=document.createElement('div');
+      notice.className='overlayNotice';
+      notice.innerHTML=`<div class="text">このサイトは <code>iframe</code> で表示できない場合があります。</div>
+                        <div class="actions"><button class="openExt">新しいタブで開く</button>
+                        <button class="dismiss" style="background:#6c757d">閉じる</button></div>`;
+      const iframeContainer=document.createElement('div'); iframeContainer.className='overlayIframeContainer';
+      const iframe=document.createElement('iframe');
+      iframe.setAttribute('allowfullscreen','');
+      iframe.setAttribute('referrerpolicy','no-referrer-when-downgrade');
+      iframe.setAttribute('allow','fullscreen; clipboard-read; clipboard-write; geolocation *; microphone *; camera *');
+      iframe.src=finalUrl;
+      iframeContainer.appendChild(iframe);
+      const footer=document.createElement('div'); footer.className='overlayFooter';
+      const closeBtn=document.createElement('button'); closeBtn.textContent='閉じる';
+
+      header.appendChild(urlBar); header.appendChild(reloadButton);
+      overlay.appendChild(header); overlay.appendChild(notice); overlay.appendChild(iframeContainer);
+      footer.appendChild(closeBtn); overlay.appendChild(footer); document.body.appendChild(overlay);
+
+      // ドラッグ移動
+      let isDragging=false, offX=0, offY=0;
+      const onMouseMove=(e)=>{ if(!isDragging) return; let nx=e.clientX-offX, ny=e.clientY-offY;
+        nx=Math.min(Math.max(0,nx), window.innerWidth-overlay.offsetWidth);
+        ny=Math.min(Math.max(0,ny), window.innerHeight-overlay.offsetHeight);
+        overlay.style.left=`${nx}px`; overlay.style.top=`${ny}px`; };
+      const onMouseUp=()=>{ isDragging=false; document.removeEventListener('mousemove',onMouseMove); document.removeEventListener('mouseup',onMouseUp); };
+      header.addEventListener('mousedown',(e)=>{ isDragging=true; offX=e.clientX-overlay.offsetLeft; offY=e.clientY-overlay.offsetTop; document.addEventListener('mousemove',onMouseMove); document.addEventListener('mouseup',onMouseUp); });
+
+      // 各種イベント
+      notice.querySelector('.openExt').onclick=()=>window.open(normalized,'_blank','noopener');
+      notice.querySelector('.dismiss').onclick=()=>notice.style.display='none';
+      reloadButton.onclick=()=>{ const next=normalizeUrl(urlBar.value)||urlBar.value; iframe.src=toEmbeddable(next); notice.style.display='none'; startEmbedWatchdog(); };
+      urlBar.addEventListener('keydown',(e)=>{ if(e.key==='Enter') reloadButton.click(); });
+      closeBtn.onclick=()=>overlay.remove();
+      function startEmbedWatchdog(){ let done=false; const timer=setTimeout(()=>{ if(!done) notice.style.display='block'; },2000); iframe.onload=()=>{ done=true; clearTimeout(timer); notice.style.display='none'; }; }
+      startEmbedWatchdog();
+    }
+
+    // ========== MediaPipe初期化 ==========
+    function initializeHands(){
+      hands=new Hands({ locateFile:(f)=>`https://unpkg.com/@mediapipe/hands/${f}` });
+      hands.setOptions({ maxNumHands, modelComplexity, minDetectionConfidence, minTrackingConfidence });
+      hands.onResults(onResults);
+    }
+    function startCamera(){
+      if(camera) camera.stop();
+      camera=new Camera(videoElement,{
+        onFrame:async()=>{ try{ await hands.send({image:videoElement}); }catch(e){ showError('Hands処理エラー: '+e); } },
+        width:videoWidth, height:videoHeight, frameRate
+      });
+      camera.start().then(()=>{ canvasElement.width=videoWidth; canvasElement.height=videoHeight; })
+                   .catch(err=>showError(`カメラ開始失敗: ${err.message}`));
+    }
+
+    // ========== onResults ==========
+    function onResults(results){
+      try{
+        // FPS
+        frames++; const nowMS=Date.now();
+        if(nowMS-startTime>=1000){ fps=frames; frames=0; startTime=nowMS; fpsDisplay.innerText=`FPS: ${fps}`; }
+        ctx.save(); ctx.clearRect(0,0,canvasElement.width,canvasElement.height);
+
+        const fingerPos=[]; const controlHands=[];
+        if(results.multiHandLandmarks && results.multiHandedness){
+          for(let i=0;i<results.multiHandLandmarks.length;i++){
+            const handed=results.multiHandedness[i].label; const lm=results.multiHandLandmarks[i];
+            drawConnectors(ctx, lm, HAND_CONNECTIONS, { color: handed==='Right' ? '#13e013' : '#f23d32', lineWidth:2 });
+            drawLandmarks  (ctx, lm, { color: handed==='Right' ? '#13e013' : '#f23d32', lineWidth:1.5 });
+            const it=lm[8]; fingerPos.push({ x: it.x*videoWidth, y: it.y*videoHeight });
+            controlHands.push({ handed, lm });
+          }
+        }
+        canvasSizeDisplay.innerText=`キャンバス: ${canvasElement.width}×${canvasElement.height}`;
+        ctx.restore();
+
+        // カーソル&スナップ
+        let mx=null,my=null;
+        if(fingerPos.length>0){
+          const avg=fingerPos.reduce((a,p)=>({x:a.x+p.x,y:a.y+p.y}),{x:0,y:0});
+          const fx=avg.x/fingerPos.length, fy=avg.y/fingerPos.length;
+          let map=mapToScreen(fx,fy); mx=map.x; my=map.y;
+          const snap=applySnap(mx,my);
+          if(snap.snapped){
+            snappedElement=snap.element; mx=snap.x; my=snap.y;
+            customCursor.classList.add('snap'); setTimeout(()=>customCursor.classList.remove('snap'),190);
+            if(!snapClickTimer){
+              snapClickTimer={ timer:setTimeout(()=>{ triggerClickOnSnapElement(); snapClickTimer=null; }, snapClickDelay), element:snappedElement, start:Date.now() };
+            }
+          }else{
+            snappedElement=null; if(snapClickTimer){ if(snapClickTimer.timer) clearTimeout(snapClickTimer.timer); snapClickTimer=null; }
+          }
+          customCursor.style.left=`${mx}px`; customCursor.style.top=`${my}px`;
+        }
+        if(snapClickTimer){
+          snapTimerDisplay.style.display='block';
+          const remaining=Math.max(0,(snapClickDelay-(Date.now()-snapClickTimer.start))/1000);
+          snapTimerDisplay.textContent=`${remaining.toFixed(1)}s`;
+        }else{
+          snapTimerDisplay.style.display='none';
+        }
+
+        // ジェスチャー（UI/オーバーレイ操作）
+        if(mx!==null && my!==null && controlHands.length>0){
+          for(const {handed,lm} of controlHands){
+            const hs=handStates[handed]; const now=performance.now();
+            const extCount=countExtendedFingers(lm);
+            const pc=palmCenter(lm);
+            let palmStable=true;
+            if(hs.prevPalm){ const mv=Math.hypot(pc.x-(hs.prevPalm.x||pc.x), pc.y-(hs.prevPalm.y||pc.y)); palmStable = mv <= TWIST.maxPalmMovePx; }
+            hs.prevPalm=pc;
+
+            // ツイスト → オーバーレイ表示（YouTube例）
+            const rawTw=Math.abs(twistScore(lm));
+            hs.twistEma = hs.twistEma + TWIST.emaAlpha * (rawTw - hs.twistEma);
+            const overEnter=hs.twistEma>TWIST.enterThreshold, underExit=hs.twistEma<TWIST.exitThreshold;
+            if(palmStable && extCount>=TWIST.minOpenFingers && overEnter) hs.twistStreak=Math.min(hs.twistStreak+1, TWIST.requiredStreak+2);
+            else if(underExit) hs.twistStreak=Math.max(hs.twistStreak-1,0);
+            if(hs.twistStreak>=TWIST.requiredStreak && (now-hs.lastTwist)>TWIST.cooldownMs){
+              createOverlayWindow('https://www.wikipedia.org');
+              hs.lastTwist=now; hs.twistStreak=0;
+            }
+
+            // 画面座標の index tip
+            const idxScr=mapToScreen(lm[8].x*videoWidth, lm[8].y*videoHeight);
+
+            // オーバーレイヘッダー掴み
+            const overlays=[...document.querySelectorAll('.overlayWindow')];
+            overlays.sort((a,b)=>(parseInt(b.style.zIndex||250)-parseInt(a.style.zIndex||250)));
+            let headerOv=null;
+            for(const ov of overlays){
+              const header=ov.querySelector('.overlayHeader'); if(!header) continue;
+              const r=header.getBoundingClientRect();
+              if(idxScr.x>=r.left && idxScr.x<=r.right && idxScr.y>=r.top && idxScr.y<=r.bottom) headerOv=ov;
+            }
+            const isFist=detectFist(lm);
+            if(!hs.grabActive){
+              if(isFist && headerOv){
+                overlays.forEach(el=>el.style.zIndex=250); headerOv.style.zIndex=251;
+                hs.grabbedEl=headerOv; hs.grabActive=true;
+                hs.grabOffsetX=idxScr.x-headerOv.offsetLeft; hs.grabOffsetY=idxScr.y-headerOv.offsetTop;
+              }
+            }else{
+              if(isFist && hs.grabbedEl){
+                let nx=idxScr.x-hs.grabOffsetX, ny=idxScr.y-hs.grabOffsetY;
+                nx=Math.min(Math.max(0,nx), window.innerWidth-hs.grabbedEl.offsetWidth);
+                ny=Math.min(Math.max(0,ny), window.innerHeight-hs.grabbedEl.offsetHeight);
+                hs.grabbedEl.style.left=`${nx}px`; hs.grabbedEl.style.top=`${ny}px`;
+              }else{ hs.grabActive=false; hs.grabbedEl=null;}
+            }
+
+            // グーでスナップ先クリック（グラブ中やヘッダー上は除外）
+            let fistForClick = isFist && !hs.grabActive && !headerOv;
+            if(fistForClick){
+              hs.fistStreak=Math.min(hs.fistStreak+1, FIST.requiredStreak+2);
+            }else{
+              hs.fistStreak=Math.max(hs.fistStreak-1, 0);
+            }
+            if(hs.fistStreak>=FIST.requiredStreak && (now-hs.lastFist)>FIST.cooldownMs){
+              if(snappedElement){
+                if(snapClickTimer&&snapClickTimer.timer){ clearTimeout(snapClickTimer.timer); snapClickTimer=null; }
+                triggerClickOnSnapElement();
+              }
+              hs.lastFist=now; hs.fistStreak=0;
+            }
+
+            // チョキ（開いた→閉じる動きでClose）
+            const idxExt=isExtended(lm,8,6, CHOKI_DYNAMIC.extendMargin);
+            const midExt=isExtended(lm,12,10,CHOKI_DYNAMIC.extendMargin);
+            const ringF =isFolded (lm,16,14,CHOKI_DYNAMIC.extendMargin);
+            const pinkF =isFolded (lm,20,18,CHOKI_DYNAMIC.extendMargin);
+            const allowByRP = !CHOKI_DYNAMIC.requireRingPinkyFolded || (ringF && pinkF);
+            const gapPx=Math.hypot((lm[8].x-lm[12].x)*videoWidth, (lm[8].y-lm[12].y)*videoHeight);
+            const dt = handStates[handed].lastGapTs ? (now - handStates[handed].lastGapTs) : 0;
+            const closeSpeed = (dt>0 && handStates[handed].lastGap!==null) ? ((handStates[handed].lastGap - gapPx) / dt) * 1000 : 0;
+
+            if(idxExt && midExt && allowByRP){
+              if(handStates[handed].chokiArmAt===null && gapPx>=CHOKI_DYNAMIC.armGapPx){
+                handStates[handed].chokiArmAt=now; handStates[handed].lastGap=gapPx; handStates[handed].lastGapTs=now;
+              }else if(handStates[handed].chokiArmAt!==null){
+                const drop=(handStates[handed].lastGap??gapPx)-gapPx;
+                const withinWindow=(now-handStates[handed].chokiArmAt)<=CHOKI_DYNAMIC.maxWindowMs;
+                const fastEnough = closeSpeed >= CHOKI_DYNAMIC.minCloseSpeedPxPerSec;
+
+                if( gapPx<=CHOKI_DYNAMIC.fireGapPx &&
+                    drop>=CHOKI_DYNAMIC.minDropPx &&
+                    withinWindow && fastEnough &&
+                    (now-handStates[handed].lastChoki)>CHOKI_DYNAMIC.cooldownMs ){
+                  closeAllModals();
+                  document.querySelectorAll('.overlayWindow').forEach(el=>el.remove());
+                  handStates[handed].lastChoki=now;
+                  handStates[handed].chokiArmAt=null;
+                  handStates[handed].lastGap=gapPx; handStates[handed].lastGapTs=now;
+                }else{
+                  if(!withinWindow || gapPx>CHOKI_DYNAMIC.armGapPx*1.35 || !(idxExt&&midExt&&allowByRP)){
+                    handStates[handed].chokiArmAt=null;
+                  }else{
+                    handStates[handed].lastGap = Math.max(handStates[handed].lastGap, gapPx);
+                    handStates[handed].lastGapTs = now;
+                  }
+                }
+              }
+            }else{
+              handStates[handed].chokiArmAt=null;
+            }
+          }
+        }
+      }catch(err){ showError('onResultsエラー: '+err.message); }
+    }
+
+    // ========== イベント ==========
+    menuButton.addEventListener('click',()=>{
+      settingsWindow.style.display='block'; modalBg.style.display='block';
+      document.getElementById('resolutionSelect').value=`${videoWidth}x${videoHeight}`;
+      document.getElementById('frameRate').value=frameRate;
+      document.getElementById('modelComplexity').value=modelComplexity;
+      detectionConfidenceSlider.value=minDetectionConfidence;
+      trackingConfidenceSlider.value=minTrackingConfidence;
+      document.getElementById('handCountSelect').value=maxNumHands;
+      mirrorToggle.checked=isMirrored;
+      snapTimerInput.value=Math.round(snapClickDelay/1000);
+    });
+    closeSettings.addEventListener('click',closeAllModals);
+    modalBg.addEventListener('click',closeAllModals);
+
+    applySettings.addEventListener('click',()=>{
+      const res=document.getElementById('resolutionSelect').value;
+      [videoWidth,videoHeight]=res.split('x').map(Number);
+      modelComplexity=parseInt(document.getElementById('modelComplexity').value);
+      frameRate=parseInt(document.getElementById('frameRate').value);
+      minDetectionConfidence=parseFloat(detectionConfidenceSlider.value);
+      minTrackingConfidence=parseFloat(trackingConfidenceSlider.value);
+      maxNumHands=parseInt(document.getElementById('handCountSelect').value);
+      isMirrored=mirrorToggle.checked;
+      const s=parseFloat(snapTimerInput.value);
+      snapClickDelay=(!isNaN(s)&&s>0)? s*1000 : 4000;
+      saveSettings();
+      if(!hands) initializeHands();
+      hands && hands.setOptions({ maxNumHands, modelComplexity, minDetectionConfidence, minTrackingConfidence });
+      canvasElement.width=videoWidth; canvasElement.height=videoHeight;
+      if(isMirrored){ videoElement.classList.add('mirrored'); canvasElement.classList.add('mirrored'); }
+      else{ videoElement.classList.remove('mirrored'); canvasElement.classList.remove('mirrored'); }
+      cameraResolutionDisplay.innerText=`解像度: ${videoWidth}×${videoHeight}`;
+      startCamera();
+      closeAllModals();
+      fps=0; frames=0; startTime=Date.now(); fpsDisplay.innerText='FPS: 0';
+    });
+    startButton.addEventListener('click',()=>{ initializeHands(); startCamera(); startButton.style.display='none'; });
+    guideButton.addEventListener('click',()=>{ showGuide(true); });
+    closeGuide.addEventListener('click',()=>showGuide(false));
+    window.addEventListener('keydown',e=>{
+      if(e.key==='Escape') closeAllModals();
+    });
+    window.addEventListener('resize',()=>{
+      customCursor.style.left=`${Math.max(0, Math.min(window.innerWidth, parseFloat(customCursor.style.left)||0))}px`;
+      customCursor.style.top =`${Math.max(0, Math.min(window.innerHeight, parseFloat(customCursor.style.top)||0))}px`;
+      cameraResolutionDisplay.innerText=`解像度: ${videoWidth}×${videoHeight}`;
+      canvasSizeDisplay.innerText=`キャンバス: ${canvasElement.width}×${canvasElement.height}`;
+    });
+
+    // マウス移動時はカーソル復活&自動スナップ解除
+    window.addEventListener('mousemove',(e)=>{
+      customCursor.style.display='block';
+      customCursor.style.left=`${e.clientX}px`;
+      customCursor.style.top =`${e.clientY}px`;
+      document.body.style.cursor='none';
+      if(snapClickTimer){ if(snapClickTimer.timer) clearTimeout(snapClickTimer.timer); snapClickTimer=null; snappedElement=null; snapTimerDisplay.style.display='none'; }
+    });
+
+    // 初期化
+    window.addEventListener('load',()=>{
+      loadSettings();
+      cameraResolutionDisplay.innerText=`解像度: ${videoWidth}×${videoHeight}`;
+      canvasSizeDisplay.innerText=`キャンバス: ${canvasElement.width}×${canvasElement.height}`;
+      showGuide(true);
+    });
+
+  </script>
+</body>
+</html>
