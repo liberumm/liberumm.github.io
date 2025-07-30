@@ -1,0 +1,690 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8" />
+  <title>Hands UI: Snap-to-Scrollbar & Grab-Scroll</title>
+
+  <!-- MediaPipe Hands -->
+  <script src="https://unpkg.com/@mediapipe/hands/hands.js"></script>
+  <script src="https://unpkg.com/@mediapipe/drawing_utils/drawing_utils.js"></script>
+  <script src="https://unpkg.com/@mediapipe/camera_utils/camera_utils.js"></script>
+
+  <style>
+    html, body { margin:0; padding:0; height:100%; width:100%; background:#000; overflow:hidden; font-family:Arial,sans-serif; cursor:none; }
+    #canvasContainer { position:relative; width:100%; height:100%; display:flex; justify-content:center; align-items:center; overflow:hidden; }
+    video.input_video, canvas.output_canvas { position:absolute; top:0; left:0; width:100%; height:100%; object-fit:cover; background:#000; transition:transform .3s ease; }
+    video.input_video.mirrored, canvas.output_canvas.mirrored { transform:scaleX(-1); }
+    canvas.output_canvas { pointer-events:none; background:transparent; }
+
+    #infoContainer { position:absolute; top:10px; left:50%; transform:translateX(-50%); display:flex; flex-direction:column; align-items:center; gap:5px; z-index:100; }
+    #infoContainer > div { color:#fff; font-size:14px; background:rgba(0,0,0,.5); padding:4px 8px; border-radius:5px; }
+
+    #buttonContainer { position:absolute; bottom:20px; left:50%; transform:translateX(-50%); display:flex; gap:12px; z-index:100; flex-wrap:nowrap; }
+    #buttonContainer button { padding:10px 16px; font-size:14px; border:none; background:rgba(0,123,255,.9); color:#fff; border-radius:6px; cursor:pointer; opacity:.95; box-shadow:0 2px 5px rgba(0,0,0,.3); white-space:nowrap; transition:opacity .2s; }
+    #buttonContainer button:hover { opacity:1; }
+
+    #settingsWindow { position:absolute; top:50%; left:50%; transform:translate(-50%,-50%); background:rgba(255,255,255,.97); padding:20px; border-radius:10px; display:none; z-index:200; box-shadow:0 4px 8px rgba(0,0,0,.2); max-width:360px; width:90%; }
+    #settingsWindow h2 { margin:0 0 10px; font-size:18px; text-align:center; }
+    #settingsWindow label { display:block; margin-bottom:10px; font-size:13px; }
+    #settingsWindow input[type="range"], #settingsWindow input[type="number"], #settingsWindow select { width:100%; margin-top:5px; }
+    .settingsActions { display:flex; justify-content:flex-end; align-items:center; gap:8px; margin-top:12px; }
+    .settingsActions button { padding:8px 12px; font-size:14px; border:none; border-radius:5px; cursor:pointer; color:#fff; box-shadow:0 2px 5px rgba(0,0,0,.3); }
+    #applySettings { background:#28A745; } #closeSettings { background:#DC3545; }
+
+    #errorMessage { position:absolute; top:50%; left:50%; transform:translate(-50%,-50%); background:rgba(255,0,0,.85); color:#fff; padding:16px; border-radius:8px; display:none; z-index:300; text-align:center; max-width:80%; font-size:14px; }
+
+    #customCursor { position:fixed; top:50%; left:50%; width:20px; height:20px; background:rgba(255,255,255,.8); border:2px solid #FF5722; border-radius:50%; pointer-events:none; transform:translate(-50%, -50%); z-index:400; transition:transform .06s ease-out, border-color .15s ease; }
+    #customCursor.snap { animation:snapEffect .18s forwards; }
+    #snapTimerDisplay { position:absolute; top:50%; left:50%; transform:translate(-50%,-50%); background:rgba(0,0,0,.6); color:#fff; font-size:11px; padding:2px 5px; border-radius:3px; display:none; }
+    @keyframes snapEffect { from { transform:translate(-50%,-50%) scale(1); } to { transform:translate(-50%,-50%) scale(1.2); } }
+
+    /* コンテキストメニュー（ヘッダーだけ掴める） */
+    #contextMenu { position:fixed; background:rgba(255,255,255,.97); border:1px solid #ccc; border-radius:6px; padding:10px; box-shadow:0 4px 8px rgba(0,0,0,.2); display:none; z-index:350; width:260px; }
+    #contextMenu .contextHeader { 
+      background:#f0f0f0; border-bottom:1px solid #ddd; cursor:move; user-select:none; font-weight:600;
+      padding:6px 10px; margin:-10px -10px 8px -10px; border-top-left-radius:6px; border-top-right-radius:6px;
+    }
+    #contextMenu input[type="text"] { width:100%; margin-bottom:10px; padding:6px; font-size:14px; border:1px solid #ccc; border-radius:4px; }
+    #contextMenu .contextActions { display:flex; gap:8px; justify-content:flex-end; align-items:center; }
+    #contextMenu .contextActions button { padding:6px 10px; font-size:14px; border:none; background:#28A745; color:#fff; border-radius:4px; cursor:pointer; width:auto; }
+    #contextMenu .contextActions button:hover { filter:brightness(1.05); }
+    #closeContextMenu { background:#DC3545 !important; }
+
+    /* オーバーレイ Web ウィンドウ */
+    .overlayWindow { position:fixed; top:100px; left:100px; width:420px; height:340px; background:rgba(255,255,255,.97); border:1px solid #ccc; border-radius:6px; box-shadow:0 4px 8px rgba(0,0,0,.2); z-index:351; display:flex; flex-direction:column; pointer-events:auto; cursor:auto; }
+    .overlayHeader { background:#f0f0f0; padding:6px; display:flex; gap:6px; align-items:center; border-bottom:1px solid #ddd; cursor:move; user-select:none; }
+    .overlayHeader input[type="text"] { flex:1; font-size:14px; padding:4px 6px; border:1px solid #ccc; border-radius:4px; }
+    .overlayHeader button { background:#28A745; color:#fff; border:none; padding:6px 10px; border-radius:4px; font-size:13px; cursor:pointer; }
+    .overlayHeader button:hover { filter:brightness(1.05); }
+    .overlayNotice { background:#fff3cd; color:#664d03; border:1px solid #ffecb5; padding:8px 10px; font-size:13px; display:none; }
+    .overlayNotice .actions { margin-top:6px; display:flex; gap:8px; }
+    .overlayNotice button { background:#0d6efd; color:#fff; border:none; border-radius:4px; padding:6px 10px; cursor:pointer; }
+    .overlayIframeContainer { flex:1; overflow:hidden; position:relative; }
+    .overlayIframeContainer iframe { width:100%; height:100%; border:none; }
+
+    .overlayFooter { border-top:1px solid #ddd; background:#f0f0f0; text-align:right; padding:6px; }
+    .overlayFooter button { background:#DC3545; color:#fff; border:none; padding:6px 10px; border-radius:4px; font-size:13px; cursor:pointer; }
+
+    @media (max-width:600px){ .overlayWindow{ width:92%; height:54%; top:50px; left:4%; } }
+  </style>
+</head>
+
+<body>
+  <div id="canvasContainer">
+    <video class="input_video mirrored" playsinline autoplay muted></video>
+    <canvas class="output_canvas mirrored"></canvas>
+
+    <div id="customCursor"><div id="snapTimerDisplay"></div></div>
+
+    <!-- コンテキストメニュー（ヘッダーだけ掴める） -->
+    <div id="contextMenu">
+      <div class="contextHeader">コンテキストメニュー</div>
+      <input type="text" id="urlInput" value="https://www.wikipedia.org" placeholder="URLを入力" />
+      <div class="contextActions">
+        <button id="openUrlButton">開く</button>
+        <button id="closeContextMenu">閉じる</button>
+      </div>
+    </div>
+
+    <div id="infoContainer">
+      <div id="fpsDisplay">FPS: 0</div>
+      <div id="cameraResolution">解像度: 1280×720</div>
+      <div id="canvasSize">キャンバス: 1280×720</div>
+    </div>
+
+    <div id="buttonContainer">
+      <button id="menuButton">設定</button>
+      <button id="contextButton">メニュー</button>
+      <button id="startButton">カメラ開始</button>
+      <button id="flipButton">左右反転</button>
+    </div>
+
+    <div id="errorMessage">エラーが発生しました。</div>
+
+    <div id="settingsWindow">
+      <h2>設定</h2>
+      <label>解像度:
+        <select id="resolutionSelect">
+          <option value="640x480">640×480</option>
+          <option value="1280x720" selected>1280×720</option>
+          <option value="1920x1080">1920×1080</option>
+        </select>
+      </label>
+      <label>フレームレート:
+        <input type="number" id="frameRate" min="1" max="60" value="30" />
+      </label>
+      <label>モデルの複雑さ:
+        <select id="modelComplexity">
+          <option value="0">0 (高速)</option>
+          <option value="1" selected>1 (標準)</option>
+          <option value="2">2 (高精度)</option>
+        </select>
+      </label>
+      <label>検出の信頼度: <span id="detectionConfidenceValue">0.5</span>
+        <input type="range" id="detectionConfidence" min="0" max="1" step="0.01" value="0.5" />
+      </label>
+      <label>トラッキングの信頼度: <span id="trackingConfidenceValue">0.5</span>
+        <input type="range" id="trackingConfidence" min="0" max="1" step="0.01" value="0.5" />
+      </label>
+      <label>検出する手の数:
+        <select id="handCountSelect">
+          <option value="1">1</option>
+          <option value="2" selected>2</option>
+        </select>
+      </label>
+      <label>左右反転:
+        <input type="checkbox" id="mirrorToggle" checked />
+      </label>
+      <label>スナップタイマー(秒):
+        <input type="number" id="snapTimerInput" min="1" value="4" />
+      </label>
+
+      <div class="settingsActions">
+        <button id="applySettings">適用</button>
+        <button id="closeSettings">閉じる</button>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    /* ===== 基本状態 ===== */
+    let videoWidth=1280, videoHeight=720, frameRate=30;
+    let maxNumHands=2, modelComplexity=1, minDetectionConfidence=0.5, minTrackingConfidence=0.5;
+    let isMirrored=true;
+
+    const videoElement=document.querySelector('.input_video');
+    const canvasElement=document.querySelector('.output_canvas');
+    const ctx=canvasElement.getContext('2d');
+
+    const fpsDisplay=document.getElementById('fpsDisplay');
+    const cameraResolutionDisplay=document.getElementById('cameraResolution');
+    const canvasSizeDisplay=document.getElementById('canvasSize');
+    const errorMessage=document.getElementById('errorMessage');
+
+    const menuButton=document.getElementById('menuButton');
+    const contextButton=document.getElementById('contextButton');
+    const startButton=document.getElementById('startButton');
+    const flipButton=document.getElementById('flipButton');
+
+    const settingsWindow=document.getElementById('settingsWindow');
+    const closeSettings=document.getElementById('closeSettings');
+    const applySettings=document.getElementById('applySettings');
+    const detectionConfidenceSlider=document.getElementById('detectionConfidence');
+    const detectionConfidenceValue=document.getElementById('detectionConfidenceValue');
+    const trackingConfidenceSlider=document.getElementById('trackingConfidence');
+    const trackingConfidenceValue=document.getElementById('trackingConfidenceValue');
+    const mirrorToggle=document.getElementById('mirrorToggle');
+    const snapTimerInput=document.getElementById('snapTimerInput');
+
+    const customCursor=document.getElementById('customCursor');
+    const snapTimerDisplay=document.getElementById('snapTimerDisplay');
+
+    const contextMenu=document.getElementById('contextMenu');
+    const contextHeader=document.querySelector('#contextMenu .contextHeader');
+    const closeContextMenuButton=document.getElementById('closeContextMenu');
+    const urlInput=document.getElementById('urlInput');
+    const openUrlButton=document.getElementById('openUrlButton');
+
+    let fps=0, frames=0, startTime=Date.now();
+    let hands, camera=null;
+
+    /* ===== スナップ＆自動クリック ===== */
+    const defaultSnapDistance=100;
+    let temporarySnapDistance=defaultSnapDistance;
+    let snappedElement=null; // クリック対象 or 仮想スクロールバー
+    let snapClickTimer=null;
+    let snapClickDelay=4000; // ms
+
+    /* ===== ジェスチャー設定 ===== */
+    const FIST  = { requiredStreak:3, cooldownMs:700 }; // ✊
+    const TWIST = { emaAlpha:0.5, enterThreshold:0.34, exitThreshold:0.22, requiredStreak:5, cooldownMs:1000, minOpenFingers:3, maxPalmMovePx:25 }; // 🔄
+    const CHOKI_DYNAMIC = { extendMargin:0.03, armGapPx:80, fireGapPx:28, minDropPx:35, maxWindowMs:800, cooldownMs:1200, requireRingPinkyFolded:true, minCloseSpeedPxPerSec:250 }; // ✌️
+    const GRAB_SCROLL = { gain: 2.5 }; // グラブスクロール感度
+    const SCROLLBAR_WIDTH = 14; // 仮想スクロールバー帯
+
+    const handStates={
+      'Left': { twistEma:0, twistStreak:0, lastTwist:0, fistStreak:0, lastFist:0, prevPalm:null,
+                chokiArmAt:null, lastChoki:0, lastGap:null, lastGapTs:0,
+                grabActive:false, grabbedEl:null, grabOffsetX:0, grabOffsetY:0,
+                scrollActive:false, scrollTarget:null, scrollLastY:0 },
+      'Right':{ twistEma:0, twistStreak:0, lastTwist:0, fistStreak:0, lastFist:0, prevPalm:null,
+                chokiArmAt:null, lastChoki:0, lastGap:null, lastGapTs:0,
+                grabActive:false, grabbedEl:null, grabOffsetX:0, grabOffsetY:0,
+                scrollActive:false, scrollTarget:null, scrollLastY:0 }
+    };
+
+    /* ===== URLユーティリティ ===== */
+    function normalizeUrl(input){
+      let url=(input||'').trim(); if(!url) return null;
+      if(!/^https?:\/\//i.test(url)) url='https://'+url;
+      url=url.replace(/^http:\/\//i,'https://'); try{ new URL(url); return url; }catch{ return null; }
+    }
+    function toEmbeddable(url){
+      try{
+        const u=new URL(url); const host=u.hostname.replace(/^www\./,'');
+        if(host==='youtube.com'||host==='youtu.be'||host==='m.youtube.com'){
+          let id=null;
+          if(host==='youtu.be') id=u.pathname.split('/')[1];
+          else if(u.pathname==='/watch') id=u.searchParams.get('v');
+          else if(u.pathname.startsWith('/shorts/')) id=u.pathname.split('/')[2]||u.pathname.split('/')[1];
+          if(id) return `https://www.youtube.com/embed/${id}?rel=0`;
+        }
+        return url;
+      }catch{ return url; }
+    }
+
+    /* ===== UIヘルパ ===== */
+    function showError(msg){ errorMessage.innerText=msg; errorMessage.style.display='block'; setTimeout(()=>{errorMessage.style.display='none';},5000); }
+    function showContextMenu(x,y){
+      contextMenu.style.left=`${x}px`; contextMenu.style.top=`${y}px`; contextMenu.style.display='block';
+      const w=contextMenu.offsetWidth||260, h=contextMenu.offsetHeight||120;
+      let nx=x, ny=y; if(x+w>window.innerWidth) nx=window.innerWidth-w-10; if(y+h>window.innerHeight) ny=window.innerHeight-h-10;
+      contextMenu.style.left=`${nx}px`; contextMenu.style.top=`${ny}px`;
+    }
+    function openContextMenuAtCenter(){
+      const x=Math.round(window.innerWidth/2 - 130);
+      const y=Math.round(window.innerHeight/2 - 90);
+      showContextMenu(x,y);
+    }
+    function openContextMenuAtVideoPoint(vx,vy){
+      let px=(vx/videoWidth)*window.innerWidth, py=(vy/videoHeight)*window.innerHeight; if(isMirrored) px=window.innerWidth-px;
+      if(contextMenu.style.display!=='block') showContextMenu(px,py);
+    }
+    function closeMenus(){ contextMenu.style.display='none'; settingsWindow.style.display='none'; }
+
+    /* ===== クリック/スクロール対象のスナップ ===== */
+    function applySnap(x,y){
+      // 1) 通常のクリック可能要素
+      const clickable=document.querySelectorAll('button,[onclick],a[href],input[type="button"],input[type="submit"],[role="button"]');
+      let closestEl=null, minD=Infinity, snapX=x, snapY=y;
+
+      clickable.forEach(el=>{
+        const r=el.getBoundingClientRect();
+        const cx=r.left+r.width/2, cy=r.top+r.height/2;
+        const d=Math.hypot(x-cx,y-cy);
+        if(d<minD && d<=temporarySnapDistance){ minD=d; closestEl=el; snapX=cx; snapY=cy; }
+      });
+
+      // 2) 仮想スクロールバー（各 iframe の右端帯）
+      const iframes=document.querySelectorAll('.overlayIframeContainer iframe');
+      let closestSB=null, minDSB=Infinity, sbX=x, sbY=y;
+      iframes.forEach(ifr=>{
+        const r=ifr.getBoundingClientRect();
+        const trackX = r.right - SCROLLBAR_WIDTH/2;
+        const top=r.top, bottom=r.bottom;
+        const clampedY = Math.min(Math.max(y, top), bottom);
+        // ポインタから“帯”への距離（横は中心線、縦ははみ出しのみ加点）
+        const dx=Math.abs(x - trackX);
+        const dy=(y<top? top-y : (y>bottom? y-bottom : 0));
+        const dist=Math.hypot(dx, dy);
+        if(dist<minDSB && dist<=temporarySnapDistance){
+          minDSB=dist; closestSB={__kind:'scrollbar', iframe:ifr}; sbX=trackX; sbY=clampedY;
+        }
+      });
+
+      // 近い方を採用
+      if(closestSB && minDSB <= minD){
+        return { snapped:true, element:closestSB, x:sbX, y:sbY };
+      }
+      if(closestEl){
+        return { snapped:true, element:closestEl, x:snapX, y:snapY };
+      }
+      return { snapped:false, element:null, x, y };
+    }
+
+    function triggerClickOnSnapElement(){ if(snappedElement && !snappedElement.__kind) snappedElement.click(); }
+
+    /* ===== 指の姿勢 ===== */
+    function isExtended(lm, tip, pip, margin=0){ return (lm[tip].y + margin) < lm[pip].y; }
+    function isFolded (lm, tip, pip, margin=0){ return (lm[tip].y) > (lm[pip].y + margin); }
+    function countExtendedFingers(lm){ let c=0; if(isExtended(lm,8,6,0.02)) c++; if(isExtended(lm,12,10,0.02)) c++; if(isExtended(lm,16,14,0.02)) c++; if(isExtended(lm,20,18,0.02)) c++; return c; }
+    function detectFist(lm){ const m=0.02; return isFolded(lm,8,6,m)&&isFolded(lm,12,10,m)&&isFolded(lm,16,14,m)&&isFolded(lm,20,18,m); }
+
+    /* ===== 位置計算 ===== */
+    function palmCenter(lm){ const ids=[0,5,9,13,17]; let sx=0,sy=0; ids.forEach(i=>{ sx+=lm[i].x*videoWidth; sy+=lm[i].y*videoHeight; }); return {x:sx/ids.length, y:sy/ids.length}; }
+    function twistScore(lm){ const a=lm[5], b=lm[17]; const dz=(a.z-b.z); const dx=(a.x-b.x), dy=(a.y-b.y); return dz/(Math.hypot(dx,dy)+1e-6); }
+    function mapToScreen(nx,ny){ let x=(nx/videoWidth)*window.innerWidth, y=(ny/videoHeight)*window.innerHeight; if(isMirrored) x=window.innerWidth-x; return {x,y}; }
+
+    /* ===== overlay作成（埋め込み検知付き） ===== */
+    function createOverlayWindow(rawUrl){
+      const normalized=normalizeUrl(rawUrl); if(!normalized){ showError('URLが不正です。例: https://example.com'); return; }
+      const finalUrl=toEmbeddable(normalized);
+
+      const overlay=document.createElement('div'); overlay.className='overlayWindow';
+      const header=document.createElement('div'); header.className='overlayHeader';
+      const urlBar=document.createElement('input'); urlBar.type='text'; urlBar.value=normalized;
+      const reloadButton=document.createElement('button'); reloadButton.textContent='更新';
+
+      const notice=document.createElement('div');
+      notice.className='overlayNotice';
+      notice.innerHTML=`<div class="text">このサイトは <code>iframe</code> で表示できない/スクロール制御できない場合があります。</div>
+                        <div class="actions"><button class="openExt">新しいタブで開く</button>
+                        <button class="dismiss" style="background:#6c757d">閉じる</button></div>`;
+
+      const iframeContainer=document.createElement('div'); iframeContainer.className='overlayIframeContainer';
+      const iframe=document.createElement('iframe');
+      iframe.setAttribute('allowfullscreen','');
+      iframe.setAttribute('referrerpolicy','no-referrer-when-downgrade');
+      iframe.setAttribute('allow','fullscreen; clipboard-read; clipboard-write; geolocation *; microphone *; camera *');
+      iframe.src=finalUrl;
+      iframeContainer.appendChild(iframe);
+
+      const footer=document.createElement('div'); footer.className='overlayFooter';
+      const closeBtn=document.createElement('button'); closeBtn.textContent='閉じる';
+
+      header.appendChild(urlBar); header.appendChild(reloadButton);
+      overlay.appendChild(header); overlay.appendChild(notice); overlay.appendChild(iframeContainer);
+      footer.appendChild(closeBtn); overlay.appendChild(footer); document.body.appendChild(overlay);
+
+      overlay.addEventListener('mousedown',()=>{ document.querySelectorAll('.overlayWindow').forEach(el=>el.style.zIndex=351); overlay.style.zIndex=352; });
+
+      notice.querySelector('.openExt').onclick=()=>window.open(normalized,'_blank','noopener');
+      notice.querySelector('.dismiss').onclick=()=>notice.style.display='none';
+
+      reloadButton.onclick=()=>{ const next=normalizeUrl(urlBar.value)||urlBar.value; iframe.src=toEmbeddable(next); notice.style.display='none'; startEmbedWatchdog(); };
+      urlBar.addEventListener('keydown',(e)=>{ if(e.key==='Enter') reloadButton.click(); });
+      closeBtn.onclick=()=>overlay.remove();
+
+      // マウスドラッグ（任意）
+      let isDragging=false, offX=0, offY=0;
+      const onMouseMove=(e)=>{ if(!isDragging) return; let nx=e.clientX-offX, ny=e.clientY-offY;
+        nx=Math.min(Math.max(0,nx), window.innerWidth-overlay.offsetWidth);
+        ny=Math.min(Math.max(0,ny), window.innerHeight-overlay.offsetHeight);
+        overlay.style.left=`${nx}px`; overlay.style.top=`${ny}px`; };
+      const onMouseUp=()=>{ isDragging=false; document.removeEventListener('mousemove',onMouseMove); document.removeEventListener('mouseup',onMouseUp); };
+      header.addEventListener('mousedown',(e)=>{ isDragging=true; offX=e.clientX-overlay.offsetLeft; offY=e.clientY-overlay.offsetTop; document.addEventListener('mousemove',onMouseMove); document.addEventListener('mouseup',onMouseUp); });
+
+      function startEmbedWatchdog(){ let done=false; const timer=setTimeout(()=>{ if(!done) notice.style.display='block'; },2500); iframe.onload=()=>{ done=true; clearTimeout(timer); notice.style.display='none'; }; }
+      startEmbedWatchdog();
+    }
+
+    /* ===== 当たり判定 ===== */
+    function getOverlayHeaderUnderPoint(x,y){
+      const overlays=[...document.querySelectorAll('.overlayWindow')];
+      overlays.sort((a,b)=>parseInt(b.style.zIndex||351)-parseInt(a.style.zIndex||351));
+      for(const ov of overlays){
+        const header=ov.querySelector('.overlayHeader'); if(!header) continue;
+        const r=header.getBoundingClientRect();
+        if(x>=r.left && x<=r.right && y>=r.top && y<=r.bottom) return ov;
+      }
+      return null;
+    }
+    function getContextHeaderUnderPoint(x,y){
+      if(contextMenu.style.display!=='block') return false;
+      const r=contextHeader.getBoundingClientRect();
+      return (x>=r.left && x<=r.right && y>=r.top && y<=r.bottom);
+    }
+    function getIframeUnderPoint(x,y){
+      const el=document.elementFromPoint(x,y);
+      if(el && el.tagName==='IFRAME' && el.closest('.overlayIframeContainer')) return el;
+      return null;
+    }
+    function canAccessIframe(iframe){
+      try{ return !!iframe.contentDocument; }catch(e){ return false; }
+    }
+    function wheelOnIframe(iframe, deltaY){
+      try{
+        const evt=new WheelEvent('wheel',{deltaY, bubbles:true, cancelable:true});
+        iframe.dispatchEvent(evt);
+      }catch(_){}
+    }
+    function scrollIframeBy(iframe, dy){
+      if(!iframe) return;
+      if(canAccessIframe(iframe)){
+        try{ iframe.contentWindow.scrollBy(0, dy); }catch(e){ wheelOnIframe(iframe, dy); }
+      }else{
+        wheelOnIframe(iframe, dy);
+      }
+    }
+
+    /* ===== MediaPipe 初期化/開始 ===== */
+    function initializeHands(){
+      hands=new Hands({ locateFile:(f)=>`https://unpkg.com/@mediapipe/hands/${f}` });
+      hands.setOptions({ maxNumHands, modelComplexity, minDetectionConfidence, minTrackingConfidence });
+      hands.onResults(onResults);
+    }
+    function startCamera(){
+      if(camera) camera.stop();
+      camera=new Camera(videoElement,{
+        onFrame:async()=>{ try{ await hands.send({image:videoElement}); }catch(e){ showError('Hands処理エラー: '+e); } },
+        width:videoWidth, height:videoHeight, frameRate
+      });
+      camera.start().then(()=>{ canvasElement.width=videoWidth; canvasElement.height=videoHeight; })
+                   .catch(err=>showError(`カメラ開始失敗: ${err.message}`));
+    }
+
+    /* ===== onResults ===== */
+    function onResults(results){
+      try{
+        // FPS
+        frames++; const nowMS=Date.now();
+        if(nowMS-startTime>=1000){ fps=frames; frames=0; startTime=nowMS; fpsDisplay.innerText=`FPS: ${fps}`; }
+
+        ctx.save(); ctx.clearRect(0,0,canvasElement.width,canvasElement.height);
+
+        const fingerPos=[]; const controlHands=[];
+        if(results.multiHandLandmarks && results.multiHandedness){
+          for(let i=0;i<results.multiHandLandmarks.length;i++){
+            const handed=results.multiHandedness[i].label; const lm=results.multiHandLandmarks[i];
+            drawConnectors(ctx, lm, HAND_CONNECTIONS, { color: handed==='Right' ? '#00FF00' : '#FF0000', lineWidth:2 });
+            drawLandmarks  (ctx, lm, { color: handed==='Right' ? '#00FF00' : '#FF0000', lineWidth:1 });
+            const it=lm[8]; fingerPos.push({ x: it.x*videoWidth, y: it.y*videoHeight });
+            controlHands.push({ handed, lm });
+          }
+        }
+        canvasSizeDisplay.innerText=`キャンバス: ${canvasElement.width}×${canvasElement.height}`;
+        ctx.restore();
+
+        /* ===== カーソル＆スナップ ===== */
+        let mx=null,my=null;
+        if(fingerPos.length>0){
+          const avg=fingerPos.reduce((a,p)=>({x:a.x+p.x,y:a.y+p.y}),{x:0,y:0});
+          const fx=avg.x/fingerPos.length, fy=avg.y/fingerPos.length;
+          let map=mapToScreen(fx,fy); mx=map.x; my=map.y;
+
+          const snap=applySnap(mx,my);
+          if(snap.snapped){
+            snappedElement=snap.element; mx=snap.x; my=snap.y;
+            customCursor.classList.add('snap'); setTimeout(()=>customCursor.classList.remove('snap'),180);
+            if(!snappedElement.__kind){ // 通常要素のみ自動クリック
+              if(snapClickTimer && snapClickTimer.element!==snappedElement){ if(snapClickTimer.timer) clearTimeout(snapClickTimer.timer); snapClickTimer=null; }
+              if(!snapClickTimer){
+                snapClickTimer={ timer:setTimeout(()=>{ triggerClickOnSnapElement(); snapClickTimer=null; }, snapClickDelay),
+                                 element:snappedElement, start:Date.now() };
+              }
+            }else{
+              // スクロールバーにスナップ中は自動クリックタイマーなし
+              if(snapClickTimer){ if(snapClickTimer.timer) clearTimeout(snapClickTimer.timer); snapClickTimer=null; }
+            }
+          }else{
+            snappedElement=null; if(snapClickTimer){ if(snapClickTimer.timer) clearTimeout(snapClickTimer.timer); snapClickTimer=null; }
+          }
+          customCursor.style.left=`${mx}px`; customCursor.style.top=`${my}px`;
+        }
+
+        // スナップ残り時間（通常要素のみ表示）
+        if(snapClickTimer){
+          snapTimerDisplay.style.display='block';
+          const remaining=Math.max(0,(snapClickDelay-(Date.now()-snapClickTimer.start))/1000);
+          snapTimerDisplay.textContent=`${remaining.toFixed(1)}s`;
+        }else{
+          snapTimerDisplay.style.display='none';
+        }
+
+        /* ===== ジェスチャー（手ごと） ===== */
+        if(mx!==null && my!==null && controlHands.length>0){
+          for(const {handed,lm} of controlHands){
+            const hs=handStates[handed]; const now=performance.now();
+            const extCount=countExtendedFingers(lm);
+            const pc=palmCenter(lm);
+            let palmStable=true;
+            if(hs.prevPalm){ const mv=Math.hypot(pc.x-(hs.prevPalm.x||pc.x), pc.y-(hs.prevPalm.y||pc.y)); palmStable = mv <= TWIST.maxPalmMovePx; }
+            hs.prevPalm=pc;
+
+            // ツイスト → コンテキスト表示
+            const rawTw=Math.abs(twistScore(lm));
+            hs.twistEma = hs.twistEma + TWIST.emaAlpha * (rawTw - hs.twistEma);
+            const overEnter=hs.twistEma>TWIST.enterThreshold, underExit=hs.twistEma<TWIST.exitThreshold;
+            if(palmStable && extCount>=TWIST.minOpenFingers && overEnter) hs.twistStreak=Math.min(hs.twistStreak+1, TWIST.requiredStreak+2);
+            else if(underExit) hs.twistStreak=Math.max(hs.twistStreak-1,0);
+            if(hs.twistStreak>=TWIST.requiredStreak && (now-hs.lastTwist)>TWIST.cooldownMs){
+              const wrist=lm[0]; openContextMenuAtVideoPoint(wrist.x*videoWidth, wrist.y*videoHeight);
+              hs.lastTwist=now; hs.twistStreak=0;
+            }
+
+            // 画面座標の index tip
+            const idxScr=mapToScreen(lm[8].x*videoWidth, lm[8].y*videoHeight);
+
+            // グラブ（overlay ヘッダー or コンテキストヘッダー）
+            const headerOv=getOverlayHeaderUnderPoint(idxScr.x,idxScr.y);
+            const onCtxHeader=getContextHeaderUnderPoint(idxScr.x,idxScr.y);
+            const isFist=detectFist(lm);
+
+            if(!hs.grabActive){
+              if(isFist && (headerOv || onCtxHeader)){
+                if(headerOv){
+                  document.querySelectorAll('.overlayWindow').forEach(el=>el.style.zIndex=351);
+                  headerOv.style.zIndex=352;
+                  hs.grabbedEl = headerOv;
+                }else{
+                  contextMenu.style.zIndex = 360;
+                  hs.grabbedEl = contextMenu;
+                }
+                hs.grabActive=true;
+                hs.grabOffsetX = idxScr.x - hs.grabbedEl.offsetLeft;
+                hs.grabOffsetY = idxScr.y - hs.grabbedEl.offsetTop;
+              }
+            }else{
+              if(isFist && hs.grabbedEl){
+                let nx=idxScr.x - hs.grabOffsetX, ny=idxScr.y - hs.grabOffsetY;
+                nx=Math.min(Math.max(0,nx), window.innerWidth - hs.grabbedEl.offsetWidth);
+                ny=Math.min(Math.max(0,ny), window.innerHeight- hs.grabbedEl.offsetHeight);
+                hs.grabbedEl.style.left=`${nx}px`; hs.grabbedEl.style.top=`${ny}px`;
+              }else{
+                hs.grabActive=false; hs.grabbedEl=null; contextMenu.style.zIndex=350;
+              }
+            }
+
+            // 🔽 Web表示エリア（iframe）でのグラブスクロール
+            const iframeUnder=getIframeUnderPoint(idxScr.x,idxScr.y);
+            if(!hs.scrollActive){
+              // 1) スクロールバーにスナップ中にグー → スクロール開始
+              if(isFist && snappedElement && snappedElement.__kind==='scrollbar'){
+                hs.scrollActive=true; hs.scrollTarget=snappedElement.iframe; hs.scrollLastY=idxScr.y;
+              }
+              // 2) iframe領域上でグー → スクロール開始（従来）
+              else if(isFist && iframeUnder){
+                hs.scrollActive=true; hs.scrollTarget=iframeUnder; hs.scrollLastY=idxScr.y;
+              }
+            }else{
+              if(isFist && hs.scrollTarget){
+                const dy = (hs.scrollLastY - idxScr.y) * GRAB_SCROLL.gain; // 上へ手 → 下へスクロール
+                if(Math.abs(dy) > 0.5){ scrollIframeBy(hs.scrollTarget, dy); hs.scrollLastY = idxScr.y; }
+              }else{
+                hs.scrollActive=false; hs.scrollTarget=null;
+              }
+            }
+
+            // ✊グー → スナップ先クリック（グラブ移動/スクロール中やヘッダー上では抑止）
+            const snappedIsScrollbar = snappedElement && snappedElement.__kind==='scrollbar';
+            let fistForClick = isFist && !hs.grabActive && !onCtxHeader && !headerOv && !hs.scrollActive;
+            if(fistForClick){
+              hs.fistStreak=Math.min(hs.fistStreak+1, FIST.requiredStreak+2);
+            }else{
+              hs.fistStreak=Math.max(hs.fistStreak-1, 0);
+            }
+            if(hs.fistStreak>=FIST.requiredStreak && (now-hs.lastFist)>FIST.cooldownMs){
+              if(snappedIsScrollbar){
+                // スクロールバーがスナップ対象の場合はクリックではなくスクロール開始に切替
+                hs.scrollActive=true; hs.scrollTarget=snappedElement.iframe; hs.scrollLastY=idxScr.y;
+              }else if(snappedElement){
+                if(snapClickTimer&&snapClickTimer.timer){ clearTimeout(snapClickTimer.timer); snapClickTimer=null; }
+                triggerClickOnSnapElement();
+              }
+              hs.lastFist=now; hs.fistStreak=0;
+            }
+
+            // ✌️チョキ（開いた→閉じる動きでのみ Close）
+            const idxExt=isExtended(lm,8,6, CHOKI_DYNAMIC.extendMargin);
+            const midExt=isExtended(lm,12,10,CHOKI_DYNAMIC.extendMargin);
+            const ringF =isFolded (lm,16,14,CHOKI_DYNAMIC.extendMargin);
+            const pinkF =isFolded (lm,20,18,CHOKI_DYNAMIC.extendMargin);
+            const allowByRP = !CHOKI_DYNAMIC.requireRingPinkyFolded || (ringF && pinkF);
+
+            const gapPx=Math.hypot((lm[8].x-lm[12].x)*videoWidth, (lm[8].y-lm[12].y)*videoHeight);
+            const dt = handStates[handed].lastGapTs ? (now - handStates[handed].lastGapTs) : 0;
+            const closeSpeed = (dt>0 && handStates[handed].lastGap!==null) ? ((handStates[handed].lastGap - gapPx) / dt) * 1000 : 0;
+
+            if(idxExt && midExt && allowByRP){
+              if(handStates[handed].chokiArmAt===null && gapPx>=CHOKI_DYNAMIC.armGapPx){
+                handStates[handed].chokiArmAt=now; handStates[handed].lastGap=gapPx; handStates[handed].lastGapTs=now;
+              }else if(handStates[handed].chokiArmAt!==null){
+                const drop=(handStates[handed].lastGap??gapPx)-gapPx;
+                const withinWindow=(now-handStates[handed].chokiArmAt)<=CHOKI_DYNAMIC.maxWindowMs;
+                const fastEnough = closeSpeed >= CHOKI_DYNAMIC.minCloseSpeedPxPerSec;
+
+                if( gapPx<=CHOKI_DYNAMIC.fireGapPx &&
+                    drop>=CHOKI_DYNAMIC.minDropPx &&
+                    withinWindow && fastEnough &&
+                    (now-handStates[handed].lastChoki)>CHOKI_DYNAMIC.cooldownMs ){
+                  closeMenus();
+                  handStates[handed].lastChoki=now;
+                  handStates[handed].chokiArmAt=null;
+                  handStates[handed].lastGap=gapPx; handStates[handed].lastGapTs=now;
+                }else{
+                  if(!withinWindow || gapPx>CHOKI_DYNAMIC.armGapPx*1.35 || !(idxExt&&midExt&&allowByRP)){
+                    handStates[handed].chokiArmAt=null;
+                  }else{
+                    handStates[handed].lastGap = Math.max(handStates[handed].lastGap, gapPx);
+                    handStates[handed].lastGapTs = now;
+                  }
+                }
+              }
+            }else{
+              handStates[handed].chokiArmAt=null;
+            }
+          }
+        }
+
+      }catch(err){ console.error(err); showError('onResultsエラー: '+err.message); }
+    }
+
+    /* ===== イベント ===== */
+    menuButton.addEventListener('click',()=>{ settingsWindow.style.display='block'; });
+    contextButton.addEventListener('click',()=>{ openContextMenuAtCenter(); });
+
+    closeSettings.addEventListener('click',()=>{ settingsWindow.style.display='none'; });
+    applySettings.addEventListener('click',()=>{
+      const res=document.getElementById('resolutionSelect').value;
+      [videoWidth,videoHeight]=res.split('x').map(Number);
+      modelComplexity=parseInt(document.getElementById('modelComplexity').value);
+      frameRate=parseInt(document.getElementById('frameRate').value);
+      minDetectionConfidence=parseFloat(detectionConfidenceSlider.value);
+      minTrackingConfidence=parseFloat(trackingConfidenceSlider.value);
+      maxNumHands=parseInt(document.getElementById('handCountSelect').value);
+      isMirrored=mirrorToggle.checked;
+
+      const s=parseFloat(snapTimerInput.value);
+      snapClickDelay=(!isNaN(s)&&s>0)? s*1000 : 4000;
+
+      detectionConfidenceValue.innerText=minDetectionConfidence.toFixed(2);
+      trackingConfidenceValue.innerText =minTrackingConfidence.toFixed(2);
+
+      if(!hands) initializeHands();
+      hands && hands.setOptions({ maxNumHands, modelComplexity, minDetectionConfidence, minTrackingConfidence });
+      canvasElement.width=videoWidth; canvasElement.height=videoHeight;
+
+      if(isMirrored){ videoElement.classList.add('mirrored'); canvasElement.classList.add('mirrored'); }
+      else{ videoElement.classList.remove('mirrored'); canvasElement.classList.remove('mirrored'); }
+
+      cameraResolutionDisplay.innerText=`解像度: ${videoWidth}×${videoHeight}`;
+      startCamera();
+
+      settingsWindow.style.display='none';
+      fps=0; frames=0; startTime=Date.now(); fpsDisplay.innerText='FPS: 0';
+      contextMenu.style.display='none';
+    });
+
+    flipButton.addEventListener('click',()=>{ isMirrored=!isMirrored; mirrorToggle.checked=isMirrored;
+      if(isMirrored){ videoElement.classList.add('mirrored'); canvasElement.classList.add('mirrored'); }
+      else{ videoElement.classList.remove('mirrored'); canvasElement.classList.remove('mirrored'); } });
+
+    closeContextMenuButton.addEventListener('click',()=>{ contextMenu.style.display='none'; });
+    openUrlButton.addEventListener('click',()=>{
+      const raw=urlInput.value.trim(); if(!raw) return;
+      createOverlayWindow(raw); contextMenu.style.display='none';
+    });
+
+    startButton.addEventListener('click',()=>{ initializeHands(); startCamera(); startButton.style.display='none'; });
+
+    window.addEventListener('resize',()=>{
+      const L=parseFloat(customCursor.style.left)||0, T=parseFloat(customCursor.style.top)||0;
+      customCursor.style.left=`${Math.max(0, Math.min(window.innerWidth, L))}px`;
+      customCursor.style.top =`${Math.max(0, Math.min(window.innerHeight, T))}px`;
+      if(contextMenu.style.display==='block'){
+        const w=contextMenu.offsetWidth||260, h=contextMenu.offsetHeight||120;
+        let x=parseFloat(contextMenu.style.left), y=parseFloat(contextMenu.style.top);
+        x=Math.min(x, window.innerWidth - w - 10); y=Math.min(y, window.innerHeight - h - 10);
+        contextMenu.style.left=`${x}px`; contextMenu.style.top=`${y}px`;
+      }
+      cameraResolutionDisplay.innerText=`解像度: ${videoWidth}×${videoHeight}`;
+      canvasSizeDisplay.innerText=`キャンバス: ${canvasElement.width}×${canvasElement.height}`;
+    });
+
+    // デバッグ：マウス移動でカーソル更新＆スナップ自動クリック解除
+    window.addEventListener('mousemove',(e)=>{
+      customCursor.style.display='block';
+      customCursor.style.left=`${e.clientX}px`;
+      customCursor.style.top =`${e.clientY}px`;
+      document.body.style.cursor='none';
+      if(snapClickTimer){ if(snapClickTimer.timer) clearTimeout(snapClickTimer.timer); snapClickTimer=null; snappedElement=null; snapTimerDisplay.style.display='none'; }
+    });
+
+    // 初期表示
+    window.addEventListener('load',()=>{
+      cameraResolutionDisplay.innerText=`解像度: ${videoWidth}×${videoHeight}`;
+      canvasSizeDisplay.innerText=`キャンバス: ${canvasElement.width}×${canvasElement.height}`;
+    });
+  </script>
+</body>
+</html>

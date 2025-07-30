@@ -1,0 +1,1591 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8" />
+  <title>Hands UI: Snap-to-Scrollbar & Grab-Scroll</title>
+
+  <!-- MediaPipe Hands -->
+  <script src="https://unpkg.com/@mediapipe/hands/hands.js"></script>
+  <script src="https://unpkg.com/@mediapipe/drawing_utils/drawing_utils.js"></script>
+  <script src="https://unpkg.com/@mediapipe/camera_utils/camera_utils.js"></script>
+
+  <style>
+    html, body { margin:0; padding:0; height:100%; width:100%; background:#0a0a0a; overflow:hidden; font-family:'Segoe UI', Arial, sans-serif; cursor:none; }
+    
+    #canvasContainer { 
+      position:relative; width:100%; height:100%; 
+      display:flex; justify-content:center; align-items:center; overflow:hidden;
+      background: linear-gradient(135deg, #1e3c72 0%, #2a5298 100%);
+    }
+    
+    video.input_video, canvas.output_canvas { 
+      position:absolute; top:0; left:0; width:100%; height:100%; 
+      object-fit:cover; background:#000; transition:transform .3s ease;
+      border-radius: 8px; box-shadow: 0 4px 20px rgba(0,0,0,0.3);
+    }
+    
+    video.input_video.mirrored, canvas.output_canvas.mirrored { transform:scaleX(-1); }
+    canvas.output_canvas { pointer-events:none; background:transparent; }
+
+    #infoContainer { 
+      position:absolute; top:15px; left:50%; transform:translateX(-50%); 
+      display:flex; flex-direction:column; align-items:center; gap:8px; z-index:100; 
+    }
+    
+    #infoContainer > div { 
+      color:#fff; font-size:13px; font-weight:500;
+      background:rgba(0,0,0,.7); padding:6px 12px; border-radius:20px; 
+      backdrop-filter: blur(10px); border: 1px solid rgba(255,255,255,0.1);
+      min-width: 120px; text-align: center;
+    }
+
+    #buttonContainer { 
+      position:absolute; bottom:25px; left:50%; transform:translateX(-50%); 
+      display:flex; gap:15px; z-index:100; flex-wrap:wrap; justify-content:center;
+    }
+    
+    #buttonContainer button { 
+      padding:12px 20px; font-size:14px; font-weight:600; border:none; 
+      background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+      color:#fff; border-radius:25px; cursor:pointer; 
+      box-shadow:0 4px 15px rgba(0,0,0,.3); white-space:nowrap; 
+      transition:all .3s ease; backdrop-filter: blur(10px);
+      border: 1px solid rgba(255,255,255,0.2);
+    }
+    
+    #buttonContainer button:hover { 
+      transform: translateY(-2px); box-shadow:0 6px 20px rgba(0,0,0,.4);
+      background: linear-gradient(135deg, #764ba2 0%, #667eea 100%);
+    }
+    
+    #buttonContainer button:active { transform: translateY(0px); }
+
+    #settingsWindow { 
+      position:absolute; top:50%; left:50%; transform:translate(-50%,-50%); 
+      background:rgba(255,255,255,.95); padding:25px; border-radius:15px; display:none; z-index:200; 
+      box-shadow:0 10px 40px rgba(0,0,0,.3); max-width:400px; width:90%; 
+      backdrop-filter: blur(20px); border: 1px solid rgba(255,255,255,0.3);
+    }
+    
+    #settingsWindow h2 { 
+      margin:0 0 20px; font-size:20px; text-align:center; color:#333;
+      background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+      -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+    }
+    
+    #settingsWindow label { 
+      display:block; margin-bottom:15px; font-size:14px; color:#555; font-weight:500;
+    }
+    
+    #settingsWindow input[type="range"], #settingsWindow input[type="number"], #settingsWindow select { 
+      width:100%; margin-top:8px; padding:8px; border:1px solid #ddd; border-radius:8px;
+      transition: border-color 0.3s ease;
+    }
+    
+    #settingsWindow input[type="range"]:focus, #settingsWindow input[type="number"]:focus, #settingsWindow select:focus {
+      border-color: #667eea; outline: none; box-shadow: 0 0 0 3px rgba(102, 126, 234, 0.1);
+    }
+    
+    .settingsActions { 
+      display:flex; justify-content:flex-end; align-items:center; gap:12px; margin-top:20px; 
+    }
+    
+    .settingsActions button { 
+      padding:10px 20px; font-size:14px; font-weight:600; border:none; border-radius:8px; 
+      cursor:pointer; color:#fff; transition:all .3s ease;
+    }
+    
+    #applySettings { 
+      background: linear-gradient(135deg, #28a745 0%, #20c997 100%); 
+      box-shadow: 0 4px 15px rgba(40, 167, 69, 0.3);
+    }
+    
+    #applySettings:hover { 
+      transform: translateY(-1px);
+      box-shadow: 0 6px 20px rgba(40, 167, 69, 0.4);
+    }
+    
+    #closeSettings { 
+      background: linear-gradient(135deg, #dc3545 0%, #c82333 100%);
+      box-shadow: 0 4px 15px rgba(220, 53, 69, 0.3);
+    }
+    
+    #closeSettings:hover { 
+      transform: translateY(-1px);
+      box-shadow: 0 6px 20px rgba(220, 53, 69, 0.4);
+    }
+
+    #errorMessage { 
+      position:absolute; top:50%; left:50%; transform:translate(-50%,-50%); 
+      background: linear-gradient(135deg, #ff6b6b 0%, #ee5a52 100%);
+      color:#fff; padding:20px 25px; border-radius:12px; display:none; z-index:300; 
+      text-align:center; max-width:80%; font-size:14px; font-weight:500;
+      box-shadow: 0 8px 25px rgba(255, 107, 107, 0.3);
+      backdrop-filter: blur(10px);
+    }
+
+    #customCursor { 
+      position:fixed; top:50%; left:50%; width:24px; height:24px; 
+      background: radial-gradient(circle, rgba(255,255,255,0.9) 0%, rgba(255,87,34,0.8) 100%);
+      border:3px solid #FF5722; border-radius:50%; pointer-events:none; 
+      transform:translate(-50%, -50%); z-index:400; 
+      transition:all .08s ease-out; box-shadow: 0 0 20px rgba(255, 87, 34, 0.5);
+    }
+    
+    #customCursor.snap { 
+      animation:snapEffect .25s ease-out forwards; 
+      background: radial-gradient(circle, rgba(76, 175, 80, 0.9) 0%, rgba(56, 142, 60, 0.8) 100%);
+      border-color: #4CAF50; box-shadow: 0 0 25px rgba(76, 175, 80, 0.7);
+    }
+    
+    #snapTimerDisplay { 
+      position:absolute; top:50%; left:50%; transform:translate(-50%,-50%); 
+      background:rgba(0,0,0,.8); color:#fff; font-size:10px; font-weight:600;
+      padding:3px 6px; border-radius:10px; display:none; 
+      backdrop-filter: blur(5px);
+    }
+    
+    @keyframes snapEffect { 
+      0% { transform:translate(-50%,-50%) scale(1); } 
+      50% { transform:translate(-50%,-50%) scale(1.4); }
+      100% { transform:translate(-50%,-50%) scale(1.2); } 
+    }
+
+    /* コンテキストメニュー */
+    #contextMenu { 
+      position:fixed; background:rgba(255,255,255,.97); border:1px solid rgba(0,0,0,0.1); 
+      border-radius:12px; padding:15px; box-shadow:0 8px 30px rgba(0,0,0,.2); 
+      display:none; z-index:350; width:280px; backdrop-filter: blur(20px);
+    }
+    
+    #contextMenu .contextHeader { 
+      background: linear-gradient(135deg, #f8f9fa 0%, #e9ecef 100%);
+      border-bottom:1px solid #dee2e6; cursor:move; user-select:none; font-weight:600;
+      padding:8px 12px; margin:-15px -15px 12px -15px; border-top-left-radius:12px; 
+      border-top-right-radius:12px; color:#495057;
+    }
+    
+    #contextMenu input[type="text"] { 
+      width:100%; margin-bottom:12px; padding:10px; font-size:14px; 
+      border:2px solid #e9ecef; border-radius:8px; transition: border-color 0.3s ease;
+    }
+    
+    #contextMenu input[type="text"]:focus {
+      border-color: #667eea; outline: none; box-shadow: 0 0 0 3px rgba(102, 126, 234, 0.1);
+    }
+    
+    #contextMenu .contextActions { 
+      display:flex; gap:10px; justify-content:flex-end; align-items:center; 
+    }
+    
+    #contextMenu .contextActions button { 
+      padding:8px 16px; font-size:14px; font-weight:600; border:none; 
+      border-radius:6px; cursor:pointer; width:auto; transition:all .3s ease;
+    }
+    
+    #openUrlButton {
+      background: linear-gradient(135deg, #28a745 0%, #20c997 100%);
+      color: #fff; box-shadow: 0 2px 10px rgba(40, 167, 69, 0.3);
+    }
+    
+    #openUrlButton:hover { 
+      transform: translateY(-1px); box-shadow: 0 4px 15px rgba(40, 167, 69, 0.4);
+    }
+    
+    #closeContextMenu { 
+      background: linear-gradient(135deg, #dc3545 0%, #c82333 100%) !important;
+      color: #fff !important; box-shadow: 0 2px 10px rgba(220, 53, 69, 0.3);
+    }
+    
+    #closeContextMenu:hover { 
+      transform: translateY(-1px); box-shadow: 0 4px 15px rgba(220, 53, 69, 0.4);
+    }
+
+    /* オーバーレイ Web ウィンドウ */
+    .overlayWindow { 
+      position:fixed; top:100px; left:100px; width:450px; height:360px; 
+      background:rgba(255,255,255,.98); border:1px solid rgba(0,0,0,0.1); 
+      border-radius:12px; box-shadow:0 10px 40px rgba(0,0,0,.25); z-index:351; 
+      display:flex; flex-direction:column; pointer-events:auto; cursor:auto; 
+      backdrop-filter: blur(20px); overflow: hidden;
+    }
+    
+    .overlayHeader { 
+      background: linear-gradient(135deg, #f8f9fa 0%, #e9ecef 100%);
+      padding:10px; display:flex; gap:10px; align-items:center; 
+      border-bottom:1px solid #dee2e6; cursor:move; user-select:none; 
+    }
+    
+    .overlayHeader input[type="text"] { 
+      flex:1; font-size:14px; padding:6px 10px; border:2px solid #e9ecef; 
+      border-radius:6px; transition: border-color 0.3s ease;
+    }
+    
+    .overlayHeader input[type="text"]:focus {
+      border-color: #667eea; outline: none; box-shadow: 0 0 0 3px rgba(102, 126, 234, 0.1);
+    }
+    
+    .overlayHeader button { 
+      background: linear-gradient(135deg, #28a745 0%, #20c997 100%);
+      color:#fff; border:none; padding:8px 15px; border-radius:6px; 
+      font-size:13px; font-weight:600; cursor:pointer; transition:all .3s ease;
+      box-shadow: 0 2px 8px rgba(40, 167, 69, 0.3);
+    }
+    
+    .overlayHeader button:hover { 
+      transform: translateY(-1px); box-shadow: 0 4px 12px rgba(40, 167, 69, 0.4);
+    }
+    
+    .overlayNotice { 
+      background: linear-gradient(135deg, #fff3cd 0%, #ffeaa7 100%);
+      color:#856404; border-bottom:1px solid #ffeaa7; 
+      padding:12px 15px; font-size:13px; display:none; 
+    }
+    
+    .overlayNotice .actions { margin-top:8px; display:flex; gap:10px; }
+    
+    .overlayNotice button { 
+      background: linear-gradient(135deg, #0d6efd 0%, #0b5ed7 100%);
+      color:#fff; border:none; border-radius:5px; padding:6px 12px; 
+      cursor:pointer; font-size:12px; font-weight:600; transition:all .3s ease;
+    }
+    
+    .overlayNotice button:hover { transform: translateY(-1px); }
+    
+    .overlayIframeContainer { flex:1; overflow:hidden; position:relative; }
+    .overlayIframeContainer iframe { width:100%; height:100%; border:none; }
+
+    .overlayFooter { 
+      border-top:1px solid #dee2e6; 
+      background: linear-gradient(135deg, #f8f9fa 0%, #e9ecef 100%);
+      text-align:right; padding:10px; 
+    }
+    
+    .overlayFooter button { 
+      background: linear-gradient(135deg, #dc3545 0%, #c82333 100%);
+      color:#fff; border:none; padding:8px 15px; border-radius:6px; 
+      font-size:13px; font-weight:600; cursor:pointer; transition:all .3s ease;
+      box-shadow: 0 2px 8px rgba(220, 53, 69, 0.3);
+    }
+    
+    .overlayFooter button:hover { 
+      transform: translateY(-1px); box-shadow: 0 4px 12px rgba(220, 53, 69, 0.4);
+    }
+
+    /* ジェスチャーヒント */
+    #gestureHints {
+      position: absolute; bottom: 100px; right: 20px; z-index: 100;
+      background: rgba(0,0,0,0.8); color: #fff; padding: 15px; border-radius: 10px;
+      font-size: 12px; max-width: 200px; backdrop-filter: blur(10px);
+      border: 1px solid rgba(255,255,255,0.1);
+    }
+    
+    #gestureHints h4 { 
+      margin: 0 0 8px 0; color: #4CAF50; font-size: 13px; font-weight: 600;
+    }
+    
+    #gestureHints .gesture { 
+      margin: 4px 0; padding: 2px 0; border-bottom: 1px solid rgba(255,255,255,0.1);
+    }
+    
+    #gestureHints .gesture:last-child { border-bottom: none; }
+
+    /* パフォーマンス表示の改善 */
+    .performance-indicator {
+      display: flex; align-items: center; gap: 8px;
+    }
+    
+    .fps-bar {
+      width: 50px; height: 4px; background: rgba(255,255,255,0.3); 
+      border-radius: 2px; overflow: hidden;
+    }
+    
+    .fps-fill {
+      height: 100%; background: linear-gradient(90deg, #ff4444 0%, #ffaa00 50%, #00ff00 100%);
+      transition: width 0.3s ease; border-radius: 2px;
+    }
+
+    @media (max-width:600px){ 
+      .overlayWindow { width:92%; height:54%; top:50px; left:4%; } 
+      #buttonContainer { bottom: 15px; }
+      #buttonContainer button { padding: 10px 15px; font-size: 13px; }
+      #gestureHints { display: none; }
+    }
+
+    /* ローディングアニメーション */
+    .loading-spinner {
+      display: inline-block; width: 20px; height: 20px;
+      border: 3px solid rgba(255,255,255,.3);
+      border-radius: 50%; border-top-color: #fff;
+      animation: spin 1s ease-in-out infinite;
+    }
+    
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    /* スクロールバー改善 */
+    .virtual-scrollbar {
+      position: absolute; right: 2px; top: 0; bottom: 0; width: 12px;
+      background: rgba(0,0,0,0.1); border-radius: 6px; pointer-events: none;
+      opacity: 0; transition: opacity 0.3s ease;
+    }
+    
+    .virtual-scrollbar.active { opacity: 1; }
+    
+    .virtual-scrollbar-thumb {
+      background: rgba(0,0,0,0.5); border-radius: 6px; min-height: 20px;
+      transition: background-color 0.3s ease;
+    }
+    
+    .virtual-scrollbar-thumb:hover { background: rgba(0,0,0,0.7); }
+  </style>
+</head>
+
+<body>
+  <div id="canvasContainer">
+    <video class="input_video mirrored" playsinline autoplay muted></video>
+    <canvas class="output_canvas mirrored"></canvas>
+
+    <div id="customCursor"><div id="snapTimerDisplay"></div></div>
+
+    <!-- コンテキストメニュー -->
+    <div id="contextMenu">
+      <div class="contextHeader">🎯 コンテキストメニュー</div>
+      <input type="text" id="urlInput" value="https://www.wikipedia.org" placeholder="URLを入力してください" />
+      <div class="contextActions">
+        <button id="openUrlButton">🚀 開く</button>
+        <button id="closeContextMenu">❌ 閉じる</button>
+      </div>
+    </div>
+
+    <div id="infoContainer">
+      <div id="fpsDisplay" class="performance-indicator">
+        <span>FPS: 0</span>
+        <div class="fps-bar"><div class="fps-fill" style="width: 0%"></div></div>
+      </div>
+      <div id="cameraResolution">📹 解像度: 1280×720</div>
+      <div id="canvasSize">🖼️ キャンバス: 1280×720</div>
+    </div>
+
+    <div id="gestureHints">
+      <h4>🤲 ジェスチャー</h4>
+      <div class="gesture">✊ グー: クリック</div>
+      <div class="gesture">🔄 ひねり: メニュー</div>
+      <div class="gesture">✌️ チョキ: 閉じる</div>
+      <div class="gesture">👊 グラブ: ドラッグ</div>
+    </div>
+
+    <div id="buttonContainer">
+      <button id="menuButton">⚙️ 設定</button>
+      <button id="contextButton">📋 メニュー</button>
+      <button id="startButton">📹 カメラ開始</button>
+      <button id="flipButton">🔄 左右反転</button>
+    </div>
+
+    <div id="errorMessage">⚠️ エラーが発生しました。</div>
+
+    <div id="settingsWindow">
+      <h2>⚙️ 設定</h2>
+      <label>📹 解像度:
+        <select id="resolutionSelect">
+          <option value="640x480">640×480</option>
+          <option value="1280x720" selected>1280×720 (推奨)</option>
+          <option value="1920x1080">1920×1080</option>
+        </select>
+      </label>
+      <label>🎯 フレームレート:
+        <input type="number" id="frameRate" min="1" max="60" value="30" />
+      </label>
+      <label>🧠 モデルの複雑さ:
+        <select id="modelComplexity">
+          <option value="0">0 (高速)</option>
+          <option value="1" selected>1 (標準)</option>
+          <option value="2">2 (高精度)</option>
+        </select>
+      </label>
+      <label>🎯 検出の信頼度: <span id="detectionConfidenceValue">0.5</span>
+        <input type="range" id="detectionConfidence" min="0" max="1" step="0.01" value="0.5" />
+      </label>
+      <label>📍 トラッキングの信頼度: <span id="trackingConfidenceValue">0.5</span>
+        <input type="range" id="trackingConfidence" min="0" max="1" step="0.01" value="0.5" />
+      </label>
+      <label>✋ 検出する手の数:
+        <select id="handCountSelect">
+          <option value="1">1</option>
+          <option value="2" selected>2</option>
+        </select>
+      </label>
+      <label>🔄 左右反転:
+        <input type="checkbox" id="mirrorToggle" checked />
+      </label>
+      <label>⏰ スナップタイマー(秒):
+        <input type="number" id="snapTimerInput" min="1" value="4" />
+      </label>
+
+      <div class="settingsActions">
+        <button id="applySettings">✅ 適用</button>
+        <button id="closeSettings">❌ 閉じる</button>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    /* ===== 基本状態 ===== */
+    let videoWidth=1280, videoHeight=720, frameRate=30;
+    let maxNumHands=2, modelComplexity=1, minDetectionConfidence=0.5, minTrackingConfidence=0.5;
+    let isMirrored=true;
+    let isInitialized = false;
+
+    const videoElement=document.querySelector('.input_video');
+    const canvasElement=document.querySelector('.output_canvas');
+    const ctx=canvasElement.getContext('2d');
+
+    const fpsDisplay=document.getElementById('fpsDisplay');
+    const fpsFill=document.querySelector('.fps-fill');
+    const cameraResolutionDisplay=document.getElementById('cameraResolution');
+    const canvasSizeDisplay=document.getElementById('canvasSize');
+    const errorMessage=document.getElementById('errorMessage');
+
+    const menuButton=document.getElementById('menuButton');
+    const contextButton=document.getElementById('contextButton');
+    const startButton=document.getElementById('startButton');
+    const flipButton=document.getElementById('flipButton');
+
+    const settingsWindow=document.getElementById('settingsWindow');
+    const closeSettings=document.getElementById('closeSettings');
+    const applySettings=document.getElementById('applySettings');
+    const detectionConfidenceSlider=document.getElementById('detectionConfidence');
+    const detectionConfidenceValue=document.getElementById('detectionConfidenceValue');
+    const trackingConfidenceSlider=document.getElementById('trackingConfidence');
+    const trackingConfidenceValue=document.getElementById('trackingConfidenceValue');
+    const mirrorToggle=document.getElementById('mirrorToggle');
+    const snapTimerInput=document.getElementById('snapTimerInput');
+
+    const customCursor=document.getElementById('customCursor');
+    const snapTimerDisplay=document.getElementById('snapTimerDisplay');
+
+    const contextMenu=document.getElementById('contextMenu');
+    const contextHeader=document.querySelector('#contextMenu .contextHeader');
+    const closeContextMenuButton=document.getElementById('closeContextMenu');
+    const urlInput=document.getElementById('urlInput');
+    const openUrlButton=document.getElementById('openUrlButton');
+
+    let fps=0, frames=0, startTime=Date.now();
+    let hands, camera=null;
+    let lastFrameTime = 0;
+
+    /* ===== スナップ＆自動クリック ===== */
+    const defaultSnapDistance=100;
+    let temporarySnapDistance=defaultSnapDistance;
+    let snappedElement=null;
+    let snapClickTimer=null;
+    let snapClickDelay=4000;
+
+    /* ===== ジェスチャー設定（改善版） ===== */
+    const FIST  = { requiredStreak:2, cooldownMs:500 }; // より反応よく
+    const TWIST = { emaAlpha:0.6, enterThreshold:0.3, exitThreshold:0.2, requiredStreak:4, cooldownMs:800, minOpenFingers:3, maxPalmMovePx:30 };
+    const CHOKI_DYNAMIC = { extendMargin:0.03, armGapPx:75, fireGapPx:25, minDropPx:30, maxWindowMs:900, cooldownMs:1000, requireRingPinkyFolded:true, minCloseSpeedPxPerSec:200 };
+    const GRAB_SCROLL = { gain: 3.0 }; // より敏感に
+    const SCROLLBAR_WIDTH = 16; // 少し太く
+
+    const handStates={
+      'Left': { twistEma:0, twistStreak:0, lastTwist:0, fistStreak:0, lastFist:0, prevPalm:null,
+                chokiArmAt:null, lastChoki:0, lastGap:null, lastGapTs:0,
+                grabActive:false, grabbedEl:null, grabOffsetX:0, grabOffsetY:0,
+                scrollActive:false, scrollTarget:null, scrollLastY:0 },
+      'Right':{ twistEma:0, twistStreak:0, lastTwist:0, fistStreak:0, lastFist:0, prevPalm:null,
+                chokiArmAt:null, lastChoki:0, lastGap:null, lastGapTs:0,
+                grabActive:false, grabbedEl:null, grabOffsetX:0, grabOffsetY:0,
+                scrollActive:false, scrollTarget:null, scrollLastY:0 }
+    };
+
+    /* ===== パフォーマンス改善関数 ===== */
+    function updateFPSDisplay(currentFps) {
+      const fpsText = fpsDisplay.querySelector('span');
+      fpsText.textContent = `FPS: ${currentFps}`;
+      
+      const fpsPercentage = Math.min(currentFps / 60 * 100, 100);
+      fpsFill.style.width = `${fpsPercentage}%`;
+      
+      // 色の最適化
+      const color = currentFps >= 25 ? '#00ff00' : currentFps >= 15 ? '#ffaa00' : '#ff4444';
+      fpsFill.style.background = color;
+    }
+
+    function debounce(func, wait) {
+      let timeout;
+      return function executedFunction(...args) {
+        const later = () => {
+          clearTimeout(timeout);
+          func(...args);
+        };
+        clearTimeout(timeout);
+        timeout = setTimeout(later, wait);
+      };
+    }
+
+    /* ===== URLユーティリティ（改善版） ===== */
+    function normalizeUrl(input){
+      let url=(input||'').trim(); 
+      if(!url) return null;
+      
+      // より柔軟なURL正規化
+      if(!/^https?:\/\//i.test(url)) {
+        // 一般的なドメインパターンの検出
+        if(/^[a-zA-Z0-9-]+\.[a-zA-Z]{2,}/.test(url)) {
+          url = 'https://' + url;
+        } else {
+          // 検索クエリとして扱う
+          url = `https://www.google.com/search?q=${encodeURIComponent(url)}`;
+        }
+      }
+      
+      url=url.replace(/^http:\/\//i,'https://'); 
+      try{ 
+        new URL(url); 
+        return url; 
+      }catch{ 
+        return null; 
+      }
+    }
+    
+    function toEmbeddable(url){
+      try{
+        const u=new URL(url); 
+        const host=u.hostname.replace(/^www\./,'');
+        
+        // YouTube埋め込み対応の改善
+        if(host==='youtube.com'||host==='youtu.be'||host==='m.youtube.com'){
+          let id=null;
+          if(host==='youtu.be') {
+            id=u.pathname.split('/')[1]?.split('?')[0];
+          } else if(u.pathname==='/watch') {
+            id=u.searchParams.get('v');
+          } else if(u.pathname.startsWith('/shorts/')) {
+            id=u.pathname.split('/')[2]||u.pathname.split('/')[1];
+          } else if(u.pathname.startsWith('/embed/')) {
+            id=u.pathname.split('/')[2];
+          }
+          if(id) return `https://www.youtube.com/embed/${id}?rel=0&modestbranding=1&controls=1`;
+        }
+        
+        // Twitter/X埋め込み対応
+        if(host==='twitter.com'||host==='x.com'){
+          const tweetMatch = u.pathname.match(/\/status\/(\d+)/);
+          if(tweetMatch) {
+            return `https://twitframe.com/show?url=${encodeURIComponent(url)}`;
+          }
+        }
+        
+        return url;
+      }catch{ 
+        return url; 
+      }
+    }
+
+    /* ===== UIヘルパ（改善版） ===== */
+    function showError(msg, duration = 5000){ 
+      errorMessage.innerHTML = `⚠️ ${msg}`; 
+      errorMessage.style.display='block'; 
+      setTimeout(()=>{
+        errorMessage.style.display='none';
+      }, duration); 
+    }
+    
+    function showSuccess(msg, duration = 3000) {
+      const successDiv = document.createElement('div');
+      successDiv.style.cssText = `
+        position: fixed; top: 20px; right: 20px; z-index: 400;
+        background: linear-gradient(135deg, #28a745 0%, #20c997 100%);
+        color: #fff; padding: 15px 20px; border-radius: 8px;
+        box-shadow: 0 4px 15px rgba(40, 167, 69, 0.3);
+        font-weight: 600; backdrop-filter: blur(10px);
+      `;
+      successDiv.innerHTML = `✅ ${msg}`;
+      document.body.appendChild(successDiv);
+      
+      setTimeout(() => {
+        successDiv.style.opacity = '0';
+        successDiv.style.transform = 'translateX(100%)';
+        successDiv.style.transition = 'all 0.3s ease';
+        setTimeout(() => successDiv.remove(), 300);
+      }, duration);
+    }
+    
+    function showContextMenu(x,y){
+      contextMenu.style.left=`${x}px`; 
+      contextMenu.style.top=`${y}px`; 
+      contextMenu.style.display='block';
+      contextMenu.style.transform = 'scale(0.8)';
+      contextMenu.style.opacity = '0';
+      
+      // アニメーション
+      requestAnimationFrame(() => {
+        contextMenu.style.transition = 'all 0.2s ease';
+        contextMenu.style.transform = 'scale(1)';
+        contextMenu.style.opacity = '1';
+      });
+      
+      const w=contextMenu.offsetWidth||280, h=contextMenu.offsetHeight||120;
+      let nx=x, ny=y; 
+      if(x+w>window.innerWidth) nx=window.innerWidth-w-10; 
+      if(y+h>window.innerHeight) ny=window.innerHeight-h-10;
+      contextMenu.style.left=`${nx}px`; 
+      contextMenu.style.top=`${ny}px`;
+    }
+    
+    function openContextMenuAtCenter(){
+      const x=Math.round(window.innerWidth/2 - 140);
+      const y=Math.round(window.innerHeight/2 - 90);
+      showContextMenu(x,y);
+    }
+    
+    function openContextMenuAtVideoPoint(vx,vy){
+      let px=(vx/videoWidth)*window.innerWidth, py=(vy/videoHeight)*window.innerHeight; 
+      if(isMirrored) px=window.innerWidth-px;
+      if(contextMenu.style.display!=='block') showContextMenu(px,py);
+    }
+    
+    function closeMenus(){ 
+      // アニメーション付きで閉じる
+      if(contextMenu.style.display === 'block') {
+        contextMenu.style.transition = 'all 0.2s ease';
+        contextMenu.style.transform = 'scale(0.8)';
+        contextMenu.style.opacity = '0';
+        setTimeout(() => {
+          contextMenu.style.display='none';
+          contextMenu.style.transform = 'scale(1)';
+          contextMenu.style.opacity = '1';
+        }, 200);
+      }
+      
+      if(settingsWindow.style.display === 'block') {
+        settingsWindow.style.transition = 'all 0.2s ease';
+        settingsWindow.style.transform = 'translate(-50%,-50%) scale(0.9)';
+        settingsWindow.style.opacity = '0';
+        setTimeout(() => {
+          settingsWindow.style.display='none';
+          settingsWindow.style.transform = 'translate(-50%,-50%) scale(1)';
+          settingsWindow.style.opacity = '1';
+        }, 200);
+      }
+    }
+
+    /* ===== クリック/スクロール対象のスナップ（改善版） ===== */
+    function applySnap(x,y){
+      // 1) 通常のクリック可能要素（より広範囲に対応）
+      const clickable=document.querySelectorAll(`
+        button, [onclick], a[href], input[type="button"], input[type="submit"], 
+        [role="button"], [role="tab"], [role="menuitem"], .clickable,
+        input[type="checkbox"], input[type="radio"], select, textarea
+      `);
+      
+      let closestEl=null, minD=Infinity, snapX=x, snapY=y;
+
+      clickable.forEach(el=>{
+        // 非表示要素はスキップ
+        if(el.offsetParent === null) return;
+        
+        const r=el.getBoundingClientRect();
+        const cx=r.left+r.width/2, cy=r.top+r.height/2;
+        const d=Math.hypot(x-cx,y-cy);
+        
+        // 要素のサイズに応じて有効距離を調整
+        const effectiveDistance = Math.min(temporarySnapDistance, Math.max(50, Math.min(r.width, r.height) / 2 + 20));
+        
+        if(d<minD && d<=effectiveDistance){ 
+          minD=d; closestEl=el; snapX=cx; snapY=cy; 
+        }
+      });
+
+      // 2) 仮想スクロールバー（改善版）
+      const iframes=document.querySelectorAll('.overlayIframeContainer iframe');
+      let closestSB=null, minDSB=Infinity, sbX=x, sbY=y;
+      
+      iframes.forEach(ifr=>{
+        const r=ifr.getBoundingClientRect();
+        const trackX = r.right - SCROLLBAR_WIDTH/2;
+        const top=r.top, bottom=r.bottom;
+        const clampedY = Math.min(Math.max(y, top), bottom);
+        
+        const dx=Math.abs(x - trackX);
+        const dy=(y<top? top-y : (y>bottom? y-bottom : 0));
+        const dist=Math.hypot(dx, dy);
+        
+        if(dist<minDSB && dist<=temporarySnapDistance){
+          minDSB=dist; 
+          closestSB={__kind:'scrollbar', iframe:ifr}; 
+          sbX=trackX; sbY=clampedY;
+        }
+      });
+
+      // 近い方を採用（スクロールバーを優先）
+      if(closestSB && (minDSB <= minD * 0.8)){ // スクロールバーを少し優先
+        return { snapped:true, element:closestSB, x:sbX, y:sbY };
+      }
+      if(closestEl){
+        return { snapped:true, element:closestEl, x:snapX, y:snapY };
+      }
+      return { snapped:false, element:null, x, y };
+    }
+
+    function triggerClickOnSnapElement(){ 
+      if(snappedElement && !snappedElement.__kind) {
+        // クリック効果の視覚フィードバック
+        const clickEffect = document.createElement('div');
+        clickEffect.style.cssText = `
+          position: fixed; pointer-events: none; z-index: 500;
+          width: 40px; height: 40px; border-radius: 50%;
+          background: radial-gradient(circle, rgba(76, 175, 80, 0.8) 0%, transparent 70%);
+          left: ${customCursor.style.left}; top: ${customCursor.style.top};
+          transform: translate(-50%, -50%); animation: clickRipple 0.6s ease-out forwards;
+        `;
+        document.body.appendChild(clickEffect);
+        
+        setTimeout(() => clickEffect.remove(), 600);
+        
+        // 実際のクリック実行
+        snappedElement.click();
+        showSuccess('クリックしました');
+      }
+    }
+
+    /* ===== 指の姿勢（最適化版） ===== */
+    const isExtended = (lm, tip, pip, margin=0) => (lm[tip].y + margin) < lm[pip].y;
+    const isFolded = (lm, tip, pip, margin=0) => lm[tip].y > (lm[pip].y + margin);
+    
+    function countExtendedFingers(lm){ 
+      const margin = 0.02;
+      return [8,12,16,20].reduce((c, tip) => c + (isExtended(lm, tip, tip-2, margin) ? 1 : 0), 0);
+    }
+    
+    function detectFist(lm){ 
+      const m = 0.025;
+      return [8,12,16,20].every(tip => isFolded(lm, tip, tip-2, m));
+    }
+
+    /* ===== 位置計算（改善版） ===== */
+    function palmCenter(lm){ 
+      const ids = [0,5,9,13,17];
+      const sum = ids.reduce((acc, i) => ({
+        x: acc.x + lm[i].x * videoWidth,
+        y: acc.y + lm[i].y * videoHeight
+      }), {x:0, y:0});
+      return {x: sum.x/ids.length, y: sum.y/ids.length};
+    }
+    
+    const twistScore = (lm) => {
+      const [a, b] = [lm[5], lm[17]];
+      return (a.z - b.z) / (Math.hypot(a.x - b.x, a.y - b.y) + 1e-6);
+    };
+    
+    const mapToScreen = (nx, ny) => {
+      const x = (nx / videoWidth) * window.innerWidth;
+      return {
+        x: isMirrored ? window.innerWidth - x : x,
+        y: (ny / videoHeight) * window.innerHeight
+      };
+    };
+
+    /* ===== overlay作成（改善版） ===== */
+    function createOverlayWindow(rawUrl){
+      const normalized=normalizeUrl(rawUrl); 
+      if(!normalized){ 
+        showError('URLが不正です。例: https://example.com または検索語句'); 
+        return; 
+      }
+      
+      const finalUrl=toEmbeddable(normalized);
+
+      const overlay=document.createElement('div'); 
+      overlay.className='overlayWindow';
+      overlay.style.transform = 'scale(0.8)';
+      overlay.style.opacity = '0';
+      
+      const header=document.createElement('div'); 
+      header.className='overlayHeader';
+      
+      const urlBar=document.createElement('input'); 
+      urlBar.type='text'; 
+      urlBar.value=normalized;
+      urlBar.placeholder = "URL または検索語句を入力";
+      
+      const reloadButton=document.createElement('button'); 
+      reloadButton.innerHTML='🔄 更新';
+
+      const notice=document.createElement('div');
+      notice.className='overlayNotice';
+      notice.innerHTML=`
+        <div class="text">🚨 このサイトは iframe で表示できない場合があります。</div>
+        <div class="actions">
+          <button class="openExt">🌐 新しいタブで開く</button>
+          <button class="dismiss" style="background:#6c757d">❌ 閉じる</button>
+        </div>
+      `;
+
+      const iframeContainer=document.createElement('div'); 
+      iframeContainer.className='overlayIframeContainer';
+      
+      const iframe=document.createElement('iframe');
+      iframe.setAttribute('allowfullscreen','');
+      iframe.setAttribute('referrerpolicy','no-referrer-when-downgrade');
+      iframe.setAttribute('allow','fullscreen; clipboard-read; clipboard-write; geolocation *; microphone *; camera *');
+      iframe.setAttribute('sandbox', 'allow-same-origin allow-scripts allow-forms allow-popups allow-presentation');
+      iframe.src=finalUrl;
+      iframeContainer.appendChild(iframe);
+
+      const footer=document.createElement('div'); 
+      footer.className='overlayFooter';
+      const closeBtn=document.createElement('button'); 
+      closeBtn.innerHTML='❌ 閉じる';
+
+      header.appendChild(urlBar); 
+      header.appendChild(reloadButton);
+      overlay.appendChild(header); 
+      overlay.appendChild(notice); 
+      overlay.appendChild(iframeContainer);
+      footer.appendChild(closeBtn); 
+      overlay.appendChild(footer); 
+      document.body.appendChild(overlay);
+
+      // アニメーション
+      requestAnimationFrame(() => {
+        overlay.style.transition = 'all 0.3s cubic-bezier(0.34, 1.56, 0.64, 1)';
+        overlay.style.transform = 'scale(1)';
+        overlay.style.opacity = '1';
+      });
+
+      overlay.addEventListener('mousedown',()=>{ 
+        document.querySelectorAll('.overlayWindow').forEach(el=>el.style.zIndex=351); 
+        overlay.style.zIndex=352; 
+      });
+
+      notice.querySelector('.openExt').onclick=()=>{
+        window.open(normalized,'_blank','noopener');
+        showSuccess('新しいタブで開きました');
+      };
+      
+      notice.querySelector('.dismiss').onclick=()=>{
+        notice.style.display='none';
+      };
+
+      reloadButton.onclick=debounce(()=>{ 
+        const next=normalizeUrl(urlBar.value)||urlBar.value; 
+        iframe.src=toEmbeddable(next); 
+        notice.style.display='none'; 
+        startEmbedWatchdog();
+        showSuccess('ページを更新しました');
+      }, 300);
+      
+      urlBar.addEventListener('keydown',(e)=>{ 
+        if(e.key==='Enter') {
+          e.preventDefault();
+          reloadButton.click(); 
+        }
+      });
+      
+      closeBtn.onclick=()=>{
+        overlay.style.transition = 'all 0.3s ease';
+        overlay.style.transform = 'scale(0.8)';
+        overlay.style.opacity = '0';
+        setTimeout(() => overlay.remove(), 300);
+      };
+
+      // マウスドラッグ（改善版）
+      let isDragging=false, offX=0, offY=0;
+      
+      const onMouseMove=(e)=>{ 
+        if(!isDragging) return; 
+        let nx=e.clientX-offX, ny=e.clientY-offY;
+        nx=Math.min(Math.max(10,nx), window.innerWidth-overlay.offsetWidth-10);
+        ny=Math.min(Math.max(10,ny), window.innerHeight-overlay.offsetHeight-10);
+        overlay.style.left=`${nx}px`; 
+        overlay.style.top=`${ny}px`; 
+      };
+      
+      const onMouseUp=()=>{ 
+        isDragging=false; 
+        document.removeEventListener('mousemove',onMouseMove); 
+        document.removeEventListener('mouseup',onMouseUp); 
+        header.style.cursor = 'move';
+      };
+      
+      header.addEventListener('mousedown',(e)=>{ 
+        isDragging=true; 
+        offX=e.clientX-overlay.offsetLeft; 
+        offY=e.clientY-overlay.offsetTop; 
+        document.addEventListener('mousemove',onMouseMove); 
+        document.addEventListener('mouseup',onMouseUp);
+        header.style.cursor = 'grabbing';
+      });
+
+      function startEmbedWatchdog(){ 
+        let done=false; 
+        const timer=setTimeout(()=>{ 
+          if(!done) {
+            notice.style.display='block';
+            showError('サイトの読み込みに時間がかかっています', 3000);
+          }
+        }, 3000); // 少し短く
+        
+        iframe.onload=()=>{ 
+          done=true; 
+          clearTimeout(timer); 
+          notice.style.display='none';
+          showSuccess('ページが読み込まれました');
+        }; 
+        
+        iframe.onerror=()=>{
+          done=true;
+          clearTimeout(timer);
+          notice.style.display='block';
+          showError('ページの読み込みに失敗しました');
+        };
+      }
+      
+      startEmbedWatchdog();
+      showSuccess('新しいウィンドウを作成しました');
+    }
+
+    /* ===== 当たり判定（最適化版） ===== */
+    function getOverlayHeaderUnderPoint(x,y){
+      const overlays=[...document.querySelectorAll('.overlayWindow')];
+      overlays.sort((a,b)=>parseInt(b.style.zIndex||351)-parseInt(a.style.zIndex||351));
+      
+      for(const ov of overlays){
+        const header=ov.querySelector('.overlayHeader'); 
+        if(!header) continue;
+        const r=header.getBoundingClientRect();
+        if(x>=r.left && x<=r.right && y>=r.top && y<=r.bottom) return ov;
+      }
+      return null;
+    }
+    
+    function getContextHeaderUnderPoint(x,y){
+      if(contextMenu.style.display!=='block') return false;
+      const r=contextHeader.getBoundingClientRect();
+      return (x>=r.left && x<=r.right && y>=r.top && y<=r.bottom);
+    }
+    
+    function getIframeUnderPoint(x,y){
+      const el=document.elementFromPoint(x,y);
+      if(el && el.tagName==='IFRAME' && el.closest('.overlayIframeContainer')) return el;
+      return null;
+    }
+    
+    function canAccessIframe(iframe){
+      try{ return !!iframe.contentDocument; }catch(e){ return false; }
+    }
+    
+    function wheelOnIframe(iframe, deltaY){
+      try{
+        const evt=new WheelEvent('wheel',{deltaY, bubbles:true, cancelable:true});
+        iframe.dispatchEvent(evt);
+      }catch(_){}
+    }
+    
+    function scrollIframeBy(iframe, dy){
+      if(!iframe) return;
+      
+      // より確実なスクロール処理
+      if(canAccessIframe(iframe)){
+        try{ 
+          iframe.contentWindow.scrollBy(0, dy); 
+        }catch(e){ 
+          wheelOnIframe(iframe, dy); 
+        }
+      } else {
+        wheelOnIframe(iframe, dy);
+        
+        // PostMessage APIを試す
+        try {
+          iframe.contentWindow.postMessage({
+            type: 'scroll',
+            deltaY: dy
+          }, '*');
+        } catch(e) {}
+      }
+    }
+
+    /* ===== MediaPipe 初期化/開始（改善版） ===== */
+    function initializeHands(){
+      if(hands) return; // 重複初期化防止
+      
+      startButton.innerHTML = '<span class="loading-spinner"></span> 初期化中...';
+      startButton.disabled = true;
+      
+      hands=new Hands({ 
+        locateFile:(f)=>`https://unpkg.com/@mediapipe/hands/${f}` 
+      });
+      
+      hands.setOptions({ 
+        maxNumHands, 
+        modelComplexity, 
+        minDetectionConfidence, 
+        minTrackingConfidence 
+      });
+      
+      hands.onResults(onResults);
+      isInitialized = true;
+      
+      startButton.innerHTML = '📹 カメラ開始';
+      startButton.disabled = false;
+      showSuccess('MediaPipe Handsを初期化しました');
+    }
+    
+    function startCamera(){
+      if(camera) {
+        camera.stop();
+        camera = null;
+      }
+      
+      startButton.innerHTML = '<span class="loading-spinner"></span> 開始中...';
+      startButton.disabled = true;
+      
+      camera=new Camera(videoElement,{
+        onFrame:async()=>{ 
+          try{ 
+            if(hands) {
+              await hands.send({image:videoElement}); 
+            }
+          }catch(e){ 
+            console.error('Hands処理エラー:', e);
+            showError('手の検出処理でエラーが発生しました'); 
+          } 
+        },
+        width:videoWidth, 
+        height:videoHeight, 
+        frameRate
+      });
+      
+      camera.start()
+        .then(()=>{ 
+          canvasElement.width=videoWidth; 
+          canvasElement.height=videoHeight;
+          startButton.style.display='none';
+          showSuccess('カメラが開始されました');
+        })
+        .catch(err=>{
+          console.error('カメラエラー:', err);
+          showError(`カメラ開始失敗: ${err.message}`);
+          startButton.innerHTML = '📹 カメラ開始';
+          startButton.disabled = false;
+        });
+    }
+
+    /* ===== onResults（最適化版） ===== */
+    function onResults(results){
+      try{
+        const currentTime = performance.now();
+        
+        // FPS計算の改善
+        if(++frames >= 30 || Date.now() - startTime >= 1000) {
+          fps = Math.round(frames * 1000 / (Date.now() - startTime));
+          frames = 0;
+          startTime = Date.now();
+          updateFPSDisplay(fps);
+        }
+
+        ctx.save(); 
+        ctx.clearRect(0,0,canvasElement.width,canvasElement.height);
+
+        const fingerPos=[]; 
+        const controlHands=[];
+        
+        if(results.multiHandLandmarks && results.multiHandedness){
+          for(let i=0;i<results.multiHandLandmarks.length;i++){
+            const handed=results.multiHandedness[i].label; 
+            const lm=results.multiHandLandmarks[i];
+            
+            // より美しい描画
+            const isRight = handed === 'Right';
+            const handColor = isRight ? '#4CAF50' : '#FF5722';
+            const handColorAlpha = isRight ? 'rgba(76, 175, 80, 0.8)' : 'rgba(255, 87, 34, 0.8)';
+            
+            drawConnectors(ctx, lm, HAND_CONNECTIONS, {color: handColor, lineWidth: 3});
+            drawLandmarks(ctx, lm, {color: handColorAlpha, lineWidth: 2, radius: 4});
+            
+            const it=lm[8]; 
+            fingerPos.push({ x: it.x*videoWidth, y: it.y*videoHeight });
+            controlHands.push({ handed, lm });
+          }
+        }
+        
+        canvasSizeDisplay.innerText=`🖼️ キャンバス: ${canvasElement.width}×${canvasElement.height}`;
+        ctx.restore();
+
+        /* ===== カーソル＆スナップ（改善版） ===== */
+        let mx=null, my=null;
+        if(fingerPos.length > 0){
+          const avg = fingerPos.reduce((a,p) => ({x: a.x + p.x, y: a.y + p.y}), {x:0, y:0});
+          const {x: fx, y: fy} = {x: avg.x / fingerPos.length, y: avg.y / fingerPos.length};
+          ({x: mx, y: my} = mapToScreen(fx, fy));
+
+          const snap=applySnap(mx,my);
+          if(snap.snapped){
+            snappedElement=snap.element; 
+            mx=snap.x; my=snap.y;
+            
+            customCursor.classList.add('snap'); 
+            setTimeout(()=>customCursor.classList.remove('snap'),250);
+            
+            if(!snappedElement.__kind){ // 通常要素のみ自動クリック
+              if(snapClickTimer && snapClickTimer.element!==snappedElement){ 
+                if(snapClickTimer.timer) clearTimeout(snapClickTimer.timer); 
+                snapClickTimer=null; 
+              }
+              if(!snapClickTimer){
+                snapClickTimer={ 
+                  timer:setTimeout(()=>{ 
+                    triggerClickOnSnapElement(); 
+                    snapClickTimer=null; 
+                  }, snapClickDelay),
+                  element:snappedElement, 
+                  start:Date.now() 
+                };
+              }
+            }else{
+              // スクロールバーにスナップ中は自動クリックタイマーなし
+              if(snapClickTimer){ 
+                if(snapClickTimer.timer) clearTimeout(snapClickTimer.timer); 
+                snapClickTimer=null; 
+              }
+            }
+          }else{
+            snappedElement=null; 
+            if(snapClickTimer){ 
+              if(snapClickTimer.timer) clearTimeout(snapClickTimer.timer); 
+              snapClickTimer=null; 
+            }
+          }
+          
+          // カーソル位置の更新（スムーズに）
+          customCursor.style.left=`${mx}px`; 
+          customCursor.style.top=`${my}px`;
+        }
+
+        // スナップ残り時間（通常要素のみ表示）
+        if(snapClickTimer){
+          snapTimerDisplay.style.display='block';
+          const remaining=Math.max(0,(snapClickDelay-(Date.now()-snapClickTimer.start))/1000);
+          snapTimerDisplay.textContent=`${remaining.toFixed(1)}s`;
+        }else{
+          snapTimerDisplay.style.display='none';
+        }
+
+        /* ===== ジェスチャー処理（最適化版） ===== */
+        if(mx!==null && my!==null && controlHands.length>0){
+          for(const {handed,lm} of controlHands){
+            const hs=handStates[handed]; 
+            const now=performance.now();
+            const extCount=countExtendedFingers(lm);
+            const pc=palmCenter(lm);
+            
+            let palmStable=true;
+            if(hs.prevPalm){ 
+              const mv=Math.hypot(pc.x-(hs.prevPalm.x||pc.x), pc.y-(hs.prevPalm.y||pc.y)); 
+              palmStable = mv <= TWIST.maxPalmMovePx; 
+            }
+            hs.prevPalm=pc;
+
+            // ツイスト → コンテキスト表示（改善）
+            const rawTw=Math.abs(twistScore(lm));
+            hs.twistEma = hs.twistEma + TWIST.emaAlpha * (rawTw - hs.twistEma);
+            const overEnter=hs.twistEma>TWIST.enterThreshold, underExit=hs.twistEma<TWIST.exitThreshold;
+            
+            if(palmStable && extCount>=TWIST.minOpenFingers && overEnter) {
+              hs.twistStreak=Math.min(hs.twistStreak+1, TWIST.requiredStreak+2);
+            } else if(underExit) {
+              hs.twistStreak=Math.max(hs.twistStreak-1,0);
+            }
+            
+            if(hs.twistStreak>=TWIST.requiredStreak && (now-hs.lastTwist)>TWIST.cooldownMs){
+              const wrist=lm[0]; 
+              openContextMenuAtVideoPoint(wrist.x*videoWidth, wrist.y*videoHeight);
+              hs.lastTwist=now; 
+              hs.twistStreak=0;
+            }
+
+            // 画面座標の index tip
+            const idxScr=mapToScreen(lm[8].x*videoWidth, lm[8].y*videoHeight);
+
+            // グラブ（overlay ヘッダー or コンテキストヘッダー）
+            const headerOv=getOverlayHeaderUnderPoint(idxScr.x,idxScr.y);
+            const onCtxHeader=getContextHeaderUnderPoint(idxScr.x,idxScr.y);
+            const isFist=detectFist(lm);
+
+            if(!hs.grabActive){
+              if(isFist && (headerOv || onCtxHeader)){
+                if(headerOv){
+                  document.querySelectorAll('.overlayWindow').forEach(el=>el.style.zIndex=351);
+                  headerOv.style.zIndex=352;
+                  hs.grabbedEl = headerOv;
+                  showSuccess('ウィンドウをグラブしました');
+                }else{
+                  contextMenu.style.zIndex = 360;
+                  hs.grabbedEl = contextMenu;
+                  showSuccess('メニューをグラブしました');
+                }
+                hs.grabActive=true;
+                hs.grabOffsetX = idxScr.x - hs.grabbedEl.offsetLeft;
+                hs.grabOffsetY = idxScr.y - hs.grabbedEl.offsetTop;
+              }
+            }else{
+              if(isFist && hs.grabbedEl){
+                let nx=idxScr.x - hs.grabOffsetX, ny=idxScr.y - hs.grabOffsetY;
+                nx=Math.min(Math.max(0,nx), window.innerWidth - hs.grabbedEl.offsetWidth);
+                ny=Math.min(Math.max(0,ny), window.innerHeight- hs.grabbedEl.offsetHeight);
+                hs.grabbedEl.style.left=`${nx}px`; 
+                hs.grabbedEl.style.top=`${ny}px`;
+              }else{
+                hs.grabActive=false; 
+                hs.grabbedEl=null; 
+                contextMenu.style.zIndex=350;
+              }
+            }
+
+            // Web表示エリア（iframe）でのグラブスクロール（改善版）
+            const iframeUnder=getIframeUnderPoint(idxScr.x,idxScr.y);
+            
+            if(!hs.scrollActive){
+              // 1) スクロールバーにスナップ中にグー → スクロール開始
+              if(isFist && snappedElement && snappedElement.__kind==='scrollbar'){
+                hs.scrollActive=true; 
+                hs.scrollTarget=snappedElement.iframe; 
+                hs.scrollLastY=idxScr.y;
+                showSuccess('スクロールバーでスクロール開始');
+              }
+              // 2) iframe領域上でグー → スクロール開始（従来）
+              else if(isFist && iframeUnder){
+                hs.scrollActive=true; 
+                hs.scrollTarget=iframeUnder; 
+                hs.scrollLastY=idxScr.y;
+                showSuccess('グラブスクロール開始');
+              }
+            }else{
+              if(isFist && hs.scrollTarget){
+                const dy = (hs.scrollLastY - idxScr.y) * GRAB_SCROLL.gain;
+                if(Math.abs(dy) > 1){ // 閾値を上げて誤動作を防止
+                  scrollIframeBy(hs.scrollTarget, dy); 
+                  hs.scrollLastY = idxScr.y; 
+                }
+              }else{
+                hs.scrollActive=false; 
+                hs.scrollTarget=null;
+              }
+            }
+
+            // ✊グー → スナップ先クリック（改善版）
+            const snappedIsScrollbar = snappedElement && snappedElement.__kind==='scrollbar';
+            let fistForClick = isFist && !hs.grabActive && !onCtxHeader && !headerOv && !hs.scrollActive;
+            
+            if(fistForClick){
+              hs.fistStreak=Math.min(hs.fistStreak+1, FIST.requiredStreak+2);
+            }else{
+              hs.fistStreak=Math.max(hs.fistStreak-1, 0);
+            }
+            
+            if(hs.fistStreak>=FIST.requiredStreak && (now-hs.lastFist)>FIST.cooldownMs){
+              if(snappedIsScrollbar){
+                // スクロールバーがスナップ対象の場合はスクロール開始
+                hs.scrollActive=true; 
+                hs.scrollTarget=snappedElement.iframe; 
+                hs.scrollLastY=idxScr.y;
+                showSuccess('スクロールバーでスクロール開始');
+              }else if(snappedElement){
+                if(snapClickTimer&&snapClickTimer.timer){ 
+                  clearTimeout(snapClickTimer.timer); 
+                  snapClickTimer=null; 
+                }
+                triggerClickOnSnapElement();
+              }
+              hs.lastFist=now; 
+              hs.fistStreak=0;
+            }
+
+            // ✌️チョキ（改善版）
+            const idxExt=isExtended(lm,8,6, CHOKI_DYNAMIC.extendMargin);
+            const midExt=isExtended(lm,12,10,CHOKI_DYNAMIC.extendMargin);
+            const ringF =isFolded (lm,16,14,CHOKI_DYNAMIC.extendMargin);
+            const pinkF =isFolded (lm,20,18,CHOKI_DYNAMIC.extendMargin);
+            const allowByRP = !CHOKI_DYNAMIC.requireRingPinkyFolded || (ringF && pinkF);
+
+            const gapPx=Math.hypot((lm[8].x-lm[12].x)*videoWidth, (lm[8].y-lm[12].y)*videoHeight);
+            const dt = handStates[handed].lastGapTs ? (now - handStates[handed].lastGapTs) : 0;
+            const closeSpeed = (dt>0 && handStates[handed].lastGap!==null) ? 
+              ((handStates[handed].lastGap - gapPx) / dt) * 1000 : 0;
+
+            if(idxExt && midExt && allowByRP){
+              if(handStates[handed].chokiArmAt===null && gapPx>=CHOKI_DYNAMIC.armGapPx){
+                handStates[handed].chokiArmAt=now; 
+                handStates[handed].lastGap=gapPx; 
+                handStates[handed].lastGapTs=now;
+              }else if(handStates[handed].chokiArmAt!==null){
+                const drop=(handStates[handed].lastGap??gapPx)-gapPx;
+                const withinWindow=(now-handStates[handed].chokiArmAt)<=CHOKI_DYNAMIC.maxWindowMs;
+                const fastEnough = closeSpeed >= CHOKI_DYNAMIC.minCloseSpeedPxPerSec;
+
+                if( gapPx<=CHOKI_DYNAMIC.fireGapPx &&
+                    drop>=CHOKI_DYNAMIC.minDropPx &&
+                    withinWindow && fastEnough &&
+                    (now-handStates[handed].lastChoki)>CHOKI_DYNAMIC.cooldownMs ){
+                  closeMenus();
+                  showSuccess('チョキでメニューを閉じました');
+                  handStates[handed].lastChoki=now;
+                  handStates[handed].chokiArmAt=null;
+                  handStates[handed].lastGap=gapPx; 
+                  handStates[handed].lastGapTs=now;
+                }else{
+                  if(!withinWindow || gapPx>CHOKI_DYNAMIC.armGapPx*1.35 || !(idxExt&&midExt&&allowByRP)){
+                    handStates[handed].chokiArmAt=null;
+                  }else{
+                    handStates[handed].lastGap = Math.max(handStates[handed].lastGap, gapPx);
+                    handStates[handed].lastGapTs = now;
+                  }
+                }
+              }
+            }else{
+              handStates[handed].chokiArmAt=null;
+            }
+          }
+        }
+
+        lastFrameTime = currentTime;
+
+      }catch(err){ 
+        console.error('onResults Error:', err); 
+        showError('手の検出処理でエラーが発生しました: '+err.message); 
+      }
+    }
+
+    /* ===== イベントリスナー（改善版） ===== */
+    menuButton.addEventListener('click',()=>{ 
+      settingsWindow.style.display='block'; 
+      settingsWindow.style.transform = 'translate(-50%,-50%) scale(0.9)';
+      settingsWindow.style.opacity = '0';
+      requestAnimationFrame(() => {
+        settingsWindow.style.transition = 'all 0.3s cubic-bezier(0.34, 1.56, 0.64, 1)';
+        settingsWindow.style.transform = 'translate(-50%,-50%) scale(1)';
+        settingsWindow.style.opacity = '1';
+      });
+    });
+    
+    contextButton.addEventListener('click',()=>{ 
+      openContextMenuAtCenter(); 
+    });
+    
+    // スライダーのリアルタイム更新
+    detectionConfidenceSlider.addEventListener('input', () => {
+      detectionConfidenceValue.textContent = parseFloat(detectionConfidenceSlider.value).toFixed(2);
+    });
+    
+    trackingConfidenceSlider.addEventListener('input', () => {
+      trackingConfidenceValue.textContent = parseFloat(trackingConfidenceSlider.value).toFixed(2);
+    });
+
+    closeSettings.addEventListener('click',()=>{ closeMenus(); });
+    
+    applySettings.addEventListener('click', debounce(()=>{
+      const res=document.getElementById('resolutionSelect').value;
+      [videoWidth,videoHeight]=res.split('x').map(Number);
+      modelComplexity=parseInt(document.getElementById('modelComplexity').value);
+      frameRate=parseInt(document.getElementById('frameRate').value);
+      minDetectionConfidence=parseFloat(detectionConfidenceSlider.value);
+      minTrackingConfidence=parseFloat(trackingConfidenceSlider.value);
+      maxNumHands=parseInt(document.getElementById('handCountSelect').value);
+      isMirrored=mirrorToggle.checked;
+
+      const s=parseFloat(snapTimerInput.value);
+      snapClickDelay=(!isNaN(s)&&s>0)? s*1000 : 4000;
+
+      detectionConfidenceValue.innerText=minDetectionConfidence.toFixed(2);
+      trackingConfidenceValue.innerText =minTrackingConfidence.toFixed(2);
+
+      if(!isInitialized) initializeHands();
+      if(hands) {
+        hands.setOptions({ 
+          maxNumHands, 
+          modelComplexity, 
+          minDetectionConfidence, 
+          minTrackingConfidence 
+        });
+      }
+      
+      canvasElement.width=videoWidth; 
+      canvasElement.height=videoHeight;
+
+      if(isMirrored){ 
+        videoElement.classList.add('mirrored'); 
+        canvasElement.classList.add('mirrored'); 
+      } else { 
+        videoElement.classList.remove('mirrored'); 
+        canvasElement.classList.remove('mirrored'); 
+      }
+
+      cameraResolutionDisplay.innerText=`📹 解像度: ${videoWidth}×${videoHeight}`;
+      startCamera();
+
+      closeMenus();
+      fps=0; frames=0; startTime=Date.now(); 
+      updateFPSDisplay(0);
+      
+      showSuccess('設定を適用しました');
+    }, 300));
+
+    flipButton.addEventListener('click',()=>{ 
+      isMirrored=!isMirrored; 
+      mirrorToggle.checked=isMirrored;
+      if(isMirrored){ 
+        videoElement.classList.add('mirrored'); 
+        canvasElement.classList.add('mirrored'); 
+      } else { 
+        videoElement.classList.remove('mirrored'); 
+        canvasElement.classList.remove('mirrored'); 
+      }
+      showSuccess(`左右反転を${isMirrored ? '有効' : '無効'}にしました`);
+    });
+
+    closeContextMenuButton.addEventListener('click',()=>{ closeMenus(); });
+    
+    openUrlButton.addEventListener('click', debounce(()=>{
+      const raw=urlInput.value.trim(); 
+      if(!raw) {
+        showError('URLまたは検索語句を入力してください');
+        return;
+      }
+      createOverlayWindow(raw); 
+      closeMenus();
+    }, 300));
+
+    startButton.addEventListener('click', debounce(()=>{ 
+      if(!isInitialized) {
+        initializeHands();
+        setTimeout(() => {
+          if(isInitialized) startCamera();
+        }, 1000);
+      } else {
+        startCamera(); 
+      }
+    }, 500));
+
+    // キーボードショートカット
+    document.addEventListener('keydown', (e) => {
+      if(e.ctrlKey || e.metaKey) {
+        switch(e.key) {
+          case 'm':
+            e.preventDefault();
+            openContextMenuAtCenter();
+            break;
+          case ',':
+            e.preventDefault();
+            menuButton.click();
+            break;
+          case 'f':
+            e.preventDefault();
+            flipButton.click();
+            break;
+        }
+      }
+      
+      if(e.key === 'Escape') {
+        closeMenus();
+      }
+    });
+
+    // ウィンドウリサイズの改善
+    window.addEventListener('resize', debounce(()=>{
+      const L=parseFloat(customCursor.style.left)||0, T=parseFloat(customCursor.style.top)||0;
+      customCursor.style.left=`${Math.max(0, Math.min(window.innerWidth, L))}px`;
+      customCursor.style.top =`${Math.max(0, Math.min(window.innerHeight, T))}px`;
+      
+      if(contextMenu.style.display==='block'){
+        const w=contextMenu.offsetWidth||280, h=contextMenu.offsetHeight||120;
+        let x=parseFloat(contextMenu.style.left), y=parseFloat(contextMenu.style.top);
+        x=Math.min(x, window.innerWidth - w - 10); 
+        y=Math.min(y, window.innerHeight - h - 10);
+        contextMenu.style.left=`${x}px`; 
+        contextMenu.style.top=`${y}px`;
+      }
+      
+      cameraResolutionDisplay.innerText=`📹 解像度: ${videoWidth}×${videoHeight}`;
+      canvasSizeDisplay.innerText=`🖼️ キャンバス: ${canvasElement.width}×${canvasElement.height}`;
+    }, 250));
+
+    // マウス移動でのカーソル更新（最適化）
+    let mouseMovementTimer;
+    const handleMouseMove = (e) => {
+      customCursor.style.cssText = `display:block;left:${e.clientX}px;top:${e.clientY}px`;
+      document.body.style.cursor = 'none';
+      
+      clearTimeout(mouseMovementTimer);
+      mouseMovementTimer = setTimeout(() => {
+        if(snapClickTimer?.timer) {
+          clearTimeout(snapClickTimer.timer);
+          snapClickTimer = null;
+          snappedElement = null;
+          snapTimerDisplay.style.display = 'none';
+        }
+      }, 100);
+    };
+    window.addEventListener('mousemove', handleMouseMove);
+
+    // タッチデバイス対応
+    let touchStartTime;
+    document.addEventListener('touchstart', (e) => {
+      touchStartTime = Date.now();
+      const touch = e.touches[0];
+      customCursor.style.left = `${touch.clientX}px`;
+      customCursor.style.top = `${touch.clientY}px`;
+    });
+
+    document.addEventListener('touchend', (e) => {
+      const touchDuration = Date.now() - touchStartTime;
+      if(touchDuration > 1000) { // 長押し
+        const touch = e.changedTouches[0];
+        showContextMenu(touch.clientX, touch.clientY);
+      }
+    });
+
+    // エラーハンドリングの最適化
+    const handleGlobalError = (e) => {
+      console.error('Global Error:', e.error || e.reason);
+      showError('予期しないエラーが発生しました');
+    };
+    
+    window.addEventListener('error', handleGlobalError);
+    window.addEventListener('unhandledrejection', handleGlobalError);
+
+    // 初期表示とウェルカムメッセージ
+    window.addEventListener('load',()=>{
+      cameraResolutionDisplay.innerText=`📹 解像度: ${videoWidth}×${videoHeight}`;
+      canvasSizeDisplay.innerText=`🖼️ キャンバス: ${canvasElement.width}×${canvasElement.height}`;
+      
+      // ウェルカムメッセージ
+      setTimeout(() => {
+        showSuccess('Hands UIへようこそ！カメラを開始してジェスチャー操作を始めましょう', 5000);
+      }, 1000);
+    });
+
+    // クリック効果のCSS追加
+    const style = document.createElement('style');
+    style.textContent = `
+      @keyframes clickRipple {
+        0% { transform: translate(-50%, -50%) scale(0); opacity: 1; }
+        100% { transform: translate(-50%, -50%) scale(2); opacity: 0; }
+      }
+    `;
+    document.head.appendChild(style);
+
+    // パフォーマンス監視（最適化）
+    let performanceWarningShown = false;
+    const performanceCheck = () => {
+      if(fps < 15 && fps > 0 && !performanceWarningShown) {
+        showError('FPSが低下しています。設定でモデルの複雑さを下げることを検討してください', 8000);
+        performanceWarningShown = true;
+        setTimeout(() => performanceWarningShown = false, 30000);
+      }
+    };
+    setInterval(performanceCheck, 5000);
+
+  </script>
+</body>
+</html>
