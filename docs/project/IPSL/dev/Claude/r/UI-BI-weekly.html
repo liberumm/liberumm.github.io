@@ -1,0 +1,938 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>売上分析 / ダッシュボード（A001/B001連携）</title>
+
+  <!-- Fonts / Icons -->
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Roboto:wght@300;400;500;700&display=swap"/>
+  <link rel="stylesheet" href="https://fonts.googleapis.com/icon?family=Material+Icons"/>
+
+  <!-- React / Babel / MUI / Chart.js -->
+  <script src="https://cdn.jsdelivr.net/npm/react@18.2.0/umd/react.production.min.js" crossorigin></script>
+  <script src="https://cdn.jsdelivr.net/npm/react-dom@18.2.0/umd/react-dom.production.min.js" crossorigin></script>
+  <script src="https://cdn.jsdelivr.net/npm/@babel/standalone@7.23.8/babel.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@mui/material@5.15.3/umd/material-ui.production.min.js" crossorigin></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js" crossorigin></script>
+
+  <style>
+    html, body { margin:0; padding:0; height:100%; font-family: Roboto, sans-serif; background:#f5f7fa; }
+    #root { height:100%; }
+    header.masthead { background:#1976d2; color:#fff; }
+    main { display:flex; flex-direction:column; gap:16px; padding:16px; }
+
+    .section-box { background:#fff; border:1px solid rgba(0,0,0,.10); border-radius:14px; }
+    .soft-bg { background: linear-gradient(180deg,#f8fbff 0%, #f2f5f8 100%); }
+
+    .table-wrap { overflow:auto; border-top:1px solid rgba(0,0,0,.08); max-height:560px; }
+    table.analysis-table { border-collapse:separate; border-spacing:0; width:100%; background:#fff; min-width:1400px; }
+    .analysis-table th, .analysis-table td { border-right:1px solid #e0e0e0; border-bottom:1px solid #e0e0e0; padding:6px 8px; font-size:12px; white-space:nowrap; }
+    .analysis-table thead th { background:#e9f1ff; color:#333; font-weight:600; text-align:center; position:sticky; top:0; z-index:3; }
+    .analysis-table thead tr.group th { background:#dbe8ff; }
+    .analysis-table thead tr:nth-child(2) th { top:34px; z-index:3; }
+    .analysis-table tbody tr:nth-child(odd) { background:#fafcff; }
+    .analysis-table tbody tr:hover { background:#f3f8ff; }
+    .sticky-col { position:sticky; left:0; background:#fff; z-index:4; }
+    tbody tr:nth-child(odd) .sticky-col { background:#fafcff; }
+    tbody tr:hover .sticky-col { background:#f3f8ff; }
+    thead .sticky-col { background:#dbe8ff !important; }
+    .subtotal { background:#fff9e6 !important; font-weight:700; }
+    .total-row { background:#eaf7ea !important; font-weight:800; }
+    .clickable { cursor:pointer; }
+
+    .pill-tabs { display:inline-flex; gap:8px; }
+    .pill-tab { border:1px solid #cfd8dc; border-radius:999px; padding:6px 12px; background:#f8fafc; color:#1565c0; font-weight:500; cursor:pointer; }
+    .pill-tab.active { background:#fff; box-shadow:0 1px 2px rgba(0,0,0,.08); }
+
+    .kpi-grid .kpi { text-align:center; padding:12px; }
+    .kpi .value { font-weight:800; font-size:22px; }
+    .kpi .label { color:#607d8b; font-size:12px; }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+
+  <script type="text/babel">
+    const {
+      AppBar, Toolbar, Typography, Box, Container, Grid, Paper, TextField, MenuItem,
+      Button, FormGroup, FormControlLabel, Checkbox, Chip, Stack, Tooltip, IconButton,
+      RadioGroup, Radio, ToggleButtonGroup, ToggleButton, Switch, ThemeProvider, createTheme, Snackbar
+    } = MaterialUI;
+
+    /* ========= 共通テーマ ========= */
+    const theme = createTheme({
+      palette: {
+        primary: { main:'#1976d2' },
+        success: { main:'#2e7d32' },
+        warning: { main:'#ff8a00' },
+        background: { default:'#f5f7fa' }
+      },
+      shape: { borderRadius:14 },
+      components: {
+        MuiPaper: { styleOverrides: { root: { borderRadius:14 } } },
+        MuiButton: { styleOverrides: { root: { borderRadius:12, textTransform:'none' } } },
+        MuiChip: { styleOverrides: { root: { borderRadius:10 } } }
+      }
+    });
+
+    /* ========= マスター・定数 ========= */
+    const MASTER_STORES = [
+      { value:'079', label:'079) ○○南青山店' },
+      { value:'350', label:'350) 三軒茶屋店' },
+      { value:'999', label:'999) 全店' }
+    ];
+    const MASTER_DEPTS  = [
+      { value:'総菜', label:'総菜' }, { value:'ベーカリー', label:'ベーカリー' }, { value:'精肉', label:'精肉' }
+    ];
+    const MASTER_UNITS  = [
+      { value:'千円未満四捨五入', label:'千円未満四捨五入' },
+      { value:'円単位', label:'円単位' },
+      { value:'百円未満四捨五入', label:'百円未満四捨五入' }
+    ];
+    const HIERARCHY     = [
+      { value:'line', label:'ライン' }, { value:'corner', label:'コーナー' },
+      { value:'category', label:'カテゴリ' }, { value:'item', label:'アイテム' }
+    ];
+    const PARENT_OF     = { line:null, corner:'line', category:'corner', item:'category' };
+    const ROW_COUNT     = 5000;
+    const SEED          = 42;
+
+    /* ========= 日付ユーティリティ ========= */
+    const wd = ['日','月','火','水','木','金','土'];
+    const fmtDateShort = (d)=>`${d.getFullYear()}/${String(d.getMonth()+1).padStart(2,'0')}/${String(d.getDate()).padStart(2,'0')}(${wd[d.getDay()]})`;
+    const jaDateHeader = (d)=>`${d.getFullYear()}年${String(d.getMonth()+1).padStart(2,'0')}月${String(d.getDate()).padStart(2,'0')}日（${wd[d.getDay()]}）`;
+    const startOfISOWeek = (date)=>{ const d=new Date(date); const day=(d.getDay()+6)%7; d.setDate(d.getDate()-day); d.setHours(0,0,0,0); return d; };
+    const getISOWeek = (date)=>{ const d=new Date(Date.UTC(date.getFullYear(),date.getMonth(),date.getDate())); const day=(d.getUTCDay()+6)%7; d.setUTCDate(d.getUTCDate()-day+3); const firstThursday=new Date(Date.UTC(d.getUTCFullYear(),0,4)); return 1+Math.round((d-firstThursday)/(7*24*3600*1000)); };
+
+    function generateWeekOptions(count=54, base=new Date()){
+      const opts=[]; const thisMon = startOfISOWeek(base);
+      for (let i=0;i<count;i++){
+        const mon = new Date(thisMon); mon.setDate(mon.getDate()-7*i);
+        const iso = String(getISOWeek(mon)).padStart(2,'0');
+        opts.push({ value:`W${iso}-${mon.toISOString()}`, label:`${iso}週:${fmtDateShort(mon)}` });
+      }
+      return opts;
+    }
+    function generateMonthOptions(count=25, base=new Date()){
+      const opts=[]; const y = base.getFullYear(), m = base.getMonth();
+      for (let i=0;i<count;i++){
+        const d = new Date(y, m - i, 1);
+        const label = (i===0) ? '当月' : `${d.getFullYear()}/${String(d.getMonth()+1).padStart(2,'0')}`;
+        opts.push({ value:`M${d.getFullYear()}-${d.getMonth()+1}`, label });
+      }
+      return opts;
+    }
+
+    /* ========= 疑似データ（5000行） ========= */
+    function mulberry32(a){return function(){let t=a+=0x6D2B79F5;t=Math.imul(t^t>>>15,t|1);t^=t+Math.imul(t^t>>>7,t|61);return((t^t>>>14)>>>0)/4294967296;};}
+    const randRange = (rng, min, max) => min + (max-min)*rng();
+
+    function generateFacts(n=ROW_COUNT, seed=SEED) {
+      const rng = mulberry32(seed);
+      const lines    = ['和日配','洋日配','惣菜','グロサリー','生鮮','非食品','日配','日用雑貨'];
+      const corners  = ['惣菜','お弁当','ホットメン','デリ・イタチ','ベーカリー','精肉','青果','鮮魚','日配','グロサリー'];
+      const categories = Array.from({length:12},(_,i)=>`カテゴリ${i+1}`);
+      const items    = Array.from({length:40},(_,i)=>`SKU-${1000+i}`);
+
+      const facts = [];
+      for (let i=0;i<n;i++){
+        const line     = lines[i % lines.length];
+        const corner   = corners[(i*3) % corners.length];
+        const category = categories[(i*5) % categories.length];
+        const item     = `${items[(i*7)%items.length]}-${String(i%100).padStart(2,'0')}`;
+
+        const periodIndex = (i % 8) + 1; // トレンド用
+        const baseGross   = Math.round(randRange(rng, 2_000, 200_000));
+        const yoyFactor   = randRange(rng, 0.88, 1.12);
+        const grossPrev   = Math.max(100, Math.round(baseGross / yoyFactor));
+        const grossCurr   = baseGross;
+
+        const lossRatePrev = randRange(rng, 0.03, 0.10);
+        const lossRateCurr = Math.min(0.20, Math.max(0.005, lossRatePrev + randRange(rng, -0.02, 0.02)));
+        const lossPrev     = Math.round(grossPrev * lossRatePrev);
+        const lossCurr     = Math.round(grossCurr * lossRateCurr);
+
+        const markdownRate = randRange(rng, 0.01, 0.08);
+        const wasteRate    = randRange(rng, 0.005, 0.03);
+
+        const priceCurr = randRange(rng, 120, 600);
+        const pricePrev = priceCurr * randRange(rng, 0.9, 1.1);
+        const qtyCurr   = Math.max(1, Math.round(grossCurr / priceCurr));
+        const qtyPrev   = Math.max(1, Math.round(grossPrev / pricePrev));
+
+        const promoThis = (i % 4 === 0) ? 1 : 0;
+        const promoPrev = (i % 5 === 0) ? 1 : 0;
+        const flyer     = promoThis > 0;
+
+        const existWeight  = 0.98 + (Array.from(line).reduce((a,c)=>a+c.charCodeAt(0),0) % 5) * 0.01;
+
+        facts.push({ id:i+1, line, corner, category, item, periodIndex,
+          grossCurr, grossPrev, lossCurr, lossPrev, markdownRate, wasteRate,
+          qtyCurr, qtyPrev, priceCurr, pricePrev,
+          promoThis, promoPrev, flyer, existWeight
+        });
+      }
+      return facts;
+    }
+
+    /* ========= 集計ロジック ========= */
+    function aggregateFacts(facts, {filters, level, includeSmall, winnersOnly}) {
+      const filtered = facts.filter(f => {
+        if (filters.line && f.line !== filters.line) return false;
+        if (filters.corner && f.corner !== filters.corner) return false;
+        if (filters.category && f.category !== filters.category) return false;
+        return true;
+      });
+
+      const totalGross     = filtered.reduce((a,x)=>a+x.grossCurr, 0);
+      const totalGrossPrev = filtered.reduce((a,x)=>a+x.grossPrev, 0);
+      const totalExistGross= filtered.reduce((a,x)=>a+x.grossCurr*x.existWeight, 0);
+      const totalCount     = filtered.length || 1;
+
+      const keyOf = (f) => (level==='line' ? f.line : level==='corner' ? f.corner : level==='category' ? f.category : f.item);
+      const parentKeyOf = (f) => {
+        const parent = PARENT_OF[level];
+        if (!parent) return null;
+        return parent==='line' ? f.line : parent==='corner' ? f.corner : parent==='category' ? f.category : null;
+      };
+
+      const map = new Map();
+      for (const f of filtered) {
+        const k = keyOf(f);
+        const p = parentKeyOf(f);
+        if (!map.has(k)) map.set(k, {
+          key:k, parent:p,
+          grossCurr:0, grossPrev:0, lossCurr:0, lossPrev:0, existGross:0,
+          markdownWeighted:0, wasteWeighted:0, weightGross:0,
+          qtyCurr:0, qtyPrev:0, promoThis:0, promoPrev:0
+        });
+        const g = map.get(k);
+        g.grossCurr += f.grossCurr;
+        g.grossPrev += f.grossPrev;
+        g.lossCurr  += f.lossCurr;
+        g.lossPrev  += f.lossPrev;
+        g.existGross+= f.grossCurr * f.existWeight;
+        g.markdownWeighted += f.markdownRate * f.grossCurr;
+        g.wasteWeighted    += f.wasteRate * f.grossCurr;
+        g.weightGross      += f.grossCurr;
+        g.qtyCurr += f.qtyCurr;
+        g.qtyPrev += f.qtyPrev;
+        g.promoThis += f.promoThis;
+        g.promoPrev += f.promoPrev;
+      }
+
+      let rows = Array.from(map.values()).map((g, idx)=> {
+        const comp_self = totalGross>0 ? (g.grossCurr/totalGross*100) : 0;
+        const comp_exist= totalExistGross>0 ? (g.existGross/totalExistGross*100) : 0;
+        const yoy_self  = g.grossPrev>0 ? (g.grossCurr/g.grossPrev*100) : 100;
+        const currLossRate = g.grossCurr>0 ? (g.lossCurr/g.grossCurr*100) : 0;
+        const prevLossRate = g.grossPrev>0 ? (g.lossPrev/g.grossPrev*100) : currLossRate;
+        const markdownRate = g.weightGross>0 ? (g.markdownWeighted/g.weightGross*100) : 0;
+        const wasteRate    = g.weightGross>0 ? (g.wasteWeighted/g.weightGross*100) : 0;
+        const lossSumRate  = markdownRate + wasteRate;
+        const gpCurr       = g.grossCurr - g.lossCurr; // 見込粗利（デモ）
+        const gpPrev       = g.grossPrev - g.lossPrev;
+        const gpRateCurr   = g.grossCurr>0 ? (gpCurr/g.grossCurr*100) : 0;
+        const gpRatePrev   = g.grossPrev>0 ? (gpPrev/g.grossPrev*100) : 0;
+        const initMarginCurr = gpRateCurr + markdownRate + wasteRate; // 近似
+        const initMarginPrev = gpRatePrev + markdownRate + wasteRate; // 近似
+        const qtyYoY       = g.qtyPrev>0 ? (g.qtyCurr/g.qtyPrev*100) : 100;
+        const priceCurr    = g.qtyCurr>0 ? (g.grossCurr/g.qtyCurr) : 0;
+        const pricePrev    = g.qtyPrev>0 ? (g.grossPrev/g.qtyPrev) : priceCurr;
+        const priceYoY     = pricePrev>0 ? (priceCurr/pricePrev*100) : 100;
+
+        const win          = yoy_self >= 100 ? '○' : '●';
+        const win2         = currLossRate <= prevLossRate ? '○' : '●';
+
+        return {
+          id: idx+2, name: g.key, parent: g.parent, code: 'C' + (Math.abs(hashCode(g.key))%9999).toString().padStart(4,'0'),
+          win,
+          comp_self:+comp_self.toFixed(1), comp_exist:+comp_exist.toFixed(1),
+          yoy_self:+yoy_self.toFixed(1),
+          yoy_exist:+yoy_self.toFixed(1), // デモでは同値
+          grossCurr:g.grossCurr, grossPrev:g.grossPrev, deltaGross:g.grossCurr-g.grossPrev,
+          gpCurr, gpPrev, gpRateCurr:+gpRateCurr.toFixed(1), gpRatePrev:+gpRatePrev.toFixed(1), gpRateDiff:+(gpRateCurr-gpRatePrev).toFixed(1),
+          initMarginCurr:+initMarginCurr.toFixed(1), initMarginPrev:+initMarginPrev.toFixed(1), initMarginDiff:+(initMarginCurr-initMarginPrev).toFixed(1),
+          currLossRate:+currLossRate.toFixed(1), prevLossRate:+prevLossRate.toFixed(1),
+          markdownRate:+markdownRate.toFixed(1), wasteRate:+wasteRate.toFixed(1), lossSumRate:+lossSumRate.toFixed(1),
+          lossDiff:+(lossSumRate - prevLossRate).toFixed(1),
+          qtyCurr:g.qtyCurr, qtyPrev:g.qtyPrev, qtyYoY:+qtyYoY.toFixed(1),
+          priceCurr:+priceCurr.toFixed(1), priceYoY:+priceYoY.toFixed(1),
+          existGross:g.existGross,
+          promoThis:g.promoThis, promoPrev:g.promoPrev, flyer:g.promoThis>0?'有':'無',
+          // 影響度（デモ）：(前年比-100) * 構成比(自店)/100
+          impact:+(((yoy_self-100) * comp_self/100)).toFixed(1),
+          win2
+        };
+      });
+
+      if (winnersOnly) rows = rows.filter(r => r.win==='○');
+
+      const parentDim = PARENT_OF[level];
+      let withSubtotals = rows;
+      if (includeSmall && parentDim) {
+        const groupByParent = new Map();
+        for (const r of rows) {
+          const p = r.parent || '（親未設定）';
+          if (!groupByParent.has(p)) groupByParent.set(p, []);
+          groupByParent.get(p).push(r);
+        }
+        withSubtotals = [];
+        let idc = 2;
+        for (const [p, arr] of groupByParent.entries()) {
+          const agg = arr.reduce((a,r)=>({
+            grossCurr: a.grossCurr + r.grossCurr,
+            grossPrev: a.grossPrev + r.grossPrev,
+            gpCurr: a.gpCurr + r.gpCurr,
+            gpPrev: a.gpPrev + r.gpPrev,
+            qtyCurr: a.qtyCurr + r.qtyCurr,
+            qtyPrev: a.qtyPrev + r.qtyPrev
+          }), {grossCurr:0,grossPrev:0,gpCurr:0,gpPrev:0,qtyCurr:0,qtyPrev:0});
+
+          const yoy_self  = agg.grossPrev>0 ? (agg.grossCurr/agg.grossPrev*100) : 100;
+          const priceCurr = agg.qtyCurr>0 ? (agg.grossCurr/agg.qtyCurr) : 0;
+          const pricePrev = agg.qtyPrev>0 ? (agg.grossPrev/agg.qtyPrev) : 0;
+          const priceYoY  = pricePrev>0 ? (priceCurr/pricePrev*100) : 100;
+
+          withSubtotals.push({
+            id: idc++,
+            name:`◆ ${p} 小計`, code:'-', parent:null, win:'-',
+            comp_self:'-', comp_exist:'-',
+            yoy_self:+yoy_self.toFixed(1), yoy_exist:'-',
+            grossCurr:agg.grossCurr, grossPrev:agg.grossPrev, deltaGross:agg.grossCurr-agg.grossPrev,
+            gpCurr:agg.gpCurr, gpPrev:agg.gpPrev,
+            gpRateCurr:'-', gpRatePrev:'-', gpRateDiff:'-',
+            initMarginCurr:'-', initMarginPrev:'-', initMarginDiff:'-',
+            currLossRate:'-', prevLossRate:'-', markdownRate:'-', wasteRate:'-', lossSumRate:'-', lossDiff:'-',
+            qtyCurr:agg.qtyCurr, qtyPrev:agg.qtyPrev, qtyYoY: agg.qtyPrev>0 ? +((agg.qtyCurr/agg.qtyPrev*100).toFixed(1)) : 100,
+            priceCurr:+priceCurr.toFixed(1), priceYoY:+priceYoY.toFixed(1),
+            existGross:'-', promoThis:'-', promoPrev:'-', flyer:'-',
+            impact:'-', win2:'-', _subtotal:true
+          }, ...arr);
+        }
+      }
+
+      // 総計
+      const gpCurrTotal = filtered.reduce((a,x)=>a+(x.grossCurr-x.lossCurr),0);
+      const gpPrevTotal = filtered.reduce((a,x)=>a+(x.grossPrev-x.lossPrev),0);
+      const qtyCurrTotal= filtered.reduce((a,x)=>a+x.qtyCurr,0);
+      const qtyPrevTotal= filtered.reduce((a,x)=>a+x.qtyPrev,0);
+      const priceCurrT  = qtyCurrTotal>0 ? (totalGross/qtyCurrTotal) : 0;
+      const pricePrevT  = qtyPrevTotal>0 ? (totalGrossPrev/qtyPrevTotal) : 0;
+
+      const totalRow = {
+        id:1, name:'総計', code:'-', win:'-',
+        comp_self:100.0, comp_exist:100.0,
+        yoy_self: totalGrossPrev>0 ? +((totalGross/totalGrossPrev)*100).toFixed(1) : 100.0,
+        yoy_exist:'-',
+        grossCurr: totalGross, grossPrev: totalGrossPrev, deltaGross: totalGross-totalGrossPrev,
+        gpCurr: gpCurrTotal, gpPrev: gpPrevTotal,
+        gpRateCurr: totalGross>0 ? +((gpCurrTotal/totalGross*100).toFixed(1)) : 0,
+        gpRatePrev: totalGrossPrev>0 ? +((gpPrevTotal/totalGrossPrev*100).toFixed(1)) : 0,
+        gpRateDiff: '-',
+        initMarginCurr:'-', initMarginPrev:'-', initMarginDiff:'-',
+        currLossRate: totalGross>0 ? +((filtered.reduce((a,x)=>a+x.lossCurr,0)/totalGross*100).toFixed(1)) : 0,
+        prevLossRate: totalGrossPrev>0 ? +((filtered.reduce((a,x)=>a+x.lossPrev,0)/totalGrossPrev*100).toFixed(1)) : 0,
+        markdownRate:'-', wasteRate:'-', lossSumRate:'-', lossDiff:'-',
+        qtyCurr: qtyCurrTotal, qtyPrev: qtyPrevTotal, qtyYoY: qtyPrevTotal>0? +((qtyCurrTotal/qtyPrevTotal*100).toFixed(1)) : 100,
+        priceCurr:+priceCurrT.toFixed(1), priceYoY: pricePrevT>0 ? +((priceCurrT/pricePrevT*100).toFixed(1)) : 100,
+        existGross: '-', promoThis:'-', promoPrev:'-', flyer:'-',
+        impact:'-', win2:'-', _total:true
+      };
+
+      return { rows:[totalRow, ...withSubtotals] };
+    }
+
+    function hashCode(str){ let h=0; for(let i=0;i<str.length;i++){ h=((h<<5)-h)+str.charCodeAt(i); h|=0; } return h; }
+
+    /* ========= CSV ========= */
+    function exportCsv(rows, headers, pick){
+      const head = headers.join(',');
+      const body = rows.map(r => pick(r).join(',')).join('\n');
+      const csv = head + '\n' + body;
+      const bom = new Uint8Array([0xEF,0xBB,0xBF]);
+      const blob = new Blob([bom, csv], { type:'text/csv;charset=utf-8;' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a'); a.href = url; a.download = '売上分析_集計.csv'; a.click();
+      URL.revokeObjectURL(url);
+    }
+
+    /* ========= 共有UI ========= */
+    function TopHeaderCard({ screenTitle }) {
+      return (
+        <Paper elevation={0} className="section-box" sx={{ p: 1.25, mb: 2, display:'flex', alignItems:'center', gap: 1 }}>
+          <Chip size="small" color="success" label="サミット" />
+          <Typography variant="h6" fontWeight={700}>{screenTitle}</Typography>
+          <Typography sx={{ ml: 1, color: 'text.secondary' }}>店舗ウィークリーチェンジ 1.0.25.0</Typography>
+          <Box sx={{ flexGrow: 1 }} />
+          <Typography sx={{ color: 'text.secondary' }}>{jaDateHeader(new Date())}</Typography>
+        </Paper>
+      );
+    }
+    function SectionPanel({ title, children, right = null }) {
+      return (
+        <Paper className="soft-bg section-box" elevation={1} sx={{ p: 2, mb: 2 }}>
+          <Stack direction="row" alignItems="center" justifyContent="space-between" sx={{ mb: 1 }}>
+            <Typography variant="h6" fontWeight={700}>{title}</Typography>
+            {right ?? <Button size="small" variant="outlined" startIcon={<span className="material-icons">help_outline</span>}>ヘルプ</Button>}
+          </Stack>
+          {children}
+        </Paper>
+      );
+    }
+    function UtilityExitCard({ onExit, showUtility = true }) {
+      const [snack, setSnack] = React.useState(false);
+      React.useEffect(() => {
+        const h = (e) => { if (e.key === 'Escape') { setSnack(true); onExit?.(); } };
+        window.addEventListener('keydown', h);
+        return () => window.removeEventListener('keydown', h);
+      }, [onExit]);
+
+      return (
+        <Paper className="section-box" elevation={1} sx={{ p: 2 }}>
+          {showUtility && (
+            <Stack spacing={1} sx={{ mb: 2 }}>
+              <Typography variant="subtitle1" fontWeight={700}>ユーティリティ</Typography>
+              <Stack direction={{ xs:'column', sm:'row' }} spacing={1}>
+                <Button variant="outlined" startIcon={<span className="material-icons">edit_note</span>}>補填額入力</Button>
+                <Button variant="outlined" startIcon={<span className="material-icons">timeline</span>}>週間粗利修正</Button>
+                <Button variant="outlined" startIcon={<span className="material-icons">calendar_month</span>}>月間粗利修正</Button>
+              </Stack>
+            </Stack>
+          )}
+          <Button
+            fullWidth size="large" variant="contained" color="warning"
+            startIcon={<span className="material-icons">logout</span>}
+            onClick={() => { setSnack(true); onExit?.(); }}
+            sx={{ fontWeight: 800 }}
+          >
+            終了（ESC）
+          </Button>
+          <Snackbar open={snack} autoHideDuration={1800} onClose={()=>setSnack(false)} message="終了しました（デモ）" />
+        </Paper>
+      );
+    }
+    function PillTabs({ value, onChange }) {
+      return (
+        <div className="pill-tabs" role="tablist" aria-label="テーブル階層選択">
+          {HIERARCHY.map(h => (
+            <button key={h.value} className={`pill-tab ${value===h.value?'active':''}`} role="tab" aria-selected={value===h.value} onClick={() => onChange(h.value)}>{h.label}</button>
+          ))}
+        </div>
+      );
+    }
+
+    /* ========= ダッシュボード用テーブル（スキーマ切替） ========= */
+    // B001 仕様の列グルーピング
+    const B001_GROUPS = [
+      { label:'コーナー', cols:[
+        {key:'name', label:'コーナー', sticky:true, align:'left'},
+        {key:'code', label:'ｺｰﾄﾞ', align:'left'}
+      ]},
+      { label:'特売回数', cols:[
+        {key:'promoThis', label:'当年'}, {key:'promoPrev', label:'前年'}
+      ]},
+      { label:'チラシ', cols:[ {key:'flyer', label:' '} ]},
+      { label:'売上', cols:[
+        {key:'comp_self', label:'構成比(自店)', fmt:(v)=>v.toFixed?.(1)+'%'},
+        {key:'comp_exist',label:'構成比(既存店)', fmt:(v)=>v.toFixed?.(1)+'%'},
+        {key:'synergy',   label:'相乗比', derive:(r)=> (r.comp_exist>0? (r.comp_self/r.comp_exist*100):100), fmt:(v)=>v.toFixed(1)},
+        {key:'grossCurr', label:'金額', fmt:(v)=>Number(v).toLocaleString('ja-JP')},
+        {key:'yoy_self',  label:'前年比', fmt:(v)=>v.toFixed?.(1)+'%'},
+        {key:'deltaGross',label:'前年差異', fmt:(v)=>Number(v).toLocaleString('ja-JP')}
+      ]},
+      { label:'見込粗利', cols:[
+        {key:'gpCurr',     label:'粗利高', fmt:(v)=>Number(v).toLocaleString('ja-JP')},
+        {key:'gpRateCurr', label:'率', fmt:(v)=>v.toFixed?.(1)+'%'},
+        {key:'gpRateYoY',  label:'前年比', derive:(r)=> r.gpRatePrev>0 ? (r.gpRateCurr/r.gpRatePrev*100):100, fmt:(v)=>v.toFixed(1)+'%'},
+        {key:'gpRateDiff', label:'差異', fmt:(v)=> (typeof v==='number'? v.toFixed(1):v) }
+      ]},
+      { label:'値入（調整前）', cols:[
+        {key:'initMarginCurr', label:'値入率', fmt:(v)=> (typeof v==='number'? v.toFixed(1)+'%':v)},
+        {key:'initMarginDiff', label:'差異', fmt:(v)=> (typeof v==='number'? v.toFixed(1):v)}
+      ]},
+      { label:'ロス（率）', cols:[
+        {key:'markdownRate', label:'値下率', fmt:(v)=>v.toFixed?.(1)+'%'},
+        {key:'wasteRate',    label:'廃棄率', fmt:(v)=>v.toFixed?.(1)+'%'},
+        {key:'lossSumRate',  label:'ロス率計', fmt:(v)=>v.toFixed?.(1)+'%'},
+        {key:'lossDiff',     label:'差異', fmt:(v)=> (typeof v==='number'? v.toFixed(1)+'%':v)}
+      ]},
+      { label:'数量', cols:[
+        {key:'qtyCurr', label:'当年', fmt:(v)=>Number(v).toLocaleString('ja-JP')},
+        {key:'qtyYoY',  label:'前年比', fmt:(v)=>v.toFixed?.(1)+'%'}
+      ]},
+      { label:'平均単価', cols:[
+        {key:'priceCurr', label:'当年', fmt:(v)=>Number(v).toLocaleString('ja-JP')},
+        {key:'priceYoY',  label:'前年比', fmt:(v)=>v.toFixed?.(1)+'%'}
+      ]},
+    ];
+
+    // A001 仕様の列グルーピング
+    const A001_GROUPS = [
+      { label:'NO', cols:[ {key:'rowNo', label:'NO'} ]},
+      { label:'コーナー', cols:[ {key:'name', label:'コーナー', sticky:true, align:'left'} ]},
+      { label:'売上', cols:[ {key:'win', label:'勝　敗', align:'center'} ]},
+      { label:'影響度', cols:[ {key:'impact', label:'影響度', fmt:(v)=> (typeof v==='number'? v.toFixed(1):v)} ]},
+      { label:'売上前年比', cols:[
+        {key:'yoy_exist', label:'既存店', fmt:(v)=> (typeof v==='number'? v.toFixed(1)+'%':v)},
+        {key:'yoyDiff',   label:'差異', derive:(r)=> (typeof r.yoy_exist==='number'? r.yoy_exist-100 : 0), fmt:(v)=>v.toFixed(1)}
+      ]},
+      { label:'構成比', cols:[ {key:'comp_self', label:'構成比', fmt:(v)=>v.toFixed?.(1)+'%'} ]},
+      { label:'自店 = 久我山店（売上/数量）', cols:[
+        {key:'grossCurr', label:'当年売上', fmt:(v)=>Number(v).toLocaleString('ja-JP')},
+        {key:'yoy_self',  label:'前年比', fmt:(v)=>v.toFixed?.(1)+'%'},
+        {key:'deltaGross',label:'差異', fmt:(v)=>Number(v).toLocaleString('ja-JP')},
+        {key:'qtyCurr',   label:'当年数量', fmt:(v)=>Number(v).toLocaleString('ja-JP')},
+        {key:'qtyYoY',    label:'数量前年比', fmt:(v)=>v.toFixed?.(1)+'%'}
+      ]},
+      { label:'既存店平均', cols:[
+        {key:'existGross', label:'当年売上', fmt:(v)=> (typeof v==='number'? Math.round(v).toLocaleString('ja-JP'):v)},
+        {key:'existQty',   label:'当年数量', derive:(r)=> r.priceCurr>0 ? Math.round(r.existGross/r.priceCurr) : 0, fmt:(v)=>Number(v).toLocaleString('ja-JP')},
+        {key:'diffVsExist',label:'差異', derive:(r)=> r.grossCurr - (typeof r.existGross==='number'? r.existGross:0), fmt:(v)=>Number(v).toLocaleString('ja-JP')}
+      ]},
+      { label:'自店（見込粗利）', cols:[
+        {key:'gpCurr',     label:'見込粗利', fmt:(v)=>Number(v).toLocaleString('ja-JP')},
+        {key:'gpDelta',    label:'差異', derive:(r)=> r.gpCurr - r.gpPrev, fmt:(v)=>Number(v).toLocaleString('ja-JP')},
+        {key:'gpRatePrev', label:'前年粗利率', fmt:(v)=> (typeof v==='number'? v.toFixed(1)+'%':v)},
+        {key:'gpRateDiff', label:'差異', fmt:(v)=> (typeof v==='number'? v.toFixed(1):v)}
+      ]},
+      { label:'値入', cols:[
+        {key:'valueInNow', label:'値入高', derive:(r)=> Math.round(r.grossCurr * (r.initMarginCurr/100)), fmt:(v)=>Number(v).toLocaleString('ja-JP')},
+        {key:'valueInPrev',label:'前年高', derive:(r)=> Math.round(r.grossPrev * (r.initMarginPrev/100)), fmt:(v)=>Number(v).toLocaleString('ja-JP')}
+      ]},
+    ];
+
+    function DashboardTable({ rows, schema }) {
+      const GROUPS = schema==='A001' ? A001_GROUPS : B001_GROUPS;
+
+      // NOの採番
+      const bodyRows = rows.map((r, i)=> ({ ...r, rowNo: r._total? '' : (r._subtotal? '' : i) }));
+
+      return (
+        <div className="table-wrap">
+          <table className="analysis-table" role="table" aria-label="集計表（可変スキーマ）">
+            <thead>
+              <tr className="group">
+                {GROUPS.map((g, gi)=>(
+                  <th key={gi} colSpan={g.cols.length} className={g.cols[0].sticky?'sticky-col':''} style={{ background:'#dbe8ff', zIndex:4 }}>
+                    {g.label}
+                  </th>
+                ))}
+              </tr>
+              <tr>
+                {GROUPS.flatMap(g => g.cols.map((c,ci)=>(
+                  <th key={g.label+'_'+ci} className={c.sticky?'sticky-col':''} style={{ textAlign:'center' }}>{c.label}</th>
+                )))}
+              </tr>
+            </thead>
+            <tbody>
+              {bodyRows.map((r) => {
+                const cls = r._total ? 'total-row' : r._subtotal ? 'subtotal' : '';
+                return (
+                  <tr key={r.id} className={cls}>
+                    {GROUPS.flatMap(g => g.cols.map((c,ci)=>{
+                      let v = typeof c.derive==='function' ? c.derive(r) : r[c.key];
+                      if (typeof c.fmt==='function') v = c.fmt(v);
+                      const align = c.align || (typeof v==='number' ? 'right' : 'right');
+                      const content = (c.key==='name') ? r.name : v;
+                      const style = { textAlign: c.align || (isNaN(Number(String(v).replace(/[,％%]/g,''))) ? (c.key==='name'?'left':'right') : 'right'), fontWeight: r._total?800 : r._subtotal?700 : 500 };
+                      return <td key={r.id+'_'+c.key} className={c.sticky?'sticky-col':''} style={style}>{content}</td>;
+                    }))}
+                  </tr>
+                );
+              })}
+              {Array.from({ length: 6 }).map((_, i) => (
+                <tr key={`empty-${i}`}>
+                  {GROUPS.flatMap(g => g.cols.map((_, j) => <td key={g.label+'-'+i+'-'+j}>&nbsp;</td>))}
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      );
+    }
+
+    /* ========= KPI / チャート（簡易） ========= */
+    function KpiCards({ totalGross, yoy, lossRate, winCount }){
+      const fmtMoneyShort = (n) => {
+        if (n>=1_0000_0000) return (n/1_0000_0000).toFixed(2)+'億';
+        if (n>=1_0000) return (n/1_0000).toFixed(2)+'万';
+        return n.toLocaleString('ja-JP');
+      };
+      return (
+        <Grid container spacing={1} className="kpi-grid">
+          <Grid item xs={6} md={3}><Paper className="kpi" elevation={1}><div className="value">{fmtMoneyShort(totalGross)} 円</div><div className="label">合計売上</div></Paper></Grid>
+          <Grid item xs={6} md={3}><Paper className="kpi" elevation={1}><div className="value">{Number(yoy).toFixed(1)}%</div><div className="label">前年比（総計）</div></Paper></Grid>
+          <Grid item xs={6} md={3}><Paper className="kpi" elevation={1}><div className="value">{Number(lossRate).toFixed(1)}%</div><div className="label">当年ロス率（総計）</div></Paper></Grid>
+          <Grid item xs={6} md={3}><Paper className="kpi" elevation={1}><div className="value">{winCount} 件</div><div className="label">勝ち（○）</div></Paper></Grid>
+        </Grid>
+      );
+    }
+
+    /* ========= B001 / A001（統一UI） ========= */
+    function B001Menu({ onRunWeekly, onRunMonthly, onExit }) {
+      const weekOptions  = React.useMemo(() => generateWeekOptions(54, new Date()), []);
+      const monthOptions = React.useMemo(() => generateMonthOptions(25, new Date()), []);
+      const [weekly, setWeekly] = React.useState({ dept:'30:家庭用品', start:weekOptions[1]?.label||'', end:weekOptions[0]?.label||'', mode:'sales' });
+      const [monthly, setMonthly] = React.useState({ dept:'30:家庭用品', start:monthOptions[0]?.label||'当月', end:monthOptions[0]?.label||'当月', mode:'sales', scope:'all' });
+
+      return (
+        <Container maxWidth="md" sx={{ py:3 }}>
+          <TopHeaderCard screenTitle="◆メイン画面(B001)◆" />
+          <SectionPanel title="当週を含む過去54週間">
+            <Grid container spacing={1} alignItems="center">
+              <Grid item xs={12} sm={6} md={4}><TextField size="small" fullWidth label="部門選択" value={weekly.dept} onChange={(e)=>setWeekly(s=>({...s,dept:e.target.value}))}/></Grid>
+              <Grid item xs={12} sm={6} md={8}>
+                <Grid container spacing={1}>
+                  <Grid item xs={12} sm={6}><TextField select size="small" fullWidth label="開始週" value={weekly.start} onChange={(e)=>setWeekly(s=>({...s,start:e.target.value}))}>{weekOptions.map(o=><MenuItem key={o.value} value={o.label}>{o.label}</MenuItem>)}</TextField></Grid>
+                  <Grid item xs={12} sm={6}><TextField select size="small" fullWidth label="終了週" value={weekly.end} onChange={(e)=>setWeekly(s=>({...s,end:e.target.value}))}>{weekOptions.map(o=><MenuItem key={o.value} value={o.label}>{o.label}</MenuItem>)}</TextField></Grid>
+                </Grid>
+              </Grid>
+              <Grid item xs={12}>
+                <RadioGroup row value={weekly.mode} onChange={(e)=>setWeekly(s=>({...s,mode:e.target.value}))} sx={{ mb:1 }}>
+                  <FormControlLabel value="sales" control={<Radio size="small" />} label="売上分析" />
+                  <FormControlLabel value="loss"  control={<Radio size="small" />} label="ロス分析" />
+                </RadioGroup>
+                <Stack direction="row" spacing={1}>
+                  <Button variant="contained" startIcon={<span className="material-icons">play_arrow</span>}
+                          onClick={()=> onRunWeekly?.({ dept:weekly.dept, start:weekly.start, end:weekly.end, schema:'B001' })}>実行</Button>
+                  <Button variant="text" startIcon={<span className="material-icons">tune</span>}>詳細条件</Button>
+                </Stack>
+              </Grid>
+            </Grid>
+          </SectionPanel>
+
+          <SectionPanel title="当月を含む過去25ヶ月">
+            <Grid container spacing={1} alignItems="center">
+              <Grid item xs={12} sm={6} md={4}><TextField size="small" fullWidth label="部門選択" value={monthly.dept} onChange={(e)=>setMonthly(s=>({...s,dept:e.target.value}))}/></Grid>
+              <Grid item xs={12} sm={6} md={8}>
+                <Grid container spacing={1}>
+                  <Grid item xs={12} sm={6}><TextField select size="small" fullWidth label="開始月" value={monthly.start} onChange={(e)=>setMonthly(s=>({...s,start:e.target.value}))}>{monthOptions.map(o=><MenuItem key={o.value} value={o.label}>{o.label}</MenuItem>)}</TextField></Grid>
+                  <Grid item xs={12} sm={6}><TextField select size="small" fullWidth label="終了月" value={monthly.end} onChange={(e)=>setMonthly(s=>({...s,end:e.target.value}))}>{monthOptions.map(o=><MenuItem key={o.value} value={o.label}>{o.label}</MenuItem>)}</TextField></Grid>
+                </Grid>
+              </Grid>
+              <Grid item xs={12}>
+                <RadioGroup row value={monthly.scope} onChange={(e)=>setMonthly(s=>({...s,scope:e.target.value}))} sx={{ mb:1 }}>
+                  <FormControlLabel value="all"   control={<Radio size="small" />} label="全店" />
+                  <FormControlLabel value="exist" control={<Radio size="small" />} label="既存店" />
+                </RadioGroup>
+                <RadioGroup row value={monthly.mode} onChange={(e)=>setMonthly(s=>({...s,mode:e.target.value}))} sx={{ mb:1 }}>
+                  <FormControlLabel value="sales" control={<Radio size="small" />} label="売上分析" />
+                  <FormControlLabel value="loss"  control={<Radio size="small" />} label="ロス分析" />
+                </RadioGroup>
+                <Stack direction="row" spacing={1}>
+                  <Button variant="contained" startIcon={<span className="material-icons">play_arrow</span>}
+                          onClick={()=> onRunMonthly?.({ dept:monthly.dept, start:monthly.start, end:monthly.end, schema:'B001' })}>実行</Button>
+                  <Button variant="text" startIcon={<span className="material-icons">tune</span>}>詳細条件</Button>
+                </Stack>
+              </Grid>
+            </Grid>
+          </SectionPanel>
+
+          <UtilityExitCard onExit={onExit}/>
+        </Container>
+      );
+    }
+
+    function A001Menu({ onRunWeekly, onRunMonthly, onExit }) {
+      const weekOptions  = React.useMemo(() => generateWeekOptions(54, new Date()), []);
+      const monthOptions = React.useMemo(() => generateMonthOptions(25, new Date()), []);
+      const [weekly, setWeekly] = React.useState({ dept:'60:家庭用品', start:weekOptions[1]?.label||'', end:weekOptions[0]?.label||'', mode:'sales' });
+      const [monthly, setMonthly] = React.useState({ dept:'10:青果', start:monthOptions[0]?.label||'当月', end:monthOptions[0]?.label||'当月', mode:'sales' });
+
+      return (
+        <Container maxWidth="md" sx={{ py:3 }}>
+          <TopHeaderCard screenTitle="◆メイン画面(A001)◆" />
+          <SectionPanel title="当週を含む過去54週間">
+            <Grid container spacing={1} alignItems="center">
+              <Grid item xs={12} sm={6} md={4}><TextField size="small" fullWidth label="部門選択" value={weekly.dept} onChange={(e)=>setWeekly(s=>({...s,dept:e.target.value}))}/></Grid>
+              <Grid item xs={12} sm={6} md={8}>
+                <Grid container spacing={1}>
+                  <Grid item xs={12} sm={6}><TextField select size="small" fullWidth label="開始週" value={weekly.start} onChange={(e)=>setWeekly(s=>({...s,start:e.target.value}))}>{weekOptions.map(o=><MenuItem key={o.value} value={o.label}>{o.label}</MenuItem>)}</TextField></Grid>
+                  <Grid item xs={12} sm={6}><TextField select size="small" fullWidth label="終了週" value={weekly.end} onChange={(e)=>setWeekly(s=>({...s,end:e.target.value}))}>{weekOptions.map(o=><MenuItem key={o.value} value={o.label}>{o.label}</MenuItem>)}</TextField></Grid>
+                </Grid>
+              </Grid>
+              <Grid item xs={12}>
+                <RadioGroup row value={weekly.mode} onChange={(e)=>setWeekly(s=>({...s,mode:e.target.value}))} sx={{ mb:1 }}>
+                  <FormControlLabel value="sales" control={<Radio size="small" />} label="売上分析" />
+                  <FormControlLabel value="loss"  control={<Radio size="small" />} label="ロス分析" />
+                </RadioGroup>
+                <Stack direction="row" spacing={1}>
+                  <Button variant="contained" startIcon={<span className="material-icons">play_arrow</span>}
+                          onClick={()=> onRunWeekly?.({ dept:weekly.dept, start:weekly.start, end:weekly.end, schema:'A001' })}>実行</Button>
+                  <Button variant="text" startIcon={<span className="material-icons">tune</span>}>詳細条件</Button>
+                </Stack>
+              </Grid>
+            </Grid>
+          </SectionPanel>
+
+          <SectionPanel title="当月を含む過去25ヶ月">
+            <Grid container spacing={1} alignItems="center">
+              <Grid item xs={12} sm={6} md={4}><TextField size="small" fullWidth label="部門選択" value={monthly.dept} onChange={(e)=>setMonthly(s=>({...s,dept:e.target.value}))}/></Grid>
+              <Grid item xs={12} sm={6} md={8}>
+                <Grid container spacing={1}>
+                  <Grid item xs={12} sm={6}><TextField select size="small" fullWidth label="開始月" value={monthly.start} onChange={(e)=>setMonthly(s=>({...s,start:e.target.value}))}>{monthOptions.map(o=><MenuItem key={o.value} value={o.label}>{o.label}</MenuItem>)}</TextField></Grid>
+                  <Grid item xs={12} sm={6}><TextField select size="small" fullWidth label="終了月" value={monthly.end} onChange={(e)=>setMonthly(s=>({...s,end:e.target.value}))}>{monthOptions.map(o=><MenuItem key={o.value} value={o.label}>{o.label}</MenuItem>)}</TextField></Grid>
+                </Grid>
+              </Grid>
+              <Grid item xs={12}>
+                <RadioGroup row value={monthly.mode} onChange={(e)=>setMonthly(s=>({...s,mode:e.target.value}))} sx={{ mb:1 }}>
+                  <FormControlLabel value="sales" control={<Radio size="small" />} label="売上分析" />
+                  <FormControlLabel value="loss"  control={<Radio size="small" />} label="ロス分析" />
+                </RadioGroup>
+                <Stack direction="row" spacing={1}>
+                  <Button variant="contained" startIcon={<span className="material-icons">play_arrow</span>}
+                          onClick={()=> onRunMonthly?.({ dept:monthly.dept, start:monthly.start, end:monthly.end, schema:'A001' })}>実行</Button>
+                  <Button variant="text" startIcon={<span className="material-icons">tune</span>}>詳細条件</Button>
+                </Stack>
+              </Grid>
+            </Grid>
+          </SectionPanel>
+
+          <UtilityExitCard onExit={onExit}/>
+        </Container>
+      );
+    }
+
+    /* ========= 検索条件（ダッシュボード） ========= */
+    function SearchConditions({ onSearch, onExport, state, setState, winnersOnly, setWinnersOnly, schema, setSchema }) {
+      const levelObj = HIERARCHY.find(h=>h.value===state.level) || {};
+      const chips = React.useMemo(() => ([
+        `表示範囲: ${state.start} - ${state.end}`,
+        `部門: ${state.dept}`,
+        `表示単位: ${state.unit}`,
+        `表示階層: ${levelObj.label || ''}`,
+        `カラム: ${schema}`
+      ]), [state.start, state.end, state.dept, state.unit, state.level, schema]);
+      const dateLabels = React.useMemo(() => state.mode === 'week'
+        ? { start:'開始週', end:'終了週', hint:'例: 2025/08/04(月)' }
+        : { start:'開始月', end:'終了月', hint:'例: 2025/08' }
+      , [state.mode]);
+
+      return (
+        <Paper className="section-box" elevation={0}>
+          <Box sx={{ p: 2 }}>
+            <Stack direction={{ xs:'column', sm:'row' }} spacing={1} alignItems={{ xs:'flex-start', sm:'center' }} sx={{ mb: 1 }}>
+              <Typography variant="h6" sx={{ fontWeight:700, flexGrow:1 }}>売上分析（検索条件）</Typography>
+              <FormControlLabel control={<Switch checked={winnersOnly} onChange={(e)=>setWinnersOnly(e.target.checked)}/>} label="勝ち（○）のみ" />
+              <TextField select size="small" value={schema} onChange={(e)=>setSchema(e.target.value)} label="列スキーマ" sx={{ minWidth:140 }}>
+                <MenuItem value="B001">B001</MenuItem>
+                <MenuItem value="A001">A001</MenuItem>
+              </TextField>
+            </Stack>
+            <Grid container spacing={1}>
+              <Grid item xs={12} sm={6} md={3}>
+                <TextField size="small" fullWidth label={dateLabels.start} placeholder={dateLabels.hint} value={state.start} onChange={(e)=>setState(s=>({...s,start:e.target.value}))} />
+              </Grid>
+              <Grid item xs={12} sm={6} md={3}>
+                <TextField size="small" fullWidth label={dateLabels.end} placeholder={dateLabels.hint} value={state.end} onChange={(e)=>setState(s=>({...s,end:e.target.value}))} />
+              </Grid>
+              <Grid item xs={12} sm={6} md={3}>
+                <TextField select size="small" fullWidth label="店舗" value={state.store} onChange={(e)=>setState(s=>({...s,store:e.target.value}))}>
+                  {MASTER_STORES.map(x=> <MenuItem key={x.value} value={x.value}>{x.label}</MenuItem>)}
+                </TextField>
+              </Grid>
+              <Grid item xs={12} sm={6} md={3}>
+                <TextField select size="small" fullWidth label="部門" value={state.dept} onChange={(e)=>setState(s=>({...s,dept:e.target.value}))}>
+                  {MASTER_DEPTS.map(x=> <MenuItem key={x.value} value={x.value}>{x.label}</MenuItem>)}
+                </TextField>
+              </Grid>
+              <Grid item xs={12} sm={8} md={4}>
+                <TextField select size="small" fullWidth label="データ表示単位" value={state.unit} onChange={(e)=>setState(s=>({...s,unit:e.target.value}))}>
+                  {MASTER_UNITS.map(x=> <MenuItem key={x.value} value={x.value}>{x.label}</MenuItem>)}
+                </TextField>
+              </Grid>
+              <Grid item xs={12} sm={4} md={2}>
+                <FormGroup>
+                  <FormControlLabel control={<Checkbox checked={state.includeSmall} onChange={(e)=>setState(s=>({...s,includeSmall:e.target.checked}))} />} label="小計行" />
+                </FormGroup>
+              </Grid>
+              <Grid item xs={12}>
+                <Stack direction="row" spacing={1}>
+                  <Tooltip title="条件で検索"><Button variant="contained" size="small" onClick={onSearch} startIcon={<span className="material-icons">search</span>}>検索実行</Button></Tooltip>
+                  <Tooltip title="CSVとして保存"><Button variant="outlined" size="small" onClick={onExport} startIcon={<span className="material-icons">file_download</span>}>Excel</Button></Tooltip>
+                </Stack>
+              </Grid>
+              <Grid item xs={12}>
+                <Stack direction="row" spacing={1} sx={{ flexWrap:'wrap' }}>
+                  {chips.map((c,i)=>(<Chip key={i} size="small" label={c} />))}
+                </Stack>
+              </Grid>
+            </Grid>
+          </Box>
+        </Paper>
+      );
+    }
+
+    /* ========= アプリ本体 ========= */
+    function App() {
+      const [view, setView] = React.useState('dashboard'); // dashboard | b001 | a001
+      const [state, setState] = React.useState({
+        mode:'week', level:'corner', store:'079', dept:'総菜',
+        start:'2025/08/04(月)', end:'2025/08/17(日)',
+        unit:'千円未満四捨五入', includeSmall:true
+      });
+      const [schema, setSchema] = React.useState('B001'); // ←列スキーマ（B001/A001）
+      const [seed, setSeed] = React.useState(SEED);
+      const [winnersOnly, setWinnersOnly] = React.useState(false);
+      const [filters, setFilters] = React.useState({ line:null, corner:null, category:null });
+
+      const goDashboardWith = React.useCallback((payload)=>{
+        setFilters({ line:null, corner:null, category:null });
+        if (payload.schema) setSchema(payload.schema);
+        setState(s => ({ ...s, mode:(payload.schema? s.mode : s.mode), dept: payload.dept ?? s.dept, start: payload.start, end: payload.end, level:'corner' }));
+        setView('dashboard');
+      }, []);
+
+      const handleB001RunWeekly  = ({dept, start, end, schema}) => goDashboardWith({ dept, start, end, schema });
+      const handleB001RunMonthly = ({dept, start, end, schema}) => goDashboardWith({ dept, start, end, schema });
+      const handleA001RunWeekly  = ({dept, start, end, schema}) => goDashboardWith({ dept, start, end, schema });
+      const handleA001RunMonthly = ({dept, start, end, schema}) => goDashboardWith({ dept, start, end, schema });
+
+      const facts = React.useMemo(()=> generateFacts(ROW_COUNT, seed), [seed]);
+
+      const [sortKey, setSortKey] = React.useState('grossCurr');
+      const [sortDir, setSortDir] = React.useState('desc');
+
+      const { rows } = React.useMemo(()=>{
+        const { rows } = aggregateFacts(facts, { filters, level: state.level, includeSmall: state.includeSmall, winnersOnly });
+
+        // 並べ替え：小計ブロックごと
+        const [head, rest] = [rows[0], rows.slice(1)];
+        const keyGetter = (r)=>r[sortKey];
+        const cmp = (a,b)=> {
+          const av = keyGetter(a), bv = keyGetter(b);
+          const nA = typeof av==='number' ? av : parseFloat(av) || -Infinity;
+          const nB = typeof bv==='number' ? bv : parseFloat(bv) || -Infinity;
+          return sortDir==='asc' ? (nA-nB) : (nB-nA);
+        };
+        const sorted = [];
+        let block = []; let inSubtotal = false;
+        for (const r of rest) {
+          if (r._subtotal) { if (block.length){ block.sort(cmp); sorted.push(...block); block=[]; } inSubtotal = true; sorted.push(r); }
+          else if (inSubtotal) block.push(r);
+          else sorted.push(r);
+        }
+        if (block.length) { block.sort(cmp); sorted.push(...block); }
+        return { rows:[head, ...sorted] };
+      }, [facts, filters, state.level, state.includeSmall, winnersOnly, sortKey, sortDir]);
+
+      const total = rows[0] || {};
+      const kpi = { yoy: total?.yoy_self ?? 100, lossRate: total?.currLossRate ?? 0, winCount: rows.slice(1).filter(r=>r.win==='○').length };
+
+      const handleRefresh = ()=> setSeed(s => s + Math.floor(Math.random()*1000) + 1);
+
+      const handleExport = ()=>{
+        const groups = schema==='A001' ? A001_GROUPS : B001_GROUPS;
+        const leafs = groups.flatMap(g=>g.cols);
+        const headers = leafs.map(c=>c.label);
+        const pick = (r)=> leafs.map(c=>{
+          const raw = typeof c.derive==='function' ? c.derive(r) : r[c.key];
+          if (typeof c.fmt==='function') {
+            // 文字列化から％を除くと数値が壊れるので、CSVはfmtしないで生値寄りを出す
+            return (typeof raw==='number') ? raw : (raw ?? '');
+          }
+          return (typeof raw==='number') ? raw : (raw ?? '');
+        });
+        exportCsv(rows, headers, pick);
+      };
+
+      const clearFilter = (dim) => {
+        setFilters(f=>{
+          const nf = {...f};
+          if (dim==='line') { nf.line=null; nf.corner=null; nf.category=null; }
+          if (dim==='corner') { nf.corner=null; nf.category=null; }
+          if (dim==='category') { nf.category=null; }
+          return nf;
+        });
+      };
+      const crumbs = [];
+      if (filters.line) crumbs.push({dim:'line', label:`ライン: ${filters.line}`});
+      if (filters.corner) crumbs.push({dim:'corner', label:`コーナー: ${filters.corner}`});
+      if (filters.category) crumbs.push({dim:'category', label:`カテゴリ: ${filters.category}`});
+
+      return (
+        <ThemeProvider theme={theme}>
+          <Box sx={{ height:'100%', display:'grid', gridTemplateRows:'auto 1fr auto' }}>
+            <header className="masthead">
+              <AppBar position="static" elevation={1} sx={{ bgcolor:'primary.main' }}>
+                <Toolbar>
+                  <Typography variant="h6" sx={{ fontWeight:700, flexGrow:1 }}>
+                    {view==='dashboard' ? `売上分析ダッシュボード（${schema}列）` : view==='b001' ? '◆メイン画面(B001)◆' : '◆メイン画面(A001)◆'}
+                  </Typography>
+                  <Stack direction="row" spacing={1}>
+                    <Button color="inherit" onClick={()=>setView('dashboard')}>ダッシュボード</Button>
+                    <Button color="inherit" onClick={()=>setView('b001')}>B001</Button>
+                    <Button color="inherit" onClick={()=>setView('a001')}>A001</Button>
+                  </Stack>
+                </Toolbar>
+              </AppBar>
+            </header>
+
+            <main>
+              {view==='dashboard' && (
+                <Container maxWidth="xl" disableGutters>
+                  <SearchConditions
+                    state={state} setState={setState}
+                    onSearch={handleRefresh} onExport={handleExport}
+                    winnersOnly={winnersOnly} setWinnersOnly={setWinnersOnly}
+                    schema={schema} setSchema={setSchema}
+                  />
+                  <Box sx={{ mb:1 }}>
+                    <KpiCards totalGross={total?.grossCurr||0} yoy={kpi.yoy} lossRate={kpi.lossRate} winCount={kpi.winCount}/>
+                  </Box>
+                  {crumbs.length>0 && (
+                    <Box sx={{ mb:1 }}>
+                      <Stack direction="row" spacing={1}>
+                        {crumbs.map(c=>(
+                          <Chip key={c.dim} label={c.label} onDelete={()=>clearFilter(c.dim)} color="primary" variant="outlined" />
+                        ))}
+                        <Button size="small" onClick={()=>clearFilter('line')}>すべて解除</Button>
+                      </Stack>
+                    </Box>
+                  )}
+
+                  <Paper className="section-box" elevation={0}>
+                    <Box sx={{ p:1, borderBottom:'1px solid rgba(0,0,0,.08)' }}>
+                      <Typography variant="subtitle2" sx={{ color:'#455a64' }}>
+                        対象期間: {state.start} - {state.end}（単位: %, 円）
+                      </Typography>
+                    </Box>
+                    <Box sx={{ p:1, borderBottom:'1px solid rgba(0,0,0,.06)' }}>
+                      <Stack direction="row" spacing={1} alignItems="center" flexWrap="wrap">
+                        <ToggleButtonGroup exclusive size="small" value={state.mode} onChange={(e,v)=> v && setState(s=>({...s,mode:v}))} sx={{ mr:1 }} aria-label="週次月次切替">
+                          <ToggleButton value="week" aria-label="週次">週次</ToggleButton>
+                          <ToggleButton value="month" aria-label="月次">月次</ToggleButton>
+                        </ToggleButtonGroup>
+                        <PillTabs value={state.level} onChange={(v)=>setState(s=>({...s, level:v}))} />
+                        <Box sx={{ flexGrow:1 }}/>
+                        <Stack direction="row" spacing={1}>
+                          <Button variant="contained" size="small" onClick={()=>setSeed(s=>s+1)} startIcon={<span className="material-icons">refresh</span>}>再表示</Button>
+                          <Button variant="outlined"  size="small" onClick={handleExport} startIcon={<span className="material-icons">file_download</span>}>Excel</Button>
+                        </Stack>
+                      </Stack>
+                    </Box>
+                    <Box sx={{ p:1 }}>
+                      <DashboardTable rows={rows} schema={schema}/>
+                    </Box>
+                  </Paper>
+                </Container>
+              )}
+
+              {view==='b001' && (<B001Menu onRunWeekly={handleB001RunWeekly} onRunMonthly={handleB001RunMonthly} onExit={()=>setView('dashboard')}/>)}
+              {view==='a001' && (<A001Menu onRunWeekly={handleA001RunWeekly} onRunMonthly={handleA001RunMonthly} onExit={()=>setView('dashboard')}/>)}
+            </main>
+
+            <Box component="footer" sx={{ textAlign:'center', padding:'12px', color:'#607d8b' }}>
+              &copy; 2025 My Company
+            </Box>
+          </Box>
+        </ThemeProvider>
+      );
+    }
+
+    ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+  </script>
+</body>
+</html>
