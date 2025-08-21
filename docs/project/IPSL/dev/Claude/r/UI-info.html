@@ -1,0 +1,656 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>電子メールシステム（一覧＋新規作成＋送信先モーダル）</title>
+
+<!-- Fonts / Icons -->
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Roboto:wght@300;400;500;700&display=swap"/>
+<link rel="stylesheet" href="https://fonts.googleapis.com/icon?family=Material+Icons"/>
+
+<!-- React / Babel / MUI (UMD) -->
+<script src="https://cdn.jsdelivr.net/npm/react@18.2.0/umd/react.production.min.js" crossorigin></script>
+<script src="https://cdn.jsdelivr.net/npm/react-dom@18.2.0/umd/react-dom.production.min.js" crossorigin></script>
+<script src="https://cdn.jsdelivr.net/npm/@babel/standalone@7.23.8/babel.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@mui/material@5.15.3/umd/material-ui.production.min.js" crossorigin></script>
+
+<style>
+  html,body,#root{height:100%}
+  body{margin:0;background:#f6f7fb}
+  .scroll{overflow:auto;-webkit-overflow-scrolling:touch}
+  .sidebar{width:280px;border-right:1px solid #eee}
+  .stickyTop{position:sticky;top:0;background:#fff;z-index:2;border-bottom:1px solid #eee}
+  .stickyBottom{position:sticky;bottom:0;background:#fff;z-index:1;border-top:1px solid #eee}
+  .dashed{border-top:1px dashed #cfd4dc}
+  .navPane{width:280px;border-right:1px solid #eee;background:#fff}
+  .twocol{height:calc(100vh - 150px)}
+  /* モバイルのタップ領域を確保 */
+  .touchy .MuiButton-root{min-height:44px}
+  .touchy .MuiListItemButton-root{min-height:44px}
+  @media (max-width: 980px){
+    .sidebar{width:100%;border-right:none;border-bottom:1px solid #eee}
+    .navPane{display:none}
+    .twocol{height:auto}
+  }
+</style>
+</head>
+<body>
+<div id="root"></div>
+
+<script type="text/babel">
+const {useMemo,useState,useEffect,useRef} = React;
+const {
+  ThemeProvider,createTheme,AppBar,Toolbar,Tooltip,IconButton,Button,Divider,Box,Paper,Grid,Stack,
+  Typography,TextField,InputAdornment,Chip,Badge,List,ListItemButton,ListItemIcon,ListItemText,Checkbox,
+  Tabs,Tab,Dialog,DialogTitle,DialogContent,DialogActions,Select,MenuItem,Table,TableHead,TableBody,TableRow,TableCell,
+  Switch,FormControlLabel,Collapse,useMediaQuery,RadioGroup,FormControlLabel:FCLabel,Radio
+} = MaterialUI;
+
+/* ===================== データ（差し替え可） ===================== */
+const GROUPS=[
+  {id:'sales',name:'営業部',members:[
+    {id:'u1',name:'田中 太郎',email:'taro.tanaka@example.com'},
+    {id:'u2',name:'山田 花子',email:'hanako.yamada@example.com'},
+    {id:'u3',name:'佐藤 健',email:'ken.sato@example.com'},
+    {id:'u4',name:'高橋 茜',email:'akane.takahashi@example.com'},
+  ]},
+  {id:'dev',name:'開発部',members:[
+    {id:'u5',name:'小林 翔',email:'sho.kobayashi@example.com'},
+    {id:'u6',name:'鈴木 直子',email:'naoko.suzuki@example.com'},
+    {id:'u7',name:'伊藤 誠',email:'makoto.ito@example.com'},
+    {id:'u8',name:'渡辺 沙織',email:'saori.watanabe@example.com'},
+    {id:'u9',name:'中村 悠',email:'haruka.nakamura@example.com'},
+  ]},
+  {id:'hr',name:'人事・総務',members:[
+    {id:'u10',name:'加藤 翔子',email:'shoko.kato@example.com'},
+    {id:'u11',name:'松本 大',email:'dai.matsumoto@example.com'},
+    {id:'u12',name:'石井 未来',email:'miki.ishii@example.com'},
+  ]}
+];
+
+/* 事前定義プリセット（=宛先パターン：指定6種）
+   ※必要に応じて groups / members を社内ルールに合わせて調整してください。 */
+const PATTERNS=[
+  {id:'all',   name:'全社',     groups:['sales','dev','hr'], members:[]},
+  {id:'store', name:'店舗連絡', groups:['sales'],            members:[]},
+  {id:'hq',    name:'本部連絡', groups:['dev','hr'],         members:[]},
+  {id:'plan',  name:'企画書',   groups:['dev'],              members:['u6']},   // 例：開発部＋鈴木
+  {id:'asset', name:'資産購入', groups:['hr'],               members:['u11']},  // 例：人事・総務＋松本
+  {id:'trip',  name:'出張申請', groups:['sales','hr'],       members:[]},
+];
+
+/* 一覧画面ダミーデータ */
+const LIST = [
+  { id:'m1', date:'2025-08-21', time:'11:50', dept:'神谷商店', form:'修繕', title:'セルフ精算レジ端末修繕', status:'発信', deadline:'' },
+  { id:'m2', date:'2025-08-21', time:'12:45', dept:'システム部', form:'作業依頼', title:'インカム備品発送', status:'発信', deadline:'' },
+  { id:'m3', date:'2025-08-21', time:'07:34', dept:'総務部', form:'配車', title:'誤配達対応のお願い', status:'発信', deadline:'2025/08/31' },
+  { id:'m4', date:'2025-08-20', time:'16:03', dept:'能代店', form:'修繕依頼', title:'床補修の件', status:'発信', deadline:'' },
+  { id:'m5', date:'2025-08-20', time:'14:22', dept:'経理部', form:'請求', title:'精算の件', status:'返却', deadline:'' },
+  { id:'m6', date:'2025-08-19', time:'09:10', dept:'営業企画', form:'お知らせ', title:'棚卸のお願い', status:'発信待ち', deadline:'' },
+];
+
+/* ===================== ヘルパー ===================== */
+const memberById=Object.fromEntries(GROUPS.flatMap(g=>g.members.map(m=>[m.id,{...m,groupId:g.id,groupName:g.name}])));
+const blankSel=()=>Object.fromEntries(GROUPS.map(g=>[g.id,new Set()]));
+const allCount=(map)=>Object.values(map).reduce((n,s)=>n+s.size,0);
+const formatDate=(d)=>new Date(d).toLocaleDateString('ja-JP',{year:'numeric',month:'2-digit',day:'2-digit',weekday:'short'});
+
+/* ===================== パターン選択（サブモーダル） ===================== */
+function PatternDialog({open,onClose,onApply}){
+  const isSm = useMediaQuery('(max-width:600px)');
+  const [chosen,setChosen]=useState(PATTERNS[0]?.id||'all');
+  const [mode,setMode]=useState('add'); // add | replace
+  useEffect(()=>{ if(open){ setChosen(PATTERNS[0]?.id||'all'); setMode('add'); } },[open]);
+  return (
+    <Dialog open={open} onClose={onClose} fullWidth maxWidth="sm" fullScreen={isSm} aria-labelledby="pat-title">
+      <DialogTitle id="pat-title">宛先パターンを選択</DialogTitle>
+      <DialogContent dividers className={isSm?'touchy':''}>
+        <RadioGroup value={chosen} onChange={(e)=>setChosen(e.target.value)}>
+          {PATTERNS.map(p=>(
+            <FCLabel key={p.id} value={p.id} control={<Radio/>} label={p.name} sx={{mx:0}}/>
+          ))}
+        </RadioGroup>
+        <Divider sx={{my:1.5}}/>
+        <Stack direction="row" spacing={1} alignItems="center">
+          <Typography variant="body2">適用モード</Typography>
+          <Select size="small" value={mode} onChange={e=>setMode(e.target.value)}>
+            <MenuItem value="add">追加</MenuItem>
+            <MenuItem value="replace">置換</MenuItem>
+          </Select>
+        </Stack>
+      </DialogContent>
+      <DialogActions>
+        <Button onClick={onClose}>キャンセル</Button>
+        <Button variant="contained" startIcon={<span className="material-icons">bolt</span>} onClick={()=>onApply(chosen,mode)}>適用</Button>
+      </DialogActions>
+    </Dialog>
+  );
+}
+
+/* ===================== 送信先ピッカー（ご指定レイアウト） ===================== */
+function PickerBody({sel,setSel,activeGroupId,setActiveGroupId}){
+  const isSm = useMediaQuery('(max-width:600px)');
+  const [qGroup,setQGroup]=useState('');
+  const [qMember,setQMember]=useState('');
+  const [filter,setFilter]=useState('all'); // all | selected | unselected
+  const [openPat,setOpenPat]=useState(false);
+  const [lastPat,setLastPat]=useState('');
+
+  const g = useMemo(()=>GROUPS.find(x=>x.id===activeGroupId),[activeGroupId]);
+  const cur = sel[activeGroupId]||new Set();
+
+  /* ---- パターン適用 ---- */
+  const applyPattern = (patId, mode='add')=>{
+    const p=PATTERNS.find(x=>x.id===patId); if(!p) return;
+    const toAdd=new Set();
+    p.groups.forEach(gid=>{const grp=GROUPS.find(x=>x.id===gid); if(grp) grp.members.forEach(m=>toAdd.add(m.id));});
+    p.members.forEach(id=>toAdd.add(id));
+    setSel(prev=>{
+      const next=(mode==='replace')?blankSel():{...prev};
+      toAdd.forEach(id=>{
+        const gid=memberById[id]?.groupId; if(!gid) return;
+        const s=new Set(next[gid]||[]); s.add(id); next[gid]=s;
+      });
+      return next;
+    });
+    setLastPat(`${p.name}（${mode==='add'?'追加':'置換'}）`);
+    setOpenPat(false);
+  };
+
+  /* ---- 表示用 ---- */
+  const idsAll=useMemo(()=>{const a=[]; for(const gid in sel) sel[gid].forEach(id=>a.push(id)); return a;},[sel]);
+
+  const visibleGroups = useMemo(()=>{
+    const t=qGroup.trim().toLowerCase();
+    return GROUPS.filter(x=>!t || x.name.toLowerCase().includes(t));
+  },[qGroup]);
+
+  const visibleMembers = useMemo(()=>{
+    const t=qMember.trim().toLowerCase();
+    return g.members.filter(m=>{
+      const hit=!t || m.name.toLowerCase().includes(t) || m.email.toLowerCase().includes(t);
+      if(!hit) return false;
+      if(filter==='selected') return cur.has(m.id);
+      if(filter==='unselected') return !cur.has(m.id);
+      return true;
+    });
+  },[g,qMember,filter,cur]);
+
+  /* ---- 操作 ---- */
+  const toggleMember=(id)=>setSel(prev=>{
+    const n={...prev},s=new Set(prev[activeGroupId]); s.has(id)?s.delete(id):s.add(id); n[activeGroupId]=s; return n;
+  });
+  const removeAnywhere=(id)=>{
+    const gid=memberById[id].groupId;
+    setSel(prev=>{const n={...prev},s=new Set(prev[gid]); s.delete(id); n[gid]=s; return n;});
+  };
+  const clearAll=()=>setSel(blankSel());
+
+  const allChecked=g.members.every(m=>cur.has(m.id));
+  const toggleAll=()=>setSel(prev=>{
+    const n={...prev},s=new Set(prev[activeGroupId]),ids=g.members.map(m=>m.id);
+    const all=ids.every(id=>s.has(id)); ids.forEach(id=>all?s.delete(id):s.add(id)); n[activeGroupId]=s; return n;
+  });
+  const goPrev=()=>{ const i=GROUPS.findIndex(x=>x.id===activeGroupId); setActiveGroupId(GROUPS[(i-1+GROUPS.length)%GROUPS.length].id); };
+  const goNext=()=>{ const i=GROUPS.findIndex(x=>x.id===activeGroupId); setActiveGroupId(GROUPS[(i+1)%GROUPS.length].id); };
+
+  const listH = isSm ? '42vh' : '48vh';
+
+  return (
+    <Box className={isSm?'touchy':''} sx={{display:'flex',flexDirection:'column'}}>
+      {/* ===== ヘッダー ===== */}
+      <Box className="stickyTop" sx={{p:1.25}}>
+        <Stack direction="row" alignItems="center" spacing={1}>
+          <span className="material-icons">send</span>
+          <Typography variant="h6" sx={{fontWeight:600}}>送信先の選択</Typography>
+          <Box sx={{flex:1}}/>
+          <Chip label={`選択中: ${idsAll.length}`}/>
+        </Stack>
+      </Box>
+
+      {/* ===== パターン選択（ボタン→サブモーダル） ===== */}
+      <Box sx={{p:1.25,borderBottom:'1px solid #eee'}}>
+        <Stack direction={{xs:'column',sm:'row'}} spacing={1} alignItems={{xs:'stretch',sm:'center'}}>
+          <Typography sx={{fontWeight:600}}>宛先パターン</Typography>
+          <Button variant="outlined" startIcon={<span className="material-icons">category</span>} onClick={()=>setOpenPat(true)}>
+            パターン選択
+          </Button>
+          {lastPat && <Chip size="small" variant="outlined" label={`適用済み: ${lastPat}`}/>}
+          <Box sx={{flex:1}}/>
+          <Button size="small" variant={allChecked?'outlined':'contained'} onClick={toggleAll}
+            startIcon={<span className="material-icons">{allChecked?'check_box':'check_box_outline_blank'}</span>}
+          >全選択</Button>
+        </Stack>
+      </Box>
+
+      {/* ===== グループ選択｜メンバー選択 ===== */}
+      <Grid container spacing={0}>
+        {/* 左：グループ */}
+        <Grid item xs={12} md={4} lg={3} sx={{borderRight:{md:'1px solid #eee'}}}>
+          <Box className="stickyTop" sx={{p:1.25}}>
+            <TextField size="small" fullWidth placeholder="グループを検索…"
+              value={qGroup} onChange={e=>setQGroup(e.target.value)}
+              InputProps={{startAdornment:(<InputAdornment position="start"><span className="material-icons">search</span></InputAdornment>)}}
+            />
+          </Box>
+          <Box className="scroll" style={{maxHeight:listH}}>
+            <List dense>
+              {visibleGroups.map(x=>{
+                const c=sel[x.id]?.size??0,active=x.id===activeGroupId;
+                return (
+                  <ListItemButton key={x.id} selected={active} onClick={()=>setActiveGroupId(x.id)}>
+                    <ListItemText
+                      primary={<Stack direction="row" spacing={1} alignItems="center">
+                        <Typography sx={{fontWeight:active?700:500}}>{x.name}</Typography>
+                        <Badge color={c?'primary':'default'} badgeContent={c}><span style={{width:0}}/></Badge>
+                      </Stack>}
+                      secondary={`${x.members.length}名`}
+                    />
+                  </ListItemButton>
+                );
+              })}
+            </List>
+          </Box>
+        </Grid>
+
+        {/* 右：メンバー */}
+        <Grid item xs={12} md={8} lg={9}>
+          <Box className="stickyTop" sx={{p:1.25}}>
+            <Box sx={{display:'grid',gap:8,gridTemplateColumns:{xs:'1fr',sm:'1fr auto auto'}}}>
+              <TextField size="small" fullWidth placeholder={`${g.name} から検索…`}
+                value={qMember} onChange={e=>setQMember(e.target.value)}
+                InputProps={{startAdornment:(<InputAdornment position="start"><span className="material-icons">person_search</span></InputAdornment>)}}
+              />
+              <Stack direction="row" spacing={0.5} alignItems="center" justifyContent="center">
+                <IconButton size="small" onClick={goPrev}><span className="material-icons">chevron_left</span></IconButton>
+                <Typography variant="body2" color="text.secondary">{g.name}</Typography>
+                <IconButton size="small" onClick={goNext}><span className="material-icons">chevron_right</span></IconButton>
+              </Stack>
+              <Select size="small" value={filter} onChange={e=>setFilter(e.target.value)}>
+                <MenuItem value="all">すべて</MenuItem>
+                <MenuItem value="selected">選択中のみ</MenuItem>
+                <MenuItem value="unselected">未選択のみ</MenuItem>
+              </Select>
+            </Box>
+          </Box>
+          <Box className="scroll" style={{maxHeight:listH}}>
+            <List dense>
+              {visibleMembers.length===0 && (<Box p={3}><Typography color="text.secondary">該当するメンバーがいません。</Typography></Box>)}
+              {visibleMembers.map(m=>{
+                const checked=cur.has(m.id);
+                return (
+                  <ListItemButton key={m.id} onClick={()=>toggleMember(m.id)}>
+                    <ListItemIcon><Checkbox edge="start" checked={checked} tabIndex={-1} disableRipple/></ListItemIcon>
+                    <ListItemText primary={<Typography sx={{fontWeight:checked?600:400}}>{m.name}</Typography>}
+                                  secondary={<Typography variant="caption" color="text.secondary">{m.email}</Typography>} />
+                  </ListItemButton>
+                );
+              })}
+            </List>
+          </Box>
+        </Grid>
+      </Grid>
+
+      {/* ===== 選択状況確認（サマリー） ===== */}
+      <Box sx={{p:1.25,borderTop:'1px solid #eee'}}>
+        <Stack direction="row" alignItems="center" spacing={1} mb={1}>
+          <span className="material-icons">groups</span>
+          <Typography variant="subtitle1" sx={{fontWeight:600}}>選択状況確認</Typography>
+          <Box sx={{flex:1}}/>
+          {idsAll.length>0 && <Button size="small" onClick={clearAll} startIcon={<span className="material-icons">clear_all</span>}>すべてクリア</Button>}
+        </Stack>
+        <Box className="scroll" style={{maxHeight:isSm?'22vh':'24vh',padding:'4px 0'}}>
+          {idsAll.length===0 ? (
+            <Typography variant="body2" color="text.secondary">まだ選択されていません。</Typography>
+          ) : (
+            <Box style={{display:'flex',gap:8,flexWrap:'wrap'}}>
+              {idsAll.map(id=>(
+                <Chip key={id} label={`${memberById[id].name}（${memberById[id].groupName}）`}
+                  onDelete={()=>removeAnywhere(id)} icon={<span className="material-icons" style={{fontSize:18}}>person</span>} />
+              ))}
+            </Box>
+          )}
+        </Box>
+      </Box>
+
+      {/* サブモーダル（パターン） */}
+      <PatternDialog open={openPat} onClose={()=>setOpenPat(false)} onApply={applyPattern}/>
+    </Box>
+  );
+}
+
+/* モーダル外枠（フッター=DialogActions） */
+function PickerDialog({open,onClose,onConfirm,initial}){
+  const isSm = useMediaQuery('(max-width:600px)');
+  const [gid,setGid]=useState(GROUPS[0].id);
+  const [sel,setSel]=useState(()=> initial||blankSel());
+  useEffect(()=>{ if(open&&initial){
+    const cloned=Object.fromEntries(Object.entries(initial).map(([g,s])=>[g,new Set([...s])]));
+    setSel(cloned);
+  }},[open,initial]);
+  return (
+    <Dialog open={open} onClose={onClose} fullWidth maxWidth="lg" fullScreen={isSm} aria-labelledby="dlg-title">
+      <DialogContent dividers sx={{p:0}}>
+        <PickerBody sel={sel} setSel={setSel} activeGroupId={gid} setActiveGroupId={setGid}/>
+      </DialogContent>
+      <DialogActions className="stickyBottom" sx={{position:isSm?'sticky':'static',bottom:0}}>
+        <Button onClick={onClose} fullWidth={isSm}>キャンセル</Button>
+        <Button variant="contained" onClick={()=>onConfirm(sel)} startIcon={<span className="material-icons">check</span>} fullWidth={isSm}>決定して追加</Button>
+      </DialogActions>
+    </Dialog>
+  );
+}
+
+/* ===================== 簡易リッチエディタ（軽量） ===================== */
+function RichEditor({value,setValue}){
+  const ref=useRef(null);
+  const exec=(cmd,val=null)=>document.execCommand(cmd,false,val);
+  useEffect(()=>{ if(ref.current && value!==ref.current.innerHTML){ ref.current.innerHTML=value||''; }},[]);
+  return (
+    <Paper variant="outlined" sx={{borderRadius:1}}>
+      <Stack direction="row" spacing={0.5} sx={{p:1,borderBottom:'1px solid #e5e7eb',flexWrap:'wrap'}}>
+        <Tooltip title="太字"><IconButton size="small" onClick={()=>exec('bold')}><span className="material-icons">format_bold</span></IconButton></Tooltip>
+        <Tooltip title="斜体"><IconButton size="small" onClick={()=>exec('italic')}><span className="material-icons">format_italic</span></IconButton></Tooltip>
+        <Tooltip title="下線"><IconButton size="small" onClick={()=>exec('underline')}><span className="material-icons">format_underlined</span></IconButton></Tooltip>
+        <Divider orientation="vertical" flexItem/>
+        <Tooltip title="左寄せ"><IconButton size="small" onClick={()=>exec('justifyLeft')}><span className="material-icons">format_align_left</span></IconButton></Tooltip>
+        <Tooltip title="中央"><IconButton size="small" onClick={()=>exec('justifyCenter')}><span className="material-icons">format_align_center</span></IconButton></Tooltip>
+        <Tooltip title="右寄せ"><IconButton size="small" onClick={()=>exec('justifyRight')}><span className="material-icons">format_align_right</span></IconButton></Tooltip>
+        <Divider orientation="vertical" flexItem/>
+        <Tooltip title="番号付き"><IconButton size="small" onClick={()=>exec('insertOrderedList')}><span className="material-icons">format_list_numbered</span></IconButton></Tooltip>
+        <Tooltip title="箇条書き"><IconButton size="small" onClick={()=>exec('insertUnorderedList')}><span className="material-icons">format_list_bulleted</span></IconButton></Tooltip>
+        <Box sx={{flex:1}}/>
+      </Stack>
+      <Box ref={ref} contentEditable suppressContentEditableWarning
+        onInput={e=>setValue(e.currentTarget.innerHTML)}
+        sx={{minHeight:'40vh',p:2,background:'#fff'}}/>
+    </Paper>
+  );
+}
+
+/* ===================== 一覧画面（モダン化） ===================== */
+function InboxList(){
+  const [query,setQuery]=useState(''),[status,setStatus]=useState('all'),[dense,setDense]=useState(false);
+  const folders=[{key:'latest',label:'最新1週間',children:[
+    {key:'01',label:'01.日別発信'},
+    {key:'02',label:'02.○○他発信別'},
+    {key:'03',label:'03.処理待ち'},
+    {key:'04',label:'04.発信済み'},
+    {key:'05',label:'05.返信文書'},
+    {key:'06',label:'06.伝達対象別'},
+  ]}];
+  const [openKeys,setOpenKeys]=useState(new Set(['latest']));
+  const [activeKey,setActiveKey]=useState('01');
+  const toggleKey=(k)=>setOpenKeys(prev=>{const s=new Set(prev); s.has(k)?s.delete(k):s.add(k); return s;});
+
+  const filtered=useMemo(()=>{
+    const t=query.trim().toLowerCase();
+    return LIST.filter(r=>{
+      const k=!t || [r.dept,r.title,r.form].some(x=>x.toLowerCase().includes(t));
+      const s=status==='all'||r.status===status;
+      return k&&s;
+    }).sort((a,b)=> (a.date===b.date? (a.time<b.time?1:-1) : (a.date<b.date?1:-1)));
+  },[query,status]);
+
+  const groups=filtered.reduce((m,r)=>{(m[r.date] ||= []).push(r); return m;},{});
+  const chip=(st)=>({
+    '発信': <Chip label="発信" size="small" color="success" variant="outlined"/>,
+    '返却': <Chip label="返却" size="small" color="error" variant="outlined"/>,
+    '発信待ち': <Chip label="発信待ち" size="small" color="warning" variant="outlined"/>
+  }[st] || <Chip size="small" label={st}/>);
+
+  return (
+    <Box sx={{maxWidth:1400,mx:'auto',p:2}}>
+      <Paper sx={{p:1.5,mb:1}}>
+        <Grid container spacing={1} alignItems="center">
+          <Grid item xs={12} md={5}>
+            <TextField size="small" value={query} onChange={e=>setQuery(e.target.value)} fullWidth
+              placeholder="検索（部署 / 件名 / フォーム）"
+              InputProps={{startAdornment:(<InputAdornment position="start"><span className="material-icons">search</span></InputAdornment>)}} />
+          </Grid>
+          <Grid item xs={7} md={4}>
+            <Tabs value={status} onChange={(_,v)=>setStatus(v)} variant="scrollable" allowScrollButtonsMobile
+              sx={{minHeight:36,'.MuiTab-root':{minWidth:0,paddingInline:10}}}>
+              <Tab value="all" label="すべて"/><Tab value="発信" label="発信"/><Tab value="発信待ち" label="発信待ち"/><Tab value="返却" label="返却"/>
+            </Tabs>
+          </Grid>
+          <Grid item xs={5} md="auto">
+            <FormControlLabel control={<Switch checked={dense} onChange={e=>setDense(e.target.checked)} />} label="プレビューモード"/>
+          </Grid>
+          <Grid item xs md="auto" sx={{textAlign:'right'}}>
+            <Tooltip title="印刷"><IconButton><span className="material-icons">print</span></IconButton></Tooltip>
+          </Grid>
+        </Grid>
+      </Paper>
+
+      <Paper sx={{display:'flex'}} className="twocol">
+        {/* 左：ツリー */}
+        <Box className="navPane">
+          <List dense disablePadding>
+            {folders.map(f=>(
+              <Box key={f.key}>
+                <ListItemButton onClick={()=>toggleKey(f.key)}>
+                  <ListItemIcon><span className="material-icons">{openKeys.has(f.key)?'expand_more':'chevron_right'}</span></ListItemIcon>
+                  <ListItemText primary={f.label}/>
+                </ListItemButton>
+                <Collapse in={openKeys.has(f.key)} timeout="auto" unmountOnExit>
+                  <List dense disablePadding>
+                    {f.children.map(c=>(
+                      <ListItemButton key={c.key} sx={{pl:6}} selected={activeKey===c.key} onClick={()=>setActiveKey(c.key)}>
+                        <ListItemText primary={c.label}/>
+                      </ListItemButton>
+                    ))}
+                  </List>
+                </Collapse>
+              </Box>
+            ))}
+          </List>
+        </Box>
+
+        {/* 右：テーブル */}
+        <Box sx={{flex:1,overflow:'auto'}}>
+          <Table size={dense?'small':'medium'} stickyHeader>
+            <TableHead>
+              <TableRow>
+                <TableCell width="120">時刻</TableCell>
+                <TableCell width="160">発信部署</TableCell>
+                <TableCell>件名</TableCell>
+                <TableCell width="160">フォーム</TableCell>
+                <TableCell width="120">状況</TableCell>
+                <TableCell width="140">返信期限</TableCell>
+              </TableRow>
+            </TableHead>
+            <TableBody>
+              {Object.keys(groups).sort((a,b)=>a<b?1:-1).map(date=>(
+                <React.Fragment key={date}>
+                  <TableRow>
+                    <TableCell colSpan={6} sx={{fontWeight:700,background: 'linear-gradient(90deg,#e8f5e9,#f1f8e9)'}}>
+                      {formatDate(date)}
+                    </TableCell>
+                  </TableRow>
+                  {groups[date].map((r,i)=>(
+                    <TableRow key={r.id} hover sx={r.status==='発信'?{background:'rgba(76,175,80,.07)'}:null}>
+                      <TableCell>{r.time}</TableCell>
+                      <TableCell>{r.dept}</TableCell>
+                      <TableCell>
+                        <Stack direction="row" spacing={1} alignItems="center">
+                          {i===0 && <span className="material-icons" style={{fontSize:16}}>star</span>}
+                          <Typography noWrap={!dense}>{r.title}</Typography>
+                        </Stack>
+                      </TableCell>
+                      <TableCell>{r.form}</TableCell>
+                      <TableCell>{chip(r.status)}</TableCell>
+                      <TableCell>{r.deadline}</TableCell>
+                    </TableRow>
+                  ))}
+                </React.Fragment>
+              ))}
+              {filtered.length===0 && (
+                <TableRow><TableCell colSpan={6}><Typography color="text.secondary">該当するデータがありません。</Typography></TableCell></TableRow>
+              )}
+            </TableBody>
+          </Table>
+        </Box>
+      </Paper>
+    </Box>
+  );
+}
+
+/* ===================== 新規作成（フォーム） ===================== */
+function ComposeView(){
+  const [subject,setSubject]=useState(''),[originator,setOriginator]=useState(''),[assignee,setAssignee]=useState('');
+  const [target,setTarget]=useState(''),[sendDate,setSendDate]=useState(''),[deadline,setDeadline]=useState('');
+  const [body,setBody]=useState('');
+
+  // 宛先（To/Cc）
+  const [toSel,setToSel]=useState(blankSel());
+  const [ccSel,setCcSel]=useState(blankSel());
+  const toCount=allCount(toSel), ccCount=allCount(ccSel);
+
+  const [openPicker,setOpenPicker]=useState(false),[pickerKind,setPickerKind]=useState('to');
+  const openTo = ()=>{setPickerKind('to'); setOpenPicker(true);};
+  const openCc = ()=>{setPickerKind('cc'); setOpenPicker(true);};
+
+  const ids=(map)=>{const a=[]; for(const gid in map) map[gid].forEach(id=>a.push(id)); return a;};
+  const toIds=ids(toSel), ccIds=ids(ccSel);
+  const rm=(kind,id)=>{
+    const gid=memberById[id].groupId;
+    const updater=(prev)=>{const n={...prev},s=new Set(prev[gid]); s.delete(id); n[gid]=s; return n;};
+    if(kind==='to') setToSel(updater); else setCcSel(updater);
+  };
+
+  return (
+    <Box sx={{maxWidth:1200,mx:'auto',p:2}}>
+      <Paper sx={{p:2}}>
+        {/* 件名行 */}
+        <Grid container spacing={2} alignItems="center">
+          <Grid item xs={12} md={8}>
+            <Typography variant="subtitle2" color="text.secondary" sx={{mb:.5}}>発信件名</Typography>
+            <TextField fullWidth value={subject} onChange={e=>setSubject(e.target.value)} placeholder="件名を入力"/>
+          </Grid>
+          <Grid item xs={6} md={2}>
+            <Typography variant="subtitle2" color="text.secondary" sx={{mb:.5}}>の件</Typography>
+            <TextField fullWidth placeholder="任意入力"/>
+          </Grid>
+          <Grid item xs={6} md={2}>
+            <Typography variant="subtitle2" color="text.secondary" sx={{mb:.5}}>発信日</Typography>
+            <TextField type="date" fullWidth value={sendDate} onChange={e=>setSendDate(e.target.value)}/>
+          </Grid>
+        </Grid>
+
+        <Divider className="dashed" sx={{my:2}}/>
+
+        {/* 宛先 / 伝達対象 / 発信者 */}
+        <Grid container spacing={2}>
+          <Grid item xs={12} md={6}>
+            <Typography variant="subtitle2" color="text.secondary" sx={{mb:.5}}>宛先</Typography>
+            <Stack direction="row" spacing={1} alignItems="center" sx={{mb:1}}>
+              <Tooltip title="宛先を選択">
+                <Button variant="outlined" onClick={openTo}
+                  startIcon={<span className="material-icons">group_add</span>}
+                  endIcon={<Badge badgeContent={toCount} color={toCount?'secondary':'default'}><span className="material-icons">groups</span></Badge>}
+                >宛先</Button>
+              </Tooltip>
+              <Tooltip title="（写）を選択">
+                <Button variant="outlined" onClick={openCc}
+                  startIcon={<span className="material-icons">group</span>}
+                  endIcon={<Badge badgeContent={ccCount} color={ccCount?'secondary':'default'}><span className="material-icons">groups</span></Badge>}
+                >（写）</Button>
+              </Tooltip>
+            </Stack>
+
+            {toIds.length===0?(
+              <Typography variant="body2" color="text.secondary">宛先は未選択です。</Typography>
+            ):(
+              <Box sx={{display:'flex',gap:.75,flexWrap:'wrap',mb:1}}>
+                {toIds.map(id=>(
+                  <Chip key={id} size="small" onDelete={()=>rm('to',id)}
+                    label={`${memberById[id].name}（${memberById[id].groupName}）`}
+                    icon={<span className="material-icons" style={{fontSize:18}}>person</span>}/>
+                ))}
+              </Box>
+            )}
+            {ccIds.length>0 && (
+              <Box sx={{display:'flex',gap:.75,flexWrap:'wrap'}}>
+                {ccIds.map(id=>(
+                  <Chip key={id} size="small" color="default" onDelete={()=>rm('cc',id)}
+                    label={`(写) ${memberById[id].name}（${memberById[id].groupName}）`}
+                    icon={<span className="material-icons" style={{fontSize:18}}>person</span>}/>
+                ))}
+              </Box>
+            )}
+          </Grid>
+
+          <Grid item xs={12} md={3}>
+            <Typography variant="subtitle2" color="text.secondary" sx={{mb:.5}}>伝達対象</Typography>
+            <TextField fullWidth placeholder="例：全社員 / 取締役会" value={target} onChange={e=>setTarget(e.target.value)}/>
+          </Grid>
+          <Grid item xs={12} md={3}>
+            <Typography variant="subtitle2" color="text.secondary" sx={{mb:.5}}>発信者</Typography>
+            <TextField fullWidth placeholder="所属・氏名" value={originator} onChange={e=>setOriginator(e.target.value)}/>
+          </Grid>
+        </Grid>
+
+        {/* 返信期限 / 担当者 */}
+        <Grid container spacing={2} sx={{mt:1}}>
+          <Grid item xs={12} md={3}>
+            <Typography variant="subtitle2" color="text.secondary" sx={{mb:.5}}>返信期限</Typography>
+            <TextField type="date" fullWidth value={deadline} onChange={e=>setDeadline(e.target.value)}/>
+          </Grid>
+          <Grid item xs={12} md={3}>
+            <Typography variant="subtitle2" color="text.secondary" sx={{mb:.5}}>担当者</Typography>
+            <TextField fullWidth placeholder="担当者名" value={assignee} onChange={e=>setAssignee(e.target.value)}/>
+          </Grid>
+        </Grid>
+
+        <Divider className="dashed" sx={{my:2}}/>
+
+        {/* 本文 */}
+        <Typography variant="subtitle2" color="text.secondary" sx={{mb:.5}}>本文</Typography>
+        <RichEditor value={body} setValue={setBody}/>
+      </Paper>
+
+      <Box mt={2} display="flex" justifyContent="flex-end" gap={1}>
+        <Button>プレビュー/印刷</Button>
+        <Button>一時保管</Button>
+        <Button variant="contained" startIcon={<span className="material-icons">send</span>}
+          onClick={()=>alert(`送信（デモ） 宛先:${toCount}／写:${ccCount}`)}>発信</Button>
+      </Box>
+
+      {/* 宛先モーダル（To/Ccで共通使用） */}
+      <PickerDialog
+        open={openPicker}
+        onClose={()=>setOpenPicker(false)}
+        onConfirm={(s)=>{(pickerKind==='to'?setToSel:setCcSel)(s); setOpenPicker(false);}}
+        initial={pickerKind==='to'?toSel:ccSel}
+      />
+    </Box>
+  );
+}
+
+/* ===================== メイン（一覧 ↔ 新規作成） ===================== */
+function App(){
+  const theme=useMemo(()=>createTheme({palette:{background:{default:'#f6f7fb'}},shape:{borderRadius:10}}),[]);
+  const [page,setPage]=useState('list'); // 'list' | 'compose'
+
+  return (
+    <ThemeProvider theme={theme}>
+      <AppBar elevation={0} position="sticky" sx={{background:'#fff',borderBottom:'1px solid #e5e7eb',color:'inherit'}}>
+        <Toolbar variant="dense" sx={{gap:1,flexWrap:'wrap'}}>
+          <Button variant={page==='list'?'contained':'text'} onClick={()=>setPage('list')} startIcon={<span className="material-icons">inbox</span>}>一覧</Button>
+          <Button variant={page==='compose'?'contained':'text'} onClick={()=>setPage('compose')} startIcon={<span className="material-icons">edit</span>}>新規作成</Button>
+          <Box sx={{flex:1}}/>
+          <Tooltip title="印刷"><IconButton><span className="material-icons">print</span></IconButton></Tooltip>
+        </Toolbar>
+      </AppBar>
+
+      {page==='list'? <InboxList/> : <ComposeView/>}
+    </ThemeProvider>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById('root')).render(<App/>);
+</script>
+</body>
+</html>
