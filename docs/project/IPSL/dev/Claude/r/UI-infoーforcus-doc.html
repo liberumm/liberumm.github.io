@@ -1,0 +1,366 @@
+<!DOCTYPE html><html lang="ja"><head><meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>電子メールシステム｜企画書タブのみ有効（他はモック）</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Roboto:wght@300;400;500;700&display=swap"/>
+<link rel="stylesheet" href="https://fonts.googleapis.com/icon?family=Material+Icons"/>
+<script src="https://cdn.jsdelivr.net/npm/react@18.2.0/umd/react.production.min.js" crossorigin></script>
+<script src="https://cdn.jsdelivr.net/npm/react-dom@18.2.0/umd/react-dom.production.min.js" crossorigin></script>
+<script src="https://cdn.jsdelivr.net/npm/@babel/standalone@7.23.8/babel.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@mui/material@5.15.3/umd/material-ui.production.min.js" crossorigin></script>
+<style>
+  html,body,#root{height:100%}
+  body{margin:0;background:#f6f7fb}
+  .paper{border-radius:12px}
+  .stickyTop{position:sticky;top:0;background:#fff;z-index:2;border-bottom:1px solid #eee}
+  .rte-img{max-width:100%;height:auto;border-radius:8px}
+  .rte-attachment{display:inline-flex;align-items:center;gap:6px;padding:4px 8px;border:1px solid #e0e0e0;border-radius:8px;background:#fafafa}
+
+  /* ====== A4 プレビュー（画面） ====== */
+  .pageWrap{background:#e9ebf0;padding:16px}
+  .a4{width:210mm;height:297mm;margin:16px auto;background:#fff;box-shadow:0 2px 12px rgba(0,0,0,.12);position:relative;overflow:hidden;--content-top:15mm;--content-bottom:18mm;--header-h:0px}
+  .a4 .content{padding:15mm;box-sizing:border-box;height:calc(297mm - var(--content-top) - var(--content-bottom) - var(--header-h));overflow:visible;word-break:break-word}
+  .a4-guides::before{content:"";position:absolute;inset:12mm;border:1px dashed rgba(0,0,0,.12);pointer-events:none}
+
+  /* ====== 1ページ目ヘッダー ====== */
+  .doc-header{padding:8mm 15mm 0 15mm;font-size:12px}
+  .doc-header-row{display:flex;gap:12px;align-items:flex-start;margin-bottom:6px;flex-wrap:wrap}
+  .doc-header-col{flex:1 1 200px;min-width:200px}
+  .doc-header-label{min-width:80px;color:#64748b;font-weight:600;font-size:11px}
+  .doc-header-value{flex:1;border-bottom:1px solid #e2e8f0;padding:2px 0 4px;word-break:break-all}
+  .doc-header-sep{border:none;border-top:2px solid #0ea5e9;margin:10px 0 8px}
+
+  /* 改行記号（↵ / ¶）表示 */
+  .content.show-breaks p,.content.show-breaks li,.content.show-breaks pre,.content.show-breaks blockquote{position:relative;min-height:1.2em}
+  .content.show-breaks p::after,.content.show-breaks li::after,.content.show-breaks pre::after,.content.show-breaks blockquote::after{content:"¶";position:absolute;right:-0.8em;top:50%;transform:translateY(-50%);font-size:.85em;color:#94a3b8;opacity:.8;pointer-events:none}
+  .content.breaks-hidden p::after,.content.breaks-hidden li::after,.content.breaks-hidden pre::after,.content.breaks-hidden blockquote::after,.content.breaks-hidden br::before{display:none!important}
+
+  /* モック用の簡易オーバーレイ */
+  .mock{position:relative}
+  .mock::after{content:"これはモック（無効）です";position:absolute;inset:0;display:flex;align-items:center;justify-content:center;background:rgba(255,255,255,.6);backdrop-filter:blur(1px);font-weight:700;color:#334155;border:1px dashed #94a3b8}
+</style>
+</head><body><div id="root"></div>
+<script type="text/babel">
+// =============== 最低限ユーティリティ ===============
+const {useMemo,useState,useEffect,useRef} = React;
+const M = MaterialUI;
+const {ThemeProvider,createTheme,AppBar,Toolbar,Tooltip,IconButton,Button,Divider,Box,Paper,Grid,Stack,Typography,TextField,InputAdornment,Chip,Badge,Dialog,DialogTitle,DialogContent,DialogActions,Select,MenuItem,Popover,Slider} = M;
+
+// グループ/メンバー（宛先ピッカー用）
+const GROUPS=[{id:'dev',name:'開発部',members:[{id:'u6',name:'鈴木 直子',email:'naoko.suzuki@example.com'},{id:'u7',name:'伊藤 誠',email:'makoto.ito@example.com'}]},{id:'hr',name:'人事・総務',members:[{id:'u11',name:'松本 大',email:'dai.matsumoto@example.com'}]}];
+const PATTERNS=[{id:'plan',name:'企画書',groups:['dev'],members:['u6']},{id:'hq',name:'本部連絡',groups:['dev','hr']}];
+const memberById=Object.fromEntries(GROUPS.flatMap(g=>g.members.map(m=>[m.id,{...m,groupId:g.id,groupName:g.name}])));
+const blankSel=()=>Object.fromEntries(GROUPS.map(g=>[g.id,new Set()]));
+const cloneSel=sel=>Object.fromEntries(Object.entries(sel).map(([k,v])=>[k,new Set([...v])]));
+const allIds=sel=>Object.values(sel).reduce((a,s)=>(s.forEach(id=>a.push(id)),a),[]);
+const Icon=({name,style})=> <span className="material-icons" style={style}>{name}</span>;
+
+// A4印刷（プレビュー領域を別ウィンドウへ複製）
+function printA4(){
+  const src=document.querySelector('.pageWrap.print-area');
+  if(!src){alert('印刷対象（A4プレビュー）が見つかりません。');return;}
+  const win=window.open('','_blank');
+  const html=`<!DOCTYPE html><html lang=ja><head><meta charset=utf-8><title>印刷</title><style>@page{size:A4 portrait;margin:12mm}body{margin:0;-webkit-print-color-adjust:exact;print-color-adjust:exact;font-family:Roboto,"Noto Sans JP",system-ui} .a4{width:210mm;min-height:297mm;margin:0 auto;page-break-after:always} .a4:last-child{page-break-after:auto} .a4 .content{padding:15mm} .a4-guides::before{content:none!important} .doc-header{padding:0 15mm} .doc-header-row{display:flex;gap:12px;flex-wrap:wrap;margin-bottom:6px} .doc-header-label{min-width:80px;color:#64748b;font-weight:600;font-size:11px} .doc-header-value{flex:1;border-bottom:1px solid #e2e8f0;padding:2px 0 4px}</style></head><body>${src.innerHTML}<script>window.onload=()=>{try{print()}finally{close()}}<\/script></body></html>`;
+  win.document.open();win.document.write(html);win.document.close();
+}
+
+// =============== 宛先ピッカー（簡易版） ===============
+function PatternDialog({open,onClose,onApply}){
+  const [chosen,setChosen]=useState(PATTERNS[0].id);
+  const [mode,setMode]=useState('add');
+  useEffect(()=>{if(open){setChosen(PATTERNS[0].id);setMode('add')}},[open]);
+  return (
+    <Dialog open={open} onClose={onClose} fullWidth maxWidth="sm">
+      <DialogTitle>宛先パターンを選択</DialogTitle>
+      <DialogContent dividers>
+        <Stack spacing={1}>
+          <Select size="small" value={chosen} onChange={e=>setChosen(e.target.value)}>
+            {PATTERNS.map(p=><MenuItem key={p.id} value={p.id}>{p.name}</MenuItem>)}
+          </Select>
+          <Select size="small" value={mode} onChange={e=>setMode(e.target.value)}>
+            <MenuItem value="add">追加</MenuItem>
+            <MenuItem value="replace">置換</MenuItem>
+          </Select>
+        </Stack>
+      </DialogContent>
+      <DialogActions>
+        <Button onClick={onClose}>キャンセル</Button>
+        <Button variant="contained" startIcon={<Icon name="bolt"/>} onClick={()=>onApply(chosen,mode)}>適用</Button>
+      </DialogActions>
+    </Dialog>
+  );
+}
+
+function RecipientPicker({value,onChange}){
+  // value: { [groupId]: Set<memberId> }
+  const [openPat,setOpenPat]=useState(false);
+  const ids=allIds(value);
+  const remove=(id)=>{const gid=memberById[id].groupId;onChange(prev=>{const n={...prev},s=new Set(n[gid]);s.delete(id);n[gid]=s;return n})};
+  const applyPattern=(patId,mode)=>{
+    const p=PATTERNS.find(x=>x.id===patId); if(!p) return;
+    onChange(prev=>{
+      const next=(mode==='replace')?blankSel():cloneSel(prev);
+      const add=(id)=>{const gid=memberById[id]?.groupId;if(!gid) return;(next[gid]||(next[gid]=new Set())).add(id)};
+      (p.groups||[]).forEach(gid=>GROUPS.find(x=>x.id===gid)?.members.forEach(m=>add(m.id)));
+      (p.members||[]).forEach(add);
+      return next;
+    });
+  };
+  return (
+    <Box>
+      <Stack direction="row" spacing={1} alignItems="center" sx={{mb:1}}>
+        <Button size="small" variant="outlined" startIcon={<Icon name="category"/>} onClick={()=>setOpenPat(true)}>宛先パターン</Button>
+        <Chip label={`選択中: ${ids.length}`} size="small"/>
+      </Stack>
+      {ids.length===0? <Typography variant="body2" color="text.secondary">宛先は未選択です。</Typography>:
+        <Box sx={{display:'flex',gap:.75,flexWrap:'wrap'}}>
+          {ids.map(id=> <Chip key={id} size="small" onDelete={()=>remove(id)} label={`${memberById[id].name}（${memberById[id].groupName}）`} icon={<Icon name="person" style={{fontSize:18}}/>}/>) }
+        </Box>}
+      <PatternDialog open={openPat} onClose={()=>setOpenPat(false)} onApply={(id,mode)=>{applyPattern(id,mode);setOpenPat(false)}}/>
+    </Box>
+  );
+}
+
+// =============== リッチエディタ（A4固定 + 改ページ + 画像調整） ===============
+function PageCanvas({initialHtml,onChange,onMouseDown,onAfterEdit,showBreaks}){
+  const ref=useRef(null); const composing=useRef(false); const raf=useRef(0);
+  useEffect(()=>{ if(ref.current) ref.current.innerHTML=initialHtml||''; },[]);
+  useEffect(()=>{const el=ref.current;if(!el) return;showBreaks?el.classList.add('show-breaks'):el.classList.remove('show-breaks')},[showBreaks]);
+  const emit=()=>{if(!ref.current) return; cancelAnimationFrame(raf.current); raf.current=requestAnimationFrame(()=>{onChange(ref.current.innerHTML); onAfterEdit?.();});};
+  return <div ref={ref} className="content" contentEditable suppressContentEditableWarning spellCheck={false} style={{outline:'none'}} onMouseDown={onMouseDown} onCompositionStart={()=>{composing.current=true}} onCompositionEnd={()=>{composing.current=false;emit()}} onInput={()=>{if(!composing.current) emit()}} onBlur={emit}/>;
+}
+
+function RichEditor({pages,setPages,headerData}){
+  const imgInputRef=useRef(null),fileInputRef=useRef(null); const [showBreaks,setShowBreaks]=useState(true);
+  const [imgAnchor,setImgAnchor]=useState(null),[imgNode,setImgNode]=useState(null),[imgPct,setImgPct]=useState(60);
+
+  const getPageEls=()=>Array.from(document.querySelectorAll('.a4 .content'));
+  const getBlocks=el=>Array.from(el.childNodes).filter(n=>n.nodeType===1||(n.nodeType===3&&n.textContent.trim()));
+  const isHeading=el=>el?.nodeType===1 && /H[1-3]/.test(el.tagName);
+  const withBreaksHidden=(fn)=>{const els=getPageEls(); els.forEach(e=>e.classList.add('breaks-hidden')); try{return fn()} finally{setTimeout(()=>els.forEach(e=>e.classList.remove('breaks-hidden')),10)}};
+  const sync=()=>setPages(getPageEls().map(el=>el.innerHTML));
+  const recalc=()=>withBreaksHidden(()=>{Array.from(document.querySelectorAll('.a4')).forEach((pageEl,idx)=>{const header=idx===0?pageEl.querySelector('.doc-header'):null; const h=header?.getBoundingClientRect().height||0; pageEl.style.setProperty('--header-h',`${h}px`);});});
+  const ensureLayout=()=>{requestAnimationFrame(()=>{recalc(); enforceHeadingsTop(); withBreaksHidden(()=>checkAllOverflows());});};
+
+  const nearestUnit=(node)=>node?.closest?.('tr')||node?.closest?.('thead,tbody,tfoot')||node?.closest?.('table')||node;
+  const checkLastOverflow=(pageIndex)=>{const pagesEls=getPageEls(); const cur=pagesEls[pageIndex]; if(!cur) return; recalc(); const overflow=withBreaksHidden(()=> (cur.scrollHeight-cur.clientHeight) > Math.max(8,cur.clientHeight*0.015)); if(!overflow) return; const blocks=getBlocks(cur); if(!blocks.length) return; let last=nearestUnit(blocks[blocks.length-1]); if(!pagesEls[pageIndex+1]){ setPages(prev=>[...prev.slice(0,pageIndex+1),'',...prev.slice(pageIndex+1)]); return;} const next=getPageEls()[pageIndex+1]; if(last.nodeType===1 && last.tagName==='IMG' && last.offsetHeight>cur.clientHeight*0.8){ const curPct=parseInt(String(last.style.width||'').replace('%',''))||100; if(curPct>40){ last.style.width=`${Math.max(40,curPct-15)}%`; sync(); return; } } const move=isHeading(last)&&last.nextSibling?[last,last.nextSibling]:[last]; try{ move.reverse().forEach(n=>next.insertBefore(n,next.firstChild)); sync(); }catch{} };
+  const enforceHeadingsTop=()=>{const pages=getPageEls(); let changed=false; pages.forEach((pageEl,idx)=>{const children=getBlocks(pageEl); if(children.length<=1) return; const i=children.findIndex((node,i)=>i>0 && isHeading(node)); if(i===-1) return; const heading=children[i]; if(!pages[idx+1]){ setPages(prev=>[...prev,'']); changed=true; return;} const next=getPageEls()[idx+1]; const move=heading.nextSibling?[heading,heading.nextSibling]:[heading]; try{ move.reverse().forEach(n=>next.insertBefore(n,next.firstChild)); changed=true; }catch{} }); if(changed) sync(); };
+  const checkAllOverflows=()=>{withBreaksHidden(()=>{for(let i=0;i<getPageEls().length;i++) checkLastOverflow(i);});};
+
+  const exec=(cmd,val=null)=>{document.querySelector('.a4 .content')?.focus(); try{document.execCommand(cmd,false,val)}catch{} sync(); recalc(); enforceHeadingsTop()};
+  const execCss=(cmd,val=null)=>{document.querySelector('.a4 .content')?.focus(); try{document.execCommand('styleWithCSS',true)}catch{} try{document.execCommand(cmd,false,val)}catch{} sync(); recalc(); enforceHeadingsTop()};
+  const wrapSpan=(styles)=>{const sel=window.getSelection(); if(!sel||sel.rangeCount===0) return; const range=sel.getRangeAt(0); const pagesEls=getPageEls(); let targetIdx=pagesEls.findIndex(el=>el.contains(range.commonAncestorContainer)); if(range.collapsed){const span=document.createElement('span'); Object.assign(span.style,styles); span.appendChild(document.createTextNode('\u200B')); range.insertNode(span); const n=document.createRange(); n.setStart(span.firstChild,1); n.collapse(true); sel.removeAllRanges(); sel.addRange(n);}else{ try{const span=document.createElement('span'); Object.assign(span.style,styles); const contents=range.extractContents(); span.appendChild(contents); range.insertNode(span); sel.removeAllRanges(); const n=document.createRange(); n.selectNodeContents(span); sel.addRange(n);}catch{ const div=document.createElement('div'); div.appendChild(range.cloneContents()); const css=Object.entries(styles).map(([k,v])=>`${k.replace(/[A-Z]/g,m=>'-'+m.toLowerCase())}:${v}`).join(';'); document.execCommand('insertHTML',false,`<span style="${css}">${div.innerHTML}</span>`); } } sync(); requestAnimationFrame(()=>{recalc(); enforceHeadingsTop(); withBreaksHidden(()=>{if(targetIdx<0) targetIdx=0; checkLastOverflow(targetIdx);});}); };
+  const applyFont=(ff)=>wrapSpan({fontFamily:ff});
+  const applySize=(px)=>wrapSpan({fontSize:`${px}px`,lineHeight:'1.7'});
+  const applyColor=(c)=>execCss('foreColor',c);
+  const applyBg=(c)=>{try{execCss('hiliteColor',c)}catch{execCss('backColor',c)}};
+
+  const onPick=(e,type)=>{const files=[...e.target.files||[]]; files.forEach(f=>{const reader=new FileReader(); reader.onload=()=>{insertAtTop(type==='img'?`<img class="rte-img" style="width:60%" src="${reader.result}" alt="${f.name}"/>`:`<span class="rte-attachment"><span class="material-icons">attach_file</span><a href="${URL.createObjectURL(f)}" download="${f.name}">${f.name}</a><span>(${Math.round(f.size/1024)}KB)</span></span>&nbsp;`)}; type==='img'?reader.readAsDataURL(f):reader.readAsArrayBuffer(f)}); e.target.value=''; ensureLayout(); };
+  const insertAtTop=(html)=>{const first=document.querySelector('.a4 .content'); if(!first) return; const range=document.createRange(); range.setStart(first,0); range.collapse(true); const sel=window.getSelection(); sel?.removeAllRanges(); sel?.addRange(range); if(document.queryCommandSupported('insertHTML')){document.execCommand('insertHTML',false,html)} else {const div=document.createElement('div'); div.innerHTML=html; const frag=document.createDocumentFragment(); let node; while((node=div.firstChild)) frag.appendChild(node); range.insertNode(frag);} const updated=document.querySelector('.a4 .content')?.innerHTML||''; setPages(p=>{const n=[...p]; n[0]=updated; return n}); ensureLayout(); };
+  const onEditorMouseDown=e=>{const t=e.target; if(t && t.tagName==='IMG'){setImgNode(t); const pct=parseInt(String(t.style.width||'').replace('%',''))||100; setImgPct(pct); setImgAnchor(t)} else {setImgAnchor(null); setImgNode(null)}};
+  const applyImgWidth=pct=>{if(!imgNode) return; const v=Math.max(10,Math.min(100,pct)); imgNode.style.width=v+'%'; setImgPct(v); const idx=getPageEls().findIndex(el=>el.contains(imgNode)); if(idx>=0){ const html=getPageEls()[idx].innerHTML; setPages(p=>{const n=[...p]; n[idx]=html; return n}); ensureLayout(); }};
+  const removeImg=()=>{if(!imgNode) return; const parent=getPageEls().find(el=>el.contains(imgNode)); imgNode.remove(); setImgNode(null); setImgAnchor(null); if(parent){ const idx=getPageEls().indexOf(parent); setPages(p=>{const n=[...p]; n[idx]=parent.innerHTML; return n}); ensureLayout(); }};
+
+  const addPage=()=>setPages(prev=>[...prev,'']);
+  const delLast=()=>setPages(prev=> prev.length<=1?prev : prev.slice(0,-1));
+
+  const ToolbarBtn=({icon,label,onClick,active})=> (<Tooltip title={label}><IconButton size="small" onClick={onClick} color={active?'primary':'default'}><span className="material-icons">{icon}</span></IconButton></Tooltip>);
+
+  return (
+    <Paper className="paper" variant="outlined">
+      <Stack direction="row" spacing={0.5} sx={{p:1,borderBottom:'1px solid #e5e7eb',flexWrap:'wrap'}} alignItems="center">
+        <Tooltip title="画像挿入（1ページ目の先頭）"><IconButton size="small" onClick={()=>imgInputRef.current.click()}><span className="material-icons">image</span></IconButton></Tooltip>
+        <input ref={imgInputRef} type="file" accept="image/*" multiple hidden onChange={e=>onPick(e,'img')}/>
+        <Tooltip title="添付（本文にバッジ）"><IconButton size="small" onClick={()=>fileInputRef.current.click()}><span className="material-icons">attach_file</span></IconButton></Tooltip>
+        <input ref={fileInputRef} type="file" multiple hidden onChange={e=>onPick(e,'file')}/>
+        <Divider flexItem orientation="vertical" sx={{mx:1}}/>
+        <Button size="small" startIcon={<Icon name="post_add"/>} onClick={addPage}>ページ追加</Button>
+        <Button size="small" startIcon={<Icon name="delete"/>} onClick={delLast}>最後のページ削除</Button>
+        <Box sx={{flex:1}}/><Typography variant="caption" color="text.secondary" sx={{px:1}}>A4プレビュー</Typography>
+      </Stack>
+
+      <div className="stickyTop" style={{display:'flex',flexWrap:'wrap',gap:6,padding:8}}>
+        <ToolbarBtn icon="undo" label="取り消し" onClick={()=>exec('undo')}/>
+        <ToolbarBtn icon="redo" label="やり直し" onClick={()=>exec('redo')}/>
+        <Divider orientation="vertical" flexItem sx={{mx:1}}/>
+        <ToolbarBtn icon="format_bold" label="太字" onClick={()=>exec('bold')}/>
+        <ToolbarBtn icon="format_italic" label="斜体" onClick={()=>exec('italic')}/>
+        <ToolbarBtn icon="format_underline" label="下線" onClick={()=>exec('underline')}/>
+        <ToolbarBtn icon="strikethrough_s" label="取消線" onClick={()=>exec('strikeThrough')}/>
+        <ToolbarBtn icon="format_clear" label="書式クリア" onClick={()=>exec('removeFormat')}/>
+        <Divider orientation="vertical" flexItem sx={{mx:1}}/>
+        <Select size="small" defaultValue={"P"} onChange={e=>exec('formatBlock',e.target.value)} sx={{minWidth:120}}>
+          <MenuItem value="P">段落</MenuItem><MenuItem value="H1">見出しH1</MenuItem><MenuItem value="H2">見出しH2</MenuItem><MenuItem value="H3">見出しH3</MenuItem><MenuItem value="BLOCKQUOTE">引用</MenuItem><MenuItem value="PRE">コード</MenuItem>
+        </Select>
+        <Select size="small" defaultValue={14} onChange={e=>applySize(Number(e.target.value))} sx={{minWidth:90,ml:1}}>
+          {[12,13,14,15,16,18,20,24,28].map(s=> <MenuItem key={s} value={s}>{s}px</MenuItem>)}
+        </Select>
+        <Tooltip title="文字色"><IconButton size="small" onClick={()=>document.getElementById('txtColor').click()}><span className="material-icons">format_color_text</span></IconButton></Tooltip>
+        <input id="txtColor" type="color" hidden onChange={e=>applyColor(e.target.value)}/>
+        <Tooltip title="背景色"><IconButton size="small" onClick={()=>document.getElementById('bgColor').click()}><span className="material-icons">format_color_fill</span></IconButton></Tooltip>
+        <input id="bgColor" type="color" hidden onChange={e=>applyBg(e.target.value)}/>
+        <ToolbarBtn icon="horizontal_rule" label="ページ区切り（横罫線）" onClick={()=>document.execCommand('insertHTML',false,'<hr class=\'rte-hr\'/>')}/>
+        <ToolbarBtn icon="link" label="リンク" onClick={()=>{const u=prompt('リンクURL（https://…）'); if(u) document.execCommand('createLink',false,u)}}/>
+        <ToolbarBtn icon="link_off" label="リンク解除" onClick={()=>exec('unlink')}/>
+        <ToolbarBtn icon="visibility" label={showBreaks?'改行記号を非表示':'改行記号を表示'} active={showBreaks} onClick={()=>setShowBreaks(v=>!v)}/>
+      </div>
+
+      <Box className="pageWrap print-area">
+        {pages.map((html,idx)=> (
+          <div key={idx} className="a4 a4-guides">
+            {idx===0 && (
+              <div className="doc-header" contentEditable={false}>
+                <div className="doc-header-row"><div className="doc-header-label">発信件名</div><div className="doc-header-value">{headerData.subject||'（未入力）'}</div></div>
+                <div className="doc-header-row">
+                  <div className="doc-header-col"><div className="doc-header-label">フォーム</div><div className="doc-header-value">企画書</div></div>
+                  <div className="doc-header-col"><div className="doc-header-label">発信日</div><div className="doc-header-value">{headerData.sendDate||'yyyy/mm/dd'}</div></div>
+                </div>
+                <div className="doc-header-row"><div className="doc-header-label">宛先</div><div className="doc-header-value">{headerData.toText||'宛先は未選択です。'}</div></div>
+                <div className="doc-header-row">
+                  <div className="doc-header-col"><div className="doc-header-label">伝達対象</div><div className="doc-header-value">{headerData.target||'—'}</div></div>
+                  <div className="doc-header-col"><div className="doc-header-label">発信部署</div><div className="doc-header-value">{headerData.originator||'—'}</div></div>
+                </div>
+                <div className="doc-header-row">
+                  <div className="doc-header-col"><div className="doc-header-label">返信期限</div><div className="doc-header-value">{headerData.deadline||'—'}</div></div>
+                  <div className="doc-header-col"><div className="doc-header-label">担当者</div><div className="doc-header-value">{headerData.assignee||'—'}</div></div>
+                </div>
+                <hr className="doc-header-sep"/>
+              </div>
+            )}
+            <PageCanvas initialHtml={html} onChange={nh=>setPages(p=>{const n=[...p];n[idx]=nh;return n})} onMouseDown={onEditorMouseDown} onAfterEdit={()=>{withBreaksHidden(()=>{recalc(); enforceHeadingsTop(); checkAllOverflows();})}} showBreaks={showBreaks}/>
+          </div>
+        ))}
+      </Box>
+
+      <Popover open={Boolean(imgAnchor)} anchorEl={imgAnchor} onClose={()=>setImgAnchor(null)} anchorOrigin={{vertical:'top',horizontal:'center'}} transformOrigin={{vertical:'bottom',horizontal:'center'}}>
+        <Box sx={{p:1.5,width:260}}>
+          <Typography variant="caption" sx={{display:'block',mb:.5}}>画像サイズ（%）</Typography>
+          <Slider min={10} max={100} step={1} value={imgPct} onChange={(_,v)=>applyImgWidth(v)}/>
+          <Stack direction="row" spacing={1} justifyContent="space-between">
+            {[25,50,75,100].map(p=> <Button key={p} size="small" variant={imgPct===p?'contained':'outlined'} onClick={()=>applyImgWidth(p)}>{p}%</Button>)}
+            <Box sx={{flex:1}}/>
+            <Tooltip title="画像を削除"><IconButton color="error" size="small" onClick={removeImg}><span className="material-icons">delete</span></IconButton></Tooltip>
+          </Stack>
+        </Box>
+      </Popover>
+    </Paper>
+  );
+}
+
+function ComposeProposal(){
+  const [subject,setSubject]=useState('');
+  const [originator,setOriginator]=useState('');
+  const [assignee,setAssignee]=useState('');
+  const [target,setTarget]=useState('');
+  const [sendDate,setSendDate]=useState('');
+  const [deadline,setDeadline]=useState('');
+  const [pages,setPages]=useState(['']);
+  const [toSel,setToSel]=useState(blankSel());
+
+  const toIds=allIds(toSel);
+  const toText=toIds.length? toIds.map(id=>memberById[id].name).join('、') : '宛先は未選択です。';
+
+  const upsert=(status)=>{
+    const payload={status,subject,originator,assignee,target,sendDate,deadline,body:pages.join('<hr style="page-break-after:always;border:none;"/>'), to:toIds};
+    console.log('企画書',payload);
+    alert(status==='発信'?'発信しました（コンソールを確認）':'下書き保存しました（コンソールを確認）');
+  };
+
+  return (
+    <Box sx={{width:'100%',mx:'auto',p:2}}>
+      <Paper className="paper" sx={{p:2}}>
+        <Grid container spacing={2} alignItems="center">
+          <Grid item xs={12} md={6}>
+            <Typography variant="subtitle2" color="text.secondary" sx={{mb:.5}}>発信件名</Typography>
+            <TextField fullWidth value={subject} onChange={e=>setSubject(e.target.value)} placeholder="件名を入力"/>
+          </Grid>
+          <Grid item xs={6} md={3}>
+            <Typography variant="subtitle2" color="text.secondary" sx={{mb:.5}}>フォーム</Typography>
+            <TextField fullWidth value="企画書" disabled/>
+          </Grid>
+          <Grid item xs={6} md={3}>
+            <Typography variant="subtitle2" color="text.secondary" sx={{mb:.5}}>発信日</Typography>
+            <TextField type="date" fullWidth value={sendDate} onChange={e=>setSendDate(e.target.value)}/>
+          </Grid>
+        </Grid>
+
+        <Divider sx={{my:2,borderStyle:'dashed'}}/>
+
+        <Grid container spacing={2}>
+          <Grid item xs={12} md={6}>
+            <Typography variant="subtitle2" color="text.secondary" sx={{mb:.5}}>宛先</Typography>
+            <RecipientPicker value={toSel} onChange={setToSel}/>
+          </Grid>
+          <Grid item xs={12} md={3}>
+            <Typography variant="subtitle2" color="text.secondary" sx={{mb:.5}}>伝達対象</Typography>
+            <TextField fullWidth placeholder="例：全社員 / 取締役会" value={target} onChange={e=>setTarget(e.target.value)}/>
+          </Grid>
+          <Grid item xs={12} md={3}>
+            <Typography variant="subtitle2" color="text.secondary" sx={{mb:.5}}>発信部署</Typography>
+            <TextField fullWidth placeholder="所属名" value={originator} onChange={e=>setOriginator(e.target.value)}/>
+          </Grid>
+        </Grid>
+
+        <Grid container spacing={2} sx={{mt:1}}>
+          <Grid item xs={12} md={3}>
+            <Typography variant="subtitle2" color="text.secondary" sx={{mb:.5}}>返信期限</Typography>
+            <TextField type="date" fullWidth value={deadline.replaceAll('/','-')} onChange={e=>setDeadline(e.target.value.replaceAll('-','/'))}/>
+          </Grid>
+          <Grid item xs={12} md={3}>
+            <Typography variant="subtitle2" color="text.secondary" sx={{mb:.5}}>担当者</Typography>
+            <TextField fullWidth placeholder="担当者名" value={assignee} onChange={e=>setAssignee(e.target.value)}/>
+          </Grid>
+        </Grid>
+
+        <Divider sx={{my:2,borderStyle:'dashed'}}/>
+        <Typography variant="subtitle2" color="text.secondary" sx={{mb:.5}}>本文（A4プレビュー／改行記号／画像・添付）</Typography>
+        <RichEditor pages={pages} setPages={setPages} headerData={{subject,sendDate:sendDate.replaceAll('-','/'),toText,target,originator,deadline,assignee}}/>
+      </Paper>
+
+      <Box mt={2} display="flex" justifyContent="flex-end" gap={1}>
+        <Button startIcon={<Icon name="print"/>} onClick={printA4}>プレビュー/印刷</Button>
+        <Button onClick={()=>upsert('下書き')}>下書き保存</Button>
+        <Button variant="contained" startIcon={<Icon name="send"/>} onClick={()=>upsert('発信')}>発信（企画書）</Button>
+      </Box>
+    </Box>
+  );
+}
+
+function App(){
+  const theme=useMemo(()=>createTheme({palette:{primary:{main:'#6366F1'},secondary:{main:'#14B8A6'},background:{default:'#f6f7fb'}},shape:{borderRadius:12},typography:{fontFamily:['Roboto','system-ui','-apple-system','BlinkMacSystemFont','Segoe UI','"Noto Sans JP"','sans-serif'].join(',')}}),[]);
+  const [page,setPage]=useState('composeProposal');
+
+  const TopButton=({label,icon,active,disabled,onClick})=> (
+    <Button variant={active?'contained':'text'} disabled={disabled} onClick={onClick} startIcon={<Icon name={icon}/>}>{label}</Button>
+  );
+
+  return (
+    <ThemeProvider theme={theme}>
+      <M.AppBar elevation={0} position="sticky" sx={{background:'#fff',borderBottom:'1px solid #e5e7eb',color:'inherit'}}>
+        <Toolbar variant="dense" sx={{gap:1,flexWrap:'wrap'}}>
+          <TopButton label="一覧" icon="inbox" active={page==='list'} disabled onClick={()=>setPage('list')}/>
+          <TopButton label="発信文書作成" icon="edit" active={page==='composeNotice'} disabled onClick={()=>setPage('composeNotice')}/>
+          <TopButton label="企画書作成" icon="description" active={page==='composeProposal'} onClick={()=>setPage('composeProposal')}/>
+          <Divider orientation="vertical" flexItem sx={{mx:1}}/>
+          <Stack direction="row" alignItems="center" spacing={1}><Icon name="dashboard"/><Typography variant="h6" sx={{fontWeight:700}}>企画書作成（他タブはモック）</Typography></Stack>
+          <Box sx={{flex:1}}/>
+          <Tooltip title="A4プレビューを印刷"><IconButton onClick={printA4}><Icon name="print"/></IconButton></Tooltip>
+        </Toolbar>
+      </M.AppBar>
+
+      {page!=='composeProposal' && (
+        <Box sx={{p:2}}>
+          <Paper className="paper mock" sx={{p:3,minHeight:240}}>
+            <Typography variant="h6" gutterBottom>このタブはモック（UIのみ）です</Typography>
+            <Typography color="text.secondary">実装対象外：一覧／発信文書作成</Typography>
+          </Paper>
+        </Box>
+      )}
+
+      {page==='composeProposal' && <ComposeProposal/>}
+    </ThemeProvider>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById('root')).render(<App/>);
+</script>
+</body></html>

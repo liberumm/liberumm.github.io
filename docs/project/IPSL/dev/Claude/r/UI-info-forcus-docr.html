@@ -1,0 +1,353 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>A4アートボード型エディタ（横伸び対策）</title>
+
+  <!-- fonts/icons -->
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Roboto:wght@300;400;500;700&display=swap"/>
+  <link rel="stylesheet" href="https://fonts.googleapis.com/icon?family=Material+Icons"/>
+
+  <!-- React / ReactDOM / Babel / MUI (UMD) -->
+  <script src="https://cdn.jsdelivr.net/npm/react@18.2.0/umd/react.production.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/react-dom@18.2.0/umd/react-dom.production.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@babel/standalone@7.23.8/babel.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@mui/material@5.15.3/umd/material-ui.production.min.js"></script>
+
+  <!-- TipTap bridge (ESM -> window) -->
+  <script type="module">
+    import { Editor } from 'https://esm.sh/@tiptap/core@2';
+    import StarterKit from 'https://esm.sh/@tiptap/starter-kit@2';
+    import Underline from 'https://esm.sh/@tiptap/extension-underline@2';
+    import Link from 'https://esm.sh/@tiptap/extension-link@2';
+    import Image from 'https://esm.sh/@tiptap/extension-image@2';
+    import Placeholder from 'https://esm.sh/@tiptap/extension-placeholder@2';
+    import TextStyle from 'https://esm.sh/@tiptap/extension-text-style@2';
+    import Color from 'https://esm.sh/@tiptap/extension-color@2';
+    import Highlight from 'https://esm.sh/@tiptap/extension-highlight@2';
+    import TextAlign from 'https://esm.sh/@tiptap/extension-text-align@2';
+
+    window.TiptapCore = { Editor };
+    window.TiptapExt  = { StarterKit, Underline, Link, Image, Placeholder, TextStyle, Color, Highlight, TextAlign };
+  </script>
+
+  <style>
+    :root{
+      --left-w:220px;
+      --right-w:260px;
+      --workspace-bg:#e5e7eb;
+      --page-bg:#fff;
+      --page-shadow:0 0 6px rgba(0,0,0,0.12);
+      --a4-w:210mm;
+      --a4-h:297mm;
+      --page-padding:18mm;
+    }
+    html,body{height:100%;margin:0;font-family:'Roboto',sans-serif;background:#f3f4f6;color:#111}
+
+    .app{display:flex;flex-direction:column;height:100vh;}
+
+    /* toolbar */
+    .toolbar{
+      display:flex;flex-wrap:wrap;gap:8px;padding:8px 12px;background:#fff;border-bottom:1px solid #ddd;position:sticky;top:0;z-index:20;align-items:center;
+    }
+    .toolbar .MuiButton-root{min-width:36px;padding:4px 8px}
+
+    /* main layout: left / center / right
+       -> note: center uses minmax(0,1fr) so it can shrink and not force whole grid wide */
+    .content{flex:1;display:grid;grid-template-columns:var(--left-w) minmax(0,1fr) var(--right-w);height:100%;min-height:0;}
+
+    /* left nav */
+    .sidebar{background:#fff;border-right:1px solid #ddd;padding:12px;overflow:auto;}
+    .sidebar h4{margin:0 0 8px 0;font-size:14px}
+    .page-list{display:flex;flex-direction:column;gap:8px}
+    .page-item{display:flex;align-items:center;justify-content:space-between;padding:8px;border-radius:6px;background:#fbfcfe;cursor:pointer;border:1px solid transparent}
+    .page-item.active{background:#e6f0ff;border-color:#cfe3ff;font-weight:600}
+    .page-item .actions{display:flex;gap:6px}
+    .page-item button{background:none;border:none;cursor:pointer;padding:4px}
+
+    .left-controls{display:flex;gap:8px;margin-bottom:12px}
+
+    /* center: workspace */
+    .workspace-wrap{min-width:0; /* important to prevent grid from expanding */ overflow:auto;background:var(--workspace-bg);padding:24px;display:flex;flex-direction:column;align-items:center;gap:32px;}
+    .workspace{display:flex;flex-direction:column;align-items:center;gap:32px;width:100%;min-height:0}
+    .artboard{background:var(--page-bg);width:var(--a4-w);height:var(--a4-h);box-shadow:var(--page-shadow);position:relative;padding:var(--page-padding);box-sizing:border-box;transform-origin:top center;overflow:hidden}
+    .artboard-inner{width:100%;height:100%;box-sizing:border-box}
+    .artboard.active{outline:3px solid #2563eb}
+
+    /* ensure center column scrolls horizontally if artboard is bigger than available */
+    .workspace-wrap{overflow-x:auto}
+    /* avoid body horizontal scroll */
+    body{overflow-x:hidden}
+
+    /* right: properties */
+    .prop-panel{background:#fff;border-left:1px solid #ddd;padding:12px;overflow:auto}
+
+    /* TipTap content */
+    .ProseMirror{outline:none;min-height:100%;line-height:1.6}
+    .ProseMirror p{margin:0 0 10px}
+    .ProseMirror img{max-width:100%;height:auto}
+    .small{font-size:13px;color:#555}
+
+    @media print{
+      .toolbar,.sidebar,.prop-panel{display:none}
+      .content{grid-template-columns:1fr}
+      .workspace-wrap{padding:0;background:#fff}
+      .artboard{box-shadow:none;page-break-after:always}
+    }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+
+  <script type="text/babel">
+    const { useState, useEffect, useRef } = React;
+    const { Button, Slider, FormControl, Select, MenuItem, InputLabel, Typography } = MaterialUI;
+
+    function App(){
+      // pages are independent HTML strings
+      const [pages, setPages] = useState([
+        "<h1>1ページ目</h1><p>ここに入力してください。</p>"
+      ]);
+      const [activePage, setActivePage] = useState(0);
+      const [zoom, setZoom] = useState(1.0);
+
+      const editorRef = useRef(null);
+      const editorElRef = useRef(null);
+
+      // initialize editor when activePage changes
+      useEffect(()=>{
+        // destroy existing before creating to avoid duplicates
+        if(editorRef.current){ try{ editorRef.current.destroy(); }catch(e){}; editorRef.current = null; }
+
+        // mount editor into the single active editor DOM node
+        if(!editorElRef.current) return;
+
+        const ed = new window.TiptapCore.Editor({
+          element: editorElRef.current,
+          extensions: [
+            window.TiptapExt.StarterKit,
+            window.TiptapExt.Underline,
+            window.TiptapExt.Link,
+            window.TiptapExt.Image,
+            window.TiptapExt.Placeholder.configure({ placeholder: "テキストを入力…" }),
+            window.TiptapExt.TextStyle,
+            window.TiptapExt.Color,
+            window.TiptapExt.Highlight,
+            window.TiptapExt.TextAlign.configure({ types:["heading","paragraph"] }),
+          ],
+          content: pages[activePage] ?? "<p></p>",
+          onUpdate: ({ editor })=>{
+            // update current page content
+            setPages(prev=>{
+              const n = [...prev];
+              n[activePage] = editor.getHTML();
+              return n;
+            });
+          }
+        });
+
+        editorRef.current = ed;
+        return ()=>{ try{ ed.destroy(); }catch(e){}; editorRef.current = null; };
+      }, [activePage]);
+
+      /* ---------- page operations ---------- */
+      const addPage = (indexAfter = null) => {
+        // if indexAfter===null append at end, else insert after given index
+        setPages(prev=>{
+          const n = [...prev];
+          const newHtml = "<p>新しいページ</p>";
+          if(indexAfter === null){ n.push(newHtml); }
+          else { n.splice(indexAfter+1,0,newHtml); }
+          return n;
+        });
+        // set active to the new page (after state update, use timeout to wait)
+        setTimeout(()=> setActivePage(indexAfter===null ? pages.length : indexAfter+1), 0);
+      };
+
+      const deletePage = (idx) => {
+        setPages(prev=>{
+          if(prev.length<=1){
+            // if only one page -> clear content instead of removing to avoid empty doc
+            const n = [...prev];
+            n[0] = "<p></p>";
+            setActivePage(0);
+            return n;
+          }
+          const n = prev.filter((_,i)=>i!==idx);
+          // adjust active page
+          setActivePage(prevActive => {
+            if(prevActive > idx) return prevActive-1;
+            if(prevActive === idx) return Math.max(0, idx-1);
+            return prevActive;
+          });
+          return n;
+        });
+      };
+
+      /* ---------- toolbar commands ---------- */
+      const exec = (fn) => {
+        if(!editorRef.current) return;
+        fn(editorRef.current);
+        editorRef.current.chain().focus().run();
+      };
+      const toggle = (m)=> exec(ed=>ed.chain().focus()[`toggle${m}`]().run());
+      const setHeading = (level) => exec(ed=>ed.chain().focus().toggleHeading({level}).run());
+      const setAlign = (align) => exec(ed=>ed.chain().focus().setTextAlign(align).run());
+      const insertLink = () => {
+        const url = prompt("リンクURLを入力してください");
+        if(url) exec(ed=>ed.chain().focus().extendMarkRange('link').setLink({ href:url, target:'_blank' }).run());
+      };
+      const unsetLink = ()=> exec(ed=>ed.chain().focus().unsetLink().run());
+      const insertImage = ()=> {
+        const url = prompt("画像URLを入力してください");
+        if(url) exec(ed=>ed.chain().focus().setImage({ src:url }).run());
+      };
+      const setColor = ()=> {
+        const c = prompt("文字色（例: #e11d48 または red）");
+        if(c) exec(ed=>ed.chain().focus().setColor(c).run());
+      };
+      const clearColor = ()=> exec(ed=>ed.chain().focus().unsetColor().run());
+      const toggleHighlight = ()=> exec(ed=>ed.chain().focus().toggleHighlight().run());
+      const insertPageBreak = ()=> exec(ed=>ed.chain().focus().insertContent('<hr class="page-break" />').run());
+
+      const exportHTML = ()=>{
+        if(!editorRef.current) return;
+        const blob = new Blob([pages.join('<hr class="page-break" />')], { type:'text/html' });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a'); a.href = url; a.download = 'document.html'; a.click(); URL.revokeObjectURL(url);
+      };
+      const importHTML = (e)=>{
+        const f = e.target.files?.[0]; if(!f) return;
+        const r = new FileReader();
+        r.onload = ()=> {
+          const txt = r.result;
+          if(typeof txt === 'string'){
+            // naive: split by page-break marker if present, else entire text becomes one page
+            const parts = txt.split(/<hr class=\"page-break\"\s*\/?>/i).map(s=>s.trim()).filter(Boolean);
+            setPages(parts.length ? parts : [txt]);
+            setActivePage(0);
+          }
+        };
+        r.readAsText(f);
+        e.target.value = '';
+      };
+
+      const zoomPct = Math.round(zoom * 100);
+
+      return (
+        <div className="app">
+          {/* TOOLBAR */}
+          <div className="toolbar">
+            <Button onClick={()=> exec(ed=>ed.chain().focus().undo().run())}><span className="material-icons">undo</span></Button>
+            <Button onClick={()=> exec(ed=>ed.chain().focus().redo().run())}><span className="material-icons">redo</span></Button>
+
+            <Button onClick={()=>toggle('Bold')}><span className="material-icons">format_bold</span></Button>
+            <Button onClick={()=>toggle('Italic')}><span className="material-icons">format_italic</span></Button>
+            <Button onClick={()=>toggle('Underline')}><span className="material-icons">format_underlined</span></Button>
+
+            <Button onClick={()=> exec(ed=>ed.chain().focus().toggleBulletList().run())}><span className="material-icons">format_list_bulleted</span></Button>
+            <Button onClick={()=> exec(ed=>ed.chain().focus().toggleOrderedList().run())}><span className="material-icons">format_list_numbered</span></Button>
+
+            <FormControl size="small" style={{minWidth:100}}>
+              <InputLabel>見出し</InputLabel>
+              <Select defaultValue="p" onChange={(e)=>{ const v=e.target.value; v==='p'? exec(ed=>ed.chain().focus().setParagraph().run()) : setHeading(Number(v)); }}>
+                <MenuItem value="p">段落</MenuItem>
+                <MenuItem value={1}>H1</MenuItem>
+                <MenuItem value={2}>H2</MenuItem>
+                <MenuItem value={3}>H3</MenuItem>
+              </Select>
+            </FormControl>
+
+            <Button onClick={()=>setAlign('left')}><span className="material-icons">format_align_left</span></Button>
+            <Button onClick={()=>setAlign('center')}><span className="material-icons">format_align_center</span></Button>
+            <Button onClick={()=>setAlign('right')}><span className="material-icons">format_align_right</span></Button>
+            <Button onClick={()=>insertLink()}><span className="material-icons">link</span></Button>
+            <Button onClick={()=>unsetLink()}><span className="material-icons">link_off</span></Button>
+
+            <Button onClick={()=>insertImage()}><span className="material-icons">image</span></Button>
+            <Button onClick={()=>toggleHighlight()}><span className="material-icons">border_color</span></Button>
+            <Button onClick={()=>setColor()}><span className="material-icons">format_color_text</span></Button>
+            <Button onClick={()=>clearColor()}><span className="material-icons">format_color_reset</span></Button>
+
+            <Button onClick={()=>insertPageBreak()}><span className="material-icons">content_cut</span></Button>
+
+            <div style={{display:'flex', alignItems:'center', gap:8, marginLeft:12}}>
+              <span className="small">ズーム</span>
+              <div style={{width:140}}>
+                <Slider size="small" value={zoom} min={0.6} max={2} step={0.05} onChange={(_,v)=>setZoom(v)} />
+              </div>
+              <div className="small" style={{width:48,textAlign:'right'}}>{zoomPct}%</div>
+            </div>
+
+            <div style={{marginLeft:'auto', display:'flex', gap:8}}>
+              <input id="importHtml" type="file" accept="text/html" style={{display:'none'}} onChange={importHTML}/>
+              <label htmlFor="importHtml"><Button component="span"><span className="material-icons">file_open</span></Button></label>
+              <Button onClick={exportHTML}><span className="material-icons">download</span></Button>
+              <Button onClick={()=>addPage(null)}><span className="material-icons">note_add</span></Button>
+              <Button onClick={()=>window.print()}><span className="material-icons">print</span></Button>
+            </div>
+          </div>
+
+          {/* LAYOUT: left / center / right */}
+          <div className="content">
+            {/* LEFT: page list */}
+            <aside className="sidebar">
+              <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:12}}>
+                <Typography variant="subtitle1">ページ一覧</Typography>
+                <div>
+                  <Button size="small" onClick={()=>addPage(null)}><span className="material-icons">add</span></Button>
+                </div>
+              </div>
+
+              <div className="page-list">
+                {pages.map((p,idx)=>(
+                  <div key={idx} className={`page-item ${idx===activePage?'active':''}`} onClick={()=>setActivePage(idx)}>
+                    <div style={{display:'flex',flexDirection:'column'}}>
+                      <div>ページ {idx+1}</div>
+                      <div className="small" style={{maxWidth:140,whiteSpace:'nowrap',overflow:'hidden',textOverflow:'ellipsis'}} dangerouslySetInnerHTML={{__html: (p.replace(/<[^>]+>/g,'')) }} />
+                    </div>
+                    <div className="actions">
+                      <button title="挿入後に追加" onClick={(e)=>{ e.stopPropagation(); addPage(idx); }}>＋</button>
+                      <button title="削除" onClick={(e)=>{ e.stopPropagation(); deletePage(idx); }}>🗑</button>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </aside>
+
+            {/* CENTER: workspace (min-width:0 so grid won't expand) */}
+            <div className="workspace-wrap">
+              <div className="workspace" style={{transformOrigin:'top center'}}>
+                {pages.map((html, idx)=>(
+                  <div key={idx} className={`artboard ${idx===activePage?'active':''}`} style={{ transform:`scale(${zoom})` }} onClick={()=>setActivePage(idx)}>
+                    <div className="artboard-inner">
+                      { idx === activePage
+                        ? <div ref={editorElRef} />
+                        : <div className="ProseMirror" dangerouslySetInnerHTML={{__html: html}} />
+                      }
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+
+            {/* RIGHT: properties */}
+            <aside className="prop-panel">
+              <Typography variant="subtitle1">プロパティ</Typography>
+              <div style={{marginTop:8}} className="small">
+                <div>ページ数: {pages.length}</div>
+                <div>現在: {activePage+1} ページ目</div>
+                <div>サイズ: A4 (210×297mm)</div>
+                <div>ズーム: {zoomPct}%</div>
+              </div>
+            </aside>
+          </div>
+        </div>
+      );
+    }
+
+    ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+  </script>
+</body>
+</html>
