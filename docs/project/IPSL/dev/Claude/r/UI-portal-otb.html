@@ -1,0 +1,685 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8"/>
+  <title>仕入計画（年度×チャンネル×分類×粒度）｜Infographic / Detail（Table統合）</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <!-- Fonts / Icons -->
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Roboto:wght@300;400;500;700&display=swap"/>
+  <link rel="stylesheet" href="https://fonts.googleapis.com/icon?family=Material+Icons"/>
+  <!-- React / Babel / MUI (UMD) -->
+  <script src="https://cdn.jsdelivr.net/npm/react@18.2.0/umd/react.production.min.js" crossorigin></script>
+  <script src="https://cdn.jsdelivr.net/npm/react-dom@18.2.0/umd/react-dom.production.min.js" crossorigin></script>
+  <script src="https://cdn.jsdelivr.net/npm/@babel/standalone@7.23.8/babel.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@mui/material@5.15.3/umd/material-ui.production.min.js" crossorigin></script>
+  <style>
+    html,body,#root{height:100%}
+    body{margin:0;background:#fafafa}
+    .wrap{max-width:1200px;margin:0 auto;padding:16px}
+    .kpi{display:grid;gap:16px;grid-template-columns:repeat(4,minmax(180px,1fr))}
+    @media (max-width:1000px){.kpi{grid-template-columns:repeat(2,1fr)}}
+    @media (max-width:600px){.kpi{grid-template-columns:1fr}}
+    .mono{font-variant-numeric:tabular-nums;font-feature-settings:"tnum"}
+    .pill{display:inline-flex;align-items:center;gap:6px;border:1px solid #eee;border-radius:999px;padding:2px 8px;background:#fff}
+    .table{width:100%;border-collapse:collapse}
+    .table th,.table td{border:1px solid #eee;padding:8px}
+    .table th{background:#fafafa;text-align:left}
+    .neg{color:#c62828}.pos{color:#2e7d32}
+    .mini{font-size:12px;color:#666}
+  </style>
+</head>
+<body>
+<div id="root"></div>
+
+<script type="text/babel" data-presets="env,react">
+const {
+  AppBar, Toolbar, Typography, Container, Paper, Box, Stack, Button, Chip,
+  Card, CardContent, Divider, Grid, TextField, MenuItem, ToggleButtonGroup, ToggleButton,
+  Autocomplete, Tooltip, Select, Dialog, DialogTitle, DialogContent, DialogActions, Slider, Tabs, Tab
+} = MaterialUI;
+
+/* ===== マスター ===== */
+const CHANNELS=['店舗','アウトレット','オンライン'];
+const CATEGORIES=['アパレル','シューズ','バッグ'];
+
+/* ===== 日付・期間ユーティリティ ===== */
+const MS_DAY=86400000;
+function startOfDay(d){ const x=new Date(d); x.setHours(0,0,0,0); return x; }
+function addDays(d,n){ const x=new Date(d); x.setDate(x.getDate()+n); return x; }
+function endOfMonth(d){ const x=new Date(d); x.setMonth(x.getMonth()+1,0); x.setHours(0,0,0,0); return x; }
+function startOfISOWeek(d){ const x=startOfDay(d); const day=(x.getDay()+6)%7; x.setDate(x.getDate()-day); return x; }
+function pad2(n){ return String(n).padStart(2,'0'); }
+function fmtDate(d){ return `${d.getFullYear()}-${pad2(d.getMonth()+1)}-${pad2(d.getDate())}`; }
+function daysInclusive(a,b){ return Math.max(1, Math.floor((startOfDay(b)-startOfDay(a))/MS_DAY)+1); }
+function getISOWeek(date){
+  const d=new Date(Date.UTC(date.getFullYear(), date.getMonth(), date.getDate()));
+  const dayNum=d.getUTCDay()||7; d.setUTCDate(d.getUTCDate()+4-dayNum);
+  const yearStart=new Date(Date.UTC(d.getUTCFullYear(),0,1));
+  return Math.ceil((((d-yearStart)/MS_DAY)+1)/7);
+}
+
+/* 年度レンジ */
+function makeFiscalRange({year, fyStartMonth}){ const start=new Date(year, fyStartMonth-1, 1); const end=new Date(year+1, fyStartMonth-1, 1); return {start, end}; }
+
+/* 期間生成（粒度：month/week/day/custom） */
+function generatePeriods({year, fyStartMonth, grain, customDays}){
+  const {start,end}=makeFiscalRange({year, fyStartMonth});
+  const periods=[];
+  if(grain==='month'){
+    let cur=new Date(start);
+    while(cur<end){ const e=endOfMonth(cur);
+      periods.push({ id:`${cur.getFullYear()}-${pad2(cur.getMonth()+1)}`, label:`${cur.getFullYear()}-${pad2(cur.getMonth()+1)}`, start:startOfDay(cur), end:e });
+      cur=new Date(cur.getFullYear(), cur.getMonth()+1, 1);
+    }
+  } else if(grain==='week'){
+    let cur=startOfISOWeek(start);
+    while(cur<end){ const e=addDays(cur,6); const w=String(getISOWeek(cur)).padStart(2,'0');
+      periods.push({ id:`${cur.getFullYear()}-W${w}`, label:`${cur.getFullYear()}-W${w} (${fmtDate(cur)}〜${fmtDate(e)})`, start:cur, end:e });
+      cur=addDays(cur,7);
+    }
+  } else if(grain==='day'){
+    let cur=startOfDay(start);
+    while(cur<end){ periods.push({ id:fmtDate(cur), label:fmtDate(cur), start:cur, end:cur }); cur=addDays(cur,1); }
+  } else {
+    const step=Math.max(1, customDays||7);
+    let cur=startOfDay(start);
+    while(cur<end){ const e=addDays(cur, step-1);
+      periods.push({ id:`${fmtDate(cur)}+${step}`, label:`${fmtDate(cur)}〜${fmtDate(e)}`, start:cur, end:e });
+      cur=addDays(cur, step);
+    }
+  }
+  return periods;
+}
+
+/* ===== データモデル（最小単位＝channel×category×period） ===== */
+function baseSalesBy(cat, idx){ const base={アパレル:1200000, シューズ:800000, バッグ:600000}; const step=(cat==='アパレル'?1.05:cat==='シューズ'?1.03:1.02); return Math.round(base[cat]*Math.pow(step,idx)); }
+
+function defaultPlan({year, fyStartMonth, grain, customDays}){
+  const periods=generatePeriods({year, fyStartMonth, grain, customDays});
+  const rows={};
+  CHANNELS.forEach(ch=>{ rows[ch]={}; CATEGORIES.forEach(cat=>{ rows[ch][cat]={};
+    periods.forEach((p,idx)=>{ rows[ch][cat][p.id]={ sales:baseSalesBy(cat,idx), mdPct:10, shrinkPct:1, bomRate: idx===0? 1.2:1.0, eomRate:1.0, onOrder:0, bom: baseSalesBy(cat,idx)*(idx===0?1.2:1.0), bomManual: idx===0 }; });
+  });});
+  return { id:'otb-'+Date.now(), year, fyStartMonth, grain, customDays:customDays||7, periods, channels:CHANNELS, categories:CATEGORIES, rows };
+}
+
+/* ===== 計算（集計） ===== */
+function computeAggregate(plan, filtCh=plan.channels, filtCat=plan.categories){
+  const result={sumByPeriod:{}, total:{sales:0,receipts:0,otb:0,md:0,shrink:0,avgInv:0}};
+  const lastEOM={}; // key: ch|cat
+  plan.periods.forEach((p,pi)=>{
+    const s=result.sumByPeriod[p.id]={sales:0,md:0,shrink:0,bom:0,eom:0,receipts:0,onOrder:0,otb:0,turnSales:0,turnInv:0, days:daysInclusive(p.start,p.end)};
+    plan.channels.forEach(ch=> filtCh.includes(ch) && plan.categories.forEach(cat=>{ if(!filtCat.includes(cat)) return;
+      const c=plan.rows[ch][cat][p.id]; const sales=Number(c?.sales||0);
+      const md=Math.round(sales*(Number(c?.mdPct||0))/100); const shrink=Math.round(sales*(Number(c?.shrinkPct||0))/100);
+      const eom=Math.round(sales*(Number(c?.eomRate||0)));
+      const key=`${ch}|${cat}`; let bom;
+      if(pi===0) bom=Math.round(sales*(Number(c?.bomRate||0))); else bom = lastEOM[key] ?? Math.round(sales*(Number(c?.bomRate||0)));
+      const receipts=Math.max(0, eom + sales + md + shrink - bom);
+      const onOrder=Number(c?.onOrder||0); const otb=receipts-onOrder;
+      const avgInv=(bom+eom)/2; const turn=avgInv>0? sales/avgInv : 0;
+      lastEOM[key]=eom;
+      s.sales+=sales; s.md+=md; s.shrink+=shrink; s.bom+=bom; s.eom+=eom; s.receipts+=receipts; s.onOrder+=onOrder; s.otb+=otb; s.turnSales+=sales; s.turnInv+=avgInv;
+    }));
+    s.turn = s.turnInv>0? s.turnSales/s.turnInv : 0;
+  });
+  plan.periods.forEach(p=>{ const s=result.sumByPeriod[p.id]; result.total.sales+=s.sales; result.total.receipts+=s.receipts; result.total.otb+=s.otb; result.total.md+=s.md; result.total.shrink+=s.shrink; result.total.avgInv+=(s.bom+s.eom)/2; });
+  result.total.turn = result.total.avgInv>0? result.total.sales/result.total.avgInv : 0;
+  return result;
+}
+
+/* ===== 計算（単一ペア ch×cat のチェーン） ===== */
+function computePair(plan, ch, cat){
+  const out=[]; let lastEOM=null;
+  plan.periods.forEach((p,idx)=>{
+    const c=plan.rows[ch][cat][p.id];
+    const sales=Number(c?.sales||0);
+    const md=Math.round(sales*(Number(c?.mdPct||0))/100);
+    const shrink=Math.round(sales*(Number(c?.shrinkPct||0))/100);
+    const eomEst=Math.round(sales*(Number(c?.eomRate||0)));
+    const days=daysInclusive(p.start,p.end);
+    let bom;
+    if(idx===0) bom=Number(c?.bom ?? Math.round(sales*(Number(c?.bomRate||0))));
+    else bom = c?.bomManual ? Number(c.bom) : (lastEOM ?? Math.round(sales*(Number(c?.bomRate||0))));
+    const receipts=Math.max(0, eomEst + sales + md + shrink - bom);
+    const onOrder=Number(c?.onOrder||0);
+    const eom = Math.max(0, bom + receipts - sales - md);
+    const daily = sales>0 ? (sales/days) : 0;
+    const dos = daily>0 ? Math.round(eom / daily) : Infinity;
+    const avgInv=(bom + eom)/2; const turn = avgInv>0 ? (sales/avgInv) : 0;
+    out.push({ idx, periodId:p.id, label:p.label, days, bom, sales, markdown:md, receipts, eom, onOrder, dos, turn });
+    lastEOM=eom;
+  });
+  return out;
+}
+
+/* ===== 表示フォーマット ===== */
+const fmtYen=n=> n===Infinity ? '∞' : n.toLocaleString('ja-JP',{style:'currency',currency:'JPY',maximumFractionDigits:0});
+
+/* ===== ミニチャート ===== */
+const Sparkline=({data,width=160,height=40})=>{
+  const min=Math.min(...data,0), max=Math.max(...data,1);
+  const pts=data.map((v,i)=>`${(i/(data.length-1))*width},${height-((v-min)/(max-min||1))*height}`).join(' ');
+  return (<svg width={width} height={height}><polyline fill="none" stroke="currentColor" strokeWidth="2" points={pts}/></svg>);
+};
+const Donut=({value, max=120, size=88, label})=>{
+  const r=size/2-8, C=2*Math.PI*r, v=Math.max(0,Math.min(max,value)), dash=C*(v/max);
+  const cx=size/2, cy=size/2;
+  return (
+    <svg width={size} height={size} viewBox={`0 0 ${size} ${size}`}>
+      <circle cx={cx} cy={cy} r={r} stroke="#eee" strokeWidth="8" fill="none"/>
+      <circle cx={cx} cy={cy} r={r} stroke="currentColor" strokeWidth="8" fill="none" strokeDasharray={`${dash} ${C-dash}`} transform={`rotate(-90 ${cx} ${cy})`}/>
+      <text x={cx} y={cy} textAnchor="middle" dominantBaseline="central" fontSize="14">{label ?? Math.round(value)}</text>
+    </svg>
+  );
+};
+
+/* ===== KPIカード ===== */
+const KPI=({icon,label,value,sub,right})=>(
+  <Card elevation={0} variant="outlined"><CardContent>
+    <Stack direction="row" justifyContent="space-between" alignItems="center">
+      <Stack spacing={0.5}>
+        <Stack direction="row" spacing={0.5} alignItems="center"><span className="material-icons" style={{fontSize:18}}>{icon}</span><span className="mini">{label}</span></Stack>
+        <Typography variant="h5" className="mono">{value}</Typography>
+        {sub && <span className="mini">{sub}</span>}
+      </Stack>
+      {right}
+    </Stack>
+  </CardContent></Card>
+);
+
+/* ===== 設定バー（年度・粒度） ===== */
+function SettingsBar({plan,setPlan}){
+  const [year,setYear]=React.useState(plan.year);
+  const [fyStart,setFyStart]=React.useState(plan.fyStartMonth);
+  const [grain,setGrain]=React.useState(plan.grain);
+  const [step,setStep]=React.useState(plan.customDays||7);
+
+  const rebuild=()=>{
+    const periods=generatePeriods({year, fyStartMonth:fyStart, grain, customDays:step});
+    const rows={};
+    plan.channels.forEach(ch=>{ rows[ch]={}; plan.categories.forEach(cat=>{ rows[ch][cat]={};
+      periods.forEach((p,idx)=>{
+        const prev=plan.rows?.[ch]?.[cat]?.[p.id];
+        rows[ch][cat][p.id]= prev || { sales:baseSalesBy(cat,idx), mdPct:10, shrinkPct:1, bomRate:idx===0?1.2:1.0, eomRate:1.0, onOrder:0, bom: baseSalesBy(cat,idx)*(idx===0?1.2:1.0), bomManual: idx===0 };
+      });
+    });});
+    setPlan({...plan, year, fyStartMonth:fyStart, grain, customDays:step, periods, rows});
+  };
+
+  return (
+    <Paper variant="outlined" sx={{p:2}}>
+      <Stack direction="row" spacing={2} flexWrap="wrap" alignItems="center">
+        <TextField label="年度（西暦）" type="number" size="small" value={year} onChange={e=>setYear(Number(e.target.value)||new Date().getFullYear())}/>
+        <TextField select label="期首月" size="small" value={fyStart} onChange={e=>setFyStart(Number(e.target.value))}>
+          {Array.from({length:12},(_,i)=>i+1).map(m=><MenuItem key={m} value={m}>{m}月</MenuItem>)}
+        </TextField>
+        <TextField select label="粒度" size="small" value={grain} onChange={e=>setGrain(e.target.value)}>
+          <MenuItem value="month">月</MenuItem>
+          <MenuItem value="week">週（ISO）</MenuItem>
+          <MenuItem value="day">日</MenuItem>
+          <MenuItem value="custom">カスタムn日</MenuItem>
+        </TextField>
+        {grain==='custom' && <TextField label="n日" type="number" size="small" value={step} onChange={e=>setStep(Math.max(1,Number(e.target.value)||7))}/>}
+        <Button variant="contained" startIcon={<span className="material-icons">refresh</span>} onClick={rebuild}>期間を再生成</Button>
+      </Stack>
+    </Paper>
+  );
+}
+
+/* ===== Infographic（参照期間・グラフ・Next Actions） ===== */
+function Infographic({plan,setMode}){
+  const [selCh,setSelCh]=React.useState(plan.channels);
+  const [selCat,setSelCat]=React.useState(plan.categories);
+  const agg=computeAggregate(plan, selCh, selCat);
+
+  const [metric,setMetric]=React.useState('sales');
+  const [from,setFrom]=React.useState(plan.periods[0]?.id);
+  const [to,setTo]=React.useState(plan.periods.at(-1)?.id);
+  React.useEffect(()=>{ if(!plan.periods.find(p=>p.id===from)) setFrom(plan.periods[0]?.id); if(!plan.periods.find(p=>p.id===to)) setTo(plan.periods.at(-1)?.id); },[plan.periods]);
+  const i1=plan.periods.findIndex(p=>p.id===from), i2=plan.periods.findIndex(p=>p.id===to);
+  const lo=Math.min(i1,i2), hi=Math.max(i1,i2);
+  const slice=plan.periods.slice(lo, hi+1);
+  const len=slice.length;
+
+  const sumSel=slice.reduce((a,p)=>{const s=agg.sumByPeriod[p.id]; a.sales+=s.sales; a.receipts+=s.receipts; a.otb+=s.otb; a.avgInv+=(s.bom+s.eom)/2; return a;},{sales:0,receipts:0,otb:0,avgInv:0});
+  const turnSel = sumSel.avgInv>0 ? sumSel.sales/sumSel.avgInv : 0;
+
+  const prevSlice = plan.periods.slice(Math.max(0,lo-len), lo);
+  const sumPrev=prevSlice.reduce((a,p)=>{const s=agg.sumByPeriod[p.id]; a.sales+=s.sales; a.receipts+=s.receipts; a.otb+=s.otb; return a;},{sales:0,receipts:0,otb:0});
+  const delta=(a,b)=> b===0? null : ((a-b)/b*100);
+
+  const series=slice.map(p=> agg.sumByPeriod[p.id][metric]);
+  const approxDOS = turnSel>0 ? Math.round(30/turnSel) : 120;
+  const risks = slice.filter(p=> agg.sumByPeriod[p.id].otb<0).map(p=>p.label);
+
+  return (
+    <>
+      <Paper variant="outlined" sx={{p:2, mb:2}}>
+        <Stack direction="row" spacing={1} alignItems="center" flexWrap="wrap">
+          <Autocomplete multiple size="small" options={plan.channels} value={selCh} onChange={(e,v)=>setSelCh(v)} renderInput={(p)=><TextField {...p} label="チャネル" placeholder="選択"/>} sx={{minWidth:240}}/>
+          <Autocomplete multiple size="small" options={plan.categories} value={selCat} onChange={(e,v)=>setSelCat(v)} renderInput={(p)=><TextField {...p} label="分類" placeholder="選択"/>} sx={{minWidth:240}}/>
+          <span className="pill">
+            <span className="mini" style={{marginRight:6}}>From</span>
+            <Select size="small" value={from} onChange={e=>setFrom(e.target.value)}>{plan.periods.map(p=><MenuItem key={p.id} value={p.id}>{p.label}</MenuItem>)}</Select>
+            <span style={{margin:'0 6px'}}>〜</span>
+            <Select size="small" value={to} onChange={e=>setTo(e.target.value)}>{plan.periods.map(p=><MenuItem key={p.id} value={p.id}>{p.label}</MenuItem>)}</Select>
+          </span>
+          <span className="pill">
+            <span className="mini" style={{marginRight:6}}>グラフ</span>
+            <ToggleButtonGroup exclusive size="small" value={metric} onChange={(e,v)=> v && setMetric(v)}>
+              <ToggleButton value="sales">売上</ToggleButton>
+              <ToggleButton value="receipts">入荷</ToggleButton>
+            </ToggleButtonGroup>
+          </span>
+          <Stack direction="row" spacing={1}>
+            <Button size="small" variant="outlined" onClick={()=>{setFrom(plan.periods[0].id); setTo(plan.periods.at(-1).id);}}>全期間</Button>
+            <Button size="small" variant="outlined" onClick={()=>{const n=3; setFrom(plan.periods.at(-n).id); setTo(plan.periods.at(-1).id);}}>直近3</Button>
+            <Button size="small" variant="outlined" onClick={()=>{const n=6; setFrom(plan.periods.at(-n).id); setTo(plan.periods.at(-1).id);}}>直近6</Button>
+          </Stack>
+        </Stack>
+      </Paper>
+
+      <div className="kpi" style={{marginBottom:16}}>
+        <KPI icon="sell" label="売上（参照期間）" value={fmtYen(sumSel.sales)} sub={delta(sumSel.sales,sumPrev.sales)==null?'比較期間不足':`${delta(sumSel.sales,sumPrev.sales).toFixed(1)}% vs 直前`} right={<Sparkline data={series}/>}/>
+        <KPI icon="local_shipping" label="入荷（参照期間）" value={fmtYen(sumSel.receipts)} sub={delta(sumSel.receipts,sumPrev.receipts)==null?'比較期間不足':`${delta(sumSel.receipts,sumPrev.receipts).toFixed(1)}% vs 直前`}/>
+        <KPI icon="shopping_bag" label="OTB（参照期間）" value={fmtYen(sumSel.otb)} sub={delta(sumSel.otb,sumPrev.otb)==null?'比較期間不足':`${delta(sumSel.otb,sumPrev.otb).toFixed(1)}% vs 直前`}/>
+        <KPI icon="speed" label="在庫日数 目安" value={`${approxDOS} 日`} sub="回転から近似" right={<Donut value={approxDOS} max={120} label={`${approxDOS}`}/>}/>
+      </div>
+
+      <Paper variant="outlined" sx={{p:2, mb:2}}>
+        <b>期間サマリー</b>
+        <Divider sx={{my:1}}/>
+        <div style={{overflow:'auto'}}>
+          <table className="table">
+            <thead>
+              <tr>
+                <th>期間</th>
+                <th style={{textAlign:'right'}}>売上</th>
+                <th style={{textAlign:'right'}}>BOM</th>
+                <th style={{textAlign:'right'}}>EOM</th>
+                <th style={{textAlign:'right'}}>入荷</th>
+                <th style={{textAlign:'right'}}>OTB</th>
+                <th style={{textAlign:'right'}}>回転</th>
+              </tr>
+            </thead>
+            <tbody>
+              {slice.map(p=>{const s=agg.sumByPeriod[p.id]; return (
+                <tr key={p.id}>
+                  <td>{p.label}</td>
+                  <td style={{textAlign:'right'}}>{fmtYen(s.sales)}</td>
+                  <td style={{textAlign:'right'}}>{fmtYen(s.bom)}</td>
+                  <td style={{textAlign:'right'}}>{fmtYen(s.eom)}</td>
+                  <td style={{textAlign:'right'}}>{fmtYen(s.receipts)}</td>
+                  <td style={{textAlign:'right'}} className={s.otb<0?'neg':'pos'}>{fmtYen(s.otb)}</td>
+                  <td style={{textAlign:'right'}}>{s.turn.toFixed(2)}</td>
+                </tr>
+              );})}
+            </tbody>
+          </table>
+        </div>
+        <Box mt={1} className="mini">※ OTB=入荷−既発注。負値は過発注、正値は追加発注余地。</Box>
+      </Paper>
+
+      <Paper variant="outlined" sx={{p:2}}>
+        <Stack direction="row" spacing={1} alignItems="center"><span className="material-icons">recommend</span><b>Next Actions</b></Stack>
+        <Divider sx={{my:1}}/>
+        <ul style={{marginTop:8}}>
+          {risks.length===0 ? <li>OTBは参照期間内で非マイナス。配分の最適化を継続。</li>
+           : <li>過発注傾向：{risks.join(' / ')}。既発注の分納・延期、他チャネル/分類へのシフトを検討。</li>}
+          {approxDOS>60 ? <li>在庫が厚め（DOS&gt;60）。BOM/EOMプロファイルの見直しと仕入抑制を検討。</li> : <li>DOSは概ね適正。伸長期間に入荷枠を再配分。</li>}
+        </ul>
+        <Box mt={1}><Button variant="contained" onClick={()=>setMode('detail')} startIcon={<span className="material-icons">table_view</span>}>詳細モードで編集</Button></Box>
+      </Paper>
+    </>
+  );
+}
+
+/* ===== Detail：グリッド＋（統合）テーブル ===== */
+
+/* グリッド（最小単位＝ch×cat×period） */
+function EditableGrid({plan,setPlan}){
+  const [fCh,setFCh]=React.useState(plan.channels);
+  const [fCat,setFCat]=React.useState(plan.categories);
+  const [q,setQ]=React.useState('');
+  const onCell=(ch,cat,periodId,field,val)=>{
+    const rows=JSON.parse(JSON.stringify(plan.rows));
+    rows[ch][cat][periodId][field]=val;
+    if(field==='bom') rows[ch][cat][periodId].bomManual=true;
+    setPlan({...plan, rows});
+  };
+  const rows=plan.channels.flatMap(ch=> plan.categories.flatMap(cat=> plan.periods.map(p=>{
+    const s=computePair(plan,ch,cat).find(x=>x.periodId===p.id);
+    return {period:p.id,label:p.label,ch,cat, days:s.days, sales:s.sales, mdPct:plan.rows[ch][cat][p.id].mdPct, shrinkPct:plan.rows[ch][cat][p.id].shrinkPct,
+            bomRate:plan.rows[ch][cat][p.id].bomRate, eomRate:plan.rows[ch][cat][p.id].eomRate, onOrder:plan.rows[ch][cat][p.id].onOrder,
+            bom:s.bom, receipts:s.receipts, otb:s.receipts - plan.rows[ch][cat][p.id].onOrder, turn:s.turn};
+  })));
+  const filtered=rows.filter(x=> fCh.includes(x.ch) && fCat.includes(x.cat) && (q==='' || x.period.includes(q)));
+  const inputNum=(v,on,w=96)=>(<input type="number" value={v} onChange={e=>on(Number(e.target.value)||0)} style={{width:w}}/>);
+
+  return (
+    <Paper variant="outlined">
+      <Box p={2}>
+        <b>仕入計画（最小単位＝チャンネル×分類×期間）</b>
+        <Divider sx={{my:1}}/>
+        <Stack direction="row" spacing={1} alignItems="center" flexWrap="wrap" sx={{mb:1}}>
+          <Autocomplete multiple size="small" options={plan.channels} value={fCh} onChange={(e,v)=>setFCh(v)} renderInput={(p)=><TextField {...p} label="チャンネル" placeholder="絞り込み"/>} sx={{minWidth:240}}/>
+          <Autocomplete multiple size="small" options={plan.categories} value={fCat} onChange={(e,v)=>setFCat(v)} renderInput={(p)=><TextField {...p} label="分類" placeholder="絞り込み"/>} sx={{minWidth:240}}/>
+          <TextField size="small" label="期間ID検索" value={q} onChange={e=>setQ(e.target.value)} />
+        </Stack>
+        <div style={{overflow:'auto', maxHeight:'60vh'}}>
+          <table className="table">
+            <thead>
+              <tr>
+                <th>期間</th><th>チャンネル</th><th>分類</th>
+                <th style={{textAlign:'right'}}>売上</th>
+                <th style={{textAlign:'right'}}>値引%</th>
+                <th style={{textAlign:'right'}}>ロス%</th>
+                <th style={{textAlign:'right'}}>BOM率*</th>
+                <th style={{textAlign:'right'}}>EOM率</th>
+                <th style={{textAlign:'right'}}>既発注</th>
+                <th style={{textAlign:'right'}}>入荷</th>
+                <th style={{textAlign:'right'}}>OTB</th>
+                <th style={{textAlign:'right'}}>回転</th>
+              </tr>
+            </thead>
+            <tbody>
+              {filtered.map((x)=>(
+                <tr key={`${x.period}-${x.ch}-${x.cat}`}>
+                  <td>{x.label}</td>
+                  <td>{x.ch}</td>
+                  <td>{x.cat}</td>
+                  <td style={{textAlign:'right'}}>{inputNum(x.sales, v=>onCell(x.ch,x.cat,x.period,'sales',v),120)}</td>
+                  <td style={{textAlign:'right'}}>{inputNum(x.mdPct, v=>onCell(x.ch,x.cat,x.period,'mdPct',v),72)}</td>
+                  <td style={{textAlign:'right'}}>{inputNum(x.shrinkPct, v=>onCell(x.ch,x.cat,x.period,'shrinkPct',v),72)}</td>
+                  <td style={{textAlign:'right'}}>{inputNum(x.bomRate, v=>onCell(x.ch,x.cat,x.period,'bomRate',v),72)}</td>
+                  <td style={{textAlign:'right'}}>{inputNum(x.eomRate, v=>onCell(x.ch,x.cat,x.period,'eomRate',v),72)}</td>
+                  <td style={{textAlign:'right'}}>{inputNum(x.onOrder, v=>onCell(x.ch,x.cat,x.period,'onOrder',v),120)}</td>
+                  <td style={{textAlign:'right'}} className="mono">{fmtYen(x.receipts)}</td>
+                  <td style={{textAlign:'right'}} className={`mono ${x.otb<0?'neg':'pos'}`}>{fmtYen(x.otb)}</td>
+                  <td style={{textAlign:'right'}} className="mono">{x.turn.toFixed(2)}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+        <Box mt={1} className="mini">* 初期BOMは手入力可能（セル編集で固定）。以降は前期間EOMがBOMに自動連携。</Box>
+      </Box>
+    </Paper>
+  );
+}
+
+/* テーブル用モーダル（セル編集＆DOS→仕入高逆算） */
+function TableCellModal({open,onClose,plan,ch,cat,row,apply}){
+  const [field,setField]=React.useState(row?.field||'sales');
+  const [val,setVal]=React.useState(row?.value||0);
+  const [dosTarget,setDosTarget]=React.useState(28);
+  const labelMap={bom:'期首在庫高', sales:'売上高', markdown:'値下高', receipts:'仕入高', dos:'回転日数'};
+  React.useEffect(()=>{ setField(row?.field||'sales'); setVal(row?.value||0); },[row]);
+
+  const suggestReceiptsFromDOS=(d)=>{
+    const sales=row.sales||0, md=row.markdown||0, bom=row.bom||0, days=row.days||7;
+    const eomTarget=Math.max(0, Math.round(d * (sales/days)));
+    const receipts=Math.max(0, eomTarget - (-bom + sales + md));
+    return receipts;
+  };
+
+  return (
+    <Dialog open={open} onClose={onClose} fullWidth maxWidth="sm">
+      <DialogTitle>「{labelMap[field]}」の調整：{row?.label}／{ch}×{cat}</DialogTitle>
+      <DialogContent dividers>
+        <Stack spacing={2}>
+          <Box>
+            <div className="mini">現在値</div>
+            <Typography variant="h6" className="mono">
+              {field==='dos' ? (row?.dos===Infinity?'∞':`${row?.dos} 日`) : fmtYen(row?.value||0)}
+            </Typography>
+          </Box>
+
+          {field==='dos' ? (
+            <Box>
+              <div className="mini" style={{marginBottom:8}}>回転日数目標→仕入高を逆算</div>
+              <Slider value={dosTarget} min={7} max={120} step={1} onChange={(_,v)=>setDosTarget(v)} />
+              <div className="mini">ターゲット：<b>{dosTarget}日</b> → 推奨仕入高 <b className="mono">{fmtYen(suggestReceiptsFromDOS(dosTarget))}</b></div>
+            </Box>
+          ) : (
+            <TextField type="number" size="small" fullWidth label={`${labelMap[field]}（新しい値）`} value={val} onChange={e=>setVal(Number(e.target.value)||0)} InputProps={{ inputProps:{min:0, step:1000}}}/>
+          )}
+
+          <Box sx={{mt:1}}>
+            <div className="mini">関連情報</div>
+            <ul style={{marginTop:4}}>
+              <li>期間：<b>{row?.label}</b>（{row?.days}日）</li>
+              <li>当期 期末在庫（EOM）：<b className="mono">{fmtYen(row?.eom||0)}</b></li>
+              <li>次期BOM（自動連携時）：<b className="mono">{fmtYen(row?.eom||0)}</b></li>
+            </ul>
+          </Box>
+        </Stack>
+      </DialogContent>
+      <DialogActions>
+        <Button onClick={onClose}>キャンセル</Button>
+        {field==='dos'
+          ? <Button variant="contained" onClick={()=>{ apply(row.idx,'receipts', suggestReceiptsFromDOS(dosTarget)); onClose(); }}>仕入高を自動調整</Button>
+          : <Button variant="contained" onClick={()=>{ apply(row.idx, field, val); if(field==='bom') apply(row.idx,'bomManual',true); onClose(); }}>保存</Button>
+        }
+      </DialogActions>
+    </Dialog>
+  );
+}
+
+/* 統合テーブル（詳細モード内のサブビュー） */
+function DetailTable({plan,setPlan}){
+  const [ch,setCh]=React.useState(plan.channels[0]);
+  const [cat,setCat]=React.useState(plan.categories[0]);
+  React.useEffect(()=>{ if(!plan.channels.includes(ch)) setCh(plan.channels[0]); if(!plan.categories.includes(cat)) setCat(plan.categories[0]); },[plan]);
+
+  const chain=computePair(plan,ch,cat);
+  const applyIdx=(idx,field,value)=>{
+    const pid=plan.periods[idx].id;
+    const rows=JSON.parse(JSON.stringify(plan.rows));
+    if(field==='bomManual'){ rows[ch][cat][pid].bomManual=!!value; }
+    else if(field==='receipts'){ rows[ch][cat][pid].receipts=Number(value)||0; }
+    else if(field==='bom'){ rows[ch][cat][pid].bom=Number(value)||0; rows[ch][cat][pid].bomManual=true; }
+    else if(field==='markdown'){ rows[ch][cat][pid].markdown=Number(value)||0; }
+    else if(field==='sales'){ rows[ch][cat][pid].sales=Number(value)||0; }
+    setPlan({...plan, rows});
+  };
+
+  // モーダル
+  const [dlgOpen,setDlgOpen]=React.useState(false);
+  const [dlgRow,setDlgRow]=React.useState(null);
+  const openCell=(row, field)=>{
+    setDlgRow({...row, field, value: field==='dos'? row.dos : row[field]});
+    setDlgOpen(true);
+  };
+
+  const thRight={textAlign:'right'};
+  const tdRight={textAlign:'right', cursor:'pointer'};
+
+  return (
+    <>
+      <Paper variant="outlined" sx={{p:2, mb:2}}>
+        <Stack direction="row" spacing={2} alignItems="center" flexWrap="wrap">
+          <TextField select size="small" label="チャンネル" value={ch} onChange={e=>setCh(e.target.value)}>
+            {plan.channels.map(x=><MenuItem key={x} value={x}>{x}</MenuItem>)}
+          </TextField>
+          <TextField select size="small" label="分類" value={cat} onChange={e=>setCat(e.target.value)}>
+            {plan.categories.map(x=><MenuItem key={x} value={x}>{x}</MenuItem>)}
+          </TextField>
+          <Tooltip title="列順は固定：期首在庫高／売上高／値下高／仕入高／回転日数">
+            <span className="pill"><span className="material-icons" style={{fontSize:16}}>info</span>列仕様</span>
+          </Tooltip>
+        </Stack>
+      </Paper>
+
+      <Paper variant="outlined" sx={{p:2}}>
+        <b>{ch} × {cat}：仕入計画テーブル</b>
+        <Divider sx={{my:1}}/>
+        <div style={{overflow:'auto'}}>
+          <table className="table">
+            <thead>
+              <tr>
+                <th>期間</th>
+                <th style={thRight}>期首在庫高</th>
+                <th style={thRight}>売上高</th>
+                <th style={thRight}>値下高</th>
+                <th style={thRight}>仕入高</th>
+                <th style={thRight}>回転日数</th>
+              </tr>
+            </thead>
+            <tbody>
+              {chain.map(r=>(
+                <tr key={r.periodId}>
+                  <td>{`期間${r.idx}`}&nbsp;（{plan.periods[r.idx].label}）</td>
+                  <td style={tdRight} onClick={()=>openCell(r,'bom')}>{fmtYen(r.bom)}</td>
+                  <td style={tdRight} onClick={()=>openCell(r,'sales')}>{fmtYen(r.sales)}</td>
+                  <td style={tdRight} onClick={()=>openCell(r,'markdown')}>{fmtYen(r.markdown)}</td>
+                  <td style={tdRight} onClick={()=>openCell(r,'receipts')}>{fmtYen(r.receipts)}</td>
+                  <td style={tdRight} onClick={()=>openCell(r,'dos')}>{r.dos===Infinity?'∞':`${r.dos} 日`}</td>
+                </tr>
+              ))}
+            </tbody>
+            <tfoot>
+              <tr>
+                <th>合計 / 参考</th>
+                <th style={thRight} className="mono">{fmtYen(chain[0]?.bom || 0)}</th>
+                <th style={thRight} className="mono">{fmtYen(chain.reduce((a,x)=>a+x.sales,0))}</th>
+                <th style={thRight} className="mono">{fmtYen(chain.reduce((a,x)=>a+x.markdown,0))}</th>
+                <th style={thRight} className="mono">{fmtYen(chain.reduce((a,x)=>a+x.receipts,0))}</th>
+                <th style={thRight} className="mono">
+                  {(()=>{
+                    const salesTot=chain.reduce((a,x)=>a+x.sales,0);
+                    const avgInv=chain.reduce((a,x)=>a+(x.bom+x.eom)/2,0);
+                    const turn=avgInv>0? salesTot/avgInv : 0;
+                    const dos = turn>0 ? Math.round(30/turn) : '∞';
+                    return dos==='∞' ? '∞' : `${dos} 日（目安）`;
+                  })()}
+                </th>
+              </tr>
+            </tfoot>
+          </table>
+        </div>
+        <Box mt={1} className="mini">セルをクリックすると編集モーダルを表示します。回転日数セルではDOS目標から「仕入高」を逆算して自動調整できます。</Box>
+      </Paper>
+
+      <TableCellModal
+        open={dlgOpen}
+        onClose={()=>setDlgOpen(false)}
+        plan={plan}
+        ch={ch}
+        cat={cat}
+        row={dlgRow}
+        apply={applyIdx}
+      />
+    </>
+  );
+}
+
+/* I/Oバー（保存・読み込み・CSV/JSON） */
+function IOBar({plan,setPlan}){
+  const save=()=>{ localStorage.setItem('otb_plan_all_v2', JSON.stringify(plan)); alert('保存しました'); };
+  const load=()=>{ const j=localStorage.getItem('otb_plan_all_v2'); if(!j) return alert('保存データなし'); setPlan(JSON.parse(j)); };
+  const exportJSON=()=>{ const blob=new Blob([JSON.stringify(plan,null,2)],{type:'application/json'}); const url=URL.createObjectURL(blob); const a=document.createElement('a'); a.href=url; a.download='otb-plan.json'; a.click(); URL.revokeObjectURL(url); };
+  const importJSON=(file)=>{ const r=new FileReader(); r.onload=()=>{ try{ setPlan(JSON.parse(r.result)); }catch{ alert('JSON形式エラー'); } }; r.readAsText(file,'utf-8'); };
+  const exportCSV=()=>{
+    const lines=[['channel','category','periodId','sales','mdPct','shrinkPct','bomRate','eomRate','onOrder','bom','bomManual'].join(',')];
+    plan.channels.forEach(ch=> plan.categories.forEach(cat=> plan.periods.forEach((p)=> {
+      const c=plan.rows[ch][cat][p.id]; lines.push([ch,cat,p.id,c.sales,c.mdPct,c.shrinkPct,c.bomRate,c.eomRate,c.onOrder,c.bom||'',c.bomManual?1:0].join(','));
+    })));
+    const blob=new Blob([lines.join('\n')],{type:'text/csv'}); const url=URL.createObjectURL(blob); const a=document.createElement('a'); a.href=url; a.download='otb-plan.csv'; a.click(); URL.revokeObjectURL(url);
+  };
+  const importCSV=(file)=>{
+    const r=new FileReader();
+    r.onload=()=>{
+      const lines=r.result.split(/\r?\n/).filter(Boolean); lines.shift();
+      const rows=JSON.parse(JSON.stringify(plan.rows));
+      lines.forEach(l=>{
+        const [ch,cat,pid,sales,md,sh,br,er,oo,bom,bm]=l.split(',');
+        if(rows?.[ch]?.[cat]?.[pid]){
+          rows[ch][cat][pid]={ sales:Number(sales)||0, mdPct:Number(md)||0, shrinkPct:Number(sh)||0, bomRate:Number(br)||0, eomRate:Number(er)||0, onOrder:Number(oo)||0, bom:Number(bom)||0, bomManual:(bm==='1') };
+        }
+      });
+      setPlan({...plan, rows}); alert('CSVを取り込みました');
+    };
+    r.readAsText(file,'utf-8');
+  };
+  return (
+    <Paper variant="outlined" sx={{p:2}}>
+      <Stack direction="row" spacing={2} flexWrap="wrap" alignItems="center">
+        <Button variant="contained" startIcon={<span className="material-icons">save</span>} onClick={save}>保存</Button>
+        <Button variant="outlined" startIcon={<span className="material-icons">folder_open</span>} onClick={load}>読み込み</Button>
+        <Button variant="outlined" startIcon={<span className="material-icons">download</span>} onClick={exportJSON}>JSON出力</Button>
+        <Button variant="outlined" component="label" startIcon={<span className="material-icons">upload_file</span>}>
+          JSON入力<input type="file" hidden accept=".json" onChange={(e)=>e.target.files[0]&&importJSON(e.target.files[0])}/>
+        </Button>
+        <Button variant="outlined" onClick={exportCSV} startIcon={<span className="material-icons">download</span>}>CSV出力</Button>
+        <Button variant="outlined" component="label" startIcon={<span className="material-icons">upload_file</span>}>
+          CSV入力<input type="file" hidden accept=".csv" onChange={(e)=>e.target.files[0]&&importCSV(e.target.files[0])}/>
+        </Button>
+      </Stack>
+    </Paper>
+  );
+}
+
+/* ===== アプリ本体（Infographic / Detail（統合）） ===== */
+function DetailMode({plan,setPlan}){
+  const agg=computeAggregate(plan);
+  const [tab,setTab]=React.useState(0); // 0: Grid / 1: Table
+  return (
+    <>
+      <SettingsBar plan={plan} setPlan={setPlan}/>
+      <Box className="kpi" my={2}>
+        <KPI icon="sell" label="期間売上予測" value={fmtYen(agg.total.sales)} sub={`${plan.periods[0].label}〜${plan.periods.at(-1).label}`} />
+        <KPI icon="local_shipping" label="期間入荷（Receipts）" value={fmtYen(agg.total.receipts)} />
+        <KPI icon="shopping_bag" label="期間OTB（買い余地）" value={fmtYen(agg.total.otb)} sub={agg.total.otb<0?'過発注 注意':'適正／余地あり'}/>
+        <KPI icon="speed" label="想定回転（Turn）" value={`${agg.total.turn.toFixed(2)} 回`} />
+      </Box>
+      <IOBar plan={plan} setPlan={setPlan}/>
+      <Paper variant="outlined" sx={{mt:2}}>
+        <Box px={2}>
+          <Tabs value={tab} onChange={(e,v)=>setTab(v)}>
+            <Tab label="グリッド編集（ch×分類×期間）" />
+            <Tab label="テーブル（BOM→売上→値下→仕入→回転）" />
+          </Tabs>
+        </Box>
+        <Divider/>
+        <Box p={2}>
+          {tab===0 ? <EditableGrid plan={plan} setPlan={setPlan}/> : <DetailTable plan={plan} setPlan={setPlan}/>}
+        </Box>
+      </Paper>
+    </>
+  );
+}
+
+function App(){
+  const now=new Date(); const fyStart=4; const year = (now.getMonth()+1)>=fyStart ? now.getFullYear() : now.getFullYear()-1;
+  const [plan,setPlan]=React.useState(()=> defaultPlan({year, fyStartMonth:fyStart, grain:'week', customDays:7}));
+  const [mode,setMode]=React.useState(()=> localStorage.getItem('otb_mode_integrated_v1') || 'infographic');
+  React.useEffect(()=>{ localStorage.setItem('otb_mode_integrated_v1', mode); },[mode]);
+  React.useEffect(()=>{ const onKey=e=>{ if(e.key?.toLowerCase()==='i') setMode('infographic'); if(e.key?.toLowerCase()==='d') setMode('detail'); }; window.addEventListener('keydown',onKey); return ()=>window.removeEventListener('keydown',onKey); },[]);
+
+  return (
+    <>
+      <AppBar position="static" color="inherit" elevation={0}>
+        <Toolbar className="wrap">
+          <span className="material-icons" style={{marginRight:8}}>donut_large</span>
+          <Typography variant="h6" sx={{flexGrow:1}}>仕入計画ダッシュボード（Table統合）</Typography>
+          <ToggleButtonGroup exclusive size="small" value={mode} onChange={(e,v)=> v && setMode(v)}>
+            <ToggleButton value="infographic"><span className="material-icons" style={{fontSize:16,marginRight:4}}>dashboard</span>Infographic</ToggleButton>
+            <ToggleButton value="detail"><span className="material-icons" style={{fontSize:16,marginRight:4}}>grid_on</span>Detail</ToggleButton>
+          </ToggleButtonGroup>
+        </Toolbar>
+      </AppBar>
+
+      <div className="wrap">
+        {mode==='infographic' ? <Infographic plan={plan} setMode={setMode}/> : <DetailMode plan={plan} setPlan={setPlan}/>}
+      </div>
+    </>
+  );
+}
+
+const root=ReactDOM.createRoot(document.getElementById('root'));
+root.render(<App/>);
+</script>
+</body>
+</html>
