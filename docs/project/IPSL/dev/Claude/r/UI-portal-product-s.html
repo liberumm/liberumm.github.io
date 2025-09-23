@@ -34,6 +34,11 @@
     .nowrap{white-space:nowrap}
     .pill{display:inline-flex;gap:6px;align-items:center;padding:6px 10px;border-radius:999px;background:#eef3ff;color:#223}
   </style>
+  <style>
+    /* dense table */
+    .dense th, .dense td { padding:4px; font-size:12px }
+    .dense th { background:#fafafa }
+  </style>
 </head>
 <body>
 <div id="root"></div>
@@ -487,6 +492,36 @@ function App(){
     return `${p.sku}｜${p.name}`; // SKU
   };
 
+  // 子階層を決定（親 axis に対して次の階層を返す）
+  const axisOrder = ['全部門','部門','コーナー','ライン','カテゴリ','アイテム','SKU'];
+  const getChildAxis = (axis)=>{ const i = axisOrder.indexOf(axis); return i>=0 && i<axisOrder.length-1 ? axisOrder[i+1] : null; };
+  const childLabelFor = (p, axis)=>{
+    if(axis==='全部門') return '全部門';
+    if(axis==='部門') return p.dept;
+    if(axis==='コーナー') return P_TAXO[p.id]?.corner || '—';
+    if(axis==='ライン') return P_TAXO[p.id]?.line || '—';
+    if(axis==='カテゴリ') return P_TAXO[p.id]?.category || '—';
+    if(axis==='アイテム') return p.itemName || P_TAXO[p.id]?.item || p.name;
+    return p.id || p.sku;
+  };
+
+  // 追加ステート：アクション絞込、検索、チェック、ソート、カラムフィルタ、展開
+  const [filterAction, setFilterAction] = useState('all'); // 'all'|'発注'|'移管'|'値下'
+  const [searchTerm, setSearchTerm] = useState('');
+  const [checkedRows, setCheckedRows] = useState(new Set());
+  const [sortKey, setSortKey] = useState('totalUnits');
+  const [sortAsc, setSortAsc] = useState(false);
+  const [columnFilters, setColumnFilters] = useState({});
+  const [expandedRows, setExpandedRows] = useState(new Set());
+
+  const toggleRowCheck = (label)=>{
+    setCheckedRows(prev=>{ const s=new Set(prev); if(s.has(label)) s.delete(label); else s.add(label); return s; });
+  };
+  const toggleSelectAll = (rows)=>{
+    setCheckedRows(prev=>{ if(prev.size===rows.length) return new Set(); return new Set(rows.map(r=>r.label)); });
+  };
+  const toggleExpand = (label)=>{ setExpandedRows(prev=>{ const s=new Set(prev); if(s.has(label)) s.delete(label); else s.add(label); return s; }); };
+
   // テーブル行
   const tableRows = useMemo(()=>{
     const map = new Map();
@@ -505,13 +540,11 @@ function App(){
     // バケット毎の集計をインデックス経由で実行
     map.forEach(g=>{
       const byUnits = buckets.map(b=>{
-        // 各SKUごとにインデックスから単位数を取得（対象店舗で制約がある場合は店舗ごとに取得）
         let tot=0;
         g.items.forEach(p=>{
           if(targetStoreIds.size===STORES.length){ // 全店舗なら高速集計
             tot += sumProductUnitsInRange(p.id, b.start, b.end);
           } else {
-            // 対象店舗のみ集計
             Array.from(targetStoreIds).forEach(sid=>{ tot += sumProductUnitsByStoreInRange(p.id, sid, b.start, b.end); });
           }
         });
@@ -523,7 +556,6 @@ function App(){
           if(targetStoreIds.size===STORES.length){
             tot += sumProductRevenueInRange(p.id, b.start, b.end);
           } else {
-            // 近似：店舗単位の販売点数に売価を乗じる
             Array.from(targetStoreIds).forEach(sid=>{ const units = sumProductUnitsByStoreInRange(p.id, sid, b.start, b.end); tot += units * p.price; });
           }
         });
@@ -597,10 +629,40 @@ function App(){
         forecastEnd:g.forecastEnd, price:g.price, cost:g.cost, eol:g.eol, byStore28:g.byStore28, action,
         prevTotalUnits:g.prevTotalUnits, prevTotalRevenue:g.prevTotalRevenue};
     });
-    const keyTotal = metric==='units'?'totalUnits': metric==='revenue'?'totalRevenue':'totalProfit';
-    rows.sort((a,b)=> (b[keyTotal]-a[keyTotal]));
-    return rows;
-  },[buckets,metric,prodAxis,range.start,range.end,storeAxis,storeGroup, targetStoreIds]);
+
+    // 適用：アクション絞込・検索・カラムフィルタ
+    let filtered = rows.filter(r=>{
+      if(filterAction!=='all' && r.action.label !== filterAction) return false;
+      if(searchTerm && !r.label.toLowerCase().includes(searchTerm.toLowerCase())) return false;
+      for(const k in columnFilters){ const v=String(columnFilters[k]||'').trim(); if(!v) continue; let rv='';
+        if(k==='price') rv = r.price || '';
+        else if(k==='cost') rv = r.cost || '';
+        else if(k==='inv') rv = r.inv || 0;
+        else if(k==='planEnd') rv = r.eol || '';
+        else if(k==='forecastEnd') rv = r.forecastEnd || '';
+        else if(k==='total') rv = metric==='units'? r.totalUnits : metric==='revenue'? r.totalRevenue : r.totalProfit;
+        else rv = r[k] || '';
+        if(String(rv).toLowerCase().indexOf(v.toLowerCase())===-1) return false;
+      }
+      return true;
+    });
+
+    // ソート
+    if(sortKey){
+      filtered.sort((a,b)=>{
+        let av,bv;
+        if(sortKey==='label'){ av=a.label; bv=b.label; }
+        else if(sortKey==='price'){ av=a.price||0; bv=b.price||0; }
+        else if(sortKey==='inv'){ av=a.inv||0; bv=b.inv||0; }
+        else if(sortKey==='total'){ av = metric==='units'? a.totalUnits : metric==='revenue'? a.totalRevenue : a.totalProfit; bv = metric==='units'? b.totalUnits : metric==='revenue'? b.totalRevenue : b.totalProfit; }
+        else { av=a[sortKey]||0; bv=b[sortKey]||0; }
+        if(typeof av === 'string') return sortAsc ? av.localeCompare(bv) : bv.localeCompare(av);
+        return sortAsc ? av - bv : bv - av;
+      });
+    }
+
+    return filtered;
+  },[buckets,metric,prodAxis,range.start,range.end,storeAxis,storeGroup, targetStoreIds, filterAction, searchTerm, JSON.stringify(columnFilters), sortKey, sortAsc]);
 
   // 売上推移
   const trend = useMemo(()=>{
@@ -640,10 +702,34 @@ function App(){
 
   const th = { textAlign:'left', padding:8, border:'1px solid #eee' };
   const td = { padding:8, border:'1px solid #eee' };
+  // 表示用ヘルパー：行ごとのコードと商品名をprodAxisに応じて取得
+  const getRowCode = (row) => {
+    if(prodAxis==='SKU') return row.items[0]?.sku || row.items[0]?.id || row.label;
+    if(prodAxis==='アイテム') return (row.items[0]?.itemId || row.items[0]?.id || row.label).slice(0,8);
+    return row.label;
+  };
+  const getRowName = (row) => {
+    if(prodAxis==='SKU') return row.items[0]?.name || row.label;
+    if(prodAxis==='アイテム') return row.items[0]?.itemName || row.label;
+    return row.label;
+  };
   const metricHeader = metric==='units'?'販売点数': metric==='revenue'?'売上高':'粗利高';
   const formatCell = (v)=> metric==='units' ? v.toLocaleString() : fmtYen(v);
   const showBuckets = viewMode==='detail';
   const showMoneyCols = (prodAxis==='アイテム' || prodAxis==='SKU');
+
+  // テーブルの表示件数管理
+  const INITIAL_ROWS = 50;
+  const [rowLimit, setRowLimit] = useState(INITIAL_ROWS);
+  const tableWrapRef = useRef(null);
+  useEffect(()=>{ setRowLimit(INITIAL_ROWS); }, [tableRows.length, prodAxis, range.start, range.end]);
+  const handleScroll = () => {
+    const el = tableWrapRef.current;
+    if(!el) return;
+    if(el.scrollTop + el.clientHeight >= el.scrollHeight - 10) {
+      setRowLimit(lim => Math.min(tableRows.length, lim + 50));
+    }
+  };
 
   return (
     <>
@@ -696,6 +782,32 @@ function App(){
           </Box>
         </Section>
 
+        {/* アクション絞込＆検索 */}
+        <Section title="アクション操作" icon="bolt">
+          <Paper variant="outlined" sx={{p:1}}>
+            <Grid container spacing={1} alignItems="center">
+              <Grid item>
+                <Button variant={filterAction==='all'? 'contained':'outlined'} onClick={()=>setFilterAction('all')}>すべて</Button>
+              </Grid>
+              <Grid item>
+                <Button variant={filterAction==='発注'? 'contained':'outlined'} color="primary" onClick={()=>setFilterAction('発注')}>発注</Button>
+              </Grid>
+              <Grid item>
+                <Button variant={filterAction==='移管'? 'contained':'outlined'} color="warning" onClick={()=>setFilterAction('移管')}>移管</Button>
+              </Grid>
+              <Grid item>
+                <Button variant={filterAction==='値下'? 'contained':'outlined'} color="error" onClick={()=>setFilterAction('値下')}>値下</Button>
+              </Grid>
+              <Grid item xs>
+                <TextField size="small" placeholder="商品検索" fullWidth value={searchTerm} onChange={(e)=>setSearchTerm(e.target.value)} />
+              </Grid>
+              <Grid item>
+                <Button onClick={()=>{ setFilterAction('all'); setSearchTerm(''); setColumnFilters({}); setCheckedRows(new Set()); }}>クリア</Button>
+              </Grid>
+            </Grid>
+          </Paper>
+        </Section>
+
         {/* 販売実績テーブル */}
         <Section
           title={`販売実績テーブル（${metricHeader}｜列＝期間${showBuckets?'（詳細）':'（簡潔）'}｜行＝${prodAxis}）`}
@@ -713,32 +825,90 @@ function App(){
             拠点スコープ：{storeAxis}{storeAxis!=='全店舗' ? `｜${storeGroup}` : ''} ／ 指標：{metricHeader}
             ／ ルール：<b>発注</b>（予測&lt;計画）・<b>移管</b>（計画超過＋店舗偏差大）・<b>値下</b>（大幅計画超過）
           </div>
-          <div className="tableWrap">
-             <table>
-               <thead>
-                 <tr>
-                   <th style={th}>{prodAxis}</th>
-                   {showMoneyCols && <th style={{...th,textAlign:'right'}}>売価</th>}
-                   {showMoneyCols && <th style={{...th,textAlign:'right'}}>原価</th>}
-                   <th style={{...th,textAlign:'right'}}>在庫</th>
-                   {showBuckets
-                    ? buckets.map((b,i)=>(
-                        <th key={i} style={{...th,textAlign:'right'}}>{b.label}<br/><span className="mini">{b.start}〜{b.end}</span></th>
-                      ))
-                    : buckets.slice(-2).map((b,i)=>(
-                        <th key={i} style={{...th,textAlign:'right'}}>{i===0?'直近-1':'直近'}<br/><span className="mini">{b.start}〜{b.end}</span></th>
-                      ))
-                   }
-                   <th style={{...th,textAlign:'right'}}>累計販売実績（{metricHeader}）</th>
-                   {/* 計画終了日と予測終了日を横並びに配置 */}
-                   <th style={th}>計画終了日</th>
-                   <th style={th}>予測終了日</th>
-                   <th style={{...th,textAlign:'center'}}>推奨アクション</th>
-                   <th style={{...th,textAlign:'center'}}>対応</th>
-                 </tr>
-               </thead>
-               <tbody>
-                 {tableRows.map(row=>{
+          <div className="tableWrap" ref={tableWrapRef} onScroll={handleScroll} style={{maxHeight:'520px',overflowY:'auto'}}>
+            <table className="dense">
+              <thead>
+                {/* フィルタ行（列に合わせた順） */}
+                <tr>
+                  <th style={th}><Checkbox checked={checkedRows.size>0 && checkedRows.size===tableRows.length} indeterminate={checkedRows.size>0 && checkedRows.size<tableRows.length} onChange={()=>toggleSelectAll(tableRows)} /></th>
+                  <th style={th}></th>
+                  <th style={th}><TextField size="small" placeholder="コードで絞込" defaultValue={columnFilters.code||''} onBlur={e=>setColumnFilters({...columnFilters, code:e.target.value})} /></th>
+                  <th style={th}><TextField size="small" placeholder="商品名で絞込" defaultValue={columnFilters.name||''} onBlur={e=>setColumnFilters({...columnFilters, name:e.target.value})} /></th>
+                  {showMoneyCols && <th style={th}><TextField size="small" placeholder="売価で絞込" defaultValue={columnFilters.price||''} onBlur={e=>setColumnFilters({...columnFilters, price:e.target.value})} /></th>}
+                  {showMoneyCols && <th style={th}><TextField size="small" placeholder="原価で絞込" defaultValue={columnFilters.cost||''} onBlur={e=>setColumnFilters({...columnFilters, cost:e.target.value})} /></th>}
+                  <th style={th}><TextField size="small" placeholder="在庫で絞込" defaultValue={columnFilters.inv||''} onBlur={e=>setColumnFilters({...columnFilters, inv:e.target.value})} /></th>
+                  <th style={th}><TextField size="small" placeholder="累計で絞込" defaultValue={columnFilters.total||''} onBlur={e=>setColumnFilters({...columnFilters, total:e.target.value})} /></th>
+                  {showBuckets ? buckets.map((b,i)=>(<th key={i} style={th}><TextField size="small" placeholder={b.label} defaultValue={columnFilters['col'+i]||''} onBlur={e=>setColumnFilters({...columnFilters, ['col'+i]:e.target.value})} /></th>)) : buckets.slice(-2).map((b,i)=>(<th key={i} style={th}><TextField size="small" placeholder={i===0?'直近-1':'直近'} defaultValue={columnFilters['col'+i]||''} onBlur={e=>setColumnFilters({...columnFilters, ['col'+i]:e.target.value})} /></th>))}
+                  <th style={th}><TextField size="small" placeholder="計画終了日" defaultValue={columnFilters.planEnd||''} onBlur={e=>setColumnFilters({...columnFilters, planEnd:e.target.value})} /></th>
+                  <th style={th}><TextField size="small" placeholder="予測終了日" defaultValue={columnFilters.forecastEnd||''} onBlur={e=>setColumnFilters({...columnFilters, forecastEnd:e.target.value})} /></th>
+                  <th style={th}></th>
+                  <th style={th}></th>
+                </tr>
+                {/* ヘッダー行 */}
+                <tr>
+                  <th style={th}></th>
+                  <th style={th}>No</th>
+                  <th style={th}>
+                    <span style={{cursor:'pointer'}} onClick={()=>{ setSortKey('label'); setSortAsc(sortKey==='label'?!sortAsc:false); }}>
+                      コード {sortKey==='label' ? (sortAsc?'▲':'▼') : '▽'}
+                    </span>
+                  </th>
+                  <th style={th}>
+                    <span style={{cursor:'pointer'}} onClick={()=>{ setSortKey('name'); setSortAsc(sortKey==='name'?!sortAsc:false); }}>
+                      商品名 {sortKey==='name' ? (sortAsc?'▲':'▼') : '▽'}
+                    </span>
+                  </th>
+                  {showMoneyCols && <th style={{...th,textAlign:'right'}}>
+                    <span style={{cursor:'pointer'}} onClick={()=>{ setSortKey('price'); setSortAsc(sortKey==='price'?!sortAsc:false); }}>
+                      売価 {sortKey==='price' ? (sortAsc?'▲':'▼') : '▽'}
+                    </span>
+                   </th>}
+                  {showMoneyCols && <th style={{...th,textAlign:'right'}}>
+                    <span style={{cursor:'pointer'}} onClick={()=>{ setSortKey('cost'); setSortAsc(sortKey==='cost'?!sortAsc:false); }}>
+                      原価 {sortKey==='cost' ? (sortAsc?'▲':'▼') : '▽'}
+                    </span>
+                   </th>}
+                  <th style={{...th,textAlign:'right'}}>
+                    <span style={{cursor:'pointer'}} onClick={()=>{ setSortKey('inv'); setSortAsc(sortKey==='inv'?!sortAsc:false); }}>
+                      在庫 {sortKey==='inv' ? (sortAsc?'▲':'▼') : '▽'}
+                    </span>
+                   </th>
+                  <th style={{...th,textAlign:'right'}} onClick={()=>{ setSortKey('total'); setSortAsc(sortKey==='total'?!sortAsc:false); }}>
+                    <span style={{cursor:'pointer'}}>
+                      累計 {sortKey==='total' ? (sortAsc?'▲':'▼') : '▽'}
+                    </span>
+                   </th>
+                  {showBuckets ? buckets.map((b,i)=>(
+                    <th key={i} style={{...th,textAlign:'right'}} onClick={()=>{ setSortKey('col'+i); setSortAsc(sortKey==='col'+i?!sortAsc:false); }}>
+                      <span style={{cursor:'pointer'}}>
+                        {b.label} {sortKey==='col'+i ? (sortAsc?'▲':'▼') : '▽'}
+                      </span>
+                       <br/><span className="mini">{b.start}〜{b.end}</span>
+                    </th>
+                  )) : buckets.slice(-2).map((b,i)=>(
+                    <th key={i} style={{...th,textAlign:'right'}} onClick={()=>{ setSortKey('col'+i); setSortAsc(sortKey==='col'+i?!sortAsc:false); }}>
+                      <span style={{cursor:'pointer'}}>
+                        {i===0?'直近-1':'直近'} {sortKey==='col'+i ? (sortAsc?'▲':'▼') : '▽'}
+                      </span>
+                       <br/><span className="mini">{b.start}〜{b.end}</span>
+                    </th>
+                  ))}
+                  <th style={th}>
+                    <span style={{cursor:'pointer'}} onClick={()=>{ setSortKey('planEnd'); setSortAsc(sortKey==='planEnd'?!sortAsc:false); }}>
+                      計画終了日 {sortKey==='planEnd' ? (sortAsc?'▲':'▼') : '▽'}
+                    </span>
+                   </th>
+                  <th style={th}>
+                    <span style={{cursor:'pointer'}} onClick={()=>{ setSortKey('forecastEnd'); setSortAsc(sortKey==='forecastEnd'?!sortAsc:false); }}>
+                      予測終了日 {sortKey==='forecastEnd' ? (sortAsc?'▲':'▼') : '▽'}
+                    </span>
+                   </th>
+                  <th style={{...th,textAlign:'center'}}>推奨対応</th>
+                  <th style={{...th,textAlign:'center'}}>対応</th>
+                </tr>
+              </thead>
+              <tbody>
+                {tableRows.slice(0,rowLimit).map((row, rowIndex)=>{
                    const byBucket = metric==='units'? row.byBucketUnits : metric==='revenue'? row.byBucketRevenue : row.byBucketProfit;
                    const total    = metric==='units'? row.totalUnits : metric==='revenue'? row.totalRevenue : row.totalProfit;
                    const showBy   = (viewMode==='detail') ? byBucket : byBucket.slice(-2);
@@ -746,29 +916,101 @@ function App(){
                    const costCell  = showMoneyCols ? (row.cost!=null  ? fmtYen(row.cost)  : '—') : '—';
                    const planEnd   = row.eol || '—';
                    return (
-                    <tr key={row.label} className="rowHover" onClick={()=>setSelectedRow(row)} style={{background: selectedRow && selectedRow.label===row.label? '#eef8ff': undefined}}>
-                      <td style={td}><b>{row.label}</b>{prodAxis!=='SKU' && <div className="mini" style={{color:'#666'}}>アイテム数：{row.items.length}</div>}</td>
-                       {showMoneyCols && <td style={{...td,textAlign:'right'}}>{priceCell}</td>}
-                       {showMoneyCols && <td style={{...td,textAlign:'right'}}>{costCell}</td>}
-                       <td style={{...td,textAlign:'right'}}>{row.inv.toLocaleString()}</td>
-                       {showBy.map((v,i)=>(<td key={i} style={{...td,textAlign:'right'}}>{formatCell(v)}</td>))}
-                       {/* 累計販売実績（従来の合計） */}
-                       <td style={{...td,textAlign:'right'}}>{formatCell(total)}</td>
-                       {/* 合計の右に計画終了日と予測終了日を横並びで出力 */}
-                       <td style={td} className="nowrap">{planEnd}</td>
-                       <td style={td} className="nowrap">{row.forecastEnd || '—'}</td>
-                       <td style={{...td,textAlign:'center'}}>
-                        <Chip label={row.action.label} color={row.action.color} variant={row.action.label==='—'?'outlined':'filled'} size="small" onClick={()=>openActionModal(row.action.label,row)} style={{cursor:'pointer'}}/>
-                         {viewMode==='detail' && row.action.label!=='—' && (
-                           <div className="mini" style={{marginTop:4,color:'#666'}}>{row.action.reason}</div>
-                         )}
-                       </td>
-                       <td style={{...td,textAlign:'center'}}>
-                        <Button size="small" variant="contained" disabled={prodAxis!=='SKU'} onClick={()=>openActionModal('対応',row)}>
-                          {prodAxis==='SKU'?'対応':'SKUで表示'}
-                        </Button>
-                       </td>
-                     </tr>
+                     <React.Fragment key={row.label}>
+                       <tr className="rowHover" onClick={(e)=>{ setSelectedRow(row); const child = getChildAxis(prodAxis); if(child){ toggleExpand(row.label); } }} style={{background: selectedRow && selectedRow.label===row.label? '#eef8ff': undefined}}>
+                         <td style={td}><Checkbox size="small" checked={checkedRows.has(row.label)} onChange={(e)=>{ e.stopPropagation(); toggleRowCheck(row.label); }} /></td>
+                         <td style={td}>{rowIndex+1}</td>
+                         <td style={td}><b>{getRowCode(row)}</b></td>
+                         <td style={td}>{getRowName(row)}{prodAxis!=='SKU' ? ` ${prodAxis!=='アイテム' ? `(${row.items.length}件)` : ''}` : ''}</td>
+                         {showMoneyCols && <td style={{...td,textAlign:'right'}}>{priceCell}</td>}
+                         {showMoneyCols && <td style={{...td,textAlign:'right'}}>{costCell}</td>}
+                         <td style={{...td,textAlign:'right'}}>{row.inv.toLocaleString()}</td>
+                         {showBy.map((v,i)=>(<td key={i} style={{...td,textAlign:'right'}}>{formatCell(v)}</td>))}
+                         <td style={{...td,textAlign:'right'}}>{formatCell(total)}</td>
+                         <td style={td} className="nowrap">{planEnd}</td>
+                         <td style={td} className="nowrap">{row.forecastEnd || '—'}</td>
+                         <td style={{...td,textAlign:'center'}}>
+                           <Chip label={row.action.label} color={row.action.color} variant={row.action.label==='—'?'outlined':'filled'} size="small" onClick={(e)=>{ e.stopPropagation(); openActionModal(row.action.label,row); }} style={{cursor:'pointer'}}/>
+                           {viewMode==='detail' && row.action.label!=='—' && (<div className="mini" style={{marginTop:4,color:'#666'}}>{row.action.reason}</div>)}
+                         </td>
+                         <td style={{...td,textAlign:'center'}}><Button size="small" variant="contained" disabled={prodAxis!=='SKU'} onClick={(e)=>{ e.stopPropagation(); openActionModal('対応',row); }}>{prodAxis==='SKU'?'対応':'SKUで表示'}</Button></td>
+                       </tr>
+
+                       {expandedRows.has(row.label) && (()=>{
+                         const childAxis = getChildAxis(prodAxis);
+                         if(!childAxis) return null;
+                        // グルーピング（子階層）
+                        const cmap = new Map();
+                        row.items.forEach(p=>{
+                          const k = childLabelFor(p, childAxis) || '—';
+                          if(!cmap.has(k)) cmap.set(k,{label:k, items:[]});
+                          cmap.get(k).items.push(p);
+                        });
+                        const childGroups = Array.from(cmap.values());
+                        return (
+                          <tr>
+                            <td colSpan={ (showMoneyCols?5:3) + (showBy.length) + 7 } style={{padding:0, border:'none'}}>
+                              <div style={{padding:8}}>
+                                <div className="mini" style={{marginBottom:6}}>{childAxis}：{row.items.length}件</div>
+                                <div className="tableWrap">
+                                  <table className="dense">
+                                    <thead>
+                                      <tr>
+                                        <th style={th}></th>
+                                        <th style={th}>No</th>
+                                        <th style={th}>コード</th>
+                                        <th style={th}>商品名</th>
+                                        {showMoneyCols && <th style={{...th,textAlign:'right'}}>売価</th>}
+                                        {showMoneyCols && <th style={{...th,textAlign:'right'}}>原価</th>}
+                                        <th style={{...th,textAlign:'right'}}>在庫</th>
+                                        <th style={{...th,textAlign:'right'}}>累計</th>
+                                        {showBuckets ? buckets.map((b,i)=>(<th key={i} style={{...th,textAlign:'right'}}>{b.label}</th>)) : buckets.slice(-2).map((b,i)=>(<th key={i} style={{...th,textAlign:'right'}}>{i===0?'直近-1':'直近'}</th>))}
+                                        <th style={th}>計画終了日</th>
+                                        <th style={th}>予測終了日</th>
+                                        <th style={{...th,textAlign:'center'}}>推奨対応</th>
+                                        <th style={{...th,textAlign:'center'}}>対応</th>
+                                      </tr>
+                                    </thead>
+                                    <tbody>
+                                      {childGroups.map((g, gi)=>{
+                                        // 集計
+                                        let inv = 0; let total = 0; const byCols = buckets.map(()=>0);
+                                        g.items.forEach(p=>{
+                                          inv += sum(INVENTORY.filter(i=> p.id===i.productId && targetStoreIds.has(i.storeId)), x=>x.qty);
+                                          buckets.forEach((b,bi)=>{ byCols[bi] += sumProductUnitsInRange(p.id, b.start, b.end); });
+                                          total += sum(buckets.map((b,bi)=> sumProductUnitsInRange(p.id, b.start, b.end)));
+                                        });
+                                        const price = g.items.length===1 ? g.items[0].price : Math.round(sum(g.items.map(x=>x.price))/g.items.length);
+                                        const cost  = Math.round(price*0.6);
+                                        const planEnd = g.items[0]?.eol || '—';
+                                        const action = decideAction({forecastEnd:null, eol:g.items[0]?.eol, byStore28:{}});
+                                        return (
+                                          <tr key={g.label}>
+                                            <td style={td}></td>
+                                            <td style={td}>{gi+1}</td>
+                                            <td style={td}><b>{g.label}</b></td>
+                                            <td style={td}>{g.items.length>1? `アイテム数:${g.items.length}` : (g.items[0]?.name||'')}</td>
+                                            {showMoneyCols && <td style={{...td,textAlign:'right'}}>{price? fmtYen(price) : '—'}</td>}
+                                            {showMoneyCols && <td style={{...td,textAlign:'right'}}>{fmtYen(cost)}</td>}
+                                            <td style={{...td,textAlign:'right'}}>{inv.toLocaleString()}</td>
+                                            <td style={{...td,textAlign:'right'}}>{total.toLocaleString()}</td>
+                                            {showBuckets ? byCols.map((v,i)=>(<td key={i} style={{...td,textAlign:'right'}}>{v.toLocaleString()}</td>)) : buckets.slice(-2).map((b,i)=>{ const v = byCols.slice(-2)[i]||0; return (<td key={i} style={{...td,textAlign:'right'}}>{v.toLocaleString()}</td>); })}
+                                            <td style={td} className="nowrap">{planEnd}</td>
+                                            <td style={td} className="nowrap">—</td>
+                                            <td style={{...td,textAlign:'center'}}><Chip label={action.label} color={action.color} variant={action.label==='—'?'outlined':'filled'} size="small" /></td>
+                                            <td style={{...td,textAlign:'center'}}><Button size="small" variant="contained">対応</Button></td>
+                                          </tr>
+                                        );
+                                      })}
+                                    </tbody>
+                                  </table>
+                                </div>
+                              </div>
+                            </td>
+                          </tr>
+                        );
+                      })()}
+                     </React.Fragment>
                    );
                  })}
                </tbody>
@@ -778,53 +1020,6 @@ function App(){
             ※「アイテム／SKU」では 売価・原価・計画終了日 を必ず表示。原価はデモ上、売価の60%で算出。
            </div>
         </Section>
-
-        {/* 子テーブル：選択行のSKU詳細 */}
-        {selectedRow && (
-          <Section title="SKU 詳細" icon="inventory_2">
-            <div className="mini" style={{marginBottom:8}}>
-              {selectedRow.label} の SKU 詳細
-            </div>
-            <div className="tableWrap">
-             <table>
-               <thead>
-                 <tr>
-                   <th style={th}>SKU</th>
-                   <th style={th}>アイテム名</th>
-                   <th style={{...th,textAlign:'right'}}>売価</th>
-                   <th style={{...th,textAlign:'right'}}>原価</th>
-                   <th style={{...th,textAlign:'right'}}>在庫</th>
-                   <th style={{...th,textAlign:'right'}}>28日販売数</th>
-                   <th style={{...th,textAlign:'right'}}>予測終了日</th>
-                   <th style={{...th,textAlign:'center'}}>推奨アクション</th>
-                 </tr>
-               </thead>
-               <tbody>
-                 {selectedRow.items.map(sku=>{
-                   const skuId = sku.id;
-                   const inv = INVENTORY.find(i=>i.productId===skuId && targetStoreIds.has(i.storeId))?.qty || 0;
-                   const sales28 = sum(SALES.filter(r=> r.productId===skuId && targetStoreIds.has(r.storeId) && r.date>=ymd(new Date(toDate(range.end).getTime() - 27*86400000)) && r.date<=range.end), x=>x.units);
-                   const action = decideAction({forecastEnd:null, eol:sku.eol, byStore28:{}});
-                   return (
-                    <tr key={skuId}>
-                      <td style={td}>{skuId}</td>
-                      <td style={td}>{sku.name}</td>
-                       <td style={{...td,textAlign:'right'}}>{fmtYen(sku.price)}</td>
-                       <td style={{...td,textAlign:'right'}}>{fmtYen(Math.round(sku.price*0.6))}</td>
-                       <td style={{...td,textAlign:'right'}}>{inv.toLocaleString()}</td>
-                       <td style={{...td,textAlign:'right'}}>{sales28.toLocaleString()}</td>
-                       <td style={td} className="nowrap">{sku.eol || '—'}</td>
-                       <td style={{...td,textAlign:'center'}}>
-                        <Chip label={action.label} color={action.color} variant={action.label==='—'?'outlined':'filled'} size="small" onClick={()=>openActionModal(action.label,selectedRow)} style={{cursor:'pointer'}}/>
-                       </td>
-                     </tr>
-                   );
-                 })}
-               </tbody>
-             </table>
-           </div>
-          </Section>
-        )}
 
         {/* アクションモーダル（モックUI）*/}
         <Dialog open={actionModal.open} onClose={closeActionModal} maxWidth="sm" fullWidth>
@@ -870,6 +1065,7 @@ function App(){
             {events.map(ev=>(
               <Grid key={ev.date+ev.title} item xs={12} md={4}>
                 <Card variant="outlined">
+                 
                   <CardContent>
                     <div className="mini" style={{color:'#222', fontWeight:700}}><span className="material-icons" style={{fontSize:16, verticalAlign:'middle'}}>calendar_today</span> {ev.date}</div>
                     <Typography variant="subtitle1" sx={{mt:0.5}}>{ev.title}</Typography>
@@ -936,6 +1132,7 @@ function App(){
              borderColor: 'rgba(220,20,60,0.9)',
              borderWidth: 2,
              label: { enabled: true, content: lbl, position: 'start', backgroundColor:'rgba(220,20,60,0.85)', color:'#fff' }
+
            };
          }
        } catch(e) { /* ignore */ }
