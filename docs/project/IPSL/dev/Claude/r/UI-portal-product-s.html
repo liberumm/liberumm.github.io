@@ -1,0 +1,970 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8" />
+  <title>商品ダッシュボード｜列強化＋推奨アクション＋ToDo/イベント</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <!-- Fonts / Icons -->
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Roboto:wght@300;400;500;700&display=swap"/>
+  <link rel="stylesheet" href="https://fonts.googleapis.com/icon?family=Material+Icons"/>
+  <!-- React / Babel / MUI -->
+  <script src="https://cdn.jsdelivr.net/npm/react@18.2.0/umd/react.production.min.js" crossorigin></script>
+  <script src="https://cdn.jsdelivr.net/npm/react-dom@18.2.0/umd/react-dom.production.min.js" crossorigin></script>
+  <script src="https://cdn.jsdelivr.net/npm/@babel/standalone@7.23.8/babel.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@mui/material@5.15.3/umd/material-ui.production.min.js" crossorigin></script>
+  <!-- Chart.js + annotation -->
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.3/dist/chart.umd.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chartjs-plugin-annotation@3.0.1/dist/chartjs-plugin-annotation.min.js"></script>
+  <style>
+    html,body,#root{height:100%}
+    body{margin:0;background:#f7f7f8}
+    .wrap{max-width:100%;margin:0 auto;padding:16px}
+    .mini{font-size:12px;color:#666}
+    .tableWrap{overflow:auto}
+    table{width:100%;border-collapse:collapse}
+    /* ヘッダーは折り返し可、データセルは折り返し不可に変更 */
+    th{border:1px solid #eee;padding:8px;text-align:left;background:#fafafa;position:sticky;top:0;z-index:1;word-break:break-word}
+    td{border:1px solid #eee;padding:8px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+    .rowHover{cursor:pointer}
+    .rowHover:hover{background:#fafafa}
+    .vh35{height:35vh; min-height:260px; max-height:520px}
+    .secTitle{display:flex;align-items:center;gap:8px;font-weight:700}
+    .chipRow{display:flex;flex-wrap:wrap;gap:8px}
+    .softNote{padding:6px 8px;border-radius:6px;background:#f0f3ff;color:#344;display:inline-block}
+    .nowrap{white-space:nowrap}
+    .pill{display:inline-flex;gap:6px;align-items:center;padding:6px 10px;border-radius:999px;background:#eef3ff;color:#223}
+  </style>
+</head>
+<body>
+<div id="root"></div>
+
+<script type="text/babel" data-presets="env,react">
+const { useState, useMemo, useEffect, useRef } = React;
+const {
+  AppBar, Toolbar, Typography, Paper, Box, Stack, Button,
+  Card, CardContent, Divider, Grid, TextField, Chip, MenuItem, Switch, FormControlLabel, Tooltip, Avatar, List, ListItem, ListItemAvatar, ListItemText, Checkbox,
+  Dialog, DialogTitle, DialogContent, DialogActions
+} = MaterialUI;
+
+/* Chart.js annotation */
+if (typeof window !== 'undefined' && window['chartjs-plugin-annotation']) {
+  Chart.register(window['chartjs-plugin-annotation']);
+}
+
+/* ====== ダミーデータ（商品＋簡易階層マスタ） ====== */
+// サンプル商品を動的生成（SKU数: 300、各アイテムに1〜4SKU紐づけ）
+const NUM_SKUS = 300;
+const CORNERS = ['070 レディース','073 メンズ','076 ナイティー'];
+const ITEMS = [];
+const PRODUCTS = [];
+const P_TAXO = {};
+(function genProducts(){
+  // アイテム数を適切に決め、1〜4SKUを割り当てて合計SKUがNUM_SKUSになるようにする
+  let remaining = NUM_SKUS;
+  let itemIdx = 1;
+  while(remaining>0){
+    const skusForItem = Math.min(remaining, Math.floor(Math.random()*4)+1); // 1〜4
+    const itemId = 'I' + String(itemIdx).padStart(4,'0');
+    const itemName = `Item ${String(itemIdx).padStart(3,'0')}`;
+    const corner = CORNERS[(itemIdx-1) % CORNERS.length];
+    ITEMS.push({id:itemId, name:itemName, corner, dept:'70衣料'});
+    for(let k=0;k<skusForItem;k++){
+      const skuIndex = NUM_SKUS - remaining + 1;
+      const skuId = 'SKU' + String(skuIndex).padStart(4,'0');
+      const skuCode = `${String(1000 + itemIdx).slice(-4)}-${String(1000+skuIndex).slice(-4)}-${String(10+k).padStart(2,'0')}`;
+      // 価格はアイテムベースに少し差分をつける
+      const basePrice = 1000 + ((itemIdx % 5) * 100) + ((k%3)*50);
+      const price = Math.round(basePrice/10)*10;
+      const prod = { id: skuId, sku: skuCode, name: `${itemName} ${k+1}`, price, dept:'70衣料', eol: null, itemId, itemName };
+      PRODUCTS.push(prod);
+      P_TAXO[prod.id] = { corner, line:'ライン'+((itemIdx%5)+1), category:'カテゴリ'+((itemIdx%3)+1), item:itemName };
+      remaining--;
+      if(remaining<=0) break;
+    }
+    itemIdx++;
+  }
+})();
+
+const STORES=[
+  {id:'S01',name:'新宿本店',channel:'店舗'},
+  {id:'S02',name:'渋谷店',  channel:'店舗'},
+  {id:'S03',name:'名古屋店',channel:'店舗'},
+  {id:'S05',name:'ECサイト',channel:'オンライン'}
+];
+const STORE_BLOCK={ S01:'東日本', S02:'東日本', S03:'中部', S05:'EC' };
+
+// 在庫と日別売上を動的に生成する（デモ用）
+function generateInventory(){
+  const inv=[];
+  PRODUCTS.forEach(p=>{
+    STORES.forEach(s=>{
+      // 商品ごと・店舗ごとに異なる在庫を持たせる
+      const base = p.id==='P003' ? 500 : (p.id==='P002'? 120 : 80);
+      const variance = Math.round((Math.sin(p.id.charCodeAt(1))+1)*20);
+      const qty = Math.max(0, base + (s.id==='S05'? 50:0) + (s.id==='S01'?30:0) + Math.round((Math.random()-0.5)*variance));
+      inv.push({productId:p.id, storeId:s.id, qty});
+    });
+  });
+  return inv;
+}
+let INVENTORY = generateInventory();
+
+function generateSales(seed=42){
+  let x=seed; const rand=()=> (x=(x*1664525+1013904223)%4294967296)/4294967296;
+  const rows=[]; const today=new Date();
+  for(let d=0; d<180; d++){
+    const date=new Date(today); date.setDate(date.getDate()-d); const ds=date.toISOString().slice(0,10);
+    PRODUCTS.forEach(p=>{
+      STORES.forEach(s=>{
+        // 店舗・商品ごとのベース販売点数
+        let base;
+        if(p.id==='P002'){ // P002 は店舗差を大きくして移管判定を出しやすくする
+          base = (s.id==='S01'?12:(s.id==='S02'?6:(s.id==='S03'?0:8)));
+        } else if(p.id==='P003'){ // P003 は低販目で在庫が多い（値下判定向け）
+          base = (s.channel==='オンライン'?3:2);
+        } else {
+          base = (s.channel==='オンライン'?8:4);
+        }
+        const w=(date.getDay()===0||date.getDay()===6)?1.3:1.0;
+        const noise = rand()*0.8+0.6;
+        const units = Math.max(0, Math.round(base * w * noise - 0.5));
+        // 売価はベース売価を参照し、ランダムに一部値下げを発生させる
+        const basePrice = p.price;
+        const salePrice = (rand()<0.05 && p.id!=='P001') ? Math.round(basePrice*0.8) : basePrice; // 5%程度で値下
+        const markdown = Math.max(0, (basePrice - salePrice) * units);
+        rows.push({productId:p.id, storeId:s.id, date:ds, units, salePrice, markdown});
+      });
+    });
+  }
+  return rows;
+}
+const SALES = generateSales();
+
+// SALES の索引を作成して範囲集計を高速化
+function buildSalesIndexes(sales){
+  const idxByProductDate = new Map(); // productId -> Map(date -> {units,revenue,markdown})
+  const idxByProductStoreDate = new Map(); // productId -> Map(storeId -> Map(date -> {units}))
+  const prodPriceCache = new Map();
+  PRODUCTS.forEach(p=> prodPriceCache.set(p.id, p.price));
+  sales.forEach(r=>{
+    // by product-date
+    let m = idxByProductDate.get(r.productId);
+    if(!m){ m = new Map(); idxByProductDate.set(r.productId, m); }
+    const d = m.get(r.date) || {units:0, revenue:0, markdown:0};
+    d.units += r.units;
+    const pprice = r.salePrice || prodPriceCache.get(r.productId) || 0;
+    d.revenue += r.units * pprice;
+    d.markdown += r.markdown || 0;
+    m.set(r.date, d);
+    // by product-store-date
+    let ms = idxByProductStoreDate.get(r.productId);
+    if(!ms){ ms = new Map(); idxByProductStoreDate.set(r.productId, ms); }
+    let sd = ms.get(r.storeId);
+    if(!sd){ sd = new Map(); ms.set(r.storeId, sd); }
+    const sdv = sd.get(r.date) || {units:0}; sdv.units += r.units; sd.set(r.date, sdv);
+  });
+  return { idxByProductDate, idxByProductStoreDate };
+}
+const SALES_INDEX = buildSalesIndexes(SALES);
+
+function sumProductUnitsInRange(productId, start, end){
+  const m = SALES_INDEX.idxByProductDate.get(productId); if(!m) return 0;
+  let s=0; for(const [date, agg] of m){ if(date>=start && date<=end) s += agg.units; }
+  return s;
+}
+function sumProductRevenueInRange(productId, start, end){
+  const m = SALES_INDEX.idxByProductDate.get(productId); if(!m) return 0;
+  let s=0; for(const [date, agg] of m){ if(date>=start && date<=end) s += agg.revenue; }
+  return s;
+}
+function sumProductUnitsByStoreInRange(productId, storeId, start, end){
+  const ms = SALES_INDEX.idxByProductStoreDate.get(productId); if(!ms) return 0;
+  const sd = ms.get(storeId); if(!sd) return 0;
+  let s=0; for(const [date, agg] of sd){ if(date>=start && date<=end) s += agg.units; }
+  return s;
+}
+
+/* ====== Utils ====== */
+const ymd=(d)=> new Date(d.getTime()-d.getTimezoneOffset()*60000).toISOString().slice(0,10);
+const toDate=s=>new Date(s+'T00:00:00');
+const sum=(a,sel=x=>x)=>a.reduce((p,c)=>p+sel(c),0);
+const fmtYen=n=>n.toLocaleString('ja-JP',{style:'currency',currency:'JPY',maximumFractionDigits:0});
+const startOfWeek=(d)=>{ const x=new Date(d); const wd=x.getDay(); const mon=new Date(x); mon.setDate(x.getDate()-(wd===0?6:wd-1)); mon.setHours(0,0,0,0); return mon; };
+const endOfWeek=(d)=>{ const e=new Date(startOfWeek(d)); e.setDate(e.getDate()+6); e.setHours(23,59,59,999); return e; };
+const startOfMonth=(d)=> new Date(d.getFullYear(), d.getMonth(), 1);
+const endOfMonth=(d)=> new Date(d.getFullYear(), d.getMonth()+1, 0, 23,59,59,999);
+const startOfQuarter=(d)=> new Date(d.getFullYear(), Math.floor(d.getMonth()/3)*3, 1);
+const endOfQuarter=(d)=> new Date(d.getFullYear(), Math.floor(d.getMonth()/3)*3+3, 0, 23,59,59,999);
+const startOfHalf=(d)=> new Date(d.getFullYear(), d.getMonth()<6?0:6, 1);
+const endOfHalf=(d)=> new Date(d.getFullYear(), d.getMonth()<6?6:12, 0, 23,59,59,999);
+
+/* ====== 共通UI ====== */
+function Section({title, icon, children, actions}){
+  return (
+    <Paper variant="outlined" sx={{mb:2}}>
+      <Box sx={{p:1.0, display:'flex', alignItems:'center', justifyContent:'space-between'}}>
+        <div className="secTitle"><span className="material-icons">{icon}</span>{title}</div>
+        {actions}
+      </Box>
+      <Divider/>
+      <Box sx={{p:1.5}}>
+        {children}
+      </Box>
+    </Paper>
+  );
+}
+
+/* ====== Filter ====== */
+const Filter = ({ onApply }) => {
+  const theme = MaterialUI.useTheme();
+  const years = (()=>{const y=new Date().getFullYear(); return [y-2,y-1,y,y+1,y+2];})();
+  const months = ['選択しない','1月','2月','3月','4月','5月','6月','7月','8月','9月','10月','11月','12月'];
+  const weeks = ['選択しない', ...Array.from({ length: 52 }).map((_, i) => `${i + 1}`)];
+  const [year, setYear] = useState(new Date().getFullYear());
+  const [month, setMonth] = useState('選択しない');
+  const [weekNumber, setWeekNumber] = useState('選択しない');
+  const [startDate, setStartDate] = useState('');
+  const [endDate, setEndDate] = useState('');
+  const getMonthRange=(y,m)=>({startDate:new Date(y,m-1,1), endDate:new Date(y,m,0)});
+  const getFiscalYearStart=(date)=>{ const yr=date.getMonth()>=3?date.getFullYear():date.getFullYear()-1; return new Date(yr,3,1); };
+  const getJST=(date)=> ymd(date);
+  const handleMonthChange = (e) => {
+    const newMonth = e.target.value;
+    setMonth(newMonth); setWeekNumber('選択しない');
+    if(newMonth!=='選択しない'){
+      const {startDate:s, endDate:e2} = getMonthRange(year, parseInt(newMonth.replace('月',''),10));
+      setStartDate(getJST(s)); setEndDate(getJST(e2));
+    }
+  };
+  useEffect(()=>{
+    const today=new Date();
+    /* 初期は参照日の月初と月末を設定 */
+    const s = startOfMonth(today);
+    const e = endOfMonth(today);
+    setYear(today.getFullYear()); setMonth(`${today.getMonth()+1}月`); setWeekNumber('選択しない');
+    setStartDate(getJST(s)); setEndDate(getJST(e));
+  },[]);
+  return (
+    <Paper elevation={3} sx={{ p: 2, borderTop: `4px solid ${theme.palette.primary.main}` }}>
+      <Box display="flex" alignItems="center" justifyContent="space-between" mb={1}>
+        <Typography variant="subtitle1" sx={{ display:'flex', alignItems:'center', gap:1 }}>
+          <span className="material-icons">filter_alt</span> 条件
+        </Typography>
+        <Box display="flex" gap={1}>
+          <Button variant="outlined" startIcon={<span className="material-icons">refresh</span>} size="small"
+            onClick={()=>{ const t=new Date(); const fy=((d)=>{ const yr=d.getMonth()>=3?d.getFullYear():d.getFullYear()-1; return new Date(yr,3,1);})(t);
+              const m=new Date(t); m.setDate(t.getDate()-t.getDay()+1); const s=new Date(m); const e=new Date(m); e.setDate(m.getDate()+6);
+              setYear(fy.getFullYear()); setMonth(`${m.getMonth()+1}月`); setWeekNumber('選択しない'); setStartDate(getJST(s)); setEndDate(getJST(e)); }}>
+            リセット
+          </Button>
+          <Button variant="contained" startIcon={<span className="material-icons">search</span>} size="small"
+            onClick={()=> onApply?.({ start: startDate, end: endDate, year, month, weekNumber })}>
+            検索
+          </Button>
+        </Box>
+      </Box>
+      <Grid container spacing={1}>
+        <Grid item xs={4} sm={4} md={2}>
+          <TextField select label="年度" value={year} onChange={(e)=>setYear(e.target.value)} size="small" fullWidth>
+            {years.map(y=><MenuItem key={y} value={y}>{y}</MenuItem>)}
+          </TextField>
+        </Grid>
+        <Grid item xs={4} sm={4} md={1}>
+          <TextField select label="月度" value={month} onChange={handleMonthChange} size="small" fullWidth>
+            {months.map(m=><MenuItem key={m} value={m}>{m}</MenuItem>)}
+          </TextField>
+        </Grid>
+        <Grid item xs={4} sm={4} md={1}>
+          <TextField select label="週" value={weekNumber} onChange={(e)=>setWeekNumber(e.target.value)} size="small" fullWidth>
+            {weeks.map(w=><MenuItem key={w} value={w}>{w}</MenuItem>)}
+          </TextField>
+        </Grid>
+        <Grid item xs={6} sm={6} md={2}>
+          <TextField label="開始日" type="date" value={startDate} onChange={(e)=>setStartDate(e.target.value)} InputLabelProps={{shrink:true}} size="small" fullWidth/>
+        </Grid>
+        <Grid item xs={6} sm={6} md={2}>
+          <TextField label="終了日" type="date" value={endDate} onChange={(e)=>setEndDate(e.target.value)} InputLabelProps={{shrink:true}} size="small" fullWidth/>
+        </Grid>
+      </Grid>
+    </Paper>
+  );
+};
+
+/* ====== Chart ====== */
+/* ====== セレクターバー（指標＆表示トグル） ====== */
+function SelectorBar({granularity,setGranularity,metric,setMetric,custom,setCustom,viewMode,setViewMode}){
+  const gItems = [
+    {key:'year', label:'年'}, {key:'half', label:'半期'}, {key:'quarter', label:'四半期'},
+    {key:'month', label:'月'}, {key:'week', label:'週'}, {key:'day', label:'日'}, {key:'custom', label:'カスタム'}
+  ];
+  const mItems = [
+    {key:'units', label:'販売点数'}, {key:'revenue', label:'売上高'}, {key:'profit', label:'粗利高'}
+  ];
+  return (
+    <Stack spacing={1}>
+      <div className="mini" style={{fontWeight:700}}>集計単位</div>
+      <div className="chipRow">
+        {gItems.map(it=>(
+          <Chip key={it.key} label={it.label}
+            color={granularity===it.key?'primary':'default'}
+            variant={granularity===it.key?'filled':'outlined'}
+            onClick={()=>setGranularity(it.key)}
+          />
+        ))}
+      </div>
+      {granularity==='custom' && (
+        <Grid container spacing={1} alignItems="center" sx={{mt:0.5}}>
+          <Grid item xs={6} md={2}>
+            <TextField size="small" type="number" label="間隔（日）" value={custom.intervalDays}
+              onChange={e=>setCustom({...custom, intervalDays: Math.max(1, Number(e.target.value)||1)})} fullWidth/>
+          </Grid>
+          <Grid item xs={6} md={2}>
+            <TextField size="small" type="number" label="列数" value={custom.columns}
+              onChange={e=>setCustom({...custom, columns: Math.max(1, Number(e.target.value)||1)})} fullWidth/>
+          </Grid>
+          <Grid item xs={12} md="auto"><span className="mini softNote">終了日から遡って作成（最大24列）</span></Grid>
+        </Grid>
+      )}
+      <Divider sx={{my:1}}/>
+      <Grid container alignItems="center" spacing={1}>
+        <Grid item xs={12} md={7}>
+          <div className="mini" style={{fontWeight:700}}>表示指標</div>
+          <div className="chipRow">
+            {mItems.map(it=>(
+              <Chip key={it.key} label={it.label}
+                color={metric===it.key?'primary':'default'}
+                variant={metric===it.key?'filled':'outlined'}
+                onClick={()=>setMetric(it.key)}
+              />
+            ))}
+          </div>
+        </Grid>
+        <Grid item xs={12} md={5}>
+          <FormControlLabel
+            control={<Switch checked={viewMode==='detail'} onChange={(e)=>setViewMode(e.target.checked?'detail':'simple')}/>}
+            label={viewMode==='detail' ? '詳細表示' : '簡潔表示'}
+          />
+          <span className="mini">（簡潔表示：期間列を直近2本に圧縮／要点とアクションに集中）</span>
+        </Grid>
+      </Grid>
+    </Stack>
+  );
+}
+
+/* ====== 分類軸セレクター ====== */
+function AxisSelector({prodAxis,setProdAxis,storeAxis,setStoreAxis,storeGroup,setStoreGroup}){
+  const prodItems=['全部門','部門','コーナー','ライン','カテゴリ','アイテム','SKU'];
+  const storeItems=['全店舗','事業','ブロック','店舗'];
+  const storeOptions = React.useMemo(()=>{
+    if(storeAxis==='全店舗') return ['全店舗'];
+    if(storeAxis==='事業') return Array.from(new Set(STORES.map(s=>s.channel)));
+    if(storeAxis==='ブロック') return Array.from(new Set(STORES.map(s=>STORE_BLOCK[s.id])));
+    if(storeAxis==='店舗') return STORES.map(s=>s.name);
+    return [];
+  },[storeAxis]);
+  useEffect(()=>{ setStoreGroup(storeOptions[0]||'全店舗'); },[storeAxis]);
+  return (
+    <Stack spacing={2}>
+      <div className="mini" style={{fontWeight:700}}>商品分類軸</div>
+      <div className="chipRow">
+        {prodItems.map(k=>(
+          <Chip key={k} label={k}
+            color={prodAxis===k?'primary':'default'}
+            variant={prodAxis===k?'filled':'outlined'}
+            onClick={()=>setProdAxis(k)}
+          />
+        ))}
+      </div>
+      <div className="mini" style={{fontWeight:700, marginTop:8}}>拠点分類軸</div>
+      <div className="chipRow" style={{marginBottom:4}}>
+        {storeItems.map(k=>(
+          <Chip key={k} label={k}
+            color={storeAxis===k?'primary':'default'}
+            variant={storeAxis===k?'filled':'outlined'}
+            onClick={()=>setStoreAxis(k)}
+          />
+        ))}
+      </div>
+      {storeAxis!=='全店舗' && (
+        <Grid container spacing={1} alignItems="center">
+          <Grid item xs={12} md={3}>
+            <TextField select size="small" label="対象" value={storeGroup||''} onChange={e=>setStoreGroup(e.target.value)} fullWidth>
+              {storeOptions.map(v=> <MenuItem key={v} value={v}>{v}</MenuItem>)}
+            </TextField>
+          </Grid>
+          <Grid item xs="auto"><span className="mini softNote">上位階層を選択してください</span></Grid>
+        </Grid>
+      )}
+    </Stack>
+  );
+}
+
+/* ====== バケット作成 ====== */
+function buildBuckets(range, granularity, custom){
+  const MAX_COLS=24;
+  const s=toDate(range.start), e=toDate(range.end);
+  const buckets=[]; const push=(label, bs, be)=> buckets.push({label, start: ymd(bs), end: ymd(be)});
+  if(granularity==='day'){
+    for(let d=new Date(s); d<=e; d.setDate(d.getDate()+1)){ const bs=new Date(d); const be=new Date(d); be.setHours(23,59,59,999); push(`${bs.getMonth()+1}/${bs.getDate()}`,bs,be); }
+  } else if(granularity==='week'){
+    let cur=startOfWeek(s); while(cur<=e){ const bs=new Date(cur), be=endOfWeek(cur); push(`${bs.getMonth()+1}/${bs.getDate()}週`,bs,be); cur.setDate(cur.getDate()+7); }
+  } else if(granularity==='month'){
+    let cur=startOfMonth(s); while(cur<=e){ const bs=new Date(cur), be=endOfMonth(cur); push(`${bs.getFullYear()}/${bs.getMonth()+1}`,bs,be); cur=new Date(bs.getFullYear(),bs.getMonth()+1,1); }
+  } else if(granularity==='quarter'){
+    let cur=startOfQuarter(s); while(cur<=e){ const bs=new Date(cur), be=endOfQuarter(cur); const q=Math.floor(bs.getMonth()/3)+1; push(`${bs.getFullYear()} Q${q}`,bs,be); cur=new Date(be); cur.setDate(cur.getDate()+1); }
+  } else if(granularity==='half'){
+    let cur=startOfHalf(s); while(cur<=e){ const bs=new Date(cur), be=endOfHalf(cur); const h=bs.getMonth()<6?'H1':'H2'; push(`${bs.getFullYear()} ${h}`,bs,be); cur=new Date(be); cur.setDate(cur.getDate()+1); }
+  } else { // custom
+    const step=Math.max(1,custom?.intervalDays||7); const cols=Math.max(1,custom?.columns||8);
+    let end=new Date(e);
+    for(let i=0;i<cols;i++){ const be=new Date(end); const bs=new Date(end); bs.setDate(bs.getDate()-step+1);
+      push(`${bs.getMonth()+1}/${bs.getDate()}–${be.getMonth()+1}/${be.getDate()}`,bs,be);
+      end=new Date(bs); end.setDate(end.getDate()-1); if(bs<s) break;
+    }
+    buckets.reverse();
+  }
+  if(buckets.length>MAX_COLS) return {buckets:buckets.slice(-MAX_COLS), limited:true, MAX_COLS};
+  return {buckets, limited:false, MAX_COLS};
+}
+
+/* ====== 推奨アクション判定 ====== */
+function decideAction({forecastEnd, eol, byStore28}) {
+  if(!forecastEnd || !eol) return {label:'—', color:'default', reason:'判定データ不足'};
+  const f=new Date(forecastEnd), p=new Date(eol);
+  const daysDiff = Math.round((f - p)/86400000); // +:計画より後に在庫切れ
+  const vals = Object.values(byStore28);
+  const mean = vals.length ? sum(vals)/vals.length : 0;
+  const variance = vals.length ? sum(vals, v=>(v-mean)*(v-mean))/vals.length : 0;
+  const std = Math.sqrt(variance);
+  const cv = mean>0 ? std/mean : 0;
+  const hasZero = vals.some(v=>v===0);
+  const hasHigh = vals.some(v=>v>=Math.max(3, mean*1.5));
+  if (f < p) return {label:'発注', color:'primary', reason:`在庫が${Math.abs(daysDiff)}日早く尽きる見込み`};
+  if (f > p && cv>=0.6 && hasZero && hasHigh) return {label:'移管', color:'warning', reason:'店舗間の販売偏差が大（CV≥0.6）'};
+  if (daysDiff >= 14) return {label:'値下', color:'error', reason:`計画より${daysDiff}日以上延びる見込み`};
+  return {label:'—', color:'default', reason:'軽微な超過/様子見'};
+}
+
+/* ====== メイン ====== */
+function App(){
+  // 期間（初期値を当月の月初〜月末に変更）
+  const [range,setRange]=useState(()=>{ const t=new Date(); const s=ymd(startOfMonth(t)); const e=ymd(endOfMonth(t)); return {start:s,end:e}; });
+  const applyFilter = ({start,end})=> setRange({start,end});
+  // 粒度＆指標
+  const [granularity,setGranularity]=useState('week');
+  const [metric,setMetric]=useState('units'); // 'units' | 'revenue' | 'profit'
+  const [custom,setCustom]=useState({intervalDays:7, columns:8});
+  const [viewMode,setViewMode]=useState('detail'); // 初期は詳細表示
+  const {buckets}=useMemo(()=> buildBuckets(range, granularity, custom), [range,granularity,custom]);
+  // 選択行（テーブル）
+  const [selectedRow,setSelectedRow]=useState(null);
+  // アクションモーダル
+  const [actionModal,setActionModal]=useState({open:false,type:null,row:null});
+  const openActionModal=(type,row)=> setActionModal({open:true,type,row});
+  const closeActionModal=()=> setActionModal({open:false,type:null,row:null});
+
+  // 分類軸
+  const [prodAxis,setProdAxis]=useState('SKU');
+  const [storeAxis,setStoreAxis]=useState('全店舗');
+  const [storeGroup,setStoreGroup]=useState('全店舗');
+  // 対象店舗
+  const targetStoreIds = useMemo(()=>{
+    if(storeAxis==='全店舗') return new Set(STORES.map(s=>s.id));
+    if(storeAxis==='事業')  return new Set(STORES.filter(s=>s.channel===storeGroup).map(s=>s.id));
+    if(storeAxis==='ブロック')return new Set(STORES.filter(s=>STORE_BLOCK[s.id]===storeGroup).map(s=>s.id));
+    if(storeAxis==='店舗')   return new Set(STORES.filter(s=>s.name===storeGroup).map(s=>s.id));
+    return new Set(STORES.map(s=>s.id));
+  },[storeAxis,storeGroup]);
+
+  // 行キー
+  const productKey = (p,mode)=>{
+    if(mode==='全部門') return '全部門';
+    if(mode==='部門')   return p.dept;
+    if(mode==='コーナー') return P_TAXO[p.id]?.corner || '—';
+    if(mode==='ライン')  return P_TAXO[p.id]?.line || '—';
+    if(mode==='カテゴリ')return P_TAXO[p.id]?.category || '—';
+    if(mode==='アイテム') return P_TAXO[p.id]?.item || p.name;
+    return `${p.sku}｜${p.name}`; // SKU
+  };
+
+  // テーブル行
+  const tableRows = useMemo(()=>{
+    const map = new Map();
+    const ensure = (key)=>{ if(!map.has(key)) map.set(key,{label:key, items:[], inv:0, units:[], revenue:[], profit:[], byStore28:{}, price:null, cost:null, eol:null, prevTotalUnits:0, prevTotalRevenue:0}); return map.get(key); };
+    // グルーピング
+    PRODUCTS.forEach(p=>{ const key=productKey(p,prodAxis); ensure(key).items.push(p); });
+    // 在庫集計（対象店舗のみ）
+    map.forEach(g=>{
+      g.inv = sum(INVENTORY.filter(i=> g.items.some(p=>p.id===i.productId) && targetStoreIds.has(i.storeId)), x=>x.qty);
+    });
+
+    // 期間の前年レンジ
+    const prevStart = ymd(new Date(new Date(range.start + 'T00:00:00').setFullYear(new Date(range.start + 'T00:00:00').getFullYear()-1)));
+    const prevEnd = ymd(new Date(new Date(range.end + 'T00:00:00').setFullYear(new Date(range.end + 'T00:00:00').getFullYear()-1)));
+
+    // バケット毎の集計をインデックス経由で実行
+    map.forEach(g=>{
+      const byUnits = buckets.map(b=>{
+        // 各SKUごとにインデックスから単位数を取得（対象店舗で制約がある場合は店舗ごとに取得）
+        let tot=0;
+        g.items.forEach(p=>{
+          if(targetStoreIds.size===STORES.length){ // 全店舗なら高速集計
+            tot += sumProductUnitsInRange(p.id, b.start, b.end);
+          } else {
+            // 対象店舗のみ集計
+            Array.from(targetStoreIds).forEach(sid=>{ tot += sumProductUnitsByStoreInRange(p.id, sid, b.start, b.end); });
+          }
+        });
+        return tot;
+      });
+      const byRevenue = buckets.map((_,i)=>{
+        const b=buckets[i]; let tot=0;
+        g.items.forEach(p=>{
+          if(targetStoreIds.size===STORES.length){
+            tot += sumProductRevenueInRange(p.id, b.start, b.end);
+          } else {
+            // 近似：店舗単位の販売点数に売価を乗じる
+            Array.from(targetStoreIds).forEach(sid=>{ const units = sumProductUnitsByStoreInRange(p.id, sid, b.start, b.end); tot += units * p.price; });
+          }
+        });
+        return tot;
+      });
+      const byProfit = buckets.map((_,i)=>{
+        const b=buckets[i]; let tot=0;
+        g.items.forEach(p=>{
+          const cost=Math.round(p.price*0.6);
+          if(targetStoreIds.size===STORES.length){
+            const rev = sumProductRevenueInRange(p.id, b.start, b.end);
+            const units = sumProductUnitsInRange(p.id, b.start, b.end);
+            tot += rev - units * cost;
+          } else {
+            Array.from(targetStoreIds).forEach(sid=>{ const units = sumProductUnitsByStoreInRange(p.id, sid, b.start, b.end); tot += units * (p.price - cost); });
+          }
+        });
+        return tot;
+      });
+      // last28 by store for variance
+      const last28Start = ymd(new Date(toDate(range.end).getTime() - 27*86400000));
+      const byStore = {}; STORES.forEach(s=>{ if(targetStoreIds.has(s.id)) byStore[s.id]=0; });
+      g.items.forEach(p=>{
+        Array.from(targetStoreIds).forEach(sid=>{ const v = sumProductUnitsByStoreInRange(p.id, sid, last28Start, range.end); byStore[sid]=(byStore[sid]||0)+v; });
+      });
+      g.units=byUnits; g.revenue=byRevenue; g.profit=byProfit; g.byStore28=byStore;
+    });
+
+    // 予測終了日など（インデックス利用）
+    map.forEach(g=>{
+      const last28Start = ymd(new Date(toDate(range.end).getTime() - 27*86400000));
+      let lastUnits = 0;
+      g.items.forEach(p=>{
+        if(targetStoreIds.size===STORES.length){ lastUnits += sumProductUnitsInRange(p.id, last28Start, range.end); }
+        else{ Array.from(targetStoreIds).forEach(sid=> lastUnits += sumProductUnitsByStoreInRange(p.id, sid, last28Start, range.end)); }
+      });
+      const daily = lastUnits/28;
+      let forecastEnd=null;
+      if(daily>0){ const daysLeft=Math.floor(g.inv/daily); const d=new Date(toDate(range.end)); d.setDate(d.getDate()+daysLeft); forecastEnd=ymd(d); }
+      g.forecastEnd=forecastEnd;
+    });
+
+    // 価格/原価/計画（EOL）
+    map.forEach(g=>{
+      const prices = Array.from(new Set(g.items.map(p=>p.price)));
+      const costs  = Array.from(new Set(g.items.map(p=>Math.round(p.price*0.6))));
+      const eols   = Array.from(new Set(g.items.map(p=>p.eol)));
+      g.price = prices.length===1 ? prices[0] : (prices.length>1 ? Math.round(sum(prices)/prices.length) : null);
+      g.cost  = costs.length===1  ? costs[0]  : (costs.length>1 ? Math.round(sum(costs)/costs.length) : null);
+      g.eol   = eols.length===1   ? eols[0]   : null;
+    });
+
+    // 前年値の計算（全部門表示時に使用）
+    map.forEach(g=>{
+      let prevUnits=0, prevRev=0;
+      g.items.forEach(p=>{
+        if(targetStoreIds.size===STORES.length){ prevUnits += sumProductUnitsInRange(p.id, prevStart, prevEnd); prevRev += sumProductRevenueInRange(p.id, prevStart, prevEnd); }
+        else{ Array.from(targetStoreIds).forEach(sid=> prevUnits += sumProductUnitsByStoreInRange(p.id, sid, prevStart, prevEnd)); prevRev += 0; }
+      });
+      g.prevTotalUnits = prevUnits; g.prevTotalRevenue = prevRev;
+    });
+
+    const rows=[...map.values()].map(g=>{
+      const totalUnits = sum(g.units);
+      const totalRevenue = sum(g.revenue);
+      const totalProfit = sum(g.profit);
+      const action = decideAction({forecastEnd:g.forecastEnd, eol:g.eol, byStore28:g.byStore28});
+      return {label:g.label, inv:g.inv,
+        byBucketUnits:g.units, byBucketRevenue:g.revenue, byBucketProfit:g.profit,
+        totalUnits, totalRevenue, totalProfit, items:g.items,
+        forecastEnd:g.forecastEnd, price:g.price, cost:g.cost, eol:g.eol, byStore28:g.byStore28, action,
+        prevTotalUnits:g.prevTotalUnits, prevTotalRevenue:g.prevTotalRevenue};
+    });
+    const keyTotal = metric==='units'?'totalUnits': metric==='revenue'?'totalRevenue':'totalProfit';
+    rows.sort((a,b)=> (b[keyTotal]-a[keyTotal]));
+    return rows;
+  },[buckets,metric,prodAxis,range.start,range.end,storeAxis,storeGroup, targetStoreIds]);
+
+  // 売上推移
+  const trend = useMemo(()=>{
+    const s=toDate(range.start), e=toDate(range.end);
+    const days=[]; for(let d=new Date(s); d<=e; d.setDate(d.getDate()+1)) days.push(ymd(d));
+    const series = days.map(ds=>{
+      const rows = SALES.filter(r=> Array.from(targetStoreIds).includes(r.storeId) && r.date===ds);
+      return sum(rows, r=> r.units * (r.salePrice || (PRODUCTS.find(pp=>pp.id===r.productId)||{}).price ));
+    });
+    // 在庫系列：初期在庫（対象店舗・対象商品）から日毎の累積販売を引いた残在庫
+    const initialInvTotal = sum(INVENTORY.filter(i=> Array.from(targetStoreIds).includes(i.storeId)), x=>x.qty);
+    const inventorySeries = days.map((ds, idx)=>{
+      const soldUpTo = sum(SALES.filter(r=> Array.from(targetStoreIds).includes(r.storeId) && r.date<=ds), r=>r.units);
+      return Math.max(0, initialInvTotal - soldUpTo);
+    });
+    return {series, inventorySeries, start:range.start, end:range.end};
+  },[range,storeAxis,storeGroup, targetStoreIds]);
+
+  // ToDo（推奨アクションから自動生成）
+  const todoItems = useMemo(()=>{
+    // SKU/アイテム優先で抽出
+    const rows = tableRows.filter(r=>['SKU','アイテム'].includes(prodAxis) && ['発注','移管','値下'].includes(r.action.label));
+    return rows.slice(0,10).map(r=>({
+      id:r.label,
+      title:`${r.action.label}｜${r.label}`,
+      detail:`在庫:${r.inv} / 予測:${r.forecastEnd||'—'} / 計画:${r.eol||'—'} / 合計:${metric==='units'?r.totalUnits.toLocaleString(): (metric==='revenue'?fmtYen(r.totalRevenue):fmtYen(r.totalProfit))}`,
+      type:r.action.label
+    }));
+  },[tableRows,prodAxis,metric]);
+
+  // イベント（簡易ダミー）
+  const events = [
+    {date:'2025-09-25', title:'月末棚卸 事前確認', where:'全店', desc:'在庫差異検証・値下最終案確定'},
+    {date:'2025-09-28', title:'移管便 締切', where:'物流', desc:'東日本→中部 倉庫振替'},
+    {date:'2025-10-01', title:'10月販促開始', where:'EC/店舗', desc:'トップス強化・価格見直し反映'}
+  ];
+
+  const th = { textAlign:'left', padding:8, border:'1px solid #eee' };
+  const td = { padding:8, border:'1px solid #eee' };
+  const metricHeader = metric==='units'?'販売点数': metric==='revenue'?'売上高':'粗利高';
+  const formatCell = (v)=> metric==='units' ? v.toLocaleString() : fmtYen(v);
+  const showBuckets = viewMode==='detail';
+  const showMoneyCols = (prodAxis==='アイテム' || prodAxis==='SKU');
+
+  return (
+    <>
+      {/* アップバー */}
+      <AppBar position="static" color="inherit" elevation={0}>
+        <Toolbar className="wrap">
+          <span className="material-icons" style={{marginRight:8}}>insights</span>
+          <Typography variant="h6" sx={{flexGrow:1}}>商品ダッシュボード</Typography>
+          <span className="mini" style={{color:'#666'}}>期間: {range.start} 〜 {range.end}</span>
+        </Toolbar>
+      </AppBar>
+
+      <div className="wrap">
+
+        {/* フィルター */}
+        <Section title="フィルター" icon="filter_alt">
+          <Filter onApply={applyFilter}/>
+        </Section>
+
+        {/* グラフ */}
+        <Section title="売上推移" icon="query_stats">
+          <Paper variant="outlined" className="vh35" sx={{p:1.5}}>
+            <RevenueChartDetailed data={trend.series} inventory={trend.inventorySeries} start={trend.start} end={trend.end} selected={selectedRow} metric={metric} range={range} targetStoreIds={targetStoreIds} />
+           </Paper>
+         </Section>
+
+        {/* 集計設定 */}
+        <Section title="集計設定" icon="tune">
+          <SelectorBar
+            granularity={granularity} setGranularity={setGranularity}
+            metric={metric} setMetric={setMetric}
+            custom={custom} setCustom={setCustom}
+            viewMode={viewMode} setViewMode={setViewMode}
+          />
+        </Section>
+
+        {/* 分類軸 */}
+        <Section title="分類軸" icon="category">
+          <AxisSelector
+            prodAxis={prodAxis} setProdAxis={setProdAxis}
+            storeAxis={storeAxis} setStoreAxis={setStoreAxis}
+            storeGroup={storeGroup} setStoreGroup={setStoreGroup}
+          />
+          <Box sx={{mt:1}}>
+            <span className="pill">
+              <span className="material-icons" style={{fontSize:16}}>info</span>
+              商品コードの体系：<b>4桁＋4桁＋2桁</b>（4桁＝クラス／8桁＝アイテム／10桁＝SKU）
+              <span className="mini">※SKU＝サイズ×色の最小管理単位</span>
+            </span>
+          </Box>
+        </Section>
+
+        {/* 販売実績テーブル */}
+        <Section
+          title={`販売実績テーブル（${metricHeader}｜列＝期間${showBuckets?'（詳細）':'（簡潔）'}｜行＝${prodAxis}）`}
+          icon="table_view"
+          actions={
+            <Tooltip title="簡潔表示：期間列を直近2本に圧縮／詳細表示：全バケット">
+              <FormControlLabel
+                control={<Switch checked={viewMode==='detail'} onChange={(e)=>setViewMode(e.target.checked?'detail':'simple')}/>} 
+                label={viewMode==='detail' ? '詳細表示' : '簡潔表示'}
+              />
+            </Tooltip>
+          }
+        >
+          <div className="mini" style={{marginBottom:8}}>
+            拠点スコープ：{storeAxis}{storeAxis!=='全店舗' ? `｜${storeGroup}` : ''} ／ 指標：{metricHeader}
+            ／ ルール：<b>発注</b>（予測&lt;計画）・<b>移管</b>（計画超過＋店舗偏差大）・<b>値下</b>（大幅計画超過）
+          </div>
+          <div className="tableWrap">
+             <table>
+               <thead>
+                 <tr>
+                   <th style={th}>{prodAxis}</th>
+                   {showMoneyCols && <th style={{...th,textAlign:'right'}}>売価</th>}
+                   {showMoneyCols && <th style={{...th,textAlign:'right'}}>原価</th>}
+                   <th style={{...th,textAlign:'right'}}>在庫</th>
+                   {showBuckets
+                    ? buckets.map((b,i)=>(
+                        <th key={i} style={{...th,textAlign:'right'}}>{b.label}<br/><span className="mini">{b.start}〜{b.end}</span></th>
+                      ))
+                    : buckets.slice(-2).map((b,i)=>(
+                        <th key={i} style={{...th,textAlign:'right'}}>{i===0?'直近-1':'直近'}<br/><span className="mini">{b.start}〜{b.end}</span></th>
+                      ))
+                   }
+                   <th style={{...th,textAlign:'right'}}>累計販売実績（{metricHeader}）</th>
+                   {/* 計画終了日と予測終了日を横並びに配置 */}
+                   <th style={th}>計画終了日</th>
+                   <th style={th}>予測終了日</th>
+                   <th style={{...th,textAlign:'center'}}>推奨アクション</th>
+                   <th style={{...th,textAlign:'center'}}>対応</th>
+                 </tr>
+               </thead>
+               <tbody>
+                 {tableRows.map(row=>{
+                   const byBucket = metric==='units'? row.byBucketUnits : metric==='revenue'? row.byBucketRevenue : row.byBucketProfit;
+                   const total    = metric==='units'? row.totalUnits : metric==='revenue'? row.totalRevenue : row.totalProfit;
+                   const showBy   = (viewMode==='detail') ? byBucket : byBucket.slice(-2);
+                   const priceCell = showMoneyCols ? (row.price!=null ? fmtYen(row.price) : '—') : '—';
+                   const costCell  = showMoneyCols ? (row.cost!=null  ? fmtYen(row.cost)  : '—') : '—';
+                   const planEnd   = row.eol || '—';
+                   return (
+                    <tr key={row.label} className="rowHover" onClick={()=>setSelectedRow(row)} style={{background: selectedRow && selectedRow.label===row.label? '#eef8ff': undefined}}>
+                      <td style={td}><b>{row.label}</b>{prodAxis!=='SKU' && <div className="mini" style={{color:'#666'}}>アイテム数：{row.items.length}</div>}</td>
+                       {showMoneyCols && <td style={{...td,textAlign:'right'}}>{priceCell}</td>}
+                       {showMoneyCols && <td style={{...td,textAlign:'right'}}>{costCell}</td>}
+                       <td style={{...td,textAlign:'right'}}>{row.inv.toLocaleString()}</td>
+                       {showBy.map((v,i)=>(<td key={i} style={{...td,textAlign:'right'}}>{formatCell(v)}</td>))}
+                       {/* 累計販売実績（従来の合計） */}
+                       <td style={{...td,textAlign:'right'}}>{formatCell(total)}</td>
+                       {/* 合計の右に計画終了日と予測終了日を横並びで出力 */}
+                       <td style={td} className="nowrap">{planEnd}</td>
+                       <td style={td} className="nowrap">{row.forecastEnd || '—'}</td>
+                       <td style={{...td,textAlign:'center'}}>
+                        <Chip label={row.action.label} color={row.action.color} variant={row.action.label==='—'?'outlined':'filled'} size="small" onClick={()=>openActionModal(row.action.label,row)} style={{cursor:'pointer'}}/>
+                         {viewMode==='detail' && row.action.label!=='—' && (
+                           <div className="mini" style={{marginTop:4,color:'#666'}}>{row.action.reason}</div>
+                         )}
+                       </td>
+                       <td style={{...td,textAlign:'center'}}>
+                        <Button size="small" variant="contained" disabled={prodAxis!=='SKU'} onClick={()=>openActionModal('対応',row)}>
+                          {prodAxis==='SKU'?'対応':'SKUで表示'}
+                        </Button>
+                       </td>
+                     </tr>
+                   );
+                 })}
+               </tbody>
+             </table>
+           </div>
+           <div className="mini" style={{marginTop:6,color:'#666'}}>
+            ※「アイテム／SKU」では 売価・原価・計画終了日 を必ず表示。原価はデモ上、売価の60%で算出。
+           </div>
+        </Section>
+
+        {/* 子テーブル：選択行のSKU詳細 */}
+        {selectedRow && (
+          <Section title="SKU 詳細" icon="inventory_2">
+            <div className="mini" style={{marginBottom:8}}>
+              {selectedRow.label} の SKU 詳細
+            </div>
+            <div className="tableWrap">
+             <table>
+               <thead>
+                 <tr>
+                   <th style={th}>SKU</th>
+                   <th style={th}>アイテム名</th>
+                   <th style={{...th,textAlign:'right'}}>売価</th>
+                   <th style={{...th,textAlign:'right'}}>原価</th>
+                   <th style={{...th,textAlign:'right'}}>在庫</th>
+                   <th style={{...th,textAlign:'right'}}>28日販売数</th>
+                   <th style={{...th,textAlign:'right'}}>予測終了日</th>
+                   <th style={{...th,textAlign:'center'}}>推奨アクション</th>
+                 </tr>
+               </thead>
+               <tbody>
+                 {selectedRow.items.map(sku=>{
+                   const skuId = sku.id;
+                   const inv = INVENTORY.find(i=>i.productId===skuId && targetStoreIds.has(i.storeId))?.qty || 0;
+                   const sales28 = sum(SALES.filter(r=> r.productId===skuId && targetStoreIds.has(r.storeId) && r.date>=ymd(new Date(toDate(range.end).getTime() - 27*86400000)) && r.date<=range.end), x=>x.units);
+                   const action = decideAction({forecastEnd:null, eol:sku.eol, byStore28:{}});
+                   return (
+                    <tr key={skuId}>
+                      <td style={td}>{skuId}</td>
+                      <td style={td}>{sku.name}</td>
+                       <td style={{...td,textAlign:'right'}}>{fmtYen(sku.price)}</td>
+                       <td style={{...td,textAlign:'right'}}>{fmtYen(Math.round(sku.price*0.6))}</td>
+                       <td style={{...td,textAlign:'right'}}>{inv.toLocaleString()}</td>
+                       <td style={{...td,textAlign:'right'}}>{sales28.toLocaleString()}</td>
+                       <td style={td} className="nowrap">{sku.eol || '—'}</td>
+                       <td style={{...td,textAlign:'center'}}>
+                        <Chip label={action.label} color={action.color} variant={action.label==='—'?'outlined':'filled'} size="small" onClick={()=>openActionModal(action.label,selectedRow)} style={{cursor:'pointer'}}/>
+                       </td>
+                     </tr>
+                   );
+                 })}
+               </tbody>
+             </table>
+           </div>
+          </Section>
+        )}
+
+        {/* アクションモーダル（モックUI）*/}
+        <Dialog open={actionModal.open} onClose={closeActionModal} maxWidth="sm" fullWidth>
+          <DialogTitle>{actionModal.type || ''} - {actionModal.row?.label || actionModal.row?.itemName || ''}</DialogTitle>
+          <DialogContent>
+            <div style={{marginBottom:12}}>
+             <div><b>概要</b></div>
+             <div className="mini">在庫: {actionModal.row?.inv?.toLocaleString() || '—'} / 予測終了: {actionModal.row?.forecastEnd || '—'}</div>
+            </div>
+            <div style={{marginBottom:12}}>
+             <TextField label="コメント（メモ）" fullWidth multiline minRows={3} />
+            </div>
+            <div style={{display:'flex',gap:8}}>
+             <Button variant="outlined">関連SKUを表示</Button>
+             <Button variant="outlined">発注予定を作成</Button>
+            </div>
+          </DialogContent>
+          <DialogActions>
+            <Button onClick={closeActionModal}>キャンセル</Button>
+            <Button variant="contained" onClick={closeActionModal}>保存</Button>
+          </DialogActions>
+        </Dialog>
+
+        {/* やることリスト */}
+        <Section title="やることリスト（推奨アクションから自動集約）" icon="checklist">
+          <List dense>
+            {todoItems.length===0 && <div className="mini">現在、対応推奨はありません。</div>}
+            {todoItems.map(t=>(
+              <ListItem key={t.id} sx={{border:'1px solid #eee', borderRadius:'8px', mb:1}}>
+                <ListItemAvatar>
+                  <Avatar>{t.type==='発注'?'O':t.type==='移管'?'T':'P'}</Avatar>
+                </ListItemAvatar>
+                <ListItemText primary={t.title} secondary={t.detail}/>
+                <Button size="small" variant="outlined">詳細</Button>
+              </ListItem>
+            ))}
+          </List>
+        </Section>
+
+        {/* イベントリスト */}
+        <Section title="イベントリスト" icon="event">
+          <Grid container spacing={1}>
+            {events.map(ev=>(
+              <Grid key={ev.date+ev.title} item xs={12} md={4}>
+                <Card variant="outlined">
+                  <CardContent>
+                    <div className="mini" style={{color:'#222', fontWeight:700}}><span className="material-icons" style={{fontSize:16, verticalAlign:'middle'}}>calendar_today</span> {ev.date}</div>
+                    <Typography variant="subtitle1" sx={{mt:0.5}}>{ev.title}</Typography>
+                    <div className="mini" style={{margin:'4px 0'}}>場所：{ev.where}</div>
+                    <div className="mini" style={{color:'#444'}}>{ev.desc}</div>
+                  </CardContent>
+                </Card>
+              </Grid>
+            ))}
+          </Grid>
+        </Section>
+
+      </div>
+    </>
+  );
+ }
+
+ // チャート側に選択行の在庫切れ注釈を追加するため、RevenueChart を修正
+ function RevenueChartDetailed({ data, inventory, start, end, selected, metric, range, targetStoreIds }) {
+    const canvasRef = useRef(null);
+    const chartRef = useRef(null);
+    const toD = (s) => new Date(s + 'T00:00:00');
+    const s = toD(start), e = toD(end);
+    const days = [];
+    for (let d = new Date(s); d <= e; d.setDate(d.getDate() + 1)) days.push(new Date(d));
+    const dateToLabel = (d) => `${d.getMonth()+1}/${d.getDate()}`;
+    const labels = days.map(dateToLabel);
+    const values = days.map((_, i) => data[i] || 0);
+    const ma7 = values.map((_, i) => {
+     const from = Math.max(0, i - 6);
+     const n = i - from + 1;
+     const sumv = values.slice(from, i + 1).reduce((p, c) => p + c, 0);
+     return sumv / n;
+   });
+   const invValues = inventory || [];
+
+   useEffect(() => {
+     const ctx = canvasRef.current.getContext('2d');
+     if (chartRef.current) { chartRef.current.destroy(); chartRef.current = null; }
+     const annotations = {};
+     if (selected) {
+       try {
+         const last28Start = ymd(new Date(toD(range.end).getTime() - 27*86400000));
+         const rows = SALES.filter(r=> selected.items.some(p=>p.id===r.productId) && Array.from(targetStoreIds).includes(r.storeId) && r.date>=last28Start && r.date<=range.end);
+         let avgDaily = 0;
+         if (metric==='units') {
+           avgDaily = rows.length ? sum(rows, r=>r.units)/28 : 0;
+         } else if (metric==='revenue') {
+           avgDaily = rows.length ? sum(rows, r=>{ const p=PRODUCTS.find(pp=>pp.id===r.productId); return r.units * p.price; })/28 : 0;
+         } else {
+           avgDaily = rows.length ? sum(rows, r=>{ const p=PRODUCTS.find(pp=>pp.id===r.productId); const cost=Math.round(p.price*0.6); return r.units * (p.price-cost); })/28 : 0;
+         }
+         const inv = selected.inv || 0;
+         const daysToZero = avgDaily>0 ? Math.ceil(inv/avgDaily) : null;
+         if (daysToZero !== null) {
+           const zeroDate = new Date(toD(range.end)); zeroDate.setDate(zeroDate.getDate() + daysToZero);
+           const lbl = `${daysToZero}日で在庫0 (${ymd(zeroDate)})`;
+           // xValueとしてカテゴリラベルを使（存在しない場合は最右に表示）
+           const xLabel = `${zeroDate.getMonth()+1}/${zeroDate.getDate()}`;
+           annotations['depletion'] = {
+             type: 'line',
+             xMin: xLabel,
+             xMax: xLabel,
+             borderColor: 'rgba(220,20,60,0.9)',
+             borderWidth: 2,
+             label: { enabled: true, content: lbl, position: 'start', backgroundColor:'rgba(220,20,60,0.85)', color:'#fff' }
+           };
+         }
+       } catch(e) { /* ignore */ }
+     }
+
+     chartRef.current = new Chart(ctx, {
+       type: 'bar',
+       data: { labels,
+         datasets: [
+           { type: 'bar', label: '日別売上', data: values, backgroundColor: '#4e79a7', borderRadius:3, yAxisID: 'y' },
+           { type: 'line', label: '7日移動平均', data: ma7, borderColor: '#f28e2b', borderWidth: 2, pointRadius: 0, tension: 0.35, fill:false, yAxisID:'y' },
+           { type: 'line', label: '在庫推移（推定）', data: invValues, borderColor: '#59a14f', backgroundColor:'rgba(89,161,79,0.08)', borderWidth:2, pointRadius:0, yAxisID: 'y1' }
+         ]
+       },
+       options: { responsive: true, maintainAspectRatio: false,
+         scales: {
+           y: { position: 'left', beginAtZero:true, title:{display:true,text:'売上'} },
+           y1: { position: 'right', beginAtZero:true, grid:{ drawOnChartArea: false }, title:{display:true,text:'在庫'} }
+         },
+         plugins: { annotation: { annotations }, legend:{ position:'top' } }
+       }
+     });
+     return () => { if (chartRef.current) chartRef.current.destroy(); };
+   }, [start, end, labels.join('|'), values.join('|'), ma7.join('|'), invValues.join('|'), selected ? selected.label : null, metric]);
+   return <div className="vh35"><canvas ref={canvasRef} /></div>;
+ }
+
+ const root=ReactDOM.createRoot(document.getElementById('root'));
+ root.render(<App/>);
+</script>
+</body>
+</html>
