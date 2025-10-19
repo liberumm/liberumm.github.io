@@ -1,7 +1,27 @@
 # プロダクト概要 & モジュール関係（簡易仕様書）
 
+> **Version**: 0.2.0 | **Last Updated**: 2024-12
+
 このドキュメントは、要件定義～拡張フェーズを想定した「フロントエンドのみ」で完結する構成の**全体像**と**各モジュールの関係**をまとめた簡潔な仕様書です。
-ビルド不要（CDN＋Umd）で動作し、将来は任意の BFF/マイクロサービスにスムーズに接続できる前提です。
+ビルド不要（CDN＋UMD）で動作し、将来は任意の BFF/マイクロサービスにスムーズに接続できる前提です。
+
+## クイックスタート
+
+```bash
+# 1. リポジトリをクローン
+git clone <repository-url>
+cd <project-directory>
+
+# 2. ローカルサーバー起動（いずれか）
+# VSCode Live Preview拡張を使用
+# または Python
+python -m http.server 8000
+# または Node.js
+npx serve .
+
+# 3. ブラウザでアクセス
+# http://localhost:8000
+```
 
 ---
 
@@ -15,27 +35,27 @@
           |
           | provides helpers (ymd, bucket, formatting, etc.)
           v
-+--------------------+   uses    +-----------------------+
-|  data/masters.js   |---------->|  data/fixtures.js     |
-|  (定義: MASTERS)   |           |  (生成: Store API)    |
-+---------^----------+           +-----------^-----------+
-          |                                  |
-          | exposes global read-only         | exposes window.Store.getFixtures()
-          |                                  |
-          v                                  v
-+--------------------+   (pure functions)  +---------------------+
-|  features/sales.js |<--------------------|  features/inventory |
-|  features/forecast |                     |  features/taxonomy  |
-+---------^----------+                     +---------------------+
-          |                                              ^
-          | compute indexes, sums                        |
-          v                                              |
-+----------------------+          +----------------------+--------+
-|   app/components/*   | <------> |        app/App.js             |
-|  (Filter, Table,     |          | (全体状態/画面構築)            |
-|   AxisSelector,      |          +-------------------------------+
-|   RevenueChart...)   |
-+----------------------+
+ +--------------------+   uses    +-----------------------+
+ |  data/masters.js   |---------->|  data/fixtures.js     |
+ |  (定義: MASTERS)   |           |  (生成: Store API)    |
+ +---------^----------+           +-----------^-----------+
+           |                                  |
+           | exposes global read-only         | exposes window.Store.getFixtures()
+           |                                  |
+           v                                  v
+ +--------------------+   (pure functions)  +---------------------+
+ |  features/sales.js |<--------------------|  features/inventory |
+ |  features/forecast |                     |  features/taxonomy  |
+ +---------^----------+                     +---------------------+
+           |                                              ^
+           | compute indexes, sums                        |
+           v                                              |
+ +----------------------+          +----------------------+--------+
+ |   app/components/*   | <------> |        app/App.js             |
+ |  (Filter, Table,     |          | (全体状態/画面構築)            |
+ |   AxisSelector,      |          +-------------------------------+
+ |   RevenueChart...)   |
+ +----------------------+ 
 ```
 
 * **data**: マスタ定義（静的）とサンプルデータの生成（疑似トランザクション）。
@@ -63,7 +83,8 @@
 │   ├─ sales.js            # buildIndexes(), sumUnits(), sumRevenue(), sumUnitsByStore()...
 │   ├─ inventory.js        # computeStoreMetrics(), inv集計系
 │   ├─ forecast.js         # decideAction(), depletion予測など
-│   └─ productTaxonomy.js  # groupItemsByAxis(), itemCodeFromSku()
+│   ├─ productTaxonomy.js  # groupItemsByAxis(), itemCodeFromSku()
+│   └─ transfer.js         # 移管関連の計算・フィルタリング
 ├─ app/
 │   ├─ main.js             # ReactDOM.render / ルート起動
 │   ├─ App.js              # 画面全体の状態保持と組み立て
@@ -73,12 +94,15 @@
 │       ├─ SelectorBar.js
 │       ├─ AxisSelector.js
 │       ├─ RevenueChartDetailed.js
-│       └─ SalesTable.js
+│       ├─ SalesTable.js
+│       ├─ TransferPlanner.js    # 移管計画モーダル
+│       ├─ TaskManager.js        # タスク管理UI
+│       └─ TransferFilter.js     # 移管専用フィルタ
 ```
 
 **読み込み順の要点（index.html の `<script>`）**
 `shared → data → features → app/component → app/App → app/main`
-（上位が下位へグローバルで依存。CDN/UMD 環境でも循環参照を避けます）
+(上位が下位へグローバルで依存。CDN/UMD 環境でも循環参照を避けます)
 
 ---
 
@@ -178,33 +202,99 @@ fmtYen(n:number) => '￥1,234'
 
 ## 5. UI コンポーネントの責務
 
-* **App.js**
+### 5.1 メインコンポーネント
 
-  * 期間・指標・軸など**画面全体の状態**を保持
-  * features/shared の関数を呼び出し、整形済データを子へ渡す
-  * 比較モード（店舗間比較）の ON/OFF 管理
-* **Filter.js**
+* **App.js** - アプリケーション全体の制御中枢
+  * **状態管理**: 期間・指標・軸・比較モード・モーダル表示状態
+  * **データ処理**: features層の関数を呼び出し、整形済データを子コンポーネントに注入
+  * **イベント統合**: 各コンポーネントからのコールバックを受け取り、状態を更新
+  * **初期化**: `buildIndexes()`, `buildBuckets()` などの初期処理を実行
+  * **Props注入**: 計算結果を各子コンポーネントに適切な形で渡す
 
-  * 期間/拠点/部門の入力 → `onApply({start,end,location,department})` を App に返却
-* **SelectorBar.js**
+### 5.2 フィルタ・選択系
 
-  * 集計粒度・カスタムバケットの UI。`setGranularity`, `setCustom` を制御
-* **AxisSelector.js**
+* **Filter.js** - 基本フィルタ機能
+  * **入力**: 期間（開始/終了）、拠点、部門の選択UI
+  * **出力**: `onApply({start,end,location,department})` でAppに通知
+  * **バリデーション**: 日付範囲の妥当性チェック
+  * **再利用**: TransferFilterでも同じコンポーネントを使用
 
-  * 商品軸（全部門～SKU）・拠点軸（全店舗/事業/ブロック/店舗）・対象グループの選択
-* **SalesTable.js**
+* **AxisSelector.js** - 軸選択とグループ化
+  * **商品軸**: 全部門→部門→コーナー→ライン→カテゴリ→アイテム→SKU
+  * **拠点軸**: 全店舗→事業→ブロック→店舗
+  * **対象グループ**: 選択された軸に基づく商品・店舗の絞り込み
+  * **動的更新**: 軸変更時に利用可能な選択肢を再計算
 
-  * 行＝軸、列＝期間の**集計テーブル**描画
-  * 行展開：
+* **SelectorBar.js** - 集計設定
+  * **粒度選択**: day/week/month/quarter/half/year/custom
+  * **カスタム設定**: intervalDays, columns の入力UI
+  * **制限表示**: MAX_COLS超過時の警告表示
 
-    * 比較モードON：**店舗内訳**を表示（SKU でも展開可能）
-    * 比較モードOFF：**子分類**（部門→コーナー→…→SKU）を段階展開
-* **RevenueChartDetailed.js**
+### 5.3 表示・可視化系
 
-  * 期間別シリーズ＋在庫ライン（概算）を Chart.js で描画
-* **Section.js**
+* **SalesTable.js** - メイン集計テーブル
+  * **基本構造**: 行＝軸（商品/店舗）、列＝期間バケット
+  * **展開機能**:
+    * 比較モードON: 店舗別内訳（SKUレベルでも展開可能）
+    * 比較モードOFF: 階層展開（部門→コーナー→...→SKU）
+  * **アクション列**: 各行に予測アクション（発注/移管/値下/—）を表示
+  * **インタラクション**: 行クリック→展開、アクションクリック→詳細表示
+  * **データ同期**: App状態変更時の自動再描画
 
-  * セクション枠・タイトル・アクション領域の統一 UI
+* **RevenueChartDetailed.js** - 推移チャート
+  * **Chart.js統合**: 期間別売上・利益の折れ線グラフ
+  * **在庫ライン**: 概算在庫推移をオーバーレイ表示
+  * **インタラクション**: ホバー時の詳細情報、期間選択
+  * **レスポンシブ**: 画面サイズに応じたチャートリサイズ
+
+### 5.4 モーダル・特殊機能系
+
+* **TransferPlanner.js** - 移管計画モーダル
+  * **モーダル制御**: 開閉状態、ESCキー・背景クリック対応
+  * **タスク管理**: 移管タスクの一覧表示・編集・完了処理
+  * **フィルタ統合**: TransferFilter.jsを内包
+  * **データ連携**: App.jsとの双方向データバインディング
+  * **自動更新**: forecast結果に基づくタスク自動生成
+
+* **TaskManager.js** - タスク管理UI
+  * **CRUD操作**: タスクの作成・更新・削除・完了
+  * **優先度管理**: High/Medium/Low の視覚的表示
+  * **期限管理**: 期限切れタスクのハイライト
+  * **フィルタリング**: 状態・優先度・期限による絞り込み
+  * **永続化**: localStorage への自動保存
+
+* **TransferFilter.js** - 移管専用フィルタ
+  * **店舗間フィルタ**: 移管元・移管先店舗の選択
+  * **商品フィルタ**: 移管対象商品の絞り込み
+  * **条件設定**: 在庫量・売上実績による自動フィルタ
+  * **プリセット**: よく使う条件の保存・呼び出し
+
+### 5.5 共通・ユーティリティ系
+
+* **Section.js** - レイアウト統一
+  * **構造**: タイトル・コンテンツ・アクション領域の標準レイアウト
+  * **スタイル**: 統一されたパディング・マージン・ボーダー
+  * **アクセシビリティ**: 適切なARIA属性・キーボードナビゲーション
+  * **レスポンシブ**: モバイル対応のレイアウト調整
+
+### 5.6 コンポーネント間連携パターン
+
+```
+App.js (状態管理)
+  ├─ Filter.js → onApply() → App状態更新
+  ├─ AxisSelector.js → onChange() → 軸変更
+  ├─ SalesTable.js ← props注入 ← 計算済データ
+  ├─ RevenueChart.js ← props注入 ← チャートデータ
+  └─ TransferPlanner.js
+      ├─ TaskManager.js ← タスクデータ
+      └─ TransferFilter.js → onFilter() → タスク絞り込み
+```
+
+**重要な設計原則**:
+- **単方向データフロー**: App → 子コンポーネント（props）
+- **イベント駆動**: 子 → App（コールバック）
+- **純粋コンポーネント**: propsのみに依存、副作用なし
+- **責務分離**: 表示ロジックとビジネスロジックの分離
 
 ---
 
@@ -277,6 +367,79 @@ fmtYen(n:number) => '￥1,234'
 * [ ] 価格感応度/粗利最大化のシミュレーション UI
 * [ ] ToDo/イベントの永続化（localStorage → API）
 * [ ] 多言語化（i18n テーブルの shared 追加）
+
+---
+
+## 11. 開発者向けクイックスタート
+
+### セットアップ
+
+1. **必要な環境**
+   - モダンブラウザ（Chrome 90+, Firefox 88+, Safari 14+）
+   - 静的ファイルサーバー
+
+2. **ローカル開発**
+   ```bash
+   # VSCode Live Preview（推奨）
+   # 1. VSCode で index.html を開く
+   # 2. 右クリック → "Show Preview"
+   
+   # または任意の静的サーバー
+   python -m http.server 8000
+   # http://localhost:8000 でアクセス
+   ```
+
+3. **ファイル編集時の注意**
+   - **読み込み順序を厳守**: `shared → data → features → app`
+   - **循環参照を避ける**: 上位モジュールは下位を参照しない
+   - **副作用禁止**: features/shared は純関数のみ
+
+### デバッグ
+
+```javascript
+// ブラウザコンソールで利用可能
+window.MASTERS.STORES          // マスタデータ確認
+window.Store.getFixtures()     // サンプルデータ確認
+window.Utils.ymd(new Date())   // ユーティリティ関数テスト
+```
+
+### よくある問題
+
+- **404エラー**: ファイルパスの確認、静的サーバーの起動確認
+- **undefined参照**: script読み込み順序の確認
+- **データ不整合**: fixtures.jsの参照整合性確認
+
+---
+
+## 12. 変更履歴（Changelog）
+
+### v0.2.0 (2024-12)
+- **追加**: TransferPlanner モーダル実装
+- **追加**: 移管フィルタ UI（モーダル内配置）
+- **改善**: tasks 初期化方法の最適化
+- **修正**: App/TransferPlanner の状態同期
+- **ドキュメント**: 開発者向けクイックスタート追加
+
+### v0.1.0 (2024-11)
+- **初回リリース**: 基本アーキテクチャ実装
+- **実装**: 売上分析・在庫管理・予測機能
+- **実装**: React UI コンポーネント群
+- **実装**: CDN/UMD ベースの依存管理
+
+---
+
+## 13. アーキテクチャ詳細補足
+
+### TransferPlanner 仕様
+- **UI配置**: モーダル内でフィルタ編集可能
+- **データフロー**: App → TransferPlanner → Filter → App
+- **状態管理**: App.js で一元管理、props経由で注入
+- **tasks初期化**: `forecast.decideAction()` の結果をベースに自動生成
+
+### 移管フィルタ仕様
+- **場所**: TransferPlannerモーダル内の専用セクション
+- **機能**: 店舗間移管対象の絞り込み
+- **連携**: 既存Filter.jsコンポーネントを再利用
 
 ---
 
