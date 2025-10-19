@@ -1,0 +1,909 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"/>
+  <title>AIエージェント管理 — 立体UI（安全ガード・簡潔版）</title>
+
+  <!-- CDN -->
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Roboto:wght@300;400;500;700&display=swap"/>
+  <link rel="stylesheet" href="https://fonts.googleapis.com/icon?family=Material+Icons">
+  <script src="https://cdn.jsdelivr.net/npm/react@18.2.0/umd/react.production.min.js" crossorigin></script>
+  <script src="https://cdn.jsdelivr.net/npm/react-dom@18.2.0/umd/react-dom.production.min.js" crossorigin></script>
+  <script src="https://cdn.jsdelivr.net/npm/@babel/standalone@7.23.8/babel.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@emotion/react@11.11.3/dist/emotion-react.umd.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@emotion/styled@11.11.0/dist/emotion-styled.umd.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@mui/material@5.15.3/umd/material-ui.production.min.js" crossorigin></script>
+
+  <style>
+    html, body, #root { height: 100%; margin: 0; background: #fafafa; }
+    .material-icons { vertical-align: middle; }
+    *:focus-visible { outline: 2px solid #1976d2; outline-offset: 2px; }
+    section { scroll-margin-top: 76px; }
+    .tight > * { margin-top: 8px !important; margin-bottom: 8px !important; }
+    /* スマホ: 余白とフォント少し詰める */
+    @media (max-width: 600px){
+      .appTitle { font-size: 16px !important; }
+      .chipNav { transform: scale(.92); }
+      .denseField .MuiTextField-root { margin-bottom: 8px; }
+    }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+
+  <script type="text/babel">
+    const {
+      ThemeProvider, createTheme, CssBaseline, useMediaQuery,
+      Box, AppBar, Toolbar, Typography, Container, Paper, Stack, Button,
+      IconButton, Tooltip, Divider, TextField, Chip, Select, MenuItem,
+      FormControl, InputLabel, Slider, Switch, FormControlLabel, Dialog,
+      DialogTitle, DialogContent, DialogActions, List, ListItem,
+      ListItemText, ListItemSecondaryAction, Card, CardContent, Grid,
+      Alert, Avatar, Autocomplete, Checkbox, Accordion, AccordionSummary,
+      AccordionDetails
+    } = MaterialUI;
+
+    // ---------- Utils ----------
+    const LS = {
+      load(key, fallback){ try { return JSON.parse(localStorage.getItem(key)) ?? fallback; } catch { return fallback; } },
+      save(key, val){ localStorage.setItem(key, JSON.stringify(val)); }
+    };
+    const uid = (p="id") => `${p}_${Math.random().toString(36).slice(2,9)}`;
+
+    // ---------- Defaults ----------
+    const defaultAgent = () => ({
+      id: uid("agent"),
+      name: "新規エージェント",
+      description: "",
+      model: "gpt-4o-mini",
+      temperature: 0.2,
+      maxTokens: 1024,
+      requireCitations: true,
+      citationStyle: "inline",
+      groundingStrictness: 0.7,
+      refusalPolicy: "安全に関わるリクエストは拒否し、代替案を提示する。",
+      systemPrompt: "あなたは事実重視のアシスタントです。出典を優先。",
+      tools: ["retrieval","calculator"],
+      ragIds: [],
+      policies: { pii:"個人情報の保存禁止", safety:"危険・違法行為の助長禁止" }
+    });
+
+    const defaultRag = () => ({
+      id: uid("rag"),
+      name: "新規RAGコレクション",
+      description: "",
+      files: [],
+      chunkSize: 800,
+      chunkOverlap: 100,
+      stopwords: "the,a,an,of,for,に,は,が,を,の,と,して,や",
+      compressionRatio: 0.3,
+      reRanking: "cosine",
+      embeddingModel: "text-embedding-3-large",
+      indexBuilt: false,
+      lastIndexedAt: null,
+      qualityScore: 0.0
+    });
+
+    const defaultSystem = () => ({
+      id: uid("sys"),
+      name: "新規システム",
+      description: "このシステムはエージェントを利用します。",
+      routing: "keywords",
+      auditLog: true,
+      retentionDays: 14,
+      agentIds: []
+    });
+
+    // ★ 新規: チャットボット定義（複数エージェント紐付け）
+    const defaultBot = () => ({
+      id: uid("bot"),
+      name: "新規チャットボット",
+      description: "",
+      entryPrompt: "こんにちは、どんなことでお手伝いできますか？",
+      handoff: "keywords",      // エージェントの切替戦略
+      agentIds: [],             // 複数エージェント
+      tone: "neutral",
+      visible: true
+    });
+
+    // ---------- 共通: JSON編集 ----------
+    function JsonEditDialog({open, title, value, onClose, onSave}){
+      const [text, setText] = React.useState(JSON.stringify(value ?? {}, null, 2));
+      React.useEffect(()=> setText(JSON.stringify(value ?? {}, null, 2)), [open, value]);
+      const save = () => { try{ onSave(JSON.parse(text)); } catch(e){ alert("JSON構文エラー: " + e.message); } };
+      return (
+        <Dialog open={open} onClose={onClose} fullWidth maxWidth="md">
+          <DialogTitle>{title}</DialogTitle>
+          <DialogContent>
+            <TextField value={text} onChange={e=>setText(e.target.value)} fullWidth multiline minRows={16}
+              InputProps={{style:{fontFamily:"ui-monospace, SFMono-Regular, Menlo"}}}/>
+          </DialogContent>
+          <DialogActions>
+            <Button onClick={onClose}>キャンセル</Button>
+            <Button variant="contained" onClick={save} startIcon={<span class="material-icons">save</span>}>保存</Button>
+          </DialogActions>
+        </Dialog>
+      );
+    }
+
+    // ---------- 新: メッセージダイアログ（Snackbar→モーダルへ移行） ----------
+    function MessageDialog({open, onClose, severity="success", message=""}){
+      return (
+        <Dialog open={open} onClose={onClose} fullWidth maxWidth="xs">
+          <DialogTitle>
+            <Stack direction="row" alignItems="center" spacing={1}>
+              <span class="material-icons">{severity==="error"?"error":"info"}</span>
+              <Typography>メッセージ</Typography>
+            </Stack>
+          </DialogTitle>
+          <DialogContent>
+            <Alert severity={severity}>{message}</Alert>
+          </DialogContent>
+          <DialogActions>
+            <Button onClick={onClose} autoFocus>OK</Button>
+          </DialogActions>
+        </Dialog>
+      );
+    }
+
+    // ---------- Store ----------
+    function useStore(){
+      const [agents, setAgents]   = React.useState(()=> LS.load("agents", [defaultAgent()]));
+      const [rags, setRags]       = React.useState(()=> LS.load("rags", [defaultRag()]));
+      const [systems, setSystems] = React.useState(()=> {
+        const v = LS.load("systems", [defaultSystem()]);
+        return (v || []).map(s => ({...s, agentIds: Array.isArray(s.agentIds) ? s.agentIds : []}));
+      });
+      const [bots, setBots]       = React.useState(()=> {
+        const v = LS.load("bots", [defaultBot()]);
+        return (v || []).map(b => ({...b, agentIds: Array.isArray(b.agentIds) ? b.agentIds : []}));
+      });
+
+      // モーダルメッセージ
+      const [msg, setMsg] = React.useState({open:false, message:"", severity:"success"});
+      const notify = (message, severity="success") => setMsg({open:true, message, severity});
+
+      React.useEffect(()=> LS.save("agents", agents), [agents]);
+      React.useEffect(()=> LS.save("rags", rags), [rags]);
+      React.useEffect(()=> LS.save("systems", systems), [systems]);
+      React.useEffect(()=> LS.save("bots", bots), [bots]);
+
+      return { agents, setAgents, rags, setRags, systems, setSystems, bots, setBots, msg, setMsg, notify };
+    }
+
+    // ---------- RAG最適化（内包） ----------
+    function RagOptimizePane({rag, setRag, notify}){
+      if(!rag) return null;
+      const applySuggest = ()=>{
+        const size = (rag.files || []).reduce((s,f)=> s + (f.text?.length||0),0);
+        const sugChunk = Math.min(1200, Math.max(400, Math.round(size/8000)*200 || 600));
+        const sugOverlap = Math.min(300, Math.round(sugChunk*0.15));
+        const sugCompression = size>200000 ? 0.5 : 0.25;
+        setRag({...rag, chunkSize:sugChunk, chunkOverlap:sugOverlap, compressionRatio:sugCompression});
+        notify("最適化の推奨値を適用しました");
+      };
+      const check = ()=>{
+        const issues=[];
+        if((rag.chunkOverlap ?? 0) >= (rag.chunkSize ?? 1)) issues.push("オーバーラップはチャンクサイズ未満に");
+        if(!rag.indexBuilt) issues.push("インデックス未構築");
+        if((rag.files || []).length===0) issues.push("ファイル未登録");
+        if((rag.qualityScore ?? 0)<0.5) issues.push("品質スコアが低い可能性");
+        notify(issues.length? "警告: " + issues.join(" / ") : "問題なし", issues.length? "warning":"success");
+      };
+      return (
+        <Paper variant="outlined" sx={{p:2, bgcolor:"#fcfcfc"}}>
+          <Typography variant="subtitle1"><span class="material-icons">tune</span> RAG最適化</Typography>
+          <Grid container spacing={2} sx={{mt:1}}>
+            <Grid item xs={6} md={4}>
+              <TextField type="number" label="チャンクサイズ" value={rag.chunkSize ?? 800}
+                onChange={e=>setRag({...rag, chunkSize:parseInt(e.target.value||"0",10)})} fullWidth/>
+            </Grid>
+            <Grid item xs={6} md={4}>
+              <TextField type="number" label="オーバーラップ" value={rag.chunkOverlap ?? 100}
+                onChange={e=>setRag({...rag, chunkOverlap:parseInt(e.target.value||"0",10)})} fullWidth/>
+            </Grid>
+            <Grid item xs={12} md={4}>
+              <Typography gutterBottom>圧縮率</Typography>
+              <Slider min={0} max={0.9} step={0.05} value={rag.compressionRatio ?? 0}
+                onChange={(_,v)=>setRag({...rag, compressionRatio:v})} valueLabelDisplay="auto"/>
+            </Grid>
+          </Grid>
+          <TextField sx={{mt:2}} label="ストップワード（カンマ区切り）" value={rag.stopwords ?? ""}
+            onChange={e=>setRag({...rag, stopwords:e.target.value})} fullWidth/>
+          <Stack direction="row" spacing={1} sx={{mt:2, flexWrap:"wrap"}}>
+            <Button variant="contained" onClick={applySuggest} startIcon={<span class="material-icons">recommend</span>}>推奨適用</Button>
+            <Button variant="outlined" onClick={check} startIcon={<span class="material-icons">health_and_safety</span>}>チェック</Button>
+            <Chip label={`品質: ${rag.qualityScore ?? 0}`} color={(rag.qualityScore ?? 0)>=0.7?"success":(rag.qualityScore ?? 0)>=0.5?"warning":"default"}/>
+          </Stack>
+        </Paper>
+      );
+    }
+
+    // ---------- RAG管理（モーダル） ----------
+    function RagManagerDialog({open, onClose, store}){
+      const { rags, setRags, notify } = store;
+      const [selId, setSelId] = React.useState(rags[0]?.id ?? null);
+      React.useEffect(()=>{ if(!selId && rags[0]?.id) setSelId(rags[0].id); },[rags, selId]);
+
+      const cur = rags.find(r=>r.id===selId) || null;
+      const setCur = (next) => setRags(prev => prev.map(r=> r.id===next.id ? next : r));
+      const [jsonOpen, setJsonOpen] = React.useState(false);
+
+      const addRag = ()=>{ const r=defaultRag(); setRags(p=>[...p,r]); setSelId(r.id); notify("RAGを追加しました"); };
+      const delRag = (id)=>{ if(!confirm("削除しますか？")) return; setRags(p=>p.filter(r=>r.id!==id)); setSelId(prev=> (rags.find(x=>x.id!==id)?.id ?? null)); notify("削除","info"); };
+
+      const handleFiles = async (fileList) => {
+        if(!cur) return;
+        const arr = Array.from(fileList || []);
+        const newFiles = [];
+        for (const f of arr) {
+          const text = await f.text();
+          const tokens = Math.ceil(text.length/4);
+          const meta = { size: f.size, type: f.type || "text/plain" };
+          newFiles.push({ id:uid("file"), name:f.name, text:text.slice(0,100000), tokens, meta });
+        }
+        setCur({...cur, files:[...(cur.files||[]), ...newFiles]});
+        notify(`${arr.length} ファイルを追加しました`);
+      };
+
+      const buildIndex = ()=>{
+        if(!cur) return;
+        const wordCount = (cur.files||[]).reduce((s,f)=> s + (f.text?.split(/\s+/).length||0), 0);
+        const dupPenalty = Math.max(0, 1 - (cur.compressionRatio ?? 0));
+        const sizeFactor = Math.min(1, wordCount / 5000);
+        const stopCount = (cur.stopwords || "").split(",").filter(Boolean).length;
+        const stopPenalty = Math.max(0, 1 - Math.min(stopCount/50, 1));
+        const quality = Math.round((0.4*sizeFactor + 0.4*dupPenalty + 0.2*stopPenalty) * 100)/100;
+        setCur({...cur, indexBuilt:true, lastIndexedAt:new Date().toISOString(), qualityScore:quality});
+        notify("インデックス構築（擬似）完了");
+      };
+
+      return (
+        <Dialog open={open} onClose={onClose} fullWidth maxWidth="lg">
+          <DialogTitle>
+            <Stack direction="row" alignItems="center" justifyContent="space-between">
+              <span><span class="material-icons">folder</span> RAGファイル管理</span>
+              <Stack direction="row" spacing={1}>
+                <Button size="small" variant="contained" onClick={addRag} startIcon={<span class="material-icons">add</span>}>RAG追加</Button>
+                <Button size="small" onClick={onClose}>閉じる</Button>
+              </Stack>
+            </Stack>
+          </DialogTitle>
+          <DialogContent dividers>
+            <Grid container spacing={2}>
+              <Grid item xs={12} md={4}>
+                <List dense>
+                  {(rags||[]).map(r=>(
+                    <ListItem key={r.id} button selected={r.id===selId} onClick={()=>setSelId(r.id)}>
+                      <ListItemText primary={r.name} secondary={r.indexBuilt?`Index済 / Q=${r.qualityScore}`:"未インデックス"}/>
+                      <ListItemSecondaryAction>
+                        <IconButton onClick={()=>delRag(r.id)}><span class="material-icons">delete</span></IconButton>
+                      </ListItemSecondaryAction>
+                    </ListItem>
+                  ))}
+                </List>
+              </Grid>
+
+              <Grid item xs={12} md={8}>
+                {cur ? (
+                  <Stack spacing={2} className="tight denseField">
+                    <Grid container spacing={2}>
+                      <Grid item xs={12} md={6}><TextField label="名前" fullWidth value={cur.name ?? ""} onChange={e=>setCur({...cur, name:e.target.value})}/></Grid>
+                      <Grid item xs={12} md={6}><TextField label="説明" fullWidth value={cur.description ?? ""} onChange={e=>setCur({...cur, description:e.target.value})}/></Grid>
+                    </Grid>
+
+                    <Grid container spacing={2}>
+                      <Grid item xs={6} md={4}><TextField type="number" label="チャンクサイズ" value={cur.chunkSize ?? 800} onChange={e=>setCur({...cur, chunkSize:parseInt(e.target.value||"0",10)})} fullWidth/></Grid>
+                      <Grid item xs={6} md={4}><TextField type="number" label="オーバーラップ" value={cur.chunkOverlap ?? 100} onChange={e=>setCur({...cur, chunkOverlap:parseInt(e.target.value||"0",10)})} fullWidth/></Grid>
+                      <Grid item xs={12} md={4}>
+                        <FormControl fullWidth>
+                          <InputLabel>埋め込みモデル</InputLabel>
+                          <Select label="埋め込みモデル" value={cur.embeddingModel ?? "text-embedding-3-large"} onChange={e=>setCur({...cur, embeddingModel:e.target.value})}>
+                            <MenuItem value="text-embedding-3-large">text-embedding-3-large</MenuItem>
+                            <MenuItem value="text-embedding-3-small">text-embedding-3-small</MenuItem>
+                            <MenuItem value="bge-m3">bge-m3</MenuItem>
+                          </Select>
+                        </FormControl>
+                      </Grid>
+                    </Grid>
+
+                    <Grid container spacing={2}>
+                      <Grid item xs={12} md={8}><TextField label="ストップワード" fullWidth value={cur.stopwords ?? ""} onChange={e=>setCur({...cur, stopwords:e.target.value})}/></Grid>
+                      <Grid item xs={12} md={4}>
+                        <Typography gutterBottom>圧縮率</Typography>
+                        <Slider min={0} max={0.9} step={0.05} value={cur.compressionRatio ?? 0} onChange={(_,v)=>setCur({...cur, compressionRatio:v})} valueLabelDisplay="auto"/>
+                      </Grid>
+                    </Grid>
+
+                    <Grid container spacing={2}>
+                      <Grid item xs={12} md={6}>
+                        <FormControl fullWidth>
+                          <InputLabel>再ランキング</InputLabel>
+                          <Select label="再ランキング" value={cur.reRanking ?? "cosine"} onChange={e=>setCur({...cur, reRanking:e.target.value})}>
+                            <MenuItem value="cosine">Cosine</MenuItem>
+                            <MenuItem value="euclidean">L2</MenuItem>
+                            <MenuItem value="colbert">ColBERT</MenuItem>
+                          </Select>
+                        </FormControl>
+                      </Grid>
+                      <Grid item xs={12} md={6}><TextField label="品質スコア（自動）" value={cur.qualityScore ?? 0} InputProps={{readOnly:true}} fullWidth/></Grid>
+                    </Grid>
+
+                    <Box p={2} sx={{border:"1px dashed rgba(0,0,0,0.2)", borderRadius:1}}
+                        onDragOver={(e)=>e.preventDefault()}
+                        onDrop={(e)=>{ e.preventDefault(); handleFiles(e.dataTransfer.files); }}>
+                      <Stack spacing={1} alignItems="center">
+                        <Typography>ファイルをドラッグ&ドロップ、または選択</Typography>
+                        <Button variant="outlined" component="label" startIcon={<span class="material-icons">upload</span>}>
+                          ファイル選択
+                          <input hidden type="file" multiple onChange={(e)=>handleFiles(e.target.files)}/>
+                        </Button>
+                      </Stack>
+                    </Box>
+
+                    <List dense>
+                      {(cur.files||[]).map(f=>(
+                        <ListItem key={f.id}>
+                          <ListItemText primary={`${f.name} (${f.tokens} tok)`} secondary={`${f.meta?.type||"text/plain"} / ${Math.round((f.meta?.size||0)/1024)} KB`}/>
+                          <ListItemSecondaryAction>
+                            <Tooltip title="プレビュー"><IconButton onClick={()=>alert((f.text||"").slice(0,1000))}><span class="material-icons">visibility</span></IconButton></Tooltip>
+                            <Tooltip title="削除"><IconButton onClick={()=>setCur({...cur, files: (cur.files||[]).filter(x=>x.id!==f.id)})}><span class="material-icons">delete</span></IconButton></Tooltip>
+                          </ListItemSecondaryAction>
+                        </ListItem>
+                      ))}
+                    </List>
+
+                    <Stack direction="row" spacing={1} flexWrap="wrap">
+                      <Button variant="contained" onClick={buildIndex} startIcon={<span class="material-icons">hub</span>}>インデックス構築（擬似）</Button>
+                      <Chip label={cur.indexBuilt ? `Index済: ${new Date(cur.lastIndexedAt).toLocaleString()}` : "未インデックス"} color={cur.indexBuilt?"success":"default"}/>
+                      <Button onClick={()=>setJsonOpen(true)} startIcon={<span class="material-icons">data_object</span>}>JSON編集</Button>
+                    </Stack>
+
+                    <RagOptimizePane rag={cur} setRag={setCur} notify={notify}/>
+                  </Stack>
+                ) : <Alert severity="info">左のリストからRAGを選択/追加してください。</Alert>}
+              </Grid>
+            </Grid>
+          </DialogContent>
+
+          {cur && (
+            <JsonEditDialog open={jsonOpen} title="RAG JSON" value={cur}
+              onClose={()=>setJsonOpen(false)}
+              onSave={(data)=>{ setCur(data); setJsonOpen(false); }}/>
+          )}
+          <DialogActions><Button onClick={onClose}>閉じる</Button></DialogActions>
+        </Dialog>
+      );
+    }
+
+    // ---------- システム編集モーダル ----------
+    function SystemEditorDialog({open, onClose, store, initSystem}){
+      const { systems, setSystems, agents, notify } = store;
+      const [sys, setSys] = React.useState(initSystem ?? defaultSystem());
+      React.useEffect(()=> setSys(initSystem ?? defaultSystem()), [initSystem, open]);
+
+      const save = ()=>{
+        if(!(sys.name||"").trim()){ notify("システム名は必須です","warning"); return; }
+        const exists = (systems||[]).find(s=>s.id===sys.id);
+        if(exists) setSystems(prev=> prev.map(s=> s.id===sys.id? {...sys, agentIds:(sys.agentIds||[])} : s));
+        else setSystems(prev=> [...prev, {...sys, agentIds:(sys.agentIds||[])}]);
+        notify("システムを保存しました");
+        onClose(sys);
+      };
+
+      return (
+        <Dialog open={open} onClose={()=>onClose(null)} fullWidth maxWidth="md">
+          <DialogTitle><span class="material-icons">lan</span> システム編集</DialogTitle>
+          <DialogContent dividers>
+            <Grid container spacing={2}>
+              <Grid item xs={12} md={6}><TextField label="名前" fullWidth value={sys.name ?? ""} onChange={e=>setSys({...sys, name:e.target.value})}/></Grid>
+              <Grid item xs={12} md={6}>
+                <FormControl fullWidth>
+                  <InputLabel>ルーティング戦略</InputLabel>
+                  <Select label="ルーティング戦略" value={sys.routing ?? "keywords"} onChange={e=>setSys({...sys, routing:e.target.value})}>
+                    <MenuItem value="keywords">キーワード</MenuItem>
+                    <MenuItem value="classifier">分類器</MenuItem>
+                    <MenuItem value="score-based">スコアベース</MenuItem>
+                    <MenuItem value="round-robin">ラウンドロビン</MenuItem>
+                  </Select>
+                </FormControl>
+              </Grid>
+            </Grid>
+            <TextField sx={{mt:2}} label="説明" fullWidth value={sys.description ?? ""} onChange={e=>setSys({...sys, description:e.target.value})}/>
+            <Stack direction="row" spacing={2} sx={{mt:2}} alignItems="center" flexWrap="wrap">
+              <FormControlLabel control={<Switch checked={!!sys.auditLog} onChange={e=>setSys({...sys, auditLog:e.target.checked})}/>} label="監査ログ"/>
+              <TextField type="number" label="保持日数" value={sys.retentionDays ?? 14} onChange={e=>setSys({...sys, retentionDays:parseInt(e.target.value||"0",10)})} sx={{width:160}}/>
+            </Stack>
+
+            <Typography variant="subtitle2" sx={{mt:2}}>このシステムで使うエージェント</Typography>
+            <Autocomplete
+              multiple options={agents||[]} value={(agents||[]).filter(a=> (sys.agentIds||[]).includes(a.id))}
+              onChange={(_,vals)=> setSys({...sys, agentIds: vals.map(v=>v.id) })}
+              getOptionLabel={(o)=>o.name} disableCloseOnSelect
+              renderOption={(props, option, { selected }) => (
+                <li {...props}>
+                  <Checkbox checked={selected} />
+                  <Avatar sx={{width:24,height:24, mr:1}}>{(option.name||"").slice(0,2)}</Avatar>
+                  {option.name}
+                </li>
+              )}
+              renderInput={(params)=> <TextField {...params} label="エージェント選択"/>}
+            />
+          </DialogContent>
+          <DialogActions>
+            <Button onClick={()=>onClose(null)}>キャンセル</Button>
+            <Button variant="contained" onClick={save} startIcon={<span class="material-icons">save</span>}>保存</Button>
+          </DialogActions>
+        </Dialog>
+      );
+    }
+
+    // ---------- 新規: チャットボット セクション（複数エージェント紐付けUI + テストチャット追加） ----------
+    function BotsSection({store}){
+      const { bots, setBots, agents, notify } = store;
+      const [selId, setSelId] = React.useState(bots[0]?.id ?? null);
+      React.useEffect(()=>{ if(!selId && bots[0]?.id) setSelId(bots[0].id); },[bots, selId]);
+
+      const cur = (bots||[]).find(b=>b.id===selId) || null;
+      const [jsonOpen, setJsonOpen] = React.useState(false);
+
+      const add = ()=>{ const b=defaultBot(); setBots(p=>[...p,b]); setSelId(b.id); notify("チャットボットを追加"); };
+      const del = (id)=>{ if(!confirm("削除しますか？")) return; setBots(p=>p.filter(b=>b.id!==id)); setSelId(prev=> (bots.find(x=>x.id!==id)?.id ?? null)); notify("削除","info"); };
+      const up = (patch)=> cur && setBots(prev=> prev.map(b=> b.id===cur.id ? {...b, ...patch} : b));
+
+      // 追加: テストチャット（モック）
+      const [chatQ, setChatQ] = React.useState("");
+      const [chat, setChat]   = React.useState([]);
+      const send = ()=>{
+        if(!(chatQ||"").trim() || !cur) return;
+        const user={role:"user", content:chatQ, id:uid("m")};
+        const firstAgentId = (cur.agentIds||[])[0];
+        const a = (agents||[]).find(x=> x.id===firstAgentId) || (agents||[])[0] || {name:"Agent"};
+        const resp = `（モック: チャットボット「${cur.name||"未命名"}」 → ${a?.name||"Agent"} / handoff:${cur.handoff}）"${chatQ}" の回答。`;
+        setChat(p=>[...p, user, {role:"assistant", content:resp, id:uid("m")}]);
+        setChatQ("");
+      };
+
+      return (
+        <section id="bots">
+          <Paper variant="outlined">
+            <Box p={2}><Typography variant="h6"><span class="material-icons">smart_display</span> チャットボット</Typography></Box>
+            <Divider/>
+            <Box p={2}>
+              <Grid container spacing={2}>
+                <Grid item xs={12} md={4}>
+                  <Stack spacing={1}>
+                    <Button variant="contained" startIcon={<span class="material-icons">add</span>} onClick={add}>チャットボットを追加</Button>
+                    <List dense>
+                      {(bots||[]).map(b=>(
+                        <ListItem key={b.id} button selected={b.id===selId} onClick={()=>setSelId(b.id)}>
+                          <Avatar sx={{mr:1}}>{(b.name||"?").slice(0,2)}</Avatar>
+                          <ListItemText primary={b.name} secondary={b.description || b.handoff}/>
+                          <ListItemSecondaryAction>
+                            <IconButton onClick={()=>del(b.id)}><span class="material-icons">delete</span></IconButton>
+                          </ListItemSecondaryAction>
+                        </ListItem>
+                      ))}
+                    </List>
+                  </Stack>
+                </Grid>
+
+                <Grid item xs={12} md={8}>
+                  {cur ? (
+                    <Stack spacing={2} className="tight denseField">
+                      <Grid container spacing={2}>
+                        <Grid item xs={12} md={6}><TextField label="名前" fullWidth value={cur.name ?? ""} onChange={e=>up({name:e.target.value})}/></Grid>
+                        <Grid item xs={12} md={6}><TextField label="説明" fullWidth value={cur.description ?? ""} onChange={e=>up({description:e.target.value})}/></Grid>
+                      </Grid>
+
+                      <Grid container spacing={2}>
+                        <Grid item xs={12} md={6}>
+                          <FormControl fullWidth>
+                            <InputLabel>ハンドオフ戦略</InputLabel>
+                            <Select label="ハンドオフ戦略" value={cur.handoff ?? "keywords"} onChange={e=>up({handoff:e.target.value})}>
+                              <MenuItem value="keywords">キーワード</MenuItem>
+                              <MenuItem value="round-robin">ラウンドロビン</MenuItem>
+                              <MenuItem value="score-based">スコアベース</MenuItem>
+                            </Select>
+                          </FormControl>
+                        </Grid>
+                        <Grid item xs={12} md={6}>
+                          <FormControl fullWidth>
+                            <InputLabel>トーン</InputLabel>
+                            <Select label="トーン" value={cur.tone ?? "neutral"} onChange={e=>up({tone:e.target.value})}>
+                              <MenuItem value="neutral">ニュートラル</MenuItem>
+                              <MenuItem value="friendly">フレンドリー</MenuItem>
+                              <MenuItem value="professional">プロフェッショナル</MenuItem>
+                            </Select>
+                          </FormControl>
+                        </Grid>
+                      </Grid>
+
+                      <TextField label="初回挨拶" fullWidth multiline minRows={2} value={cur.entryPrompt ?? ""} onChange={e=>up({entryPrompt:e.target.value})}/>
+                      <FormControlLabel control={<Switch checked={!!cur.visible} onChange={e=>up({visible:e.target.checked})}/>} label="公開"/>
+
+                      <Typography variant="subtitle2">このボットで使うエージェント（複数）</Typography>
+                      <Autocomplete
+                        multiple options={agents||[]}
+                        value={(agents||[]).filter(a=> (cur.agentIds||[]).includes(a.id))}
+                        onChange={(_,vals)=> up({agentIds: vals.map(v=>v.id) })}
+                        getOptionLabel={(o)=>o.name}
+                        disableCloseOnSelect
+                        renderOption={(props, option, { selected }) => (
+                          <li {...props}>
+                            <Checkbox checked={selected}/>
+                            <Avatar sx={{width:24,height:24, mr:1}}>{(option.name||"").slice(0,2)}</Avatar>
+                            {option.name}
+                          </li>
+                        )}
+                        renderInput={(params)=> <TextField {...params} label="エージェント選択"/>}
+                      />
+
+                      <Stack direction="row" spacing={1}>
+                        <Button onClick={()=>setJsonOpen(true)} startIcon={<span class="material-icons">data_object</span>}>JSON編集</Button>
+                      </Stack>
+
+                      {/* このチャットボットを利用するシステム */}
+                      <Paper variant="outlined" sx={{p:2, bgcolor:"#fffefc"}}>
+                        <Typography variant="subtitle1"><span class="material-icons">lan</span> このチャットボットを利用するシステム</Typography>
+                        <Autocomplete
+                          multiple options={store.systems||[]}
+                          value={(store.systems||[]).filter(s=> ((s.agentIds||[]).includes(cur.id)))} 
+                          onChange={(_,vals)=>{
+                            store.setSystems(prev => (prev||[]).map(s=>{
+                              const has = vals.map(v=>v.id).includes(s.id);
+                              const agentIds = Array.isArray(s.agentIds)? s.agentIds:[];
+                              return has
+                                ? {...s, agentIds: agentIds.includes(cur.id)? agentIds:[...agentIds, cur.id]}
+                                : {...s, agentIds: agentIds.filter(id=>id!==cur.id)};
+                            }));
+                          }}
+                          getOptionLabel={(o)=>o.name || ""}
+                          disableCloseOnSelect
+                          renderOption={(props, option, { selected }) => (
+                            <li {...props}><Checkbox checked={selected}/>{option.name}</li>
+                          )}
+                          renderInput={(params)=> <TextField {...params} label="システムを選択"/>}
+                        />
+                        <Stack direction="row" spacing={1} sx={{mt:1, flexWrap:'wrap'}}>
+                          <Button size="small" variant="outlined" startIcon={<span class="material-icons">add</span>}
+                            onClick={()=>{ /* SystemEditorDialog を開く処理 */ }}>
+                            新規システム作成
+                          </Button>
+                          {(store.systems||[]).filter(s=> (s.agentIds||[]).includes(cur.id)).map(s=>(
+                            <Chip key={s.id} label={s.name} variant="outlined" sx={{mb:1}}/>
+                          ))}
+                        </Stack>
+                      </Paper>
+
+                      {/* 追加: テストチャット（モック） */}
+                      <Accordion defaultExpanded={false}>
+                        <AccordionSummary expandIcon={<span class="material-icons">expand_more</span>}>
+                          <Typography><span class="material-icons">play_circle</span> テストチャット（モック）</Typography>
+                        </AccordionSummary>
+                        <AccordionDetails>
+                          <Stack spacing={1}>
+                            <TextField
+                              placeholder="質問を入力…"
+                              value={chatQ}
+                              onChange={e=>setChatQ(e.target.value)}
+                              onKeyDown={e=>{ if(e.key==="Enter" && !e.shiftKey){ e.preventDefault(); send(); }}}
+                              multiline
+                            />
+                            <Button variant="contained" startIcon={<span class="material-icons">send</span>} onClick={send}>送信</Button>
+                            <Stack spacing={1} sx={{maxHeight:240, overflow:"auto"}}>
+                              {chat.map(m=>(
+                                <Card key={m.id} variant="outlined">
+                                  <CardContent>
+                                    <Typography variant="overline">{m.role==="user"?"ユーザー":"アシスタント"}</Typography>
+                                    <Typography>{m.content}</Typography>
+                                  </CardContent>
+                                </Card>
+                              ))}
+                            </Stack>
+                          </Stack>
+                        </AccordionDetails>
+                      </Accordion>
+                    </Stack>
+                  ) : <Alert severity="info">左のリストからチャットボットを選択/追加してください。</Alert>}
+                </Grid>
+              </Grid>
+            </Box>
+          </Paper>
+          
+
+          {cur && (
+            <JsonEditDialog open={jsonOpen} title="チャットボット JSON" value={cur}
+              onClose={()=>setJsonOpen(false)}
+              onSave={(data)=>{ setBots(prev=>prev.map(b=>b.id===cur.id?data:b)); setJsonOpen(false); }}/>
+          )}
+        </section>
+      );
+    }
+
+    // ---------- エージェント（既存にRAG・システム紐付け維持） ----------
+    function AgentsSection({store}){
+      const { agents, setAgents, rags, systems, setSystems, notify } = store;
+      const [selId, setSelId] = React.useState(agents[0]?.id ?? null);
+      React.useEffect(()=>{ if(!selId && agents[0]?.id) setSelId(agents[0].id); },[agents, selId]);
+
+      const cur = (agents||[]).find(a=>a.id===selId) || null;
+      const [jsonOpen, setJsonOpen] = React.useState(false);
+      const [ragOpen, setRagOpen] = React.useState(false);
+      const [sysEditorOpen, setSysEditorOpen] = React.useState(false);
+      const [editingSystem, setEditingSystem] = React.useState(null);
+
+      const addAgent = ()=>{ const a=defaultAgent(); setAgents(p=>[...p,a]); setSelId(a.id); notify("エージェントを追加"); };
+      const delAgent = (id)=>{ if(!confirm("削除しますか？")) return; setAgents(p=>p.filter(a=>a.id!==id)); setSelId(prev=> (agents.find(x=>x.id!==id)?.id ?? null)); notify("削除","info"); };
+      const up = (patch)=> cur && setAgents(prev=> prev.map(a=> a.id===cur.id ? {...a, ...patch} : a));
+
+      const validate = (a)=>{
+        const errs=[];
+        if(!(a?.name||"").trim()) errs.push("名前は必須");
+        if((a?.temperature ?? 0)<0 || (a?.temperature ?? 0)>1) errs.push("温度は0〜1");
+        if(a?.requireCitations && !(a?.tools||[]).includes("retrieval")) errs.push("出典必須時は retrieval を有効に");
+        return errs;
+      };
+      const runValidate=()=>{ if(!cur) return; const e=validate(cur); e.length? notify("バリデーション: " + e.join(" / "),"warning"):notify("バリデーションOK"); };
+
+      const systemsUsingThisAgent = (systems||[]).filter(s=> ((s.agentIds||[]).includes(cur?.id||"")));
+      const setSystemsForAgent = (selectedIds=[])=>{
+        if(!cur) return;
+        setSystems(prev => (prev||[]).map(s => {
+          const has = selectedIds.includes(s.id);
+          const agentIds = Array.isArray(s.agentIds) ? s.agentIds : [];
+          return has
+            ? {...s, agentIds: agentIds.includes(cur.id) ? agentIds : [...agentIds, cur.id]}
+            : {...s, agentIds: agentIds.filter(id=> id!==cur.id)};
+        }));
+      };
+
+      // モックチャット
+      const [chatQ, setChatQ] = React.useState(""); const [chat, setChat] = React.useState([]);
+      const send = ()=>{
+        if(!cur || !(chatQ||"").trim()) return;
+        const u={role:"user",content:chatQ,id:uid("m")};
+        const a={role:"assistant", id:uid("m"), content: cur.requireCitations
+          ? `（モック）"${chatQ}" への回答。根拠: RAG(${(cur.ragIds||[]).length}) 厳格度 ${cur.groundingStrictness ?? 0}`
+          : `（モック）"${chatQ}" への回答。`};
+        setChat(p=>[...p,u,a]); setChatQ("");
+      };
+
+      return (
+        <section id="agents">
+          <Paper variant="outlined">
+            <Box p={2}><Typography variant="h6"><span class="material-icons">smart_toy</span> エージェント（RAG最適化をモーダル内包）</Typography></Box>
+            <Divider/>
+            <Box p={2}>
+              <Grid container spacing={2}>
+                <Grid item xs={12} md={4}>
+                  <Stack spacing={1}>
+                    <Button variant="contained" startIcon={<span class="material-icons">add</span>} onClick={addAgent}>エージェントを追加</Button>
+                    <List dense>
+                      {(agents||[]).map(a=>(
+                        <ListItem key={a.id} button selected={a.id===selId} onClick={()=>setSelId(a.id)}>
+                          <Avatar sx={{mr:1}}>{(a.name||"?").slice(0,2)}</Avatar>
+                          <ListItemText primary={a.name} secondary={a.description || a.model}/>
+                          <ListItemSecondaryAction>
+                            <IconButton onClick={()=>delAgent(a.id)}><span class="material-icons">delete</span></IconButton>
+                          </ListItemSecondaryAction>
+                        </ListItem>
+                      ))}
+                    </List>
+                  </Stack>
+                </Grid>
+
+                <Grid item xs={12} md={8}>
+                  {cur ? (
+                    <Stack spacing={2} className="tight denseField">
+                      <Grid container spacing={2}>
+                        <Grid item xs={12} md={6}><TextField label="名前" fullWidth value={cur.name ?? ""} onChange={e=>up({name:e.target.value})}/></Grid>
+                        <Grid item xs={12} md={6}><TextField label="説明" fullWidth value={cur.description ?? ""} onChange={e=>up({description:e.target.value})}/></Grid>
+                      </Grid>
+
+                      <Grid container spacing={2}>
+                        <Grid item xs={12} md={6}>
+                          <FormControl fullWidth>
+                            <InputLabel>モデル</InputLabel>
+                            <Select label="モデル" value={cur.model ?? "gpt-4o-mini"} onChange={e=>up({model:e.target.value})}>
+                              <MenuItem value="gpt-4o-mini">gpt-4o-mini</MenuItem>
+                              <MenuItem value="gpt-4.1">gpt-4.1</MenuItem>
+                              <MenuItem value="claude-opus">claude-opus</MenuItem>
+                              <MenuItem value="local-llm">local-llm</MenuItem>
+                            </Select>
+                          </FormControl>
+                        </Grid>
+                        <Grid item xs={6} md={3}><Typography gutterBottom>温度</Typography>
+                          <Slider min={0} max={1} step={0.05} value={cur.temperature ?? 0} onChange={(_,v)=>up({temperature:v})} valueLabelDisplay="auto"/></Grid>
+                        <Grid item xs={6} md={3}><TextField type="number" label="maxTokens" value={cur.maxTokens ?? 1024} onChange={e=>up({maxTokens:parseInt(e.target.value||"0",10)})} fullWidth/></Grid>
+                      </Grid>
+
+                      <TextField label="システムプロンプト" fullWidth multiline minRows={3} value={cur.systemPrompt ?? ""} onChange={e=>up({systemPrompt:e.target.value})}/>
+
+                      <Stack direction="row" spacing={2} alignItems="center" sx={{flexWrap:'wrap'}}>
+                        <FormControlLabel control={<Switch checked={!!cur.requireCitations} onChange={e=>up({requireCitations:e.target.checked})}/>} label="出典必須"/>
+                        <FormControl size="small">
+                          <InputLabel>引用スタイル</InputLabel>
+                          <Select label="引用スタイル" value={cur.citationStyle ?? "inline"} onChange={e=>up({citationStyle:e.target.value})}>
+                            <MenuItem value="inline">本文内</MenuItem>
+                            <MenuItem value="footnote">脚注</MenuItem>
+                            <MenuItem value="bib">参考文献</MenuItem>
+                          </Select>
+                        </FormControl>
+                        <Box sx={{width:220}}>
+                          <Typography gutterBottom>根拠厳格度</Typography>
+                          <Slider min={0} max={1} step={0.1} value={cur.groundingStrictness ?? 0.7} onChange={(_,v)=>up({groundingStrictness:v})} valueLabelDisplay="auto"/>
+                        </Box>
+                      </Stack>
+
+                      <TextField label="拒否ポリシー" fullWidth multiline minRows={2} value={cur.refusalPolicy ?? ""} onChange={e=>up({refusalPolicy:e.target.value})}/>
+
+                      <Box>
+                        <Typography gutterBottom>ツール</Typography>
+                        <Stack direction="row" spacing={1} flexWrap="wrap">
+                          {["retrieval","web-search","calculator","code-exec","vision"].map(t=>{
+                            const on=(cur.tools||[]).includes(t);
+                            return <Chip key={t} label={t} variant={on?"filled":"outlined"}
+                              onClick={()=> on? up({tools:(cur.tools||[]).filter(x=>x!==t)}):up({tools:[...(cur.tools||[]),t]})}/>;
+                          })}
+                        </Stack>
+                      </Box>
+
+                      {/* RAG 紐付け + 管理モーダル */}
+                      <Stack direction="row" spacing={1} alignItems="center" sx={{flexWrap:'wrap'}}>
+                        <FormControl fullWidth>
+                          <InputLabel>紐づけるRAG（複数）</InputLabel>
+                          <Select multiple label="紐づけるRAG（複数）" value={cur.ragIds ?? []}
+                            onChange={e=>up({ragIds:e.target.value})}
+                            renderValue={vals=> (vals||[]).map(id=> (rags||[]).find(r=>r.id===id)?.name ?? id).join(", ")}>
+                            {(rags||[]).map(r=> <MenuItem key={r.id} value={r.id}>{r.name}</MenuItem>)}
+                          </Select>
+                        </FormControl>
+                        <Button variant="outlined" onClick={()=>setRagOpen(true)} startIcon={<span class="material-icons">folder</span>}>RAGを管理</Button>
+                      </Stack>
+
+                      <Stack direction="row" spacing={1}>
+                        <Button onClick={runValidate} startIcon={<span class="material-icons">rule</span>} variant="outlined">バリデーション</Button>
+                        <Button onClick={()=>setJsonOpen(true)} startIcon={<span class="material-icons">data_object</span>}>JSON編集</Button>
+                      </Stack>
+
+                      <Accordion defaultExpanded={false}>
+                        <AccordionSummary expandIcon={<span class="material-icons">expand_more</span>}>
+                          <Typography><span class="material-icons">play_circle</span> テストチャット（モック）</Typography>
+                        </AccordionSummary>
+                        <AccordionDetails>
+                          <Stack spacing={1}>
+                            <TextField placeholder="質問を入力…" value={chatQ} onChange={e=>setChatQ(e.target.value)}
+                              onKeyDown={e=>{ if(e.key==="Enter" && !e.shiftKey){ e.preventDefault(); send(); }}} multiline/>
+                            <Button variant="contained" startIcon={<span class="material-icons">send</span>} onClick={send}>送信</Button>
+                            <Stack spacing={1} sx={{maxHeight:240, overflow:"auto"}}>
+                              {chat.map(m=>(
+                                <Card key={m.id} variant="outlined"><CardContent>
+                                  <Typography variant="overline">{m.role==="user"?"ユーザー":"アシスタント"}</Typography>
+                                  <Typography>{m.content}</Typography>
+                                </CardContent></Card>
+                              ))}
+                            </Stack>
+                          </Stack>
+                        </AccordionDetails>
+                      </Accordion>
+                    </Stack>
+                  ) : <Alert severity="info">左のリストからエージェントを選択/追加してください。</Alert>}
+                </Grid>
+              </Grid>
+            </Box>
+          </Paper>
+
+          {/* モーダル */}
+          <RagManagerDialog open={ragOpen} onClose={()=>setRagOpen(false)} store={store}/>
+          {cur && (
+            <JsonEditDialog open={jsonOpen} title="エージェント JSON" value={cur}
+              onClose={()=>setJsonOpen(false)}
+              onSave={(data)=>{ setAgents(prev=>prev.map(a=>a.id===cur.id?data:a)); setJsonOpen(false); }}/>
+          )}
+          <SystemEditorDialog
+            open={sysEditorOpen}
+            onClose={(saved)=>{ setSysEditorOpen(false);
+              if(saved && cur){
+                store.setSystems(prev => (prev||[]).map(s => s.id===saved.id
+                  ? {...s, agentIds: Array.from(new Set([...(s.agentIds||[]), cur.id]))}
+                  : s));
+              }
+            }}
+            store={store}
+            initSystem={editingSystem}
+          />
+        </section>
+      );
+    }
+
+    // ---------- ルート ----------
+    function App(){
+      const store = useStore();
+      const prefersDark = useMediaQuery('(prefers-color-scheme: dark)');
+      const theme = React.useMemo(()=> createTheme({
+        palette: { mode: prefersDark? "dark":"light", background:{ default:"#fafafa", paper:"#ffffff" } },
+        shape: { borderRadius: 10 },
+        components: {
+          MuiContainer: { styleOverrides: { root: { paddingLeft: 8, paddingRight: 8 } } },
+          MuiPaper: { defaultProps:{ elevation:0 } }
+        }
+      }), [prefersDark]);
+
+      const scrollTo = (id)=> document.getElementById(id)?.scrollIntoView({behavior:"smooth"});
+
+      return (
+        <ThemeProvider theme={theme}>
+          <CssBaseline/>
+          <AppBar position="sticky" color="inherit" elevation={1}>
+            <Toolbar sx={{gap:1, flexWrap:'wrap'}}>
+              <Typography className="appTitle" variant="h6" sx={{flexGrow:1, minWidth:200}}>AIエージェント管理（1ページ／立体UI）</Typography>
+              <Chip className="chipNav" label="ボット" onClick={()=>scrollTo("bots")} icon={<span class="material-icons">smart_display</span>}/>
+              <Chip className="chipNav" label="エージェント" onClick={()=>scrollTo("agents")} icon={<span class="material-icons">smart_toy</span>}/>
+              <Tooltip title="全データ初期化">
+                <IconButton onClick={()=>{ if(confirm("ローカルデータをすべて削除しますか？")){ localStorage.clear(); location.reload(); }}}>
+                  <span class="material-icons">delete_forever</span>
+                </IconButton>
+              </Tooltip>
+              <Tooltip title="エクスポート(JSON)">
+                <IconButton onClick={()=>{
+                  const data = { agents: store.agents, rags: store.rags, systems: store.systems, bots: store.bots, exportedAt: new Date().toISOString() };
+                  const blob = new Blob([JSON.stringify(data,null,2)], {type:"application/json"});
+                  const a = document.createElement("a"); a.href = URL.createObjectURL(blob); a.download = "ai-config.json"; a.click();
+                }}>
+                  <span class="material-icons">download</span>
+                </IconButton>
+              </Tooltip>
+              <Tooltip title="インポート(JSON)">
+                <IconButton component="label">
+                  <span class="material-icons">upload</span>
+                  <input hidden type="file" accept="application/json" onChange={async e=>{
+                    const file=e.target.files?.[0]; if(!file) return;
+                    try {
+                      const text=await file.text(); const obj=JSON.parse(text);
+                      const fixedSystems = (obj.systems||[]).map(s => ({...s, agentIds: Array.isArray(s.agentIds)? s.agentIds : []}));
+                      const fixedBots    = (obj.bots||[]).map(b => ({...b, agentIds: Array.isArray(b.agentIds)? b.agentIds : []}));
+                      if(obj.agents && obj.rags && obj.systems && obj.bots){
+                        store.setAgents(obj.agents); store.setRags(obj.rags); store.setSystems(fixedSystems); store.setBots(fixedBots);
+                        store.notify("インポートしました");
+                      } else { throw new Error("不正なフォーマット"); }
+                    } catch(err){ store.notify("インポート失敗: " + err.message, "error"); }
+                  }}/>
+                </IconButton>
+              </Tooltip>
+            </Toolbar>
+          </AppBar>
+
+          <Container maxWidth="xl" sx={{py:2}}>
+            <BotsSection store={store}/>
+            <AgentsSection store={store}/>
+
+            <Paper variant="outlined" sx={{mt:2}}>
+              <Box p={2}>
+                <Typography variant="h6"><span class="material-icons">help</span> メモ</Typography>
+              </Box>
+              <Divider/>
+              <Box p={2}>
+                <ul>
+                  <li>`.includes` / `.length` は常にガード（例: <code>(s.agentIds||[]).includes(id)</code> / <code>arr?.length ?? 0</code>）。</li>
+                  <li>既存データに抜けがあっても自己修復（<code>agentIds</code> / <code>bots</code> などを必ず配列化）。</li>
+                  <li>モバイル配慮：Chipナビ折返し・フォーム密度を下げ、Gridは <code>xs=12</code> を徹底。</li>
+                  <li>通知はすべてモーダルダイアログに統一（Snackbar撤廃）。</li>
+                </ul>
+              </Box>
+            </Paper>
+          </Container>
+
+          {/* モーダルメッセージ（グローバル） */}
+          <MessageDialog open={store.msg.open} onClose={()=>store.setMsg({...store.msg, open:false})}
+            severity={store.msg.severity} message={store.msg.message}/>
+        </ThemeProvider>
+      );
+    }
+
+    const root = ReactDOM.createRoot(document.getElementById("root"));
+    root.render(<App/>);
+  </script>
+</body>
+</html>

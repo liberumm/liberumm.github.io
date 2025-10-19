@@ -1,0 +1,942 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8" />
+  <title>Need Fit Balancer – Simple SPA</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+
+  <!-- Fonts / Icons / React / MUI / Babel -->
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Roboto:wght@300;400;600;700&display=swap"/>
+  <link rel="stylesheet" href="https://fonts.googleapis.com/icon?family=Material+Icons"/>
+  <script src="https://cdn.jsdelivr.net/npm/react@18.2.0/umd/react.production.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/react-dom@18.2.0/umd/react-dom.production.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@mui/material@5.15.14/umd/material-ui.production.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@babel/standalone@7.25.6/babel.min.js"></script>
+
+  <!-- D3 -->
+  <script src="https://cdn.jsdelivr.net/npm/d3@7/dist/d3.min.js"></script>
+
+  <!-- Leaflet -->
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+
+  <style>
+    :root{ --bg:#f7faf9; --border:#e5eeeb; --lane:#f3f6fb; }
+    *{ box-sizing:border-box; }
+    html{ scroll-behavior:smooth; }
+    body{ margin:0; font-family: Roboto, system-ui, -apple-system, "Segoe UI", sans-serif; background:var(--bg); color:#1d2939; }
+    .mono{ font-variant-numeric:tabular-nums; font-feature-settings:"tnum"; }
+    .pill{ font-size:11px; padding:2px 8px; border-radius:999px; border:1px solid #e0e3ea; background:#fff; }
+    .card { border:1px solid var(--border); border-radius:12px; background:#fff; width:100%; }
+    .rotate-90{ transform: rotate(90deg); transition: transform .2s ease; }
+    .rotate-0{ transform: rotate(0deg); transition: transform .2s ease; }
+    .leaflet-container{ border-radius:10px; }
+    .balance-icon{ font-size:22px; color:#1f3aa5; vertical-align:-4px; margin-right:8px; }
+
+    /* 図式 */
+    .diagram-wrap{ position: relative; width: 100%; }
+    .diagram-shell{
+      border-radius:12px; border:1px solid var(--border); background:#fff;
+      width:100%; height:35vh; resize: vertical; overflow: auto; position: relative;
+    }
+    .zoom-ui{
+      position: absolute; right: 12px; bottom: 12px;
+      display: flex; gap: 6px; padding: 6px; border-radius: 10px;
+      background: #ffffff; border: 1px solid var(--border);
+      box-shadow: 0 6px 20px rgba(0,0,0,.08); z-index: 2;
+    }
+
+    .lane-label{ font-weight:700; font-size:12px; fill:#1d2939; }
+    .node-title{ font-weight:600; font-size:13px; fill:#1d2939; }
+    .node-sub{ font-size:11px; fill:#667085; }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+
+  <script type="text/babel">
+    const {useState, useEffect, useRef, useMemo} = React;
+    const {
+      AppBar, Toolbar, Typography, Container, Box, Paper, Stack, Button, Divider, Collapse, IconButton,
+      Select, MenuItem, TextField, Slider, ToggleButton, ToggleButtonGroup,
+      Table, TableHead, TableRow, TableCell, TableBody, TableContainer, Checkbox, Chip, Tooltip, Snackbar, Alert,
+      FormGroup, FormControlLabel, Switch, ThemeProvider, createTheme, Avatar, Tabs, Tab, LinearProgress, Drawer
+    } = MaterialUI;
+
+    // ===== Theme =====
+    const theme = createTheme({
+      palette:{ mode:'light', primary:{main:'#1f3aa5'}, secondary:{main:'#0b8b86'}, background:{default:'#f5f7fb'} },
+      shape:{ borderRadius:10 }, typography:{ button:{ textTransform:'none', fontWeight:600 } }
+    });
+
+    // ===== Colors/Icons/Stages =====
+    const COLORS = { Raw:'#8b5cf6', Factory:'#2563eb', MfrWH:'#0ea5e9', OwnDC:'#22c55e', Store:'#6cc24a', Customer:'#f59e0b' };
+    const ICONS  = { Raw:'🧪', Factory:'🏭', MfrWH:'🏬', OwnDC:'🚚', Store:'🏪', Customer:'👤' };
+    const STAGES = ['Raw','Factory','MfrWH','OwnDC','Store','Customer'];
+
+    // ===== Nodes =====
+    const NODES = {
+      Raw: [
+        { id:'RAW-01', name:'原料A(埼玉)', lat:35.97, lng:139.65 },
+        { id:'RAW-02', name:'原料B(千葉)', lat:35.61, lng:140.13 },
+        { id:'RAW-03', name:'原料C(茨城)', lat:36.34, lng:140.43 },
+      ],
+      Factory: [
+        { id:'FCT-01', name:'メーカー工場(川崎)', lat:35.53, lng:139.70 },
+        { id:'FCT-02', name:'メーカー工場(堺)',   lat:34.57, lng:135.48 },
+      ],
+      MfrWH: [
+        { id:'MWH-01', name:'メーカー倉庫(千葉北)', lat:35.69, lng:140.10 },
+        { id:'MWH-02', name:'メーカー倉庫(神戸)',   lat:34.68, lng:135.18 },
+      ],
+      OwnDC: [
+        { id:'ODC-01', name:'自社倉庫(足立)', lat:35.78, lng:139.80 },
+        { id:'ODC-02', name:'自社倉庫(尼崎)', lat:34.73, lng:135.42 },
+      ],
+      Store: [
+        { id:'STR-01', name:'店舗(新宿西口)',   lat:35.69, lng:139.70 },
+        { id:'STR-02', name:'店舗(梅田)',       lat:34.70, lng:135.50 },
+        { id:'STR-03', name:'店舗(渋谷)',       lat:35.66, lng:139.70 },
+        { id:'STR-04', name:'店舗(池袋)',       lat:35.73, lng:139.71 },
+        { id:'STR-05', name:'店舗(品川)',       lat:35.62, lng:139.74 },
+        { id:'STR-06', name:'店舗(横浜西口)',   lat:35.47, lng:139.62 },
+        { id:'STR-07', name:'店舗(大宮)',       lat:35.91, lng:139.62 },
+        { id:'STR-08', name:'店舗(立川)',       lat:35.70, lng:139.41 },
+        { id:'STR-09', name:'店舗(千葉そごう)', lat:35.61, lng:140.11 },
+        { id:'STR-10', name:'店舗(神戸三宮)',   lat:34.69, lng:135.19 },
+        { id:'STR-11', name:'店舗(名古屋栄)',   lat:35.17, lng:136.91 },
+      ],
+      Customer: [
+        { id:'CUS-01', name:'顧客(世田谷)',   lat:35.64, lng:139.65 },
+        { id:'CUS-02', name:'顧客(此花区)',   lat:34.68, lng:135.45 },
+      ],
+    };
+
+    // ===== Scenarios（移管関連なしで簡潔） =====
+    const SCENARIOS = [
+      { id:'SC-001', sku:'スポーツドリンク 500ml', qty:240,
+        path:{ Raw:'RAW-01', Factory:'FCT-01', MfrWH:'MWH-01', OwnDC:'ODC-01', Store:'STR-01', Customer:'CUS-01' },
+        status:'in_transit', progress:0.42, eta:'2025-10-12' },
+      { id:'SC-002', sku:'カップ麺 醤油', qty:180,
+        path:{ Raw:'RAW-03', Factory:'FCT-02', MfrWH:'MWH-02', OwnDC:'ODC-02', Store:'STR-10', Customer:'CUS-02' },
+        status:'planned', progress:0.0, eta:'2025-10-15' },
+      { id:'SC-003', sku:'チョコバー', qty:320,
+        path:{ Raw:'RAW-02', Factory:'FCT-01', MfrWH:'MWH-01', OwnDC:'ODC-01', Store:'STR-11', Customer:'CUS-01' },
+        status:'in_transit', progress:0.70, eta:'2025-10-11' }
+    ];
+
+    const currency = n => "¥" + n.toLocaleString();
+
+    // ===== 折り畳みカード =====
+    function Panel({title, subtitle, right, defaultOpen=true, id, children}){
+      const [open,setOpen] = useState(defaultOpen);
+      return (
+        <Paper id={id} className="card" elevation={0} sx={{mb:2}}>
+          <Stack direction="row" alignItems="center" sx={{px:2, py:1}}>
+            <IconButton onClick={()=>setOpen(o=>!o)} size="small" aria-label="toggle">
+              <span className={`material-icons ${open?'rotate-90':'rotate-0'}`}>chevron_right</span>
+            </IconButton>
+            <Box sx={{flex:1, ml:0.5}}>
+              <Typography variant="subtitle1" sx={{fontWeight:700}}>{title}</Typography>
+              {subtitle && <Typography variant="caption" sx={{color:'#667085'}}>{subtitle}</Typography>}
+            </Box>
+            {right}
+          </Stack>
+          <Divider/>
+          <Collapse in={open} timeout="auto">
+            <Box sx={{p:2}}>{children}</Box>
+          </Collapse>
+        </Paper>
+      );
+    }
+
+    // ===== D3 図式（簡潔版：実線矢印 / ハロー / ホバー強調） =====
+    function SupplyDiagramD3({highlightId='SC-001', density='standard', otherAlpha=0.28, query='', stageFilter}){
+      const wrapRef = useRef(null);
+
+      const colW = 260;
+      const rowH = density==='comfortable'? 78 : density==='compact'? 56 : 64;
+      const rowGap = 10;
+      const topPad = 48;
+      const sidePad = 32;
+      const cellW = 210, cellH = 40;
+
+      // レイアウト
+      const positions = {};
+      let maxRows = 0;
+      STAGES.forEach((st, ci)=>{
+        maxRows = Math.max(maxRows, (NODES[st]||[]).length);
+        (NODES[st]||[]).forEach((n, ri)=>{
+          positions[`${st}:${n.id}`] = { x: sidePad + ci*colW + 28, y: topPad + ri*(rowH+rowGap) };
+        });
+      });
+      const contentW  = sidePad*2 + STAGES.length*colW;
+      const contentH  = topPad + (Math.max(maxRows,1))*(rowH+rowGap) + 32;
+
+      useEffect(()=>{
+        const wrapEl = wrapRef.current;
+        wrapEl.innerHTML = '';
+
+        const vw = wrapEl.clientWidth || contentW;
+        const vh = wrapEl.clientHeight || contentH;
+
+        const svg = d3.select(wrapEl).append('svg')
+          .attr('width', vw).attr('height', vh).style('display','block');
+
+        const defs = svg.append('defs');
+        // シャドウ
+        defs.append('filter').attr('id','cardShadow').attr('height','130%')
+          .append('feDropShadow').attr('dx',0).attr('dy',2).attr('stdDeviation',1.2).attr('flood-opacity',0.10);
+        // 矢印
+        const marker = (id, color)=>{
+          const m = defs.append('marker')
+            .attr('id', id).attr('viewBox','0 0 10 10')
+            .attr('refX', 9).attr('refY', 5)
+            .attr('markerWidth', 7).attr('markerHeight', 7)
+            .attr('orient','auto');
+          m.append('path').attr('d','M 0 0 L 10 5 L 0 10 z').attr('fill', color);
+        };
+        marker('arrow-base', '#98a2b3');
+        marker('arrow-base-hl', '#111');
+
+        const g = svg.append('g');
+        const zoom = d3.zoom().scaleExtent([0.5, 3]).on('zoom', (ev)=> g.attr('transform', ev.transform));
+        svg.call(zoom).on('dblclick.zoom', null);
+
+        // レーン
+        const lanes = g.append('g');
+        STAGES.forEach((st,idx)=>{
+          const count = (NODES[st] || []).length;
+          lanes.append('rect')
+            .attr('x', sidePad + idx*colW).attr('y', 0).attr('width', colW).attr('height', contentH)
+            .attr('fill', idx%2? 'var(--lane)' : '#fff').attr('stroke','var(--border)')
+            .style('opacity', stageFilter[st] ? 1 : 0.25);
+          lanes.append('text').attr('x', sidePad + idx*colW + 10).attr('y', 24).attr('class','lane-label').text(st);
+          lanes.append('text').attr('x', sidePad + (idx+1)*colW - 10).attr('y', 24).attr('font-size', 11).attr('fill', '#667085').attr('text-anchor','end')
+            .text(`${count} nodes`);
+        });
+
+        // ベジェ（列が異なる）
+        const pathBetween = (A,B)=>{
+          const p0 = { x:A.x + cellW - 6, y:A.y + cellH/2 - 2 };
+          const p3 = { x:B.x + 10,        y:B.y + cellH/2 - 2 };
+          const dx = (p3.x - p0.x);
+          const k  = 0.45;
+          const c1 = { x: p0.x + dx*k, y: p0.y };
+          const c2 = { x: p3.x - dx*k, y: p3.y };
+          return `M ${p0.x},${p0.y} C ${c1.x},${c1.y} ${c2.x},${c2.y} ${p3.x},${p3.y}`;
+        };
+
+        // ==== エッジ ====
+        const edges = [];
+        SCENARIOS.forEach(s=>{
+          const nodesSeq = STAGES.map(st=> ({ stage:st, id:s.path[st] }));
+          for(let i=0;i<nodesSeq.length-1;i++){
+            const a = nodesSeq[i], b = nodesSeq[i+1];
+            const A = positions[`${a.stage}:${a.id}`];
+            const B = positions[`${b.stage}:${b.id}`];
+            if(!A || !B) continue;
+            edges.push({
+              sId:s.id, sku:s.sku, qty:s.qty,
+              fromStage:a.stage, toStage:b.stage,
+              path: pathBetween(A,B)
+            });
+          }
+        });
+
+        const haloG = g.append('g').attr('stroke-linecap','round').attr('stroke-linejoin','round');
+        const mainG = g.append('g').attr('stroke-linecap','round').attr('stroke-linejoin','round');
+
+        let hoveredSid = null;
+        const isActive = d => (hoveredSid ? d.sId===hoveredSid : d.sId===highlightId);
+
+        const halos = haloG.selectAll('path')
+          .data(edges, (d,i)=>`${d.sId}-${i}`)
+          .enter().append('path')
+          .attr('d', d=> d.path)
+          .attr('fill','none')
+          .attr('stroke','#fff')
+          .attr('stroke-opacity', 0.95)
+          .attr('stroke-width', d=> isActive(d)? 7 : 5);
+
+        const mains = mainG.selectAll('path')
+          .data(edges, (d,i)=>`${d.sId}-${i}`)
+          .enter().append('path')
+          .attr('d', d=> d.path)
+          .attr('fill','none')
+          .attr('stroke', d=> isActive(d)? '#111' : '#98a2b3')
+          .attr('stroke-width', d=> isActive(d)? 4 : 2.5)
+          .attr('marker-end', d=> isActive(d)? 'url(#arrow-base-hl)' : 'url(#arrow-base)')
+          .attr('stroke-opacity', d=> isActive(d)? 0.98 : otherAlpha)
+          .style('cursor','pointer')
+          .on('mouseenter', (_,d)=>{ hoveredSid = d.sId; redraw(); })
+          .on('mouseleave', ()=>{ hoveredSid = null; redraw(); })
+          .on('click', (_,d)=> window.dispatchEvent(new CustomEvent('nf-select', { detail:{type:'scenario', id:d.sId} })));
+
+        function redraw(){
+          halos
+            .attr('stroke-width', d=> isActive(d)? 7 : 5);
+          mains
+            .attr('stroke', d=> isActive(d)? '#111' : '#98a2b3')
+            .attr('marker-end', d=> isActive(d)? 'url(#arrow-base-hl)' : 'url(#arrow-base)')
+            .attr('stroke-width', d=> isActive(d)? 4 : 2.5)
+            .attr('stroke-opacity', d=> isActive(d)? 0.98 : otherAlpha)
+            .each(function(d){ if(isActive(d)) this.parentNode.appendChild(this); });
+        }
+        redraw();
+
+        // ノード
+        const nodesG = g.append('g');
+        const allNodes = STAGES.flatMap(col=> (NODES[col]||[]).map(n=> ({...n, stage:col, col})));
+        const matchQuery = n=>{
+          if(!query.trim()) return true;
+          const q = query.toLowerCase();
+          return n.name.toLowerCase().includes(q) || n.id.toLowerCase().includes(q);
+        };
+        const nd = nodesG.selectAll('g.node').data(allNodes, d=>`${d.col}:${d.id}`).enter().append('g')
+          .attr('transform', d=> `translate(${positions[`${d.col}:${d.id}`].x},${positions[`${d.col}:${d.id}`].y})`)
+          .style('opacity', d=>(matchQuery(d) && stageFilter[d.stage]) ? 1 : 0.2)
+          .style('cursor','pointer')
+          .on('click', (_,d)=> window.dispatchEvent(new CustomEvent('nf-select', { detail:{type:'node', id:d.id, stage:d.stage} })));
+        nd.append('rect').attr('x', -6).attr('y', -6).attr('rx', 10).attr('ry', 10)
+          .attr('width', cellW).attr('height', cellH).attr('fill', '#fff').attr('stroke', '#e6e8ef').attr('filter', 'url(#cardShadow)');
+        nd.append('text').attr('x', 10).attr('y', 15).attr('font-size', 16).text(d=> ICONS[d.stage] || '•');
+        nd.append('text').attr('x', 32).attr('y', 15).attr('class','node-title').text(d=> d.name);
+        nd.append('text').attr('x', 32).attr('y', 30).attr('class','node-sub').text(d=> d.id);
+        nd.append('circle').attr('cx', cellW-14).attr('cy', 16).attr('r', 5).attr('fill', d=> COLORS[d.stage]).attr('opacity', 0.9);
+
+        // オートフィット
+        const fitAll = ()=>{
+          const bbox = g.node().getBBox();
+          const pad = 24;
+          const vw2 = +svg.attr('width'), vh2 = +svg.attr('height');
+          const scale = Math.max(0.5, Math.min(3, Math.min((vw2 - pad*2)/bbox.width, (vh2 - pad*2)/bbox.height)));
+          const translateX = (vw2 - bbox.width*scale)/2 - bbox.x*scale;
+          const translateY = (vh2 - bbox.height*scale)/2 - bbox.y*scale;
+          svg.call(zoom.transform, d3.zoomIdentity.translate(translateX, translateY).scale(scale));
+        };
+        fitAll();
+
+        const ro = new ResizeObserver(entries=>{
+          for(const entry of entries){
+            const nw = entry.contentRect.width;
+            const nh = entry.contentRect.height;
+            if(nw && nh){ svg.attr('width', nw).attr('height', nh); fitAll(); }
+          }
+        });
+        ro.observe(wrapEl);
+
+        const onZoomCmd = (e)=>{
+          const action = e.detail?.action;
+          if(!action) return;
+          if(action==='in') svg.transition().duration(200).call(zoom.scaleBy, 1.2);
+          else if(action==='out') svg.transition().duration(200).call(zoom.scaleBy, 1/1.2);
+          else if(action==='reset') svg.transition().duration(200).call(zoom.transform, d3.zoomIdentity);
+          else if(action==='fit') fitAll();
+        };
+        window.addEventListener('nf-diagram-zoom', onZoomCmd);
+
+        return ()=>{
+          window.removeEventListener('nf-diagram-zoom', onZoomCmd);
+          ro.disconnect();
+        };
+      }, [highlightId, density, otherAlpha, query, stageFilter]);
+
+      return <div className="diagram-shell" ref={wrapRef}></div>;
+    }
+
+    // ===== Leaflet 地図（簡潔：再生/速度/ループ/追尾/進捗） =====
+    function SCMap({highlightId='SC-001', showAllNodes, showAllPaths}){
+      const mapRef = useRef(null);
+      const layerRefs = useRef([]);
+      const moversRef = useRef({});
+
+      const [isPlaying, setIsPlaying] = useState(true);
+      const [speed, setSpeed] = useState(1);
+      const [loop, setLoop] = useState(false);
+      const [follow, setFollow] = useState(false);
+      const [progress, setProgress] = useState(null);
+
+      const hiScenario = useMemo(()=> SCENARIOS.find(s=> s.id===highlightId) || SCENARIOS[0], [highlightId]);
+
+      useEffect(()=>{
+        if(!mapRef.current){
+          const map = L.map('sc-map', { zoomControl:true }).setView([35.6, 139.7], 6);
+          L.tileLayer('https://cyberjapandata.gsi.go.jp/xyz/std/{z}/{x}/{y}.png', {
+            attribution: '&copy; <a href="https://www.gsi.go.jp/" target="_blank">国土地理院</a>'
+          }).addTo(map);
+          mapRef.current = map;
+        }
+      },[]);
+
+      const clearAll = ()=>{
+        const map = mapRef.current; if(!map) return;
+        layerRefs.current.forEach(l => map.removeLayer(l));
+        layerRefs.current = [];
+        Object.values(moversRef.current).forEach(m=>{
+          if(m.rafId) cancelAnimationFrame(m.rafId);
+          if(m.marker) map.removeLayer(m.marker);
+        });
+        moversRef.current = {};
+      };
+
+      const toLatLng = (nodeId)=>{
+        for(const stage of Object.keys(NODES)){
+          const hit = (NODES[stage]||[]).find(n=> n.id===nodeId);
+          if(hit) return [hit.lat, hit.lng];
+        }
+        return null;
+      };
+
+      const buildSegments = (scenario)=>{
+        const seqIds = STAGES.map(st=> scenario.path[st]);
+        const pts = seqIds.map(id => toLatLng(id)).filter(Boolean);
+        const segs = []; for (let i = 0; i < pts.length - 1; i++) segs.push([pts[i], pts[i + 1]]);
+        return { pts, segs };
+      };
+
+      const clamp01=(x)=> Math.max(0, Math.min(0.999, x));
+      const pToIdxT = (p, segCount)=>{
+        const g = clamp01(p) * segCount;
+        const idx = Math.min(segCount-1, Math.floor(g));
+        const t = g - Math.floor(g);
+        return [idx, t];
+      };
+
+      const upsertMover = (scenarioId, segments, initP)=>{
+        const map = mapRef.current; if(!map) return;
+        const segCount = segments.length;
+        const [idx, t] = pToIdxT(initP, segCount);
+        const [A,B] = segments[idx];
+        const pos = [A[0] + (B[0]-A[0])*t, A[1] + (B[1]-A[1])*t];
+
+        let rec = moversRef.current[scenarioId];
+        if(rec && rec.marker){ rec.p = initP; rec.segments = segments; rec.marker.setLatLng(pos); return rec; }
+
+        const marker = L.marker(pos, {
+          icon: L.divIcon({ className:'', iconAnchor:[8,8], html:`<div style="width:14px;height:14px;border-radius:50%;background:#111;box-shadow:0 0 0 3px rgba(0,0,0,.15);"></div>` })
+        }).addTo(map);
+
+        const sc = SCENARIOS.find(s=> s.id===scenarioId);
+        marker.bindTooltip(`配送: ${sc.id} / ${sc.sku} / ${sc.qty}個`);
+        marker.on('click', ()=> window.dispatchEvent(new CustomEvent('nf-select', { detail:{type:'scenario', id:sc.id} })));
+        const recNew = { marker, p:initP, segments, rafId:null };
+        moversRef.current[scenarioId] = recNew;
+        return recNew;
+      };
+
+      useEffect(()=>{
+        const map = mapRef.current; if(!map) return;
+        clearAll();
+        const bounds = L.latLngBounds([]);
+
+        if(showAllNodes){
+          Object.entries(NODES).forEach(([stage, list])=>{
+            list.forEach(n=>{
+              const marker = L.circleMarker([n.lat, n.lng], {
+                radius:5, weight:1.5, color:COLORS[stage], fillColor:COLORS[stage], fillOpacity:0.9, opacity:0.7
+              }).addTo(map).bindPopup(`<b>${stage}</b><br/>${n.name}<br/>${n.id}`);
+              marker.on('click', ()=> window.dispatchEvent(new CustomEvent('nf-select', { detail:{type:'node', id:n.id, stage:stage} })));
+              layerRefs.current.push(marker); bounds.extend([n.lat, n.lng]);
+            });
+          });
+        }
+
+        const drawPath = (s, thick=false)=>{
+          const { pts, segs } = buildSegments(s);
+          for (let i = 0; i < pts.length - 1; i++) {
+            const pl = L.polyline([pts[i], pts[i+1]], {
+              color: '#6b7280', weight: thick?5:2, opacity: thick?0.95:0.5
+            }).addTo(map).on('click', ()=> window.dispatchEvent(new CustomEvent('nf-select', { detail:{type:'scenario', id:s.id} })));
+            layerRefs.current.push(pl);
+          }
+          return { segs };
+        };
+
+        if(showAllPaths){ SCENARIOS.forEach(s=> drawPath(s, false)); }
+
+        const hl = SCENARIOS.find(s=> s.id===highlightId) || SCENARIOS[0];
+        const { segs: hiSegs } = drawPath(hl, true);
+        const initP = typeof hl.progress === 'number' ? clamp01(hl.progress) : 0;
+        const rec = upsertMover(hl.id, hiSegs, initP);
+        setProgress(Math.round(rec.p*100));
+        if(bounds.isValid()) map.fitBounds(bounds.pad(0.25));
+
+        // 再生ループ
+        (function start(){
+          const r = moversRef.current[hl.id]; if(!r) return;
+          let last = performance.now();
+          const tick = (now)=>{
+            if(!r) return;
+            if(!isPlaying){ r.rafId = requestAnimationFrame(tick); return; }
+            const dt = now - last; last = now;
+            const dur = 30000 / Math.max(0.1, speed);
+            const dp = dt / dur;
+            let np = r.p + dp;
+            if(np >= 1){ np = (loop ? np % 1 : 0.999); if(!loop) ; }
+            r.p = np;
+
+            const segCount = r.segments.length;
+            const g = clamp01(r.p) * segCount;
+            const idx = Math.min(segCount-1, Math.floor(g));
+            const t = g - Math.floor(g);
+            const [A,B] = r.segments[idx];
+            const pos = [A[0] + (B[0]-A[0])*t, A[1] + (B[1]-A[1])*t];
+            r.marker.setLatLng(pos);
+            if(follow){ mapRef.current?.panTo(pos, { animate:false }); }
+            setProgress(Math.round(r.p*100));
+            r.rafId = requestAnimationFrame(tick);
+          };
+          r.rafId = requestAnimationFrame(tick);
+        })();
+
+        return ()=> clearAll();
+      }, [highlightId, showAllNodes, showAllPaths]);
+
+      // 再生状態が変わったときも同じループを更新
+      useEffect(()=>{
+        const rec = moversRef.current[hiScenario.id];
+        if(!rec) return;
+        if(rec.rafId) cancelAnimationFrame(rec.rafId);
+        let last = performance.now();
+        const tick = (now)=>{
+          if(!rec) return;
+          if(!isPlaying){ rec.rafId = requestAnimationFrame(tick); return; }
+          const dt = now - last; last = now;
+          const dur = 30000 / Math.max(0.1, speed);
+          const dp = dt / dur;
+          let np = rec.p + dp;
+          if(np >= 1){ np = (loop ? np % 1 : 0.999); if(!loop) ; }
+          rec.p = np;
+
+          const segCount = rec.segments.length;
+          const g = Math.max(0, Math.min(0.999, rec.p)) * segCount;
+          const idx = Math.min(segCount-1, Math.floor(g));
+          const t = g - Math.floor(g);
+          const [A,B] = rec.segments[idx];
+          const pos = [A[0] + (B[0]-A[0])*t, A[1] + (B[1]-A[1])*t];
+          rec.marker.setLatLng(pos);
+          if(follow){ mapRef.current?.panTo(pos, { animate:false }); }
+          setProgress(Math.round(rec.p*100));
+          rec.rafId = requestAnimationFrame(tick);
+        };
+        rec.rafId = requestAnimationFrame(tick);
+      }, [isPlaying, speed, loop, follow, hiScenario.id]);
+
+      const setProgressP = (np)=>{
+        const rec = moversRef.current[hiScenario.id];
+        if(!rec) return;
+        rec.p = Math.max(0, Math.min(0.999, np));
+        const segCount = rec.segments.length;
+        const g = Math.max(0, Math.min(0.999, rec.p)) * segCount;
+        const idx = Math.min(segCount-1, Math.floor(g));
+        const t = g - Math.floor(g);
+        const [A,B] = rec.segments[idx];
+        const pos = [A[0] + (B[0]-A[0])*t, A[1] + (B[1]-A[1])*t];
+        rec.marker.setLatLng(pos);
+        if(follow){ mapRef.current?.panTo(pos, { animate:false }); }
+        setProgress(Math.round(rec.p*100));
+      };
+      const stepBy = (delta)=>{
+        const rec = moversRef.current[hiScenario.id];
+        if(!rec) return;
+        const segCount = rec.segments.length;
+        const step = 1 / (segCount * 10);
+        const np = Math.max(0, Math.min(0.999, rec.p + step*delta));
+        setProgressP(np);
+      };
+      const jumpToStage = (stageIdx)=>{
+        const rec = moversRef.current[hiScenario.id]; if(!rec) return;
+        const segCount = rec.segments.length;
+        const np = Math.max(0, Math.min(0.999, stageIdx / segCount));
+        setProgressP(np);
+      };
+
+      return (
+        <Box>
+          <Paper variant="outlined" sx={{p:1.5, mb:1.5, borderRadius:2}}>
+            <Stack direction={{xs:'column', lg:'row'}} spacing={1.5} alignItems={{xs:'stretch', lg:'center'}}>
+              <Stack direction="row" spacing={1} alignItems="center">
+                <IconButton size="small" color={isPlaying? 'primary':'default'} onClick={()=>setIsPlaying(p=>!p)} title={isPlaying?'一時停止':'再生'}>
+                  <span className="material-icons">{isPlaying?'pause':'play_arrow'}</span>
+                </IconButton>
+                <IconButton size="small" onClick={()=>stepBy(-1)} title="少し戻る">
+                  <span className="material-icons">skip_previous</span>
+                </IconButton>
+                <IconButton size="small" onClick={()=>stepBy(+1)} title="少し進む">
+                  <span className="material-icons">skip_next</span>
+                </IconButton>
+                <Button size="small" onClick={()=>setProgressP(0)} startIcon={<span className="material-icons">restart_alt</span>}>先頭</Button>
+                <Button size="small" onClick={()=>setProgressP(0.999)} startIcon={<span className="material-icons">flag</span>}>最後</Button>
+              </Stack>
+
+              <Stack direction="row" spacing={1.5} alignItems="center" sx={{minWidth:260, flex:1}}>
+                <Typography variant="body2" sx={{minWidth:64}}>進捗</Typography>
+                <Slider size="small"
+                  value={progress ?? 0}
+                  onChange={(_,v)=> setProgress(v)}
+                  onChangeCommitted={(_,v)=> setProgressP((v)/100)}
+                  min={0} max={100} step={1} sx={{flex:1}}
+                />
+                <Typography variant="body2" className="mono" sx={{minWidth:40, textAlign:'right'}}>{(progress??0)}%</Typography>
+              </Stack>
+
+              <Stack direction="row" spacing={1.25} alignItems="center">
+                <Typography variant="body2">速度</Typography>
+                <Select size="small" value={speed} onChange={e=>setSpeed(Number(e.target.value))} sx={{width:100}}>
+                  <MenuItem value={0.25}>0.25×</MenuItem>
+                  <MenuItem value={0.5}>0.5×</MenuItem>
+                  <MenuItem value={1}>1×</MenuItem>
+                  <MenuItem value={2}>2×</MenuItem>
+                  <MenuItem value={4}>4×</MenuItem>
+                </Select>
+                <FormControlLabel control={<Switch checked={loop} onChange={e=>setLoop(e.target.checked)} />} label="ループ"/>
+                <FormControlLabel control={<Switch checked={follow} onChange={e=>setFollow(e.target.checked)} />} label="追尾"/>
+              </Stack>
+
+              <Stack direction="row" spacing={0.75} alignItems="center" sx={{flexWrap:'wrap'}}>
+                <Typography variant="body2">ステージへジャンプ:</Typography>
+                {STAGES.map((c, i) => (
+                  <Button key={`${c}-${i}`} size="small" variant="outlined" onClick={()=>jumpToStage(i)}>
+                    {c}
+                  </Button>
+                ))}
+              </Stack>
+            </Stack>
+          </Paper>
+
+          <div id="sc-map" style={{width:'100%', height:'70vh'}}></div>
+        </Box>
+      );
+    }
+
+    // ===== 推奨テーブル =====
+    const RECO = [
+      {id:1, sku:"SKU-1001", name:"スポーツドリンク 500ml", from:"MfrWH(千葉北)", to:"OwnDC(足立)", qty:240, gross:320000, cost:38000, reason:"予測+42% / 在庫日数1.8→目標7", conf:"High", deadline:"2025-10-12"},
+      {id:2, sku:"SKU-2002", name:"カップ麺 醤油", from:"OwnDC(尼崎)", to:"店舗(神戸三宮)", qty:180, gross:210000, cost:62000, reason:"プロモ前 / 欠品リスク34%", conf:"Med", deadline:"2025-10-11"},
+      {id:3, sku:"SKU-3003", name:"チョコバー", from:"Factory(川崎)", to:"MfrWH(千葉北)", qty:400, gross:270000, cost:42000, reason:"都心催事 / 弾力高", conf:"High", deadline:"2025-10-13"},
+    ];
+    function Recommendations(){
+      const [rows,setRows] = useState(RECO);
+      const [sel,setSel] = useState([]);
+      const [toast,setToast] = useState(null);
+      const all = sel.length===rows.length && rows.length>0;
+      const qty = sel.reduce((a,id)=> a + (rows.find(r=>r.id===id)?.qty||0), 0);
+      const net = sel.reduce((a,id)=> { const r=rows.find(x=>x.id===id); return a + ((r?.gross||0)-(r?.cost||0)); }, 0);
+      const approve = ()=>{ setRows(p=> p.map(r=> sel.includes(r.id)? {...r, status:"承認"}:r)); setSel([]); setToast({type:'success',msg:'選択した提案を承認しました。'}); };
+      const reject = ()=>{ setRows(p=> p.filter(r=> !sel.includes(r.id))); setSel([]); setToast({type:'info',msg:'選択した提案を却下しました。'}); };
+      const Conf = ({c})=> <Chip size="small" variant="outlined" color={c==="High"?"success":c==="Med"?"warning":"default"} label={c}/>;
+      return (
+        <TableContainer component={Paper} className="card" elevation={0}>
+          <Table size="small">
+            <TableHead>
+              <TableRow>
+                <TableCell padding="checkbox">
+                  <Checkbox checked={all} indeterminate={!!sel.length && !all} onChange={e=> setSel(e.target.checked? rows.map(r=>r.id): [])}/>
+                </TableCell>
+                <TableCell>SKU / 商品名</TableCell>
+                <TableCell>移動（需要 ← 供給）</TableCell>
+                <TableCell align="right">数量</TableCell>
+                <TableCell>根拠</TableCell>
+                <TableCell>信頼度</TableCell>
+                <TableCell align="right">売上/コスト/純効果</TableCell>
+                <TableCell>期限</TableCell>
+                <TableCell>ステータス</TableCell>
+              </TableRow>
+            </TableHead>
+            <TableBody>
+              {rows.map(r=>(
+                <TableRow key={r.id} hover>
+                  <TableCell padding="checkbox">
+                    <Checkbox checked={sel.includes(r.id)} onChange={()=> setSel(p=> p.includes(r.id)? p.filter(x=>x!==r.id): [...p, r.id])}/>
+                  </TableCell>
+                  <TableCell><b>{r.sku}</b><div style={{fontSize:12,color:'#667085'}}>{r.name}</div></TableCell>
+                  <TableCell><span className="pill">{r.to}</span> ← <span className="pill">{r.from}</span></TableCell>
+                  <TableCell align="right" className="mono">{r.qty.toLocaleString()}</TableCell>
+                  <TableCell><Tooltip title={r.reason}><span>{r.reason}</span></Tooltip></TableCell>
+                  <TableCell><Conf c={r.conf}/></TableCell>
+                  <TableCell align="right" className="mono">{currency(r.gross)} / {currency(r.cost)} / <b>{currency(r.gross-r.cost)}</b></TableCell>
+                  <TableCell className="mono">{r.deadline}</TableCell>
+                  <TableCell>
+                    {r.status
+                      ? <Chip size="small" color="success" label={r.status}/>
+                      : <Chip size="small" variant="outlined" label="提案"/>}
+                  </TableCell>
+                </TableRow>
+              ))}
+            </TableBody>
+          </Table>
+          <Box sx={{px:2, py:1.2, display:'flex', justifyContent:'space-between', alignItems:'center', borderTop:'1px solid var(--border)'}}>
+            <Typography variant="body2" color="text.secondary">
+              選択：<b>{sel.length}</b>件 / 数量合計：<b className="mono">{qty.toLocaleString()}</b> / 純効果：<b className="mono">{currency(net)}</b>
+            </Typography>
+            <Stack direction="row" spacing={1}>
+              <Button size="small" variant="contained" disabled={!sel.length} onClick={approve}>
+                <span className="material-icons" style={{fontSize:18, verticalAlign:'-4px', marginRight:4}}>done_all</span>承認
+              </Button>
+              <Button size="small" color="error" disabled={!sel.length} onClick={reject}>
+                <span className="material-icons" style={{fontSize:18, verticalAlign:'-4px', marginRight:4}}>block</span>却下
+              </Button>
+            </Stack>
+          </Box>
+          <Snackbar open={!!toast} autoHideDuration={2200} onClose={()=>setToast(null)}>
+            {toast && <Alert severity={toast.type} onClose={()=>setToast(null)}>{toast.msg}</Alert>}
+          </Snackbar>
+        </TableContainer>
+      );
+    }
+
+    // ===== 右詳細 =====
+    function RightDetails({open, onClose, selection}){
+      const [tab, setTab] = useState(0);
+      const scenario = selection?.type==='scenario'
+        ? SCENARIOS.find(s=> s.id===selection.id) : (selection?.scenarioId ? SCENARIOS.find(s=> s.id===selection.scenarioId) : null);
+      const node = selection?.type==='node'
+        ? (selection.stage ? (NODES[selection.stage]||[]).find(n=> n.id===selection.id) : null) : null;
+
+      const title = selection
+        ? selection.type==='node' ? `${selection.stage} / ${node?.name||selection.id}` : `シナリオ ${scenario?.id||selection.id}`
+        : '詳細';
+      const subtitle = selection
+        ? selection.type==='node' ? node?.id : `${scenario?.sku||''} / 数量 ${scenario?.qty||''}`
+        : '図式/地図の要素をクリックするか、右上の ⓘ から開きます';
+
+      return (
+        <Drawer anchor="right" variant="temporary" open={open} onClose={onClose}
+          sx={{ '& .MuiDrawer-paper':{ width:'360px' } }}>
+          <Box sx={{width:360, p:2}}>
+            <Typography variant="subtitle1" sx={{fontWeight:700, mb:0.5}}>{title}</Typography>
+            <Typography variant="caption" sx={{color:'#667085'}}>{subtitle}</Typography>
+            <Divider sx={{my:1.5}}/>
+            <Tabs value={tab} onChange={(_,v)=>setTab(v)} size="small">
+              <Tab label="概要" />
+              <Tab label="トレース" />
+            </Tabs>
+
+            {tab===0 && (
+              <Box sx={{mt:2}}>
+                {scenario && (
+                  <>
+                    <Stack direction="row" spacing={1} alignItems="center">
+                      <Avatar sx={{width:28, height:28, fontSize:14, bgcolor:'#1f3aa5'}}>SC</Avatar>
+                      <Typography variant="body2"><b>{scenario.id}</b> / {scenario.sku}</Typography>
+                    </Stack>
+                    <Stack sx={{mt:1}} spacing={1}>
+                      <Typography variant="caption">進捗</Typography>
+                      <LinearProgress variant="determinate" value={(scenario.progress||0)*100}/>
+                      <Typography variant="caption" className="mono">{Math.round((scenario.progress||0)*100)}% / ETA {scenario.eta}</Typography>
+                    </Stack>
+                    <Divider sx={{my:1.5}}/>
+                    <Typography variant="caption">ルート</Typography>
+                    <Stack direction="row" sx={{flexWrap:'wrap', gap:0.5, mt:1}}>
+                      {STAGES.map(st=>{
+                        const nid = scenario.path[st];
+                        const n = (NODES[st]||[]).find(x=> x.id===nid);
+                        return <span key={st} className="pill">{st}: {n?.name||nid}</span>;
+                      })}
+                    </Stack>
+                  </>
+                )}
+                {node && (
+                  <>
+                    <Divider sx={{my:1.5}}/>
+                    <Typography variant="caption">ノード情報</Typography>
+                    <Stack spacing={0.5} sx={{mt:1}}>
+                      <Typography variant="body2"><b>{node.name}</b></Typography>
+                      <Typography variant="caption" className="mono">{node.id}</Typography>
+                      <Typography variant="caption">緯度経度: {node.lat}, {node.lng}</Typography>
+                    </Stack>
+                  </>
+                )}
+              </Box>
+            )}
+
+            {tab===1 && scenario && (
+              <Box sx={{mt:2}}>
+                {STAGES.map((st)=> {
+                  const nid = scenario.path[st];
+                  const n = (NODES[st]||[]).find(x=> x.id===nid);
+                  return (
+                    <Stack key={st} direction="row" spacing={1} alignItems="center" sx={{mb:1}}>
+                      <Avatar sx={{width:24, height:24, fontSize:14, bgcolor:COLORS[st]}}>{ICONS[st]}</Avatar>
+                      <Typography variant="body2" sx={{flex:1}}>{st}</Typography>
+                      <Typography variant="caption" sx={{color:'#667085'}}>{n?.name||nid}</Typography>
+                    </Stack>
+                  );
+                })}
+              </Box>
+            )}
+          </Box>
+        </Drawer>
+      );
+    }
+
+    // ===== ダッシュボード =====
+    function Dashboard(){
+      const [viz, setViz] = useState('diagram');
+      const [highlightId, setHighlightId] = useState('SC-001');
+
+      const [showFilters, setShowFilters] = useState(true);
+      const [stageFilter, setStageFilter] = useState(Object.fromEntries(STAGES.map(s=>[s,true])));
+      const [search, setSearch] = useState('');
+      const [otherAlpha, setOtherAlpha] = useState(0.28);
+      const [density, setDensity] = useState('standard');
+      const [showMapNodes, setShowMapNodes] = useState(true);
+      const [showMapPaths, setShowMapPaths] = useState(true);
+
+      const [detailOpen, setDetailOpen] = useState(false);
+      const [selection, setSelection] = useState(null);
+      useEffect(()=>{
+        const onSel = (e)=>{
+          setSelection(e.detail);
+          setDetailOpen(true);
+          if (e.detail?.type === 'scenario') setHighlightId(e.detail.id);
+        };
+        window.addEventListener('nf-select', onSel);
+        return ()=> window.removeEventListener('nf-select', onSel);
+      },[]);
+      const openDetails = ()=> setDetailOpen(true);
+
+      const topRight = (
+        <Stack direction="row" spacing={1} alignItems="center">
+          <Select size="small" value={highlightId} onChange={e=>setHighlightId(e.target.value)} sx={{minWidth:120}}>
+            {SCENARIOS.map(s=> <MenuItem key={s.id} value={s.id}>{s.id}</MenuItem>)}
+          </Select>
+          <ToggleButtonGroup value={viz} exclusive onChange={(_,v)=> v && setViz(v)} size="small">
+            <ToggleButton value="diagram">図式</ToggleButton>
+            <ToggleButton value="map">地図</ToggleButton>
+          </ToggleButtonGroup>
+          <Button size="small" onClick={()=>setShowFilters(f=>!f)} startIcon={<span className="material-icons">tune</span>}>
+            {showFilters?'フィルターを隠す':'フィルターを表示'}
+          </Button>
+          <IconButton title="詳細パネルを開く" onClick={openDetails} aria-label="open details">
+            <span className="material-icons">info</span>
+          </IconButton>
+          <Button size="small" href="#section-reco">推奨へ</Button>
+        </Stack>
+      );
+
+      return (
+        <Container maxWidth={false} sx={{py:2, px:2}}>
+          <Panel
+            id="section-top"
+            title={`サプライチェーンの全体像（${viz==='diagram'?'簡易図式':'地図'}）`}
+            subtitle="Raw → Factory → MfrWH → OwnDC → Store → Customer"
+            defaultOpen={true}
+            right={topRight}
+          >
+            <Collapse in={showFilters} timeout="auto">
+              <Paper variant="outlined" sx={{p:1.5, mb:1.5, borderRadius:2}}>
+                <Stack direction={{xs:'column', lg:'row'}} spacing={2} alignItems={{xs:'stretch', lg:'center'}}>
+                  <TextField size="small" placeholder="ノード検索（名称/ID）" value={search} onChange={e=>setSearch(e.target.value)} sx={{minWidth:280}}/>
+                  <Stack direction="row" spacing={1} flexWrap="wrap" alignItems="center">
+                    {STAGES.map(st=>(
+                      <FormControlLabel key={st}
+                        control={<Checkbox checked={stageFilter[st]} onChange={e=>setStageFilter(p=>({...p,[st]:e.target.checked}))} />}
+                        label={st}/>
+                    ))}
+                  </Stack>
+                  {viz==='diagram' && (
+                    <Stack direction={{xs:'column', sm:'row'}} spacing={2} alignItems="center">
+                      <Stack direction="row" spacing={1.25} alignItems="center">
+                        <span className="material-icons">density_medium</span>
+                        <Typography variant="body2" sx={{minWidth:64}}>表示密度</Typography>
+                        <ToggleButtonGroup size="small" exclusive value={density} onChange={(_,v)=> v && setDensity(v)}>
+                          <ToggleButton value="comfortable">快適</ToggleButton>
+                          <ToggleButton value="standard">標準</ToggleButton>
+                          <ToggleButton value="compact">密</ToggleButton>
+                        </ToggleButtonGroup>
+                      </Stack>
+                      <Stack direction="row" spacing={1.25} alignItems="center">
+                        <span className="material-icons">opacity</span>
+                        <Typography variant="body2" sx={{minWidth:86}}>他シナリオ</Typography>
+                        <Slider size="small" min={0.1} max={0.6} step={0.02} value={otherAlpha} onChange={(_,v)=>setOtherAlpha(v)} sx={{width:200}}/>
+                        <Typography variant="body2" className="mono">{Math.round(otherAlpha*100)}%</Typography>
+                      </Stack>
+                    </Stack>
+                  )}
+                  {viz==='map' && (
+                    <Stack direction={{xs:'column', sm:'row'}} spacing={2} alignItems="center">
+                      <FormGroup row>
+                        <FormControlLabel control={<Switch checked={showMapNodes} onChange={e=>setShowMapNodes(e.target.checked)} />} label="全ノード"/>
+                        <FormControlLabel control={<Switch checked={showMapPaths} onChange={e=>setShowMapPaths(e.target.checked)} />} label="全シナリオ線"/>
+                      </FormGroup>
+                    </Stack>
+                  )}
+                </Stack>
+              </Paper>
+            </Collapse>
+
+            {/* 可視化 */}
+            {viz==='diagram' ? (
+              <div className="diagram-wrap">
+                <SupplyDiagramD3
+                  highlightId={highlightId}
+                  density={density}
+                  otherAlpha={otherAlpha}
+                  query={search}
+                  stageFilter={stageFilter}
+                />
+                <div className="zoom-ui" aria-label="diagram zoom controls">
+                  <IconButton size="small" title="拡大" onClick={()=>window.dispatchEvent(new CustomEvent('nf-diagram-zoom',{detail:{action:'in'}}))}>
+                    <span className="material-icons">zoom_in</span>
+                  </IconButton>
+                  <IconButton size="small" title="縮小" onClick={()=>window.dispatchEvent(new CustomEvent('nf-diagram-zoom',{detail:{action:'out'}}))}>
+                    <span className="material-icons">zoom_out</span>
+                  </IconButton>
+                  <IconButton size="small" title="全体表示" onClick={()=>window.dispatchEvent(new CustomEvent('nf-diagram-zoom',{detail:{action:'fit'}}))}>
+                    <span className="material-icons">fullscreen</span>
+                  </IconButton>
+                  <IconButton size="small" title="リセット" onClick={()=>window.dispatchEvent(new CustomEvent('nf-diagram-zoom',{detail:{action:'reset'}}))}>
+                    <span className="material-icons">restart_alt</span>
+                  </IconButton>
+                </div>
+              </div>
+            ) : (
+              <SCMap highlightId={highlightId} showAllNodes={showMapNodes} showAllPaths={showMapPaths}/>
+            )}
+          </Panel>
+
+          <Panel id="section-reco" title="Need Fit Balancer — 推奨調整" subtitle="需要←供給の再配置提案一覧" defaultOpen={true}>
+            <Recommendations/>
+          </Panel>
+
+          <RightDetails open={detailOpen} onClose={()=>setDetailOpen(false)} selection={selection}/>
+        </Container>
+      );
+    }
+
+    // ===== App =====
+    function App(){
+      const [detailOpen, setDetailOpen] = useState(false);
+      const [selection, setSelection] = useState(null);
+
+      return (
+        <ThemeProvider theme={theme}>
+          <Box>
+            <AppBar position="sticky" elevation={0} sx={{borderBottom:"1px solid var(--border)", background:"#fff", color:"inherit"}}>
+              <Toolbar>
+                <Typography variant="h6" sx={{flex:1, fontWeight:700}}>
+                  <span className="material-icons balance-icon">balance</span>
+                  Need Fit Balancer
+                </Typography>
+                <Button size="small" href="#section-top">可視化</Button>
+                <Button size="small" href="#section-reco">推奨</Button>
+                <IconButton title="詳細パネルを開く" onClick={()=>setDetailOpen(true)} aria-label="open details">
+                  <span className="material-icons">info</span>
+                </IconButton>
+              </Toolbar>
+            </AppBar>
+
+            <Dashboard/>
+
+            <RightDetails open={detailOpen} onClose={()=>setDetailOpen(false)} selection={selection}/>
+          </Box>
+        </ThemeProvider>
+      );
+    }
+
+    ReactDOM.createRoot(document.getElementById('root')).render(<App/>);
+  </script>
+</body>
+</html>
