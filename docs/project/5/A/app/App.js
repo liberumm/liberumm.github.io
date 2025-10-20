@@ -3,7 +3,7 @@ const {
   AppBar, Toolbar, Typography, Paper, Box, Stack, Button,
   Card, CardContent, Grid, TextField, Chip, Switch, FormControlLabel, Tooltip, Avatar, List, ListItem, ListItemAvatar, ListItemText,
   Dialog, DialogTitle, DialogContent, DialogActions,
-  Table, TableHead, TableRow, TableCell, TableBody, Checkbox
+  Table, TableHead, TableRow, TableCell, TableBody, Checkbox, Tabs, Tab
 } = MaterialUI;
 
 function App(){
@@ -81,6 +81,15 @@ function App(){
   const updateTaskStatus = (id, status) => {
     setTasks(prev => prev.map(t => t.id===id ? {...t, status} : t));
   };
+  // Approve and simulate execution -> mark as done
+  const handleApprove = (task) => {
+    // mark approved first
+    setTasks(prev => prev.map(t => t.id===task.id ? {...t, status: 'approved'} : t));
+    // simulate processing / 実行: ちょっと待ってから完了状態にする
+    setTimeout(()=>{
+      setTasks(prev => prev.map(t => t.id===task.id ? {...t, status: 'done'} : t));
+    }, 800);
+  };
   // タスク詳細を見やすく要約して返す
   const renderTaskDetail = (t) => {
     const d = t.detail || {};
@@ -92,9 +101,18 @@ function App(){
       const sample = items.slice(0,3).join(', ');
       return `${d.rows.length}件${sample? '：' + sample : ''}`;
     }
-    // transfers (移管プラン) の簡易表示
+    // transfers (移管プラン) の詳細表示: 各移管の from → to (qty) を一行ずつ表示
     if(d.transfers && Array.isArray(d.transfers)){
-      return `移管 ${d.transfers.length}件`;
+      return (
+        <div style={{display:'flex', flexDirection:'column', gap:4}}>
+          {d.transfers.map((tr, i)=>{
+            const from = tr.from || tr.fromStore || tr.fromStoreId || '';
+            const to = tr.to || tr.toStore || tr.toStoreId || '';
+            const qty = tr.qty || '';
+            return <div key={i} style={{fontSize:12}}>{`${from} → ${to} (${qty})`}</div>;
+          })}
+        </div>
+      );
     }
     // fallback: keys を短く表示
     const keys = Object.keys(d).filter(k=> k!=='rows' && k!=='transfers');
@@ -239,16 +257,25 @@ function App(){
   },[buckets, viewMode, range, targetStoreIds, metric, PRODUCTS, INVENTORY, idx]);
 
   const [events, setEvents] = React.useState(()=> window.INIT_EVENTS ? window.INIT_EVENTS.slice() : []);
+  const [planPreview, setPlanPreview] = React.useState([]);
+  const [showPlanPreview, setShowPlanPreview] = React.useState(false);
+  const [taskTab, setTaskTab] = React.useState(0); // 0: all, 1: pending (open/hq_pending), 2: done (approved/skipped/done)
 
   const metricHeader = metric==='units'?'販売点数': metric==='revenue'?'売上高':'粗利高';
+
+  // レスポンシブ検知（Material-UI のブレークポイントを使用）
+	const theme = MaterialUI.useTheme();
+	const isSm = MaterialUI.useMediaQuery(theme.breakpoints.down('sm'));
+	const isMd = MaterialUI.useMediaQuery(theme.breakpoints.down('md'));
 
   return (
     <>
       <AppBar position="static" color="inherit" elevation={0}>
-        <Toolbar className="wrap">
+        {/* Toolbar を小画面で折返し対応に */}
+        <Toolbar className="wrap" sx={{ flexWrap: isSm ? 'wrap' : 'nowrap' }}>
           <span className="material-icons" style={{marginRight:8}}>insights</span>
-          <Typography variant="h6" sx={{flexGrow:1}}>商品ダッシュボード</Typography>
-          <span className="mini" style={{color:'#666'}}>期間: {range.start} 〜 {range.end}</span>
+          <Typography variant={isSm ? 'subtitle1' : 'h6'} sx={{flexGrow:1}}>商品ダッシュボード</Typography>
+          <span className="mini" style={{color:'#666', marginTop: isSm ? 8 : 0}}>期間: {range.start} 〜 {range.end}</span>
         </Toolbar>
       </AppBar>
 
@@ -260,7 +287,8 @@ function App(){
 
         {/* 推移チャート */}
         <Section title="売上推移" icon="query_stats">
-          <Paper variant="outlined" className="vh35" sx={{p:1.5}}>
+          {/* Paper の高さを画面幅に応じて調整（小画面は固定ピクセル／大画面は vh 指定） */}
+          <Paper variant="outlined" sx={{ p:1.5, minHeight: isSm ? 240 : '35vh' }}>
             <RevenueChartDetailed
               labels={trend.labels}
               data={trend.series}
@@ -316,7 +344,8 @@ function App(){
           title={`販売実績テーブル（${metricHeader}｜列＝期間${viewMode==='detail'?'（詳細）':'（簡潔）'}｜行＝${prodAxis}）`}
           icon="table_view"
           actions={
-            <Stack direction="row" spacing={1} alignItems="center">
+            // 小画面では縦並びにしてボタン等が折り返すようにする
+            <Stack direction={isSm ? "column" : "row"} spacing={1} alignItems={isSm ? "stretch" : "center"}>
               {/* 簡潔/詳細 */}
               <Tooltip title="簡潔表示：期間列を直近2本に圧縮／詳細表示：全バケット">
                 <FormControlLabel
@@ -398,12 +427,16 @@ function App(){
             columnFilters={columnFilters}
             checkedRows={checkedRows}
             setCheckedRows={setCheckedRows}
+
+            // レスポンシブフラグ（子コンポーネント側で列削減等に利用）
+            smallScreen={isSm}
           />
         </Section>
 
         {/* アクションモーダル */}
         {actionModal.type === '移管' ? (
-          <Dialog open={actionModal.open} onClose={closeActionModal} maxWidth="xl" fullWidth>
+          // 小画面では fullScreen にする
+          <Dialog open={actionModal.open} onClose={closeActionModal} maxWidth="xl" fullWidth fullScreen={isSm}>
             <DialogTitle>移管計画 - {actionModal.row?.label || actionModal.row?.itemName || ''}</DialogTitle>
             <DialogContent>
               <Grid container spacing={2} sx={{mb:1}}>
@@ -427,15 +460,16 @@ function App(){
                 windowStart={transferFilterStart}
                 windowEnd={transferFilterEnd}
                 onApplyPlan={(plan) => {
-                  // 移管計画をタスクとして追加
-                  addTask({ type: '移管', rowLabel: actionModal.row?.label, detail: plan });
-                  closeActionModal();
+                  // 直接登録せずプレビューしてから登録する
+                  setPlanPreview(plan || []);
+                  setShowPlanPreview(true);
                 }}
               />
             </DialogContent>
           </Dialog>
         ) : (
-          <Dialog open={actionModal.open} onClose={closeActionModal} maxWidth="xl" fullWidth>
+          // 汎用アクションモーダルも小画面で fullScreen に（可読性向上）
+          <Dialog open={actionModal.open} onClose={closeActionModal} maxWidth="xl" fullWidth fullScreen={isSm}>
             <DialogTitle>{actionModal.type || ''} - {actionModal.row?.label || actionModal.row?.itemName || ''}</DialogTitle>
             <DialogContent dividers>
               {/* KPI cards */}
@@ -555,44 +589,104 @@ function App(){
 
         {/* やることリスト */}
         <Section title="やることリスト（推奨アクションから自動集約）" icon="checklist">
-          <div style={{display:'flex',gap:24}}>
-            <div style={{flex:1}}>
-              <div style={{fontWeight:700, marginBottom:8}}>未完了（対応が必要）</div>
-              <List dense>
-                {tasks.filter(t=> t.status==='open' || t.status==='hq_pending').length===0 && (<div className="mini">未完了のタスクはありません。</div>)}
-                {tasks.filter(t=> t.status==='open' || t.status==='hq_pending').map(t=> (
-                  <ListItem key={t.id} secondaryAction={(
-                    <div style={{display:'flex',gap:8}}>
-                      {t.status==='hq_pending' && (
-                        <>
-                          <Button size="small" variant="contained" color="success" onClick={()=> updateTaskStatus(t.id, 'approved')}>承認</Button>
-                          <Button size="small" variant="outlined" color="inherit" onClick={()=> updateTaskStatus(t.id, 'skipped')}>見送り</Button>
-                        </>
-                      )}
-                      {t.status==='open' && (
-                        <Button size="small" variant="contained" onClick={()=> updateTaskStatus(t.id, 'hq_pending')}>本部へ送る</Button>
-                      )}
-                    </div>
-                  )}>
-                    <ListItemText primary={`${t.type} - ${t.rowLabel || ''}`} secondary={renderTaskDetail(t)} />
-                  </ListItem>
-                ))}
-              </List>
-            </div>
-
-            <div style={{flex:1}}>
-              <div style={{fontWeight:700, marginBottom:8}}>完了 / 対応済み</div>
-              <List dense>
-                {tasks.filter(t=> t.status==='approved' || t.status==='skipped').length===0 && (<div className="mini">完了済みのタスクはありません。</div>)}
-                {tasks.filter(t=> t.status==='approved' || t.status==='skipped').map(t=> (
-                  <ListItem key={t.id}>
-                    <ListItemText primary={`${t.type} - ${t.rowLabel || ''}`} secondary={`${t.status}｜${renderTaskDetail(t)}`} />
-                  </ListItem>
-                ))}
-              </List>
+          <div style={{display:'flex', justifyContent:'space-between', alignItems:'center', marginBottom:8}}>
+            <Tabs value={taskTab} onChange={(e,v)=> setTaskTab(v)} textColor="primary" indicatorColor="primary">
+              <Tab label="すべて" />
+              <Tab label="未対応" />
+              <Tab label="対応済" />
+            </Tabs>
+            <div>
+              <Button size="small" variant="outlined" onClick={()=> setTasks([])}>全タスククリア（デバッグ）</Button>
             </div>
           </div>
+          <Table size="small">
+            <TableHead>
+              <TableRow>
+                <TableCell style={{fontWeight:700}}>ID</TableCell>
+                <TableCell style={{fontWeight:700}}>種別</TableCell>
+                <TableCell style={{fontWeight:700}}>摘要</TableCell>
+                <TableCell style={{fontWeight:700}}>詳細</TableCell>
+                <TableCell style={{fontWeight:700}}>ステータス</TableCell>
+                <TableCell style={{fontWeight:700}}>操作</TableCell>
+              </TableRow>
+            </TableHead>
+            <TableBody>
+              {(() => {
+                const filtered = taskTab===0 ? tasks : (taskTab===1 ? tasks.filter(t=> t.status==='open' || t.status==='hq_pending') : tasks.filter(t=> ['approved','skipped','done'].includes(t.status)));
+                if(filtered.length===0){
+                  return (<TableRow><TableCell colSpan={6} align="center" style={{color:'#888'}}>タスクはありません。</TableCell></TableRow>);
+                }
+                return filtered.map(t=> (
+                  <TableRow key={t.id} hover>
+                    <TableCell>{t.id}</TableCell>
+                    <TableCell>{t.type}</TableCell>
+                    <TableCell>{t.rowLabel || ''}</TableCell>
+                    <TableCell style={{maxWidth:400}}>{renderTaskDetail(t)}</TableCell>
+                    <TableCell>
+                      <Chip size="small" label={t.status} color={t.status==='hq_pending' ? 'warning' : t.status==='approved' ? 'success' : t.status==='done' ? 'default' : 'default'} />
+                    </TableCell>
+                    <TableCell>
+                      <div style={{display:'flex', gap:8}}>
+                        {t.status==='hq_pending' && (
+                          <>
+                            <Button size="small" variant="contained" color="success" onClick={()=> handleApprove(t)}>承認</Button>
+                            <Button size="small" variant="outlined" color="inherit" onClick={()=> updateTaskStatus(t.id, 'skipped')}>見送り</Button>
+                          </>
+                        )}
+                        {t.status==='open' && (
+                          <Button size="small" variant="contained" onClick={()=> updateTaskStatus(t.id, 'hq_pending')}>本部へ送る</Button>
+                        )}
+                        {t.status==='approved' && (
+                          <Button size="small" variant="contained" onClick={()=> updateTaskStatus(t.id, 'done')}>実行済にする</Button>
+                        )}
+                      </div>
+                    </TableCell>
+                  </TableRow>
+                ));
+              })()}
+            </TableBody>
+          </Table>
         </Section>
+
+        {/* 移管プラン プレビュー・確認ダイアログ */}
+        <Dialog open={showPlanPreview} onClose={()=> setShowPlanPreview(false)} maxWidth="xl" fullWidth fullScreen={isSm}>
+          <DialogTitle>移管プラン プレビュー</DialogTitle>
+          <DialogContent dividers>
+            <div style={{maxHeight: '60vh', overflowY:'auto'}}>
+              <Table size="small">
+                <TableHead>
+                  <TableRow>
+                    <TableCell>SKU</TableCell>
+                    <TableCell>From</TableCell>
+                    <TableCell>To</TableCell>
+                    <TableCell align="right">Qty</TableCell>
+                  </TableRow>
+                </TableHead>
+                <TableBody>
+                  {planPreview.map((p,i)=>(
+                    <TableRow key={i}>
+                      <TableCell>{p.sku}</TableCell>
+                      <TableCell>{p.fromStore}</TableCell>
+                      <TableCell>{p.toStore}</TableCell>
+                      <TableCell align="right">{p.qty}</TableCell>
+                    </TableRow>
+                  ))}
+                </TableBody>
+              </Table>
+            </div>
+          </DialogContent>
+          <DialogActions>
+            <Button onClick={()=> setShowPlanPreview(false)}>閉じる</Button>
+            <Button variant="contained" color="primary" onClick={()=>{
+              // 登録：planPreview をタスク（1つのタスクとしてまとめる）に追加
+              if(planPreview.length){
+                addTask({ type: '移管', rowLabel: `${planPreview.length}件`, detail: { transfers: planPreview } }, 'hq_pending');
+              }
+              setShowPlanPreview(false);
+              closeActionModal();
+            }}>登録（申請）</Button>
+          </DialogActions>
+        </Dialog>
 
         {/* イベント */}
         <Section title="イベントリスト" icon="event">

@@ -161,6 +161,8 @@
     const [selected, setSelected] = React.useState(new Set());
     const [detail, setDetail] = React.useState(null);
     const [planEdits, setPlanEdits] = React.useState({});
+    const [globalPlan, setGlobalPlan] = React.useState([]);
+    const [showPreview, setShowPreview] = React.useState(false);
 
     const storeIds = React.useMemo(()=>{
       const q = (storeNameFilter||'').trim().toLowerCase();
@@ -234,6 +236,43 @@
       });
     };
 
+    const calcToBeInv = (perStore, transfers)=>{
+      const tobe = {};
+      perStore.forEach(s=> tobe[s.id] = s.inv);
+      transfers.forEach(t=>{
+        tobe[t.fromId] = (tobe[t.fromId]||0) - t.qty;
+        tobe[t.toId] = (tobe[t.toId]||0) + t.qty;
+      });
+      return tobe;
+    };
+
+    const autoGenerateTransfers = (perStore)=>{
+      const donors = perStore.filter(s=> s.diff > 0).sort((a,b)=> b.diff - a.diff);
+      const takers = perStore.filter(s=> s.diff < 0).sort((a,b)=> a.diff - b.diff);
+      const transfers = [];
+      donors.forEach(d=>{
+        let remain = d.diff;
+        for(const t of takers){
+          if(remain<=0) break;
+          const need = Math.abs(t.diff);
+          if(need<=0) continue;
+          const qty = Math.min(remain, need);
+          if(qty>=1){
+            transfers.push({
+              from: d.name,
+              fromId: d.id,
+              to: t.name,
+              toId: t.id,
+              qty
+            });
+            remain -= qty;
+            t.diff += qty;
+          }
+        }
+      });
+      return transfers;
+    };
+
     const openDetail = (row)=>{
       const edits = planEdits[row.sku];
       const transfers = edits ? edits.map(e=>({...e})) : row.transfers.map(t=>({...t}));
@@ -242,17 +281,23 @@
           id: sid,
           name: STORES.find(s=>String(s.id)===String(sid))?.name || String(sid),
           inv: row.invByStore[sid]||0,
+          sales: row.salesByStore[sid]||0,
           ideal: row.idealByStore[sid]||0,
-          diff: (row.invByStore[sid]||0) - (row.idealByStore[sid]||0)
+          diff: (row.invByStore[sid]||0) - (row.idealByStore[sid]||0),
+          transferQty: 0,
+          transferTo: ''
         };
       }).sort((a,b)=> b.diff - a.diff);
 
+      // keep inv/ideal maps to enable smarter auto-generation later
       setDetail({
         sku: row.sku,
         name: row.name,
         productId: row.productId,
         perStore,
-        transfers
+        transfers,
+        invByStore: row.invByStore || {},
+        idealByStore: row.idealByStore || {}
       });
     };
 
@@ -264,6 +309,343 @@
         d.transfers = d.transfers.map((t,i)=> i===idx? {...t, qty:Number(qty)||0 }: t);
         return d;
       });
+    };
+
+    const removeTransfer = (idx)=>{
+      setDetail(prev=>{
+        const d = {...prev};
+        d.transfers = d.transfers.filter((t,i)=> i!==idx);
+        return d;
+      });
+    };
+
+    const addTransfer = ()=>{
+      if(!detail || !detail.newFrom || !detail.newTo || detail.newQty<=0) return;
+      const fromStore = STORES.find(s=> String(s.id)===String(detail.newFrom));
+      const toStore = STORES.find(s=> String(s.id)===String(detail.newTo));
+      if(!fromStore || !toStore) return;
+      
+      setDetail(prev=>{
+        const d = {...prev};
+        d.transfers = [...d.transfers, {
+          from: fromStore.name,
+          fromId: detail.newFrom,
+          to: toStore.name,
+          toId: detail.newTo,
+          qty: detail.newQty
+        }];
+        d.newFrom = '';
+        d.newTo = '';
+        d.newQty = 0;
+        return d;
+      });
+    };
+
+    const updateNewTransferField = (field, value)=>{
+      setDetail(prev=> ({...prev, [field]: value}));
+    };
+
+    const autoGenerate = ()=>{
+      if(!detail) return;
+      const invByStore = detail.invByStore || detail.perStore.reduce((a,c)=>{a[c.id]=c.inv; return a;},{});
+      const idealByStore = detail.idealByStore || detail.perStore.reduce((a,c)=>{a[c.id]=c.ideal; return a;},{});
+      
+      // 過剰在庫店舗と不足在庫店舗を抽出
+      const donors = [];
+      const takers = [];
+      detail.perStore.forEach(s=>{
+        if(s.diff > 0) donors.push({...s, available: s.diff});
+        else if(s.diff < 0) takers.push({...s, need: Math.abs(s.diff)});
+      });
+      
+      donors.sort((a,b)=> b.available - a.available);
+      takers.sort((a,b)=> b.need - a.need);
+      
+      // 各過剰在庫店舗に移管先と数量を設定
+      const perStore = detail.perStore.map(s=> ({...s, transferQty:0, transferTo:''}));
+      const transfers = [];
+      
+      donors.forEach(d=>{
+        let remain = d.available;
+        for(const t of takers){
+          if(remain<=0) break;
+          if(t.need<=0) continue;
+          const qty = Math.min(remain, t.need);
+          if(qty>=1){
+            // perStoreに反映
+            const fromStore = perStore.find(p=> String(p.id)===String(d.id));
+            if(fromStore){
+              if(!fromStore.transferTo){
+                fromStore.transferTo = t.id;
+                fromStore.transferQty = qty;
+              } else {
+                // 既に移管先がある場合は数量を加算
+                fromStore.transferQty += qty;
+              }
+            }
+            
+            transfers.push({
+              from: d.name,
+              fromId: d.id,
+              to: t.name,
+              toId: t.id,
+              qty
+            });
+            remain -= qty;
+            t.need -= qty;
+          }
+        }
+      });
+
+      setDetail(prev=> ({...prev, transfers, perStore}));
+    };
+
+    // 全商品に対して自動生成するロジック
+    function generateTransfersForProduct({invByStore, idealByStore, minMove=1}){
+      // Build donor and taker lists with integer quantities
+      const donors = [];
+      const takers = [];
+      Object.keys(invByStore).forEach(sid=>{
+        const cur = Math.floor(invByStore[sid]||0);
+        const ideal = Math.floor(idealByStore[sid]||0);
+        const diff = cur - ideal; // positive => donor
+        if(diff >= minMove) donors.push({storeId:sid, available: diff});
+        else if(diff <= -minMove) takers.push({storeId:sid, need: -diff});
+      });
+
+      // sort donors desc by available, takers desc by need
+      donors.sort((a,b)=> b.available - a.available);
+      takers.sort((a,b)=> b.need - a.need);
+
+      const transfers = [];
+
+      // If there are no donors or takers, return early
+      if(donors.length===0 || takers.length===0) return transfers;
+
+      // Greedy match: try to assign large donors to large takers to avoid splitting donors.
+      // Track donor remaining to avoid oversubscription.
+      for(const d of donors){
+        let remain = d.available;
+        // iterate takers sorted by remaining need (largest first)
+        for(const t of takers){
+          if(remain < minMove) break; // donor cannot supply meaningful amount
+          if(t.need < minMove) continue; // taker need too small
+          const qty = Math.min(remain, t.need);
+          // ensure qty respects minMove; if qty < minMove, skip
+          if(qty >= minMove){
+            transfers.push({ fromId: d.storeId, toId: t.storeId, qty });
+            remain -= qty;
+            t.need -= qty;
+          }
+        }
+      }
+
+      // Post-process: there may be small residual needs/availabilities (< minMove) on both sides.
+      // Try to consolidate small taker needs by pulling from donors that still have some remainder
+      const smallTakers = takers.filter(t=> t.need>0 && t.need < minMove);
+      if(smallTakers.length>0){
+        for(const st of smallTakers){
+          // find donor with enough remainder (>= minMove + st.need) or largest remainder
+          let candidate = null;
+          let candidateRemain = 0;
+          for(const d of donors){
+            // compute consumed amount from this donor in transfers so far
+            const consumed = transfers.filter(x=> String(x.fromId)===String(d.storeId)).reduce((a,c)=> a + (c.qty||0), 0);
+            const availLeft = d.available - consumed;
+            if(availLeft >= minMove){
+              // prefer donor with largest availLeft
+              if(availLeft > candidateRemain){ candidate = d; candidateRemain = availLeft; }
+            }
+          }
+          if(candidate){
+            // allocate if possible (we may allocate less than minMove if it's the only way to satisfy a taker)
+            const consumed = transfers.filter(x=> String(x.fromId)===String(candidate.storeId)).reduce((a,c)=> a + (c.qty||0), 0);
+            const availLeft = candidate.available - consumed;
+            const give = Math.min(availLeft, st.need);
+            if(give>0){
+              // if give < minMove and candidate has no way to provide minMove to anyone else, still allow to avoid leaving tiny needs
+              transfers.push({ fromId: candidate.storeId, toId: st.storeId, qty: give });
+              st.need -= give;
+            }
+          }
+        }
+      }
+
+      // Final safety: ensure total outflow from donors never exceeds their available
+      // (should be guaranteed by construction but add check to adjust if needed)
+      const adjusted = [];
+      const donorTotals = {};
+      donors.forEach(d=> donorTotals[d.storeId] = 0);
+      for(const tr of transfers){
+        const sid = String(tr.fromId);
+        donorTotals[sid] = (donorTotals[sid]||0) + tr.qty;
+      }
+      // If any donor exceeded its available (due to roundups), truncate last allocations
+      for(const d of donors){
+        const sid = String(d.storeId);
+        const allowed = d.available;
+        if(donorTotals[sid] > allowed){
+          // need to reduce allocations from this donor proportionally (or trim smallest allocations)
+          let over = donorTotals[sid] - allowed;
+          // collect allocations from this donor (last-first to reduce splitting)
+          const fromAlloc = transfers.filter(t=> String(t.fromId)===sid).slice().reverse();
+          for(const fa of fromAlloc){
+            if(over<=0) break;
+            const take = Math.min(fa.qty, over);
+            fa.qty -= take;
+            over -= take;
+          }
+        }
+      }
+
+      // return transfers with qty>0
+      const result = transfers.filter(t=> t.qty>0);
+
+      // Fallbacks: if no transfers found, try the core makeTransfers (threshold-based) or a relaxed greedy
+      if(result.length === 0){
+        try{
+          // try core makeTransfers with relaxed threshold and minMove=1
+          const mt = makeTransfers({ invByStore, idealByStore, gapThreshold: Math.max(0, (gapThreshold||0)/2), minMove: 1, stores: STORES });
+          if(mt && mt.transfers && mt.transfers.length){
+            console.debug('[TransferPlanner] generateTransfersForProduct: fallback makeTransfers produced', mt.transfers.length);
+            return mt.transfers.map(x=> ({ fromId: x.fromId, toId: x.toId, qty: x.qty }));
+          }
+        }catch(e){ console.debug('[TransferPlanner] makeTransfers fallback failed', e); }
+
+        // final fallback: relaxed greedy with unit granularity
+        const donors2 = [];
+        const takers2 = [];
+        Object.keys(invByStore).forEach(sid=>{
+          const cur = Math.floor(invByStore[sid]||0);
+          const ideal = Math.floor(idealByStore[sid]||0);
+          const diff = cur - ideal;
+          if(diff > 0) donors2.push({ storeId: sid, available: diff });
+          else if(diff < 0) takers2.push({ storeId: sid, need: -diff });
+        });
+        donors2.sort((a,b)=> b.available - a.available);
+        takers2.sort((a,b)=> b.need - a.need);
+        const r2 = [];
+        for(const d of donors2){
+          let remain = d.available;
+          for(const t of takers2){
+            if(remain<=0) break;
+            if(t.need<=0) continue;
+            const qty = Math.min(remain, t.need);
+            if(qty>0){ r2.push({ fromId: d.storeId, toId: t.storeId, qty }); remain -= qty; t.need -= qty; }
+          }
+        }
+        if(r2.length) {
+          console.debug('[TransferPlanner] generateTransfersForProduct: fallback relaxed greedy produced', r2.length);
+          return r2;
+        }
+      }
+
+      return result;
+    }
+
+    const autoGenerateAll = ()=>{
+      // For each product in PRODUCTS (ignore current UI filters) compute inv/sales/ideal and generate transfers
+      // Use all stores (STORES) rather than filtered storeIds to ensure full coverage
+      const allPlan = [];
+      const allStoreIds = STORES.map(s=> s.id);
+      PRODUCTS.forEach(p=>{
+        const invByStore = sumInvByStore({productId: p.id, storeIds: allStoreIds});
+        const salesByStore = sumUnitsByStore28({ idx, productId: p.id, storeIds: allStoreIds, start: last28Start, end: effectiveEnd });
+        const { idealByStore } = computeIdeal({invByStore, salesByStore});
+        const transfers = generateTransfersForProduct({invByStore, idealByStore, minMove});
+        // enrich with store names
+        const enriched = transfers.map(t=>({
+          sku: p.sku,
+          productId: p.id,
+          fromStoreId: t.fromId,
+          fromStore: STORES.find(s=>String(s.id)===String(t.fromId))?.name || t.fromId,
+          toStoreId: t.toId,
+          toStore: STORES.find(s=>String(s.id)===String(t.toId))?.name || t.toId,
+          qty: t.qty
+        }));
+        if(enriched.length){
+          allPlan.push(...enriched);
+          console.debug('[TransferPlanner] autoGenerateAll', p.sku, 'generated', enriched.length, 'rows');
+        }
+      });
+      setGlobalPlan(allPlan);
+      // also set planEdits per SKU
+      setPlanEdits(prev=>{
+        const next = {...prev};
+        // group by sku
+        const bySku = {};
+        allPlan.forEach(p=>{ (bySku[p.sku] = bySku[p.sku]||[]).push({...p, from:p.fromStore, to:p.toStore, fromId:p.fromStoreId, toId:p.toStoreId}); });
+        Object.keys(bySku).forEach(sku=> next[sku] = bySku[sku].map(x=>({from:x.from, fromId:x.fromId, to:x.to, toId:x.toId, qty:x.qty}))); 
+        return next;
+      });
+    };
+
+    const updateStoreTransfer = (storeId, field, value)=>{
+      setDetail(prev=>{
+        const d = {...prev};
+        d.perStore = d.perStore.map(s=> s.id===storeId ? {...s, [field]: value} : s);
+        d.transfers = generateTransfersFromStores(d.perStore);
+        return d;
+      });
+    };
+
+    const generateTransfersFromStores = (perStore)=>{
+      const transfers = [];
+      perStore.forEach(s=>{
+        if(s.transferQty > 0 && s.transferTo){
+          const toStore = perStore.find(t=> String(t.id)===String(s.transferTo));
+          if(toStore){
+            transfers.push({
+              from: s.name,
+              fromId: s.id,
+              to: toStore.name,
+              toId: toStore.id,
+              qty: s.transferQty
+            });
+          }
+        }
+      });
+      return transfers;
+    };
+
+    const submitTransferRequest = (storeData)=>{
+      if(!detail || !storeData.transferTo || storeData.transferQty<=0) return;
+      const toStore = detail.perStore.find(s=> String(s.id)===String(storeData.transferTo));
+      if(!toStore) return;
+
+      const planItem = {
+        sku: detail.sku,
+        productId: detail.productId,
+        fromStoreId: storeData.id,
+        fromStore: storeData.name,
+        toStoreId: storeData.transferTo,
+        toStore: toStore.name,
+        qty: storeData.transferQty
+      };
+
+      // push to in-memory fixture list for backward compatibility
+      if(window.FIXTURES && window.FIXTURES.TASKS){
+        const task = {
+          id: `transfer_${Date.now()}_${Math.random().toString(36).substr(2,9)}`,
+          type: '移管',
+          title: `移管申請: ${detail.sku} ${storeData.name}→${toStore.name}`,
+          description: `商品: ${detail.sku} ${detail.name}\n払出元: ${storeData.name}\n受入先: ${toStore.name}\n数量: ${storeData.transferQty}`,
+          status: 'pending',
+          priority: 'medium',
+          createdAt: new Date().toISOString(),
+          dueDate: new Date(Date.now() + 7*24*60*60*1000).toISOString().split('T')[0],
+          assignee: '商品部',
+          metadata: planItem
+        };
+        window.FIXTURES.TASKS.push(task);
+      }
+
+      // If parent provided onApplyPlan, send single-item plan so App can create a task in its list
+      if(typeof onApplyPlan === 'function'){
+        onApplyPlan([planItem]);
+      }
+
+      console.log(`[TransferPlanner] 移管申請を登録: ${storeData.name} → ${toStore.name} (${storeData.transferQty}個)`);
     };
 
     const saveDetailEdits = ()=>{
@@ -297,7 +679,6 @@
         onApplyPlan(plan);
       } else {
         console.log('[TransferPlanner] applyPlan', plan);
-        alert(`移管計画（${plan.length}行）をコンソールに出力しました。`);
       }
     };
 
@@ -376,6 +757,12 @@
               <Button variant="outlined" onClick={exportCSV}>CSV出力</Button>
             </Grid>
             <Grid item>
+              <Button variant="outlined" onClick={autoGenerateAll}>全件自動生成</Button>
+            </Grid>
+            <Grid item>
+              <Button variant="contained" onClick={()=> setShowPreview(true)} disabled={globalPlan.length===0}>プレビュー</Button>
+            </Grid>
+            <Grid item>
               <Button variant="contained" color="primary" onClick={()=>applyPlan(true)} disabled={selected.size===0}>
                 選択SKUのみ適用
               </Button>
@@ -441,71 +828,256 @@
           </Table>
         </div>
 
-        <Dialog open={!!detail} onClose={closeDetail} fullWidth maxWidth="md">
-          <DialogTitle>移管詳細 — {detail?.sku} {detail?.name}</DialogTitle>
+  <Dialog open={!!detail} onClose={closeDetail} fullWidth maxWidth="xl">
+          <DialogTitle>
+            <div style={{display:'flex', alignItems:'center', justifyContent:'space-between'}}>
+              <span>移管詳細 — {detail?.sku} {detail?.name}</span>
+              <Button variant="outlined" size="small" onClick={autoGenerate}>
+                自動プラン生成
+              </Button>
+            </div>
+          </DialogTitle>
           <DialogContent dividers>
-            <div style={{marginBottom:8, fontWeight:700}}>店舗別 現在庫／理想在庫／乖離</div>
-            <Table size="small" sx={{mb:2}}>
-              <TableHead>
-                <TableRow>
-                  <TableCell style={th}>店舗</TableCell>
-                  <TableCell style={th} align="right">現在庫</TableCell>
-                  <TableCell style={th} align="right">理想在庫</TableCell>
-                  <TableCell style={th} align="right">乖離(=現在-理想)</TableCell>
-                  <TableCell style={th} align="center">判定</TableCell>
-                </TableRow>
-              </TableHead>
-              <TableBody>
-                {detail?.perStore?.map(s=>(
-                  <TableRow key={s.id}>
-                    <TableCell>{s.name}</TableCell>
-                    <TableCell align="right">{s.inv.toLocaleString()}</TableCell>
-                    <TableCell align="right">{s.ideal.toLocaleString()}</TableCell>
-                    <TableCell align="right">{(s.diff).toLocaleString()}</TableCell>
-                    <TableCell align="center">
-                      {s.diff>0 ? <Chip size="small" color="warning" label="ドナー(過剰)"/> :
-                       s.diff<0 ? <Chip size="small" color="info"    label="レシーバ(不足)"/> :
-                                  <Chip size="small" variant="outlined" label="適正"/>}
-                    </TableCell>
-                  </TableRow>
-                ))}
-              </TableBody>
-            </Table>
-
-            <div style={{marginBottom:8, fontWeight:700}}>移管ペア（編集可）</div>
-            <Table size="small">
-              <TableHead>
-                <TableRow>
-                  <TableCell style={th}>From</TableCell>
-                  <TableCell style={th}>To</TableCell>
-                  <TableCell style={th} align="right">数量</TableCell>
-                </TableRow>
-              </TableHead>
-              <TableBody>
-                {(detail?.transfers||[]).map((t,i)=>(
-                  <TableRow key={i}>
-                    <TableCell>{t.from}</TableCell>
-                    <TableCell>{t.to}</TableCell>
-                    <TableCell align="right" style={{width:140}}>
-                      <TextField
-                        size="small"
-                        type="number"
-                        value={t.qty}
-                        onChange={(e)=>changeTransferQty(i, e.target.value)}
-                        inputProps={{min:0, step:1}}
-                      />
-                    </TableCell>
-                  </TableRow>
-                ))}
-                {(!detail?.transfers || detail?.transfers.length===0) && (
-                  <TableRow><TableCell colSpan={3} align="center" style={{color:'#888'}}>移管ペアはありません</TableCell></TableRow>
-                )}
-              </TableBody>
-            </Table>
+            <Grid container spacing={2}>
+              <Grid item xs={12}>
+                <div style={{marginBottom:8, fontWeight:700}}>店舗別在庫状況（AsIs → ToBe）</div>
+                <div style={{maxHeight:'500px', overflowY:'auto'}}>
+                  <Table size="small">
+                    <TableHead>
+                      <TableRow>
+                        <TableCell style={th}>店舗</TableCell>
+                        <TableCell style={th} align="right">現在庫</TableCell>
+                        <TableCell style={th} align="right">直近28日販売</TableCell>
+                        <TableCell style={th} align="right">回転日数</TableCell>
+                        <TableCell style={th} align="right">理想</TableCell>
+                        <TableCell style={th} align="right">乖離</TableCell>
+                        <TableCell style={th}>移管先</TableCell>
+                        <TableCell style={th} align="right">移管数</TableCell>
+                        <TableCell style={th} align="right">ToBe</TableCell>
+                        <TableCell style={th} align="right">ToBe回転</TableCell>
+                        <TableCell style={th} align="right">残差</TableCell>
+                        <TableCell style={th} align="center">操作</TableCell>
+                      </TableRow>
+                    </TableHead>
+                    <TableBody>
+                      {detail?.perStore?.map(s=>{
+                        const tobeInv = calcToBeInv(detail.perStore, detail.transfers||[]);
+                        const tobe = tobeInv[s.id]||s.inv;
+                        const remaining = tobe - s.ideal;
+                        const suggestedQty = s.diff > 0 ? s.diff : 0;
+                        const dailySales = (s.sales||0) / 28;
+                        const turnoverDays = dailySales > 0 ? (s.inv / dailySales) : (s.inv > 0 ? 999 : 0);
+                        const tobeTurnoverDays = dailySales > 0 ? (tobe / dailySales) : (tobe > 0 ? 999 : 0);
+                        return (
+                          <TableRow key={s.id} style={{backgroundColor: s.diff>0 ? '#fff3e0' : s.diff<0 ? '#e3f2fd' : 'transparent'}}>
+                            <TableCell style={{fontWeight:600}}>{s.name}</TableCell>
+                            <TableCell align="right">{s.inv.toLocaleString()}</TableCell>
+                            <TableCell align="right">{(s.sales||0).toLocaleString()}</TableCell>
+                            <TableCell align="right" style={{fontSize:'0.85em'}}>
+                              {turnoverDays >= 999 ? '—' : turnoverDays.toFixed(1)}日
+                            </TableCell>
+                            <TableCell align="right">{s.ideal.toLocaleString()}</TableCell>
+                            <TableCell align="right" style={{fontWeight:700, color: s.diff>0?'#e65100':s.diff<0?'#0277bd':'#666'}}>
+                              {s.diff>0?'+':''}{s.diff.toLocaleString()}
+                            </TableCell>
+                            <TableCell style={{width:140}}>
+                              {s.diff > 0 ? (
+                                <FormControl size="small" fullWidth>
+                                  <Select
+                                    value={s.transferTo||''}
+                                    onChange={(e)=>updateStoreTransfer(s.id, 'transferTo', e.target.value)}
+                                    displayEmpty
+                                  >
+                                    <MenuItem value="">—</MenuItem>
+                                    {detail?.perStore?.filter(t=>t.diff<0 && t.id!==s.id).map(t=>(
+                                      <MenuItem key={t.id} value={t.id}>
+                                        {t.name} ({t.diff})
+                                      </MenuItem>
+                                    ))}
+                                  </Select>
+                                </FormControl>
+                              ) : <span style={{color:'#999', fontSize:'0.85em'}}>—</span>}
+                            </TableCell>
+                            <TableCell align="right" style={{width:80}}>
+                              {s.diff > 0 ? (
+                                <TextField
+                                  size="small"
+                                  type="number"
+                                  value={s.transferQty||0}
+                                  onChange={(e)=>updateStoreTransfer(s.id, 'transferQty', Number(e.target.value)||0)}
+                                  inputProps={{min:0, max:s.inv, step:1}}
+                                  placeholder={suggestedQty.toString()}
+                                  fullWidth
+                                  sx={{input:{textAlign:'right', fontSize:'0.85em'}}}
+                                />
+                              ) : <span style={{color:'#999', fontSize:'0.85em'}}>—</span>}
+                            </TableCell>
+                            <TableCell align="right" style={{fontWeight:600, backgroundColor:'#f0f9ff'}}>
+                              {tobe.toLocaleString()}
+                            </TableCell>
+                            <TableCell align="right" style={{fontSize:'0.85em', backgroundColor:'#f0f9ff'}}>
+                              {tobeTurnoverDays >= 999 ? '—' : tobeTurnoverDays.toFixed(1)}日
+                            </TableCell>
+                            <TableCell align="right" style={{fontSize:'0.85em', color: Math.abs(remaining)<Math.abs(s.diff)?'#2e7d32':'#666'}}>
+                              {remaining>0?'+':''}{remaining.toLocaleString()}
+                            </TableCell>
+                            <TableCell align="center" style={{width:80}}>
+                              {s.diff > 0 && s.transferTo && s.transferQty > 0 ? (
+                                <Button
+                                  size="small"
+                                  variant="contained"
+                                  color="primary"
+                                  onClick={()=>submitTransferRequest(s)}
+                                >
+                                  登録
+                                </Button>
+                              ) : <span style={{color:'#999', fontSize:'0.85em'}}>—</span>}
+                            </TableCell>
+                          </TableRow>
+                        );
+                      })}
+                    </TableBody>
+                  </Table>
+                </div>
+              </Grid>
+            </Grid>
           </DialogContent>
           <DialogActions>
             <Button onClick={closeDetail}>閉じる</Button>
-            <Button variant="contained" onClick={saveDetailEdits}>変更を保存</Button>
+            <Button variant="outlined" onClick={()=>{
+              // Save current edits but don't apply
+              saveDetailEdits();
+            }}>保存</Button>
+            <Button variant="contained" color="primary" onClick={()=>{
+              // Save and apply current transfers for this SKU
+              if(!detail) return;
+              const transfers = (detail.transfers || []).filter(t=> t.qty>0).map(t=>({
+                sku: detail.sku,
+                productId: detail.productId,
+                fromStoreId: t.fromId,
+                fromStore: t.from,
+                toStoreId: t.toId,
+                toStore: t.to,
+                qty: t.qty
+              }));
+              // persist locally
+              setPlanEdits(prev=> ({...prev, [detail.sku]: transfers}));
+              // notify parent
+              if(typeof onApplyPlan === 'function' && transfers.length) onApplyPlan(transfers);
+              closeDetail();
+            }}>保存して申請</Button>
+          </DialogActions>
+        </Dialog>
+        <Dialog open={!!showPreview} onClose={()=> setShowPreview(false)} fullWidth maxWidth="lg">
+          <DialogTitle>自動生成プラン プレビュー</DialogTitle>
+          <DialogContent dividers>
+            {(() => {
+              const totalQty = globalPlan.reduce((s,p)=> s + (p.qty||0), 0);
+              const totalCount = globalPlan.length;
+              const affectedSkus = new Set(globalPlan.map(p=> p.sku));
+              const storeBefore = {};
+              // aggregate before-inventory for affected SKUs
+              rows.forEach(r=>{
+                if(!affectedSkus.has(r.sku)) return;
+                const invMap = r.invByStore || {};
+                Object.keys(invMap).forEach(sid=>{
+                  storeBefore[sid] = (storeBefore[sid]||0) + (invMap[sid]||0);
+                });
+              });
+              // apply transfers to compute after-inventory
+              const storeAfter = Object.assign({}, storeBefore);
+              globalPlan.forEach(p=>{
+                const from = String(p.fromStoreId);
+                const to = String(p.toStoreId);
+                storeAfter[from] = (storeAfter[from]||0) - (p.qty||0);
+                storeAfter[to] = (storeAfter[to]||0) + (p.qty||0);
+              });
+              const storeIds = Object.keys(Object.assign({}, storeBefore, storeAfter)).sort((a,b)=>{
+                const an = (STORES.find(s=>String(s.id)===a)?.name||a).toString();
+                const bn = (STORES.find(s=>String(s.id)===b)?.name||b).toString();
+                return an.localeCompare(bn, 'ja');
+              });
+
+              return (
+                <div>
+                  <div style={{display:'flex', justifyContent:'space-between', alignItems:'center', marginBottom:8}}>
+                    <div style={{fontWeight:700}}>移管サマリ</div>
+                    <div style={{color:'#333'}}>
+                      合計 {totalCount} 件 / {totalQty.toLocaleString()} 個
+                    </div>
+                  </div>
+
+                  <div style={{marginBottom:8}}>
+                    <div style={{fontWeight:700, marginBottom:6}}>店舗別 在庫変化（対象SKU合算）</div>
+                    <div style={{maxHeight:200, overflowY:'auto', border:'1px solid #eee', padding:6, borderRadius:4}}>
+                      <Table size="small">
+                        <TableHead>
+                          <TableRow>
+                            <TableCell>店舗</TableCell>
+                            <TableCell align="right">Before</TableCell>
+                            <TableCell align="right">After</TableCell>
+                            <TableCell align="right">差分</TableCell>
+                          </TableRow>
+                        </TableHead>
+                        <TableBody>
+                          {storeIds.map(sid=>{
+                            const before = storeBefore[sid]||0;
+                            const after = storeAfter[sid]||0;
+                            const diff = after - before;
+                            const name = STORES.find(s=>String(s.id)===sid)?.name || sid;
+                            return (
+                              <TableRow key={sid}>
+                                <TableCell style={{fontWeight:600}}>{name}</TableCell>
+                                <TableCell align="right">{before.toLocaleString()}</TableCell>
+                                <TableCell align="right" style={{fontWeight:700}}>{after.toLocaleString()}</TableCell>
+                                <TableCell align="right" style={{color: diff>0? '#2e7d32' : diff<0? '#c62828' : '#666'}}>
+                                  {diff>0?'+':''}{diff.toLocaleString()}
+                                </TableCell>
+                              </TableRow>
+                            );
+                          })}
+                          {!storeIds.length && (
+                            <TableRow><TableCell colSpan={4} align="center" style={{color:'#888'}}>該当する店舗データなし</TableCell></TableRow>
+                          )}
+                        </TableBody>
+                      </Table>
+                    </div>
+                  </div>
+
+                  <div style={{maxHeight: '40vh', overflowY:'auto'}}>
+                    <Table size="small">
+                      <TableHead>
+                        <TableRow>
+                          <TableCell>SKU</TableCell>
+                          <TableCell>From</TableCell>
+                          <TableCell>To</TableCell>
+                          <TableCell align="right">Qty</TableCell>
+                        </TableRow>
+                      </TableHead>
+                      <TableBody>
+                        {globalPlan.map((p,i)=>(
+                          <TableRow key={i}>
+                            <TableCell>{p.sku}</TableCell>
+                            <TableCell>{p.fromStore}</TableCell>
+                            <TableCell>{p.toStore}</TableCell>
+                            <TableCell align="right">{p.qty}</TableCell>
+                          </TableRow>
+                        ))}
+                      </TableBody>
+                    </Table>
+                  </div>
+                </div>
+              );
+            })()}
+          </DialogContent>
+          <DialogActions>
+            <Button onClick={()=> setShowPreview(false)}>閉じる</Button>
+            <Button variant="contained" color="primary" onClick={()=>{
+              if(typeof onApplyPlan === 'function' && globalPlan.length){
+                onApplyPlan(globalPlan);
+              }
+              setShowPreview(false);
+            }}>登録してタスク化</Button>
           </DialogActions>
         </Dialog>
       </div>
