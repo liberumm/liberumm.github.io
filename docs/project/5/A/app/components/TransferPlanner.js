@@ -106,7 +106,13 @@
       gapThreshold: initGap=0.08,
       minMove: initMin=5,
       skuFilter: initQuery='',
-      onApplyPlan
+      storeNameFilter='',
+      windowStart='',
+      windowEnd='',
+      onApplyPlan,
+      onClose,
+      isModal=false,
+      modalTitle=''
     } = props;
 
     const STORES = window.MASTERS.STORES || [];
@@ -117,6 +123,9 @@
     const [gapThreshold, setGapThreshold] = React.useState(initGap);
     const [minMove, setMinMove] = React.useState(initMin);
     const [query, setQuery] = React.useState(initQuery);
+    const [storeFilter, setStoreFilter] = React.useState(storeNameFilter||'');
+    const [codeFilter, setCodeFilter] = React.useState('');
+    const [nameFilter, setNameFilter] = React.useState('');
     const [selected, setSelected] = React.useState(new Set());
     const [detail, setDetail] = React.useState(null);
     const [globalPlan, setGlobalPlan] = React.useState([]);
@@ -133,12 +142,18 @@
     const rows = React.useMemo(()=>{
       const list = [];
       PRODUCTS.forEach(p=>{
-        if(query){
-          const q = query.trim().toLowerCase();
-          const hit = (p.sku||'').toLowerCase().includes(q) ||
-                      (p.name||'').toLowerCase().includes(q) ||
-                      (p.itemName||'').toLowerCase().includes(q);
-          if(!hit) return;
+        // 統合フィルタリング
+        const codeMatch = !codeFilter || (p.sku||'').toLowerCase().includes(codeFilter.toLowerCase()) || (p.itemCode||'').toLowerCase().includes(codeFilter.toLowerCase());
+        const nameMatch = !nameFilter || (p.name||'').toLowerCase().includes(nameFilter.toLowerCase()) || (p.itemName||'').toLowerCase().includes(nameFilter.toLowerCase());
+        const queryMatch = !query || (p.sku||'').toLowerCase().includes(query.toLowerCase()) || (p.name||'').toLowerCase().includes(query.toLowerCase()) || (p.itemName||'').toLowerCase().includes(query.toLowerCase());
+        
+        if(!codeMatch || !nameMatch || !queryMatch) return;
+        
+        // 店舗フィルタ
+        if(storeFilter){
+          const storeIds = STORES.filter(s=> s.name.toLowerCase().includes(storeFilter.toLowerCase())).map(s=>s.id);
+          const hasInventory = (window.FIXTURES.INVENTORY||[]).some(i=> i.productId===p.id && storeIds.includes(i.storeId) && i.qty>0);
+          if(!hasInventory) return;
         }
         
         const invByStore = sumInvByStore({productId:p.id, storeIds});
@@ -170,7 +185,7 @@
       });
 
       return list.sort((a,b)=> b.transfers.length - a.transfers.length);
-    }, [PRODUCTS, storeIds, last28Start, range.end, gapThreshold, minMove, query]);
+    }, [PRODUCTS, storeIds, last28Start, range.end, gapThreshold, minMove, query, storeFilter, codeFilter, nameFilter]);
 
     const toggleSelect = (sku)=>{
       setSelected(prev=>{
@@ -283,17 +298,35 @@
       URL.revokeObjectURL(url);
     };
 
-    return (
+    const content = (
       <div>
         {/* 設定パネル */}
         <Paper variant="outlined" sx={{p:2, mb:2}}>
           <Grid container spacing={2} alignItems="center">
-            <Grid item xs={12} md={3}>
+            <Grid item xs={12} md={2}>
               <TextField
-                label="検索（SKU/名称）"
+                label="店舗名"
                 size="small"
-                value={query}
-                onChange={(e)=>setQuery(e.target.value)}
+                value={storeFilter}
+                onChange={(e)=>setStoreFilter(e.target.value)}
+                fullWidth
+              />
+            </Grid>
+            <Grid item xs={12} md={2}>
+              <TextField
+                label="商品コード/SKU"
+                size="small"
+                value={codeFilter}
+                onChange={(e)=>setCodeFilter(e.target.value)}
+                fullWidth
+              />
+            </Grid>
+            <Grid item xs={12} md={2}>
+              <TextField
+                label="商品名"
+                size="small"
+                value={nameFilter}
+                onChange={(e)=>setNameFilter(e.target.value)}
                 fullWidth
               />
             </Grid>
@@ -505,10 +538,14 @@
 
         {/* 詳細モーダル */}
         <Dialog open={!!detail} onClose={closeDetail} fullWidth maxWidth="lg">
-          <DialogTitle>
-            移管詳細 — {detail?.sku} {detail?.name}
+          <DialogTitle sx={{background:'linear-gradient(135deg, #667eea 0%, #764ba2 100%)', color:'#fff', display:'flex', justifyContent:'space-between', alignItems:'center', py:2}}>
+            <Box>
+              <div style={{fontSize:'1.1em', fontWeight:600}}>移管計画詳細</div>
+              <div style={{fontSize:'0.85em', opacity:0.9, marginTop:4}}>{detail?.sku} | {detail?.name}</div>
+            </Box>
+            <Button onClick={closeDetail} sx={{color:'#fff', minWidth:'auto', p:1}} size="small">×</Button>
           </DialogTitle>
-          <DialogContent dividers>
+          <DialogContent dividers sx={{p:3, backgroundColor:'#fafafa'}}>
             <Table size="small">
               <TableHead>
                 <TableRow>
@@ -651,9 +688,10 @@
               </TableBody>
             </Table>
           </DialogContent>
-          <DialogActions>
-            <Button onClick={closeDetail}>閉じる</Button>
-            <Button variant="outlined" onClick={()=>{
+          <DialogActions sx={{p:2, backgroundColor:'#f5f5f5', gap:1}}>
+            <Button onClick={closeDetail} variant="outlined" color="inherit">閉じる</Button>
+            <Box sx={{flex:1}} />
+            <Button variant="outlined" color="primary" onClick={()=>{
               // 自動プラン生成（複数店舗対応）
               const donors = detail?.perStore?.filter(s=> s.diff > 0) || [];
               const takers = detail?.perStore?.filter(s=> s.diff < 0) || [];
@@ -702,12 +740,46 @@
               
               setDetail(prev=> ({...prev, perStore: updatedPerStore, transfers}));
             }}>自動プラン生成</Button>
-            <Button variant="contained" color="primary" onClick={closeDetail}>
+            <Button variant="contained" color="success" onClick={closeDetail} sx={{fontWeight:600}}>
               保存して申請
             </Button>
           </DialogActions>
         </Dialog>
       </div>
     );
+
+    if(isModal){
+      return (
+        <Dialog open={true} onClose={onClose} maxWidth="xl" fullWidth>
+          <DialogTitle style={{display:'flex',justifyContent:'space-between',alignItems:'center'}}>
+            <span>{modalTitle || '移管計画'}</span>
+            <Button onClick={onClose} style={{minWidth:'auto',padding:'4px'}}>×</Button>
+          </DialogTitle>
+          <DialogContent>
+            <Grid container spacing={2} sx={{mb:1}}>
+              <Grid item xs={12} md={4}>
+                <TextField label="対象店舗（名前でフィルタ）" value={storeNameFilter} fullWidth size="small" disabled />
+              </Grid>
+              <Grid item xs={12} md={4}>
+                <TextField label="対象期間開始" value={windowStart} fullWidth size="small" disabled />
+              </Grid>
+              <Grid item xs={12} md={4}>
+                <TextField label="対象期間終了" value={windowEnd} fullWidth size="small" disabled />
+              </Grid>
+            </Grid>
+            {content}
+          </DialogContent>
+          <DialogActions>
+            <Button onClick={onClose}>閉じる</Button>
+          </DialogActions>
+        </Dialog>
+      );
+    }
+
+    return content;
+  };
+
+  window.TransferPlannerModal = function TransferPlannerModal(props){
+    return <window.TransferPlanner {...props} isModal={true} />;
   };
 })();

@@ -7,6 +7,7 @@
 window.MASTERS = {
   /* ===== 基本設定 ===== */
   NUM_SKUS: 300, // 総SKU想定（fixtures側でアイテムあたり1〜6SKUの範囲で割当）
+  NUM_STORES: 10, // 生成する店舗数
 
   /* ===== コーナー（売場/カテゴリ上位） ===== */
   CORNERS: [
@@ -184,16 +185,32 @@ window.MASTERS = {
     { code: '0040', name: '生活雑貨', lineCode: '010' }
   ],
 
-  /* ===== 拠点・チャネル ===== */
-  STORES: [
-    { id:'S01', name:'新宿本店', channel:'店舗' },
-    { id:'S02', name:'渋谷店',   channel:'店舗' },
-    { id:'S03', name:'名古屋店', channel:'店舗' },
-    { id:'S05', name:'ECサイト', channel:'オンライン' }
-  ],
+  /* ===== 拠点・チャネル（動的生成） ===== */
+  STORES: (function() {
+    const stores = [];
+    const storeNames = ['新宿本店','渋谷店','池袋店','横浜店','大宮店','千葉店','名古屋店','大阪店','京都店','神戸店','福岡店','札幌店','仙台店','広島店'];
+    const blocks = ['東日本','東日本','東日本','東日本','東日本','東日本','中部','西日本','西日本','西日本','西日本','北日本','東日本','西日本'];
+    const numStores = Math.min(window.MASTERS?.NUM_STORES || 15, storeNames.length + 1);
+    
+    for(let i = 0; i < numStores - 1; i++) {
+      stores.push({ id:`S${String(i+1).padStart(2,'0')}`, name:storeNames[i], channel:'店舗' });
+    }
+    stores.push({ id:`S${String(numStores).padStart(2,'0')}`, name:'ECサイト', channel:'オンライン' });
+    return stores;
+  })(),
 
-  /* ===== 店舗ブロック（エリア） ===== */
-  STORE_BLOCK: { S01:'東日本', S02:'東日本', S03:'中部', S05:'EC' },
+  /* ===== 店舗ブロック（エリア・動的生成） ===== */
+  STORE_BLOCK: (function() {
+    const blocks = ['東日本','東日本','東日本','東日本','東日本','東日本','中部','西日本','西日本','西日本','西日本','北日本','東日本','西日本'];
+    const numStores = Math.min(window.MASTERS?.NUM_STORES || 15, blocks.length + 1);
+    const result = {};
+    
+    for(let i = 0; i < numStores - 1; i++) {
+      result[`S${String(i+1).padStart(2,'0')}`] = blocks[i];
+    }
+    result[`S${String(numStores).padStart(2,'0')}`] = 'EC';
+    return result;
+  })(),
 
   /* ===== （拡張互換）サイズ／カラーの参照マスタ =====
      - fixtures.js は存在すれば利用（無ければ無視）

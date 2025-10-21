@@ -756,7 +756,7 @@
       <div>
         <div className="tableWrap compactTable" style={{maxHeight:'800px',overflowY:'auto'}}>
           <table className="dense">
-            <thead>
+            <thead style={{position:'sticky', top:0, zIndex:10, background:'#fff'}}>
               {/* フィルタ入力行 */}
               <tr>
                 <th style={th}></th>
@@ -929,41 +929,41 @@
                 </th>
                 <th style={{...th,textAlign:'center'}}>対応</th>
               </tr>
+
+              {/* 合計行 */}
+              {summaryRow && (
+                <tr style={{background:'#f7fafc', fontWeight:700}}>
+                  <th></th><th></th>
+                  <th colSpan={2}>合計</th>
+                  {showMoneyCols && <th style={{...th,textAlign:'right'}}>—</th>}
+                  {showMoneyCols && <th style={{...th,textAlign:'right'}}>—</th>}
+                  <th style={{...th,textAlign:'right'}}>{summaryRow.inv.toLocaleString()}</th>
+                  <th style={{...th,textAlign:'right'}}>—</th>
+                  {roiVisible && (
+                    <>
+                      <th style={{...th,textAlign:'right'}}>{(summaryRow.units30||0).toLocaleString()}</th>
+                      <th style={{...th,textAlign:'right'}}>{summaryRow.asp30==null?'—':fmtYen(Math.round(summaryRow.asp30))}</th>
+                      <th style={{...th,textAlign:'right'}}>{fmtYen(summaryRow.profit30||0)}</th>
+                      <th style={{...th,textAlign:'right'}}>—</th>
+                      <th style={{...th,textAlign:'right'}}>—</th>
+                    </>
+                  )}
+                  <th style={{...th,textAlign:'right'}}>—</th>
+                  <th style={{...th,textAlign:'right'}}>{formatCell(summaryRow.total)}</th>
+                  {summaryRow.byBucket.map((v,i)=>(
+                    <th key={i} style={{...th,textAlign:'right', backgroundColor:i===summaryRow.latestColIndex?'#fff0f0':'#f9fbff'}}>
+                      {formatCell(v||0)}
+                    </th>
+                  ))}
+                  <th style={th}>—</th>
+                  <th style={th}>—</th>
+                  <th style={{...th,textAlign:'center'}}>—</th>
+                  <th style={{...th,textAlign:'center'}}>—</th>
+                </tr>
+              )}
             </thead>
 
             <tbody>
-              {/* 合計行（ヘッダー直下） */}
-              {summaryRow && (
-                <tr style={{background:'#f7fafc', fontWeight:700}}>
-                  <td></td><td></td>
-                  <td colSpan={2}>合計</td>
-                  {showMoneyCols && <td style={{...td,textAlign:'right'}}>—</td>}
-                  {showMoneyCols && <td style={{...td,textAlign:'right'}}>—</td>}
-                  <td style={{...td,textAlign:'right'}}>{summaryRow.inv.toLocaleString()}</td>
-                  <td style={{...td,textAlign:'right'}}>—</td>
-                  {roiVisible && (
-                    <>
-                      <td style={{...td,textAlign:'right'}}>{(summaryRow.units30||0).toLocaleString()}</td>
-                      <td style={{...td,textAlign:'right'}}>{summaryRow.asp30==null?'—':fmtYen(Math.round(summaryRow.asp30))}</td>
-                      <td style={{...td,textAlign:'right'}}>{fmtYen(summaryRow.profit30||0)}</td>
-                      <td style={{...td,textAlign:'right'}}>—</td>
-                      <td style={{...td,textAlign:'right'}}>—</td>
-                    </>
-                  )}
-                  <td style={{...td,textAlign:'right'}}>—</td>
-                  <td style={{...td,textAlign:'right'}}>{formatCell(summaryRow.total)}</td>
-                  {summaryRow.byBucket.map((v,i)=>(
-                    <td key={i} style={{...td,textAlign:'right', backgroundColor:i===summaryRow.latestColIndex?'#fff0f0':'#f9fbff'}}>
-                      {formatCell(v||0)}
-                    </td>
-                  ))}
-                  <td style={td}>—</td>
-                  <td style={td}>—</td>
-                  <td style={{...td,textAlign:'center'}}>—</td>
-                  <td style={{...td,textAlign:'center'}}>—</td>
-                </tr>
-              )}
-
               {/* データ行 */}
               {tableRows.map((row, rowIndex)=>{
                 const priceCell = showMoneyCols ? (row.price!=null ? fmtYen(row.price) : '—') : '—';

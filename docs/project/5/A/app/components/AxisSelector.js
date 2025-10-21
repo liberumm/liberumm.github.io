@@ -192,23 +192,22 @@ function AxisSelector({prodAxis,setProdAxis,storeAxis,setStoreAxis,storeGroup,se
   const getRelatedItems = React.useMemo(() => {
     if(selectedProdItems.size === 0) return new Set();
     const P_TAXO = window.FIXTURES.P_TAXO || {};
+    const ITEMS = window.FIXTURES.ITEMS || [];
+    const CATEGORY_ITEM_MAP = window.MASTERS.CATEGORY_ITEM_MAP || {};
     const related = new Set();
     
-    // 選択されたアイテムに関連する商品を特定（直接的な関連性のみ）
+    // 選択されたアイテムに関連する商品を特定
     const relatedProducts = new Set();
     
     PRODUCTS.forEach(p => {
       const taxo = P_TAXO[p.id];
       if(!taxo) return;
       
-      // 直接的な階層関係のみチェック（SKU軸ではアイテム選択時の過度な反応を防ぐ）
       let isRelated = false;
       
       if(prodAxis === 'SKU') {
-        // SKU軸では、直接選択されたアイテムのみ関連付け
-        const ITEMS = window.FIXTURES.ITEMS || [];
         selectedProdItems.forEach(selectedItem => {
-          if(selectedItem.includes(' ')) { // アイテムコード+名前形式
+          if(selectedItem.includes(' ')) {
             const itemCode = selectedItem.split(' ')[0];
             if(p.sku && p.sku.startsWith(itemCode)) {
               isRelated = true;
@@ -218,7 +217,6 @@ function AxisSelector({prodAxis,setProdAxis,storeAxis,setStoreAxis,storeGroup,se
           }
         });
       } else {
-        // 他の軸では通常の階層関係チェック
         isRelated = selectedProdItems.has(p.dept) ||
                    selectedProdItems.has(taxo.corner) ||
                    selectedProdItems.has(taxo.line) ||
@@ -243,7 +241,6 @@ function AxisSelector({prodAxis,setProdAxis,storeAxis,setStoreAxis,storeGroup,se
       else if(prodAxis === 'ライン') related.add(taxo.line);
       else if(prodAxis === 'カテゴリ') related.add(taxo.category);
       else if(prodAxis === 'アイテム') {
-        const ITEMS = window.FIXTURES.ITEMS || [];
         const item = ITEMS.find(itm => itm.name === p.itemName);
         if(item) {
           related.add(`${item.code} ${item.name}`);
@@ -252,117 +249,47 @@ function AxisSelector({prodAxis,setProdAxis,storeAxis,setStoreAxis,storeGroup,se
       else if(prodAxis === 'SKU') related.add(p.sku);
     });
     
-    // 階層関係マッピングを使用して関連アイテムを追加
-    const CORNER_LINE_MAP = window.MASTERS.CORNER_LINE_MAP || {};
-    const CATEGORY_ITEM_MAP = window.MASTERS.CATEGORY_ITEM_MAP || {};
-    
-    selectedProdItems.forEach(selectedItem => {
-      if(prodAxis === 'ライン') {
-        // コーナーが選択されている場合、関連ラインを追加
-        if(CORNER_LINE_MAP[selectedItem]) {
-          CORNER_LINE_MAP[selectedItem].forEach(line => related.add(line));
-        }
-        // 部門が選択されている場合、全コーナーのラインを追加
-        if(selectedItem === '70衣料') {
-          Object.values(CORNER_LINE_MAP).forEach(lines => {
-            lines.forEach(line => related.add(line));
-          });
-        }
-      } else if(prodAxis === 'カテゴリ') {
-        // ラインが選択されている場合、関連カテゴリを追加
-        const lineCategories = window.MASTERS.getRelatedCategories(selectedItem);
-        if(lineCategories) {
-          lineCategories.forEach(category => related.add(category));
-        }
-        // コーナーが選択されている場合、関連ライン経由でカテゴリを追加
-        if(CORNER_LINE_MAP[selectedItem]) {
-          CORNER_LINE_MAP[selectedItem].forEach(line => {
-            const categories = window.MASTERS.getRelatedCategories(line);
-            if(categories) {
-              categories.forEach(category => related.add(category));
-            }
-          });
-        }
-      } else if(prodAxis === 'アイテム') {
-        // カテゴリが選択されている場合、関連アイテムを追加
-        const categoryCode = selectedItem.split(' ')[0]; // "0001 トップス" -> "0001"
+    // アイテム軸の場合、カテゴリマッピングから関連アイテムを追加
+    if(prodAxis === 'アイテム') {
+      selectedProdItems.forEach(selectedItem => {
+        const categoryCode = selectedItem.split(' ')[0];
         if(CATEGORY_ITEM_MAP[categoryCode]) {
-          const ITEMS = window.FIXTURES.ITEMS || [];
           CATEGORY_ITEM_MAP[categoryCode].forEach(itemName => {
-            ITEMS.forEach(itm => {
-              if(itm.name === itemName) {
-                related.add(`${itm.code} ${itm.name}`);
-              }
-            });
-          });
-        }
-        // ラインが選択されている場合、関連カテゴリ経由でアイテムを追加
-        const lineCategories = window.MASTERS.getRelatedCategories(selectedItem);
-        if(lineCategories) {
-          lineCategories.forEach(category => {
-            const catCode = category.split(' ')[0];
-            if(CATEGORY_ITEM_MAP[catCode]) {
-              const ITEMS = window.FIXTURES.ITEMS || [];
-              CATEGORY_ITEM_MAP[catCode].forEach(itemName => {
-                ITEMS.forEach(itm => {
-                  if(itm.name === itemName) {
-                    related.add(`${itm.code} ${itm.name}`);
-                  }
-                });
-              });
+            const item = ITEMS.find(itm => itm.name === itemName);
+            if(item) {
+              related.add(`${item.code} ${item.name}`);
             }
           });
         }
-        // コーナーが選択されている場合、関連ライン経由でアイテムを追加
-        if(CORNER_LINE_MAP[selectedItem]) {
-          CORNER_LINE_MAP[selectedItem].forEach(line => {
-            const categories = window.MASTERS.getRelatedCategories(line);
-            if(categories) {
-              categories.forEach(category => {
-                const catCode = category.split(' ')[0];
-                if(CATEGORY_ITEM_MAP[catCode]) {
-                  const ITEMS = window.FIXTURES.ITEMS || [];
-                  CATEGORY_ITEM_MAP[catCode].forEach(itemName => {
-                    ITEMS.forEach(itm => {
-                      if(itm.name === itemName) {
-                        related.add(`${itm.code} ${itm.name}`);
-                      }
-                    });
-                  });
-                }
-              });
-            }
-          });
-        }
+      });
+    }
+    
+    return related;
+  }, [selectedProdItems, prodAxis]);
+
+  // 拠点の関連アイテムを特定
+  const getRelatedStoreItems = React.useMemo(() => {
+    if(selectedStoreItems.size === 0) return new Set();
+    const related = new Set();
+    
+    STORES.forEach(store => {
+      let isRelated = false;
+      
+      if(selectedStoreItems.has(store.channel) || 
+         selectedStoreItems.has(STORE_BLOCK[store.id]) || 
+         selectedStoreItems.has(store.name)) {
+        isRelated = true;
+      }
+      
+      if(isRelated) {
+        if(storeAxis === '事業') related.add(store.channel);
+        else if(storeAxis === 'ブロック') related.add(STORE_BLOCK[store.id]);
+        else if(storeAxis === '店舗') related.add(store.name);
       }
     });
     
-    console.log('マッピングで追加された関連アイテム:', Array.from(related));
-    console.log('CATEGORY_ITEM_MAP keys:', Object.keys(CATEGORY_ITEM_MAP));
-    console.log('selectedProdItems:', Array.from(selectedProdItems));
-    
-    // デバッグ用ログ
-    if(prodAxis === 'ライン' && selectedProdItems.has('070 レディス')) {
-      console.log('=== DEBUG: コーナー070レディスが選択されている状態でライン軸 ===');
-      console.log('P_TAXO sample:', Object.entries(P_TAXO).slice(0, 5));
-      
-      // 070レディスコーナーに属する商品を探す
-      const corner070Products = [];
-      PRODUCTS.forEach(p => {
-        const taxo = P_TAXO[p.id];
-        if(taxo && taxo.corner === '070 レディス') {
-          corner070Products.push({id: p.id, line: taxo.line, corner: taxo.corner});
-        }
-      });
-      console.log('070レディスコーナーの商品数:', corner070Products.length);
-      console.log('070レディスコーナーのライン一覧:', [...new Set(corner070Products.map(p => p.line).filter(Boolean))]);
-    }
-    
-    console.log('getRelatedItems - selectedProdItems:', Array.from(selectedProdItems));
-    console.log('getRelatedItems - prodAxis:', prodAxis);
-    console.log('getRelatedItems - related items:', Array.from(related));
     return related;
-  }, [selectedProdItems, prodAxis]);
+  }, [selectedStoreItems, storeAxis]);
 
   // chipsを関連するものとそうでないものに分けて並び替え
   const sortedProdOptions = React.useMemo(() => {
@@ -382,10 +309,27 @@ function AxisSelector({prodAxis,setProdAxis,storeAxis,setStoreAxis,storeGroup,se
     return [...related, ...others];
   }, [prodOptions, getRelatedItems, selectedProdItems]);
 
+  const sortedStoreOptions = React.useMemo(() => {
+    if(selectedStoreItems.size === 0) return storeOptions;
+    
+    const related = [];
+    const others = [];
+    
+    storeOptions.forEach(opt => {
+      if(getRelatedStoreItems.has(opt)) {
+        related.push(opt);
+      } else {
+        others.push(opt);
+      }
+    });
+    
+    return [...related, ...others];
+  }, [storeOptions, getRelatedStoreItems, selectedStoreItems]);
+
   const displayedChips = showAllChips ? sortedProdOptions : sortedProdOptions.slice(0, 15);
   const hasMoreChips = sortedProdOptions.length > 15;
-  const displayedStoreChips = showAllStoreChips ? storeOptions : storeOptions.slice(0, 15);
-  const hasMoreStoreChips = storeOptions.length > 15;
+  const displayedStoreChips = showAllStoreChips ? sortedStoreOptions : sortedStoreOptions.slice(0, 15);
+  const hasMoreStoreChips = sortedStoreOptions.length > 15;
 
   return (
     <Stack spacing={2}>
@@ -474,6 +418,9 @@ function AxisSelector({prodAxis,setProdAxis,storeAxis,setStoreAxis,storeGroup,se
               variant={selectedStoreItems.has(opt) ? 'filled' : 'outlined'}
               onClick={()=>toggleStoreItem(opt)}
               size="small"
+              style={{
+                backgroundColor: getRelatedStoreItems.has(opt) && !selectedStoreItems.has(opt) ? '#e1f5fe' : undefined
+              }}
             />
           ))}
           {hasMoreStoreChips && !showAllStoreChips && (

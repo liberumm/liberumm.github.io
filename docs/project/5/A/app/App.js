@@ -202,60 +202,34 @@ function App(){
   const idx = React.useMemo(()=> buildIndexes(SALES, PRODUCTS), [SALES, PRODUCTS]);
 
   const trend = React.useMemo(()=>{
-    const scopeItems = PRODUCTS.slice(0, 150);
-    const scopedStoreIds = new Set(targetStoreIds);
-    scopedStoreIds._all = (scopedStoreIds.size===STORES.length);
-
     const useBuckets = (viewMode==='detail') ? buckets : buckets.slice(-2);
-
-    // inventory-aware series: simulate per-product inventory consumption across buckets
-    const series = useBuckets.map(_=>0);
-    // prepare remaining inventory per product (across target stores)
-    const remainingByProd = {};
-    scopeItems.forEach(p=>{
-      remainingByProd[p.id] = (INVENTORY || []).filter(i=> i.productId===p.id && targetStoreIds.has(i.storeId)).reduce((a,c)=>a+c.qty,0);
-    });
-
-    // for each bucket in time order, compute expected sales based on past units,
-    // but cap by remaining inventory (so sales stop when inventory exhausted)
-    for(let bi=0; bi<useBuckets.length; bi++){
-      const b = useBuckets[bi];
-      let bucketTotal = 0;
-      scopeItems.forEach(p=>{
-        let expected = 0;
-        if(scopedStoreIds._all){
-          expected = sumUnits(idx.idxByProductDate, p.id, b.start, b.end);
+    
+    // シンプルな実販売データ集計
+    const series = useBuckets.map(b=>{
+      let total = 0;
+      PRODUCTS.forEach(p=>{
+        if(targetStoreIds.size === STORES.length){
+          const units = sumUnits(idx.idxByProductDate, p.id, b.start, b.end);
+          if(metric==='units') total += units;
+          else if(metric==='revenue') total += sumRevenue(idx.idxByProductDate, p.id, b.start, b.end);
+          else total += units * (p.price - Math.round(p.price*0.6));
         } else {
-          Array.from(scopedStoreIds).forEach(sid=> expected += sumUnitsByStore(idx.idxByProductStoreDate, p.id, sid, b.start, b.end));
+          Array.from(targetStoreIds).forEach(sid=>{
+            const units = sumUnitsByStore(idx.idxByProductStoreDate, p.id, sid, b.start, b.end);
+            if(metric==='units') total += units;
+            else if(metric==='revenue') total += units * p.price;
+            else total += units * (p.price - Math.round(p.price*0.6));
+          });
         }
-
-        const avail = Math.max(0, remainingByProd[p.id] || 0);
-        const sold = Math.min(avail, expected);
-        // decrement remaining inventory
-        remainingByProd[p.id] = Math.max(0, avail - sold);
-
-        if(metric==='units') bucketTotal += sold;
-        else if(metric==='revenue') bucketTotal += sold * p.price;
-        else bucketTotal += sold * (p.price - Math.round(p.price*0.6));
       });
-      series[bi] = bucketTotal;
-    }
-
-    const itemSet = new Set(scopeItems.map(p=>p.id));
-    const initialInvTotal = INVENTORY
-      .filter(i=> itemSet.has(i.productId) && targetStoreIds.has(i.storeId))
-      .reduce((a,c)=>a+c.qty,0);
-
-    const invByBucketEnd = useBuckets.map(b=>{
-      let sold=0;
-      scopeItems.forEach(p=>{
-        if(scopedStoreIds._all) sold += sumUnits(idx.idxByProductDate, p.id, range.start, b.end);
-        else Array.from(scopedStoreIds).forEach(sid=> sold += sumUnitsByStore(idx.idxByProductStoreDate, p.id, sid, range.start, b.end));
-      });
-      return Math.max(0, initialInvTotal - sold);
+      return total;
     });
 
-    return { labels: useBuckets.map(b=>b.label), series, inventorySeries: invByBucketEnd };
+    // 在庫推移（簡易版）
+    const totalInv = INVENTORY.filter(i=> targetStoreIds.has(i.storeId)).reduce((a,c)=>a+c.qty,0);
+    const inventorySeries = useBuckets.map(()=> totalInv); // 簡易的に固定値
+
+    return { labels: useBuckets.map(b=>b.label), series, inventorySeries };
   },[buckets, viewMode, range, targetStoreIds, metric, PRODUCTS, INVENTORY, idx]);
 
   const [events, setEvents] = React.useState(()=> window.INIT_EVENTS ? window.INIT_EVENTS.slice() : []);
@@ -293,7 +267,9 @@ function App(){
           <Paper variant="outlined" sx={{ p:1.5, minHeight: isSm ? 240 : '35vh' }}>
             <RevenueChartDetailed
               labels={trend.labels}
-              data={trend.series}
+              data={selectedRow && selectedRow.byBucket ? 
+                (viewMode === 'detail' ? selectedRow.byBucket : selectedRow.byBucket.slice(-2)) : 
+                trend.series}
               inventory={trend.inventorySeries}
               selected={selectedRow}
               metric={metric}
@@ -438,157 +414,68 @@ function App(){
         </Section>
 
         {/* アクションモーダル */}
-        {actionModal.type === '移管' ? (
-          // 小画面では fullScreen にする
-          <Dialog open={actionModal.open} onClose={closeActionModal} maxWidth="xl" fullWidth fullScreen={isSm}>
-            <DialogTitle>移管計画 - {actionModal.row?.label || actionModal.row?.itemName || ''}</DialogTitle>
-            <DialogContent>
-              <Grid container spacing={2} sx={{mb:1}}>
-                <Grid item xs={12} md={4}>
-                  <TextField label="対象店舗（名前でフィルタ）" value={transferFilterStore} onChange={(e)=>setTransferFilterStore(e.target.value)} fullWidth size="small" />
-                </Grid>
-                <Grid item xs={12} md={4}>
-                  <TextField label="対象期間開始" type="date" InputLabelProps={{shrink:true}} value={transferFilterStart} onChange={(e)=>setTransferFilterStart(e.target.value)} fullWidth size="small" />
-                </Grid>
-                <Grid item xs={12} md={4}>
-                  <TextField label="対象期間終了" type="date" InputLabelProps={{shrink:true}} value={transferFilterEnd} onChange={(e)=>setTransferFilterEnd(e.target.value)} fullWidth size="small" />
-                </Grid>
-              </Grid>
-              <window.TransferPlanner 
-                range={range} 
-                targetStoreIds={targetStoreIds}
-                gapThreshold={0.08}
-                minMove={5}
-                skuFilter={actionModal.row?.items?.[0]?.sku || ''}
-                storeNameFilter={transferFilterStore}
-                windowStart={transferFilterStart}
-                windowEnd={transferFilterEnd}
-                onApplyPlan={(plan) => {
-                  // 直接登録せずプレビューしてから登録する
-                  setPlanPreview(plan || []);
-                  setShowPlanPreview(true);
-                }}
-              />
-            </DialogContent>
-          </Dialog>
-        ) : (
-          // 汎用アクションモーダルも小画面で fullScreen に（可読性向上）
-          <Dialog open={actionModal.open} onClose={closeActionModal} maxWidth="xl" fullWidth fullScreen={isSm}>
-            <DialogTitle>{actionModal.type || ''} - {actionModal.row?.label || actionModal.row?.itemName || ''}</DialogTitle>
-            <DialogContent dividers>
-              {/* KPI cards */}
-              <Grid container spacing={1} sx={{mb:1}}>
-                <Grid item xs={12} md={3}>
-                  <Card variant="outlined"><CardContent>
-                    <div className="mini">直近売上（直近28日）</div>
-                    <div style={{fontWeight:700}}>{(actionModal.row?.totalSales||0).toLocaleString()}</div>
-                  </CardContent></Card>
-                </Grid>
-                <Grid item xs={12} md={3}>
-                  <Card variant="outlined"><CardContent>
-                    <div className="mini">今後予測売上（28日先）</div>
-                    <div style={{fontWeight:700}}>{(actionModal.row?.forecastSales||'—')}</div>
-                  </CardContent></Card>
-                </Grid>
-                <Grid item xs={12} md={3}>
-                  <Card variant="outlined"><CardContent>
-                    <div className="mini">理想売上（配分ベース）</div>
-                    <div style={{fontWeight:700}}>{(actionModal.row?.idealSales||'—')}</div>
-                  </CardContent></Card>
-                </Grid>
-                <Grid item xs={12} md={3}>
-                  <Card variant="outlined"><CardContent>
-                    <div className="mini">理想販売終了日 / 実販売終了日</div>
-                    <div style={{fontWeight:700}}>{(actionModal.row?.idealEnd||'—')} / {(actionModal.row?.forecastEnd||'—')}</div>
-                  </CardContent></Card>
-                </Grid>
-              </Grid>
+        {actionModal.type === '移管' && (
+          <window.TransferPlannerModal
+            open={actionModal.open}
+            onClose={closeActionModal}
+            modalTitle={`移管計画 - ${actionModal.row?.label || actionModal.row?.itemName || ''}`}
+            range={range}
+            targetStoreIds={targetStoreIds}
+            gapThreshold={0.08}
+            minMove={5}
+            skuFilter={actionModal.row?.items?.[0]?.sku || ''}
+            storeNameFilter={transferFilterStore}
+            windowStart={transferFilterStart}
+            windowEnd={transferFilterEnd}
+            onApplyPlan={(plan) => {
+              setPlanPreview(plan || []);
+              setShowPlanPreview(true);
+            }}
+          />
+        )}
 
-              {/* Form fields differ by action type */}
-              { (actionModal.type === '発注') && (
-                <window.OrderModal
-                  batchRows={batchRows}
-                  actionForm={actionForm}
-                  setActionForm={setActionForm}
-                  checkedRows={checkedRows}
-                  setCheckedRows={setCheckedRows}
-                  onOpenTransfer={(row)=> setActionModal({open:true, type:'移管', row: {...row, label: row.name, sku: row.sku, totalInv: row.invQty}, transfers: actionModal.transfers})}
-                  onSubmitBatch={(mode)=>{
-                    const rows = batchRows.map(r=>({ sku: r.sku, productId: r.productId, desiredQty: actionForm.rows?.[r.sku]?.desiredQty, desiredDate: actionForm.rows?.[r.sku]?.desiredDate, plannedQty: actionForm.rows?.[r.sku]?.plannedQty, plannedDate: actionForm.rows?.[r.sku]?.plannedDate, confirmer: actionForm.rows?.[r.sku]?.confirmer, byStore: actionForm.rows?.[r.sku]?.byStore }));
-                    addTask({ type: '発注', rowLabel: `${rows.length}件`, detail: { rows } }, mode==='承認' ? 'approved' : 'hq_pending');
-                    closeActionModal();
-                  }}
-                  stores={STORES}
-                  targetStoreIds={targetStoreIds}
-                />
-              )}
+        {actionModal.type === '発注' && (
+          <window.OrderModalDialog
+            open={actionModal.open}
+            onClose={closeActionModal}
+            modalTitle={`発注一括処理 - ${actionModal.row?.label || actionModal.row?.itemName || ''}`}
+            row={actionModal.row}
+            batchRows={batchRows}
+            actionForm={actionForm}
+            setActionForm={setActionForm}
+            checkedRows={checkedRows}
+            setCheckedRows={setCheckedRows}
+            onOpenTransfer={(row)=> setActionModal({open:true, type:'移管', row: {...row, label: row.name, sku: row.sku, totalInv: row.invQty}, transfers: actionModal.transfers})}
+            onSubmitBatch={(mode)=>{
+              const rows = batchRows.map(r=>({ sku: r.sku, productId: r.productId, desiredQty: actionForm.rows?.[r.sku]?.desiredQty, desiredDate: actionForm.rows?.[r.sku]?.desiredDate, plannedQty: actionForm.rows?.[r.sku]?.plannedQty, plannedDate: actionForm.rows?.[r.sku]?.plannedDate, confirmer: actionForm.rows?.[r.sku]?.confirmer, byStore: actionForm.rows?.[r.sku]?.byStore }));
+              addTask({ type: '発注', rowLabel: `${rows.length}件`, detail: { rows } }, mode==='承認' ? 'approved' : 'hq_pending');
+              closeActionModal();
+            }}
+            stores={STORES}
+            targetStoreIds={targetStoreIds}
+          />
+        )}
 
-              { (actionModal.type === '値下') && (
-                <window.MarkdownModal
-                  batchRows={batchRows}
-                  actionForm={actionForm}
-                  setActionForm={setActionForm}
-                  checkedRows={checkedRows}
-                  setCheckedRows={setCheckedRows}
-                  onOpenTransfer={(row)=> setActionModal({open:true, type:'移管', row: {...row, label: row.name, sku: row.sku, totalInv: row.invQty}, transfers: actionModal.transfers})}
-                  onSubmitBatch={(mode)=>{
-                    const rows = batchRows.map(r=>({ sku: r.sku, productId: r.productId, qty: actionForm.rows?.[r.sku]?.qty, discountAmount: actionForm.rows?.[r.sku]?.discountAmount, newPrice: actionForm.rows?.[r.sku]?.newPrice, byStore: actionForm.rows?.[r.sku]?.byStore }));
-                    addTask({ type: '値下', rowLabel: `${rows.length}件`, detail: { rows } }, mode==='承認' ? 'approved' : 'hq_pending');
-                    closeActionModal();
-                  }}
-                  stores={STORES}
-                  targetStoreIds={targetStoreIds}
-                />
-              )}
-
-              {actionModal.type === '移管' && (
-                <Grid container spacing={2}>
-                  <Grid item xs={12} md={3}><TextField label="ステータス" value={actionForm.status||'下書き'} fullWidth size="small"/></Grid>
-                  <Grid item xs={12} md={3}><TextField label="アイテムコード" value={actionForm.itemCode||''} fullWidth size="small"/></Grid>
-                  <Grid item xs={12} md={2}><TextField label="SKU" value={actionForm.sku||''} fullWidth size="small"/></Grid>
-                  <Grid item xs={12} md={4}><TextField label="商品名" value={actionForm.name||''} fullWidth size="small"/></Grid>
-                  <Grid item xs={12} md={2}><TextField label="数量" value={actionForm.qty||0} onChange={(e)=>setActionForm({...actionForm, qty:e.target.value})} fullWidth size="small"/></Grid>
-                  <Grid item xs={12} md={2}><TextField label="希望数量" value={actionForm.desiredQty||''} onChange={(e)=>setActionForm({...actionForm, desiredQty:e.target.value})} fullWidth size="small"/></Grid>
-                  <Grid item xs={12} md={3}><TextField label="移管先" value={actionForm.toStore||''} onChange={(e)=>setActionForm({...actionForm, toStore:e.target.value})} fullWidth size="small"/></Grid>
-                  <Grid item xs={12} md={3}><TextField label="確認者" value={actionForm.confirmer||''} onChange={(e)=>setActionForm({...actionForm, confirmer:e.target.value})} fullWidth size="small"/></Grid>
-                  <Grid item xs={12} md={3}><TextField label="確認日" type="date" InputLabelProps={{shrink:true}} value={actionForm.confirmDate||''} onChange={(e)=>setActionForm({...actionForm, confirmDate:e.target.value})} fullWidth size="small"/></Grid>
-                </Grid>
-              )}
-
-            </DialogContent>
-            <DialogActions>
-              {/* Buttons: Cancel, Auto-calc (移管), Register variants */}
-              {actionModal.type === '移管' && <Button onClick={()=>{
-                // 自動計算：簡易的に TransferPlanner を再-open（ユーザーが呼べるよう誘導）
-                setActionModal({open:true,type:'移管',row:actionModal.row, transfers: actionModal.transfers});
-              }}>自動計算</Button>}
-              <Button onClick={closeActionModal}>キャンセル</Button>
-              <Button variant="outlined" onClick={()=>{
-                // 登録（店舗申請）
-                const detail = {...actionForm};
-                addTask({ type: actionModal.type || 'その他', rowLabel: actionModal.row?.label, detail }, 'hq_pending');
-                closeActionModal();
-              }}>登録（申請）</Button>
-              <Button variant="contained" color="success" onClick={()=>{
-                // 承認（本部）
-                const detail = {...actionForm};
-                addTask({ type: actionModal.type || 'その他', rowLabel: actionModal.row?.label, detail }, 'approved');
-                closeActionModal();
-              }}>承認（本部）</Button>
-              <Button variant="outlined" color="inherit" onClick={()=>{
-                // 差戻（本部）
-                const detail = {...actionForm};
-                addTask({ type: actionModal.type || 'その他', rowLabel: actionModal.row?.label, detail }, 'open');
-                closeActionModal();
-              }}>差戻（本部）</Button>
-              <Button variant="text" color="error" onClick={()=>{
-                // 取下（店舗）
-                const detail = {...actionForm};
-                addTask({ type: actionModal.type || 'その他', rowLabel: actionModal.row?.label, detail }, 'skipped');
-                closeActionModal();
-              }}>取下（店舗）</Button>
-            </DialogActions>
-          </Dialog>
+        {actionModal.type === '値下' && (
+          <window.MarkdownModalDialog
+            open={actionModal.open}
+            onClose={closeActionModal}
+            modalTitle={`値下げ一括処理 - ${actionModal.row?.label || actionModal.row?.itemName || ''}`}
+            row={actionModal.row}
+            batchRows={batchRows}
+            actionForm={actionForm}
+            setActionForm={setActionForm}
+            checkedRows={checkedRows}
+            setCheckedRows={setCheckedRows}
+            onOpenTransfer={(row)=> setActionModal({open:true, type:'移管', row: {...row, label: row.name, sku: row.sku, totalInv: row.invQty}, transfers: actionModal.transfers})}
+            onSubmitBatch={(mode)=>{
+              const rows = batchRows.map(r=>({ sku: r.sku, productId: r.productId, qty: actionForm.rows?.[r.sku]?.qty, discountAmount: actionForm.rows?.[r.sku]?.discountAmount, newPrice: actionForm.rows?.[r.sku]?.newPrice, byStore: actionForm.rows?.[r.sku]?.byStore }));
+              addTask({ type: '値下', rowLabel: `${rows.length}件`, detail: { rows } }, mode==='承認' ? 'approved' : 'hq_pending');
+              closeActionModal();
+            }}
+            stores={STORES}
+            targetStoreIds={targetStoreIds}
+          />
         )}
 
         {/* やることリスト */}
