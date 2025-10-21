@@ -8,207 +8,63 @@ window.ActionPanel = (function(){
 
   function Panel(props){
     const {
-      filterAction, setFilterAction,
-      searchTerm, setSearchTerm,
-      columnFilters, setColumnFilters,
-      checkedRows, setCheckedRows,
-      onClear,
-      onSearch // 🔍 検索ボタン押下時の処理を外部から渡せるように
+      openActionModal,
+      searchTerm,
+      setSearchTerm,
+      onSearch,
+      onClear
     } = props;
 
-    // クリアボタン動作
-    const handleClear = () => {
-      if (typeof onClear === "function") {
-        onClear();
-        return;
-      }
-      setFilterAction?.("all");
-      setSearchTerm?.("");
-      setColumnFilters?.({});
-      setCheckedRows?.(new Set());
+    const [localSearchTerm, setLocalSearchTerm] = React.useState('');
+
+    const open = (type) => {
+      if(typeof openActionModal === 'function') openActionModal(type, null);
+      else console.log('openActionModal not provided', type);
     };
 
-    // 検索ボタン動作
     const handleSearch = () => {
-      if (typeof onSearch === "function") {
-        onSearch(searchTerm);
-      } else {
-        console.log("検索:", searchTerm);
-      }
+      if(typeof setSearchTerm === 'function') setSearchTerm(localSearchTerm);
+      if(typeof onSearch === 'function') onSearch(localSearchTerm);
+      else console.log('検索:', localSearchTerm);
+    };
+
+    const handleClear = () => {
+      setLocalSearchTerm('');
+      if(typeof onClear === 'function') onClear();
+      else if(typeof setSearchTerm === 'function') setSearchTerm('');
     };
 
     return (
       <Paper variant="outlined" sx={{ p: 1 }}>
-        <Grid container spacing={1} alignItems="center">
-          {/* --- アクションボタン群 --- */}
-          <Grid item xs={3} sm={2} md={2}>
-            <Button
-              fullWidth
-              variant={filterAction === "all" ? "contained" : "outlined"}
-              onClick={() => setFilterAction?.("all")}
-            >
-              すべて
-            </Button>
-          </Grid>
-
-          <Grid item xs={3} sm={2} md={1}>
-            <Button
-              fullWidth
-              color="primary"
-              variant={filterAction === "発注" ? "contained" : "outlined"}
-              onClick={() => setFilterAction?.("発注")}
-            >
-              発注
-            </Button>
-          </Grid>
-
-          <Grid item xs={3} sm={2} md={1}>
-            <Button
-              fullWidth
-              color="warning"
-              variant={filterAction === "移管" ? "contained" : "outlined"}
-              onClick={() => setFilterAction?.("移管")}
-            >
-              移管
-            </Button>
-          </Grid>
-
-          <Grid item xs={3} sm={2} md={1}>
-            <Button
-              fullWidth
-              color="error"
-              variant={filterAction === "値下" ? "contained" : "outlined"}
-              onClick={() => setFilterAction?.("値下")}
-            >
-              値下
-            </Button>
-          </Grid>
-
-          {/* --- 分類フィルタ群 --- */}
-          <Grid item xs={4} sm={2} md={1}>
+        {/* 1段目: テキストフィールド、検索、クリア */}
+        <Grid container spacing={1} alignItems="center" sx={{ mb: 1 }}>
+          <Grid item xs={8} sm={8} md={10}>
             <TextField
               fullWidth
               size="small"
-              label="部門"
-              value={columnFilters?.dept || ""}
-              onChange={(e) =>
-                setColumnFilters?.((prev) => ({ ...prev, dept: e.target.value }))
-              }
-              placeholder="例）70衣料"
+              placeholder="商品コード／名称で検索"
+              value={localSearchTerm}
+              onChange={(e) => setLocalSearchTerm(e.target.value)}
             />
           </Grid>
-
-          <Grid item xs={4} sm={2} md={1}>
-            <TextField
-              fullWidth
-              size="small"
-              label="コーナー"
-              value={columnFilters?.corner || ""}
-              onChange={(e) =>
-                setColumnFilters?.((prev) => ({
-                  ...prev,
-                  corner: e.target.value,
-                }))
-              }
-              placeholder="例）070 レディス"
-            />
-          </Grid>
-
-          <Grid item xs={4} sm={2} md={1}>
-            <TextField
-              fullWidth
-              size="small"
-              label="ライン"
-              value={columnFilters?.line || ""}
-              onChange={(e) =>
-                setColumnFilters?.((prev) => ({
-                  ...prev,
-                  line: e.target.value,
-                }))
-              }
-              placeholder="例）001 ベーシック"
-            />
-          </Grid>
-
-          <Grid item xs={4} sm={2} md={1}>
-            <TextField
-              fullWidth
-              size="small"
-              label="カテゴリ"
-              value={columnFilters?.category || ""}
-              onChange={(e) =>
-                setColumnFilters?.((prev) => ({
-                  ...prev,
-                  category: e.target.value,
-                }))
-              }
-              placeholder="例）0001 トップス"
-            />
-          </Grid>
-
-          <Grid item xs={4} sm={2} md={1}>
-            <TextField
-              fullWidth
-              size="small"
-              label="アイテム"
-              value={columnFilters?.item || ""}
-              onChange={(e) =>
-                setColumnFilters?.((prev) => ({
-                  ...prev,
-                  item: e.target.value,
-                }))
-              }
-              placeholder="例）Tシャツ"
-            />
-          </Grid>
-
-          <Grid item xs={4} sm={2} md={1}>
-            <TextField
-              fullWidth
-              size="small"
-              label="SKU"
-              value={columnFilters?.sku || ""}
-              onChange={(e) =>
-                setColumnFilters?.((prev) => ({
-                  ...prev,
-                  sku: e.target.value,
-                }))
-              }
-              placeholder="例）1234-5678-01"
-            />
-          </Grid>
-
-          {/* --- 検索エリア（テキスト + ボタン） --- */}
-          <Grid item xs={8} sm={4} md={4}>
-            <TextField
-              fullWidth
-              size="small"
-              placeholder="商品検索（コード／名称）"
-              value={searchTerm || ""}
-              onChange={(e) => setSearchTerm?.(e.target.value)}
-              onKeyDown={(e) => {
-                if (e.key === "Enter") handleSearch();
-              }}
-            />
-          </Grid>
-
           <Grid item xs={2} sm={2} md={1}>
-            <Button
-              fullWidth
-              variant="contained"
-              color="primary"
-              onClick={handleSearch}
-              sx={{ whiteSpace: "nowrap" }}
-            >
-              検索
-            </Button>
+            <Button variant="contained" onClick={handleSearch} fullWidth>検索</Button>
           </Grid>
-
-          {/* --- クリアボタン --- */}
           <Grid item xs={2} sm={2} md={1}>
-            <Button fullWidth variant="outlined" onClick={handleClear}>
-              クリア
-            </Button>
+            <Button variant="outlined" onClick={handleClear} fullWidth>クリア</Button>
+          </Grid>
+        </Grid>
+        
+        {/* 2段目: 発注、移管、値下 */}
+        <Grid container spacing={1}>
+          <Grid item xs={4} sm={4} md={4}>
+            <Button color="primary" variant="contained" onClick={() => open('発注')} fullWidth>発注</Button>
+          </Grid>
+          <Grid item xs={4} sm={4} md={4}>
+            <Button color="warning" variant="contained" onClick={() => open('移管')} fullWidth>移管</Button>
+          </Grid>
+          <Grid item xs={4} sm={4} md={4}>
+            <Button color="error" variant="contained" onClick={() => open('値下')} fullWidth>値下</Button>
           </Grid>
         </Grid>
       </Paper>

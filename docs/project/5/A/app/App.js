@@ -327,14 +327,10 @@ function App(){
         {/* アクション操作：検索/アクション絞り/列フィルタ */}
         <Section title="アクション操作" icon="bolt">
           <window.ActionPanel.Panel
-            filterAction={filterAction}
-            setFilterAction={setFilterAction}
+            openActionModal={openActionModal}
             searchTerm={searchTerm}
             setSearchTerm={setSearchTerm}
-            columnFilters={columnFilters}
-            setColumnFilters={setColumnFilters}
-            checkedRows={checkedRows}
-            setCheckedRows={setCheckedRows}
+            onSearch={(term)=> setSearchTerm(term)}
             onClear={handleClearActions}
           />
         </Section>

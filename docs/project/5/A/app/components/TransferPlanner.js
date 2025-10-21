@@ -163,6 +163,15 @@
     const [planEdits, setPlanEdits] = React.useState({});
     const [globalPlan, setGlobalPlan] = React.useState([]);
     const [showPreview, setShowPreview] = React.useState(false);
+    
+    // プレビュー用フィルター・ソート・チェック
+    const [previewFilters, setPreviewFilters] = React.useState({
+      sku: '', itemName: '', price: '', fromStore: '', invQty: '', qty: '', toStore: ''
+    });
+    const [sortField, setSortField] = React.useState('');
+    const [sortOrder, setSortOrder] = React.useState('asc');
+    const [previewChecked, setPreviewChecked] = React.useState(new Set());
+    const [previewAllChecked, setPreviewAllChecked] = React.useState(true);
 
     const storeIds = React.useMemo(()=>{
       const q = (storeNameFilter||'').trim().toLowerCase();
@@ -1013,31 +1022,75 @@
                       <Table size="small">
                         <TableHead>
                           <TableRow>
-                            <TableCell>店舗</TableCell>
-                            <TableCell align="right">Before</TableCell>
-                            <TableCell align="right">After</TableCell>
-                            <TableCell align="right">差分</TableCell>
+                            <TableCell align="right">NO</TableCell>
+                            <TableCell>店舗名</TableCell>
+                            <TableCell align="right">販売数量（28日）</TableCell>
+                            <TableCell align="right">在庫数量</TableCell>
+                            <TableCell align="right">払出数</TableCell>
+                            <TableCell align="right">払出店舗数</TableCell>
+                            <TableCell align="right">受入数</TableCell>
+                            <TableCell align="right">受入店舗数</TableCell>
+                            <TableCell align="right">在庫数量</TableCell>
                           </TableRow>
                         </TableHead>
                         <TableBody>
-                          {storeIds.map(sid=>{
-                            const before = storeBefore[sid]||0;
-                            const after = storeAfter[sid]||0;
-                            const diff = after - before;
-                            const name = STORES.find(s=>String(s.id)===sid)?.name || sid;
-                            return (
-                              <TableRow key={sid}>
-                                <TableCell style={{fontWeight:600}}>{name}</TableCell>
-                                <TableCell align="right">{before.toLocaleString()}</TableCell>
-                                <TableCell align="right" style={{fontWeight:700}}>{after.toLocaleString()}</TableCell>
-                                <TableCell align="right" style={{color: diff>0? '#2e7d32' : diff<0? '#c62828' : '#666'}}>
-                                  {diff>0?'+':''}{diff.toLocaleString()}
-                                </TableCell>
-                              </TableRow>
-                            );
-                          })}
+                          {(() => {
+                            // 店舗別の販売数量を計算
+                            const storeSales = {};
+                            rows.forEach(r => {
+                              Object.keys(r.salesByStore || {}).forEach(sid => {
+                                storeSales[sid] = (storeSales[sid] || 0) + (r.salesByStore[sid] || 0);
+                              });
+                            });
+                            
+                            // 店舗別の払出・受入情報を計算
+                            const storeTransfers = {};
+                            globalPlan.forEach(p => {
+                              // 払出（From）
+                              if (!storeTransfers[p.fromStoreId]) {
+                                storeTransfers[p.fromStoreId] = { payoutQty: 0, payoutStores: new Set(), receiveQty: 0, receiveStores: new Set() };
+                              }
+                              storeTransfers[p.fromStoreId].payoutQty += p.qty;
+                              storeTransfers[p.fromStoreId].payoutStores.add(p.toStoreId);
+                              
+                              // 受入（To）
+                              if (!storeTransfers[p.toStoreId]) {
+                                storeTransfers[p.toStoreId] = { payoutQty: 0, payoutStores: new Set(), receiveQty: 0, receiveStores: new Set() };
+                              }
+                              storeTransfers[p.toStoreId].receiveQty += p.qty;
+                              storeTransfers[p.toStoreId].receiveStores.add(p.fromStoreId);
+                            });
+                            
+                            return storeIds.map((sid, index) => {
+                              const before = storeBefore[sid] || 0;
+                              const after = storeAfter[sid] || 0;
+                              const sales = storeSales[sid] || 0;
+                              const name = STORES.find(s => String(s.id) === sid)?.name || sid;
+                              const transfers = storeTransfers[sid] || { payoutQty: 0, payoutStores: new Set(), receiveQty: 0, receiveStores: new Set() };
+                              
+                              return (
+                                <TableRow key={sid}>
+                                  <TableCell align="right">{index + 1}</TableCell>
+                                  <TableCell style={{fontWeight:600}}>{name}</TableCell>
+                                  <TableCell align="right">{sales.toLocaleString()}</TableCell>
+                                  <TableCell align="right">{before.toLocaleString()}</TableCell>
+                                  <TableCell align="right" style={{color: transfers.payoutQty > 0 ? '#d32f2f' : '#666'}}>
+                                    {transfers.payoutQty.toLocaleString()}
+                                  </TableCell>
+                                  <TableCell align="right">{transfers.payoutStores.size}</TableCell>
+                                  <TableCell align="right" style={{color: transfers.receiveQty > 0 ? '#2e7d32' : '#666'}}>
+                                    {transfers.receiveQty.toLocaleString()}
+                                  </TableCell>
+                                  <TableCell align="right">{transfers.receiveStores.size}</TableCell>
+                                  <TableCell align="right" style={{fontWeight:700, backgroundColor: after !== before ? '#f0f9ff' : 'transparent'}}>
+                                    {after.toLocaleString()}
+                                  </TableCell>
+                                </TableRow>
+                              );
+                            });
+                          })()}
                           {!storeIds.length && (
-                            <TableRow><TableCell colSpan={4} align="center" style={{color:'#888'}}>該当する店舗データなし</TableCell></TableRow>
+                            <TableRow><TableCell colSpan={9} align="center" style={{color:'#888'}}>該当する店舗データなし</TableCell></TableRow>
                           )}
                         </TableBody>
                       </Table>
@@ -1047,22 +1100,232 @@
                   <div style={{maxHeight: '40vh', overflowY:'auto'}}>
                     <Table size="small">
                       <TableHead>
+                        {/* ヘッダー行 */}
                         <TableRow>
-                          <TableCell>SKU</TableCell>
-                          <TableCell>From</TableCell>
-                          <TableCell>To</TableCell>
-                          <TableCell align="right">Qty</TableCell>
+                          <TableCell padding="checkbox">
+                            <Checkbox 
+                              size="small" 
+                              checked={previewAllChecked}
+                              onChange={(e) => {
+                                const checked = e.target.checked;
+                                setPreviewAllChecked(checked);
+                                if (checked) {
+                                  setPreviewChecked(new Set(globalPlan.map((p,i) => i)));
+                                } else {
+                                  setPreviewChecked(new Set());
+                                }
+                              }}
+                            />
+                          </TableCell>
+                          <TableCell align="right" onClick={()=>handleSort('no')} style={{cursor:'pointer'}}>NO {sortField==='no'&&(sortOrder==='asc'?'↑':'↓')}</TableCell>
+                          <TableCell onClick={()=>handleSort('sku')} style={{cursor:'pointer'}}>SKU {sortField==='sku'&&(sortOrder==='asc'?'↑':'↓')}</TableCell>
+                          <TableCell onClick={()=>handleSort('itemName')} style={{cursor:'pointer'}}>アイテム名 {sortField==='itemName'&&(sortOrder==='asc'?'↑':'↓')}</TableCell>
+                          <TableCell align="right" onClick={()=>handleSort('price')} style={{cursor:'pointer'}}>売価 {sortField==='price'&&(sortOrder==='asc'?'↑':'↓')}</TableCell>
+                          <TableCell onClick={()=>handleSort('fromStore')} style={{cursor:'pointer'}}>移管元 {sortField==='fromStore'&&(sortOrder==='asc'?'↑':'↓')}</TableCell>
+                          <TableCell align="right" onClick={()=>handleSort('invQty')} style={{cursor:'pointer'}}>在庫数量 {sortField==='invQty'&&(sortOrder==='asc'?'↑':'↓')}</TableCell>
+                          <TableCell align="right" onClick={()=>handleSort('qty')} style={{cursor:'pointer'}}>移管数量 {sortField==='qty'&&(sortOrder==='asc'?'↑':'↓')}</TableCell>
+                          <TableCell onClick={()=>handleSort('toStore')} style={{cursor:'pointer'}}>移管先 {sortField==='toStore'&&(sortOrder==='asc'?'↑':'↓')}</TableCell>
+                          <TableCell align="right" style={{backgroundColor:'#fff3e0'}}>払出販売数(28日)</TableCell>
+                          <TableCell align="right" style={{backgroundColor:'#fff3e0'}}>払出元在庫数</TableCell>
+                          <TableCell align="right" style={{backgroundColor:'#fff3e0'}}>払出移管後在庫</TableCell>
+                          <TableCell align="right" style={{backgroundColor:'#e3f2fd'}}>受入販売数(28日)</TableCell>
+                          <TableCell align="right" style={{backgroundColor:'#e3f2fd'}}>受入元在庫数</TableCell>
+                          <TableCell align="right" style={{backgroundColor:'#e3f2fd'}}>受入移管後在庫</TableCell>
+                        </TableRow>
+                        
+                        {/* フィルター行 */}
+                        <TableRow>
+                          <TableCell padding="checkbox"></TableCell>
+                          <TableCell></TableCell>
+                          <TableCell>
+                            <TextField
+                              size="small"
+                              placeholder="SKU"
+                              value={previewFilters.sku}
+                              onChange={(e)=>setPreviewFilters(prev=>({...prev, sku:e.target.value}))}
+                              style={{width:'100%', minWidth:80}}
+                            />
+                          </TableCell>
+                          <TableCell>
+                            <TextField
+                              size="small"
+                              placeholder="アイテム名"
+                              value={previewFilters.itemName}
+                              onChange={(e)=>setPreviewFilters(prev=>({...prev, itemName:e.target.value}))}
+                              style={{width:'100%', minWidth:100}}
+                            />
+                          </TableCell>
+                          <TableCell>
+                            <TextField
+                              size="small"
+                              placeholder="売価"
+                              value={previewFilters.price}
+                              onChange={(e)=>setPreviewFilters(prev=>({...prev, price:e.target.value}))}
+                              style={{width:'100%', minWidth:70}}
+                            />
+                          </TableCell>
+                          <TableCell>
+                            <TextField
+                              size="small"
+                              placeholder="移管元"
+                              value={previewFilters.fromStore}
+                              onChange={(e)=>setPreviewFilters(prev=>({...prev, fromStore:e.target.value}))}
+                              style={{width:'100%', minWidth:80}}
+                            />
+                          </TableCell>
+                          <TableCell>
+                            <TextField
+                              size="small"
+                              placeholder="在庫数量"
+                              value={previewFilters.invQty}
+                              onChange={(e)=>setPreviewFilters(prev=>({...prev, invQty:e.target.value}))}
+                              style={{width:'100%', minWidth:70}}
+                            />
+                          </TableCell>
+                          <TableCell>
+                            <TextField
+                              size="small"
+                              placeholder="移管数量"
+                              value={previewFilters.qty}
+                              onChange={(e)=>setPreviewFilters(prev=>({...prev, qty:e.target.value}))}
+                              style={{width:'100%', minWidth:70}}
+                            />
+                          </TableCell>
+                          <TableCell>
+                            <TextField
+                              size="small"
+                              placeholder="移管先"
+                              value={previewFilters.toStore}
+                              onChange={(e)=>setPreviewFilters(prev=>({...prev, toStore:e.target.value}))}
+                              style={{width:'100%', minWidth:80}}
+                            />
+                          </TableCell>
+                          <TableCell style={{backgroundColor:'#fff3e0'}}></TableCell>
+                          <TableCell style={{backgroundColor:'#fff3e0'}}></TableCell>
+                          <TableCell style={{backgroundColor:'#fff3e0'}}></TableCell>
+                          <TableCell style={{backgroundColor:'#e3f2fd'}}></TableCell>
+                          <TableCell style={{backgroundColor:'#e3f2fd'}}></TableCell>
+                          <TableCell style={{backgroundColor:'#e3f2fd'}}></TableCell>
                         </TableRow>
                       </TableHead>
                       <TableBody>
-                        {globalPlan.map((p,i)=>(
-                          <TableRow key={i}>
-                            <TableCell>{p.sku}</TableCell>
-                            <TableCell>{p.fromStore}</TableCell>
-                            <TableCell>{p.toStore}</TableCell>
-                            <TableCell align="right">{p.qty}</TableCell>
-                          </TableRow>
-                        ))}
+                        {(() => {
+                          const handleSort = (field) => {
+                            if (sortField === field) {
+                              setSortOrder(sortOrder === 'asc' ? 'desc' : 'asc');
+                            } else {
+                              setSortField(field);
+                              setSortOrder('asc');
+                            }
+                          };
+                          
+                          let filteredPlan = globalPlan.filter(p => {
+                            const product = PRODUCTS.find(pr=> pr.sku === p.sku);
+                            const itemName = product?.itemName || product?.name || '';
+                            const price = product?.price || 0;
+                            const fromStoreInvBefore = rows.find(r=> r.sku === p.sku)?.invByStore?.[p.fromStoreId] || 0;
+                            
+                            return (
+                              (!previewFilters.sku || p.sku.toLowerCase().includes(previewFilters.sku.toLowerCase())) &&
+                              (!previewFilters.itemName || itemName.toLowerCase().includes(previewFilters.itemName.toLowerCase())) &&
+                              (!previewFilters.price || String(price).includes(previewFilters.price)) &&
+                              (!previewFilters.fromStore || p.fromStore.toLowerCase().includes(previewFilters.fromStore.toLowerCase())) &&
+                              (!previewFilters.invQty || String(fromStoreInvBefore).includes(previewFilters.invQty)) &&
+                              (!previewFilters.qty || String(p.qty).includes(previewFilters.qty)) &&
+                              (!previewFilters.toStore || p.toStore.toLowerCase().includes(previewFilters.toStore.toLowerCase()))
+                            );
+                          });
+                          
+                          if (sortField) {
+                            filteredPlan.sort((a, b) => {
+                              let aVal, bVal;
+                              const productA = PRODUCTS.find(pr=> pr.sku === a.sku);
+                              const productB = PRODUCTS.find(pr=> pr.sku === b.sku);
+                              
+                              switch(sortField) {
+                                case 'no': aVal = globalPlan.indexOf(a); bVal = globalPlan.indexOf(b); break;
+                                case 'sku': aVal = a.sku; bVal = b.sku; break;
+                                case 'itemName': aVal = productA?.itemName || productA?.name || ''; bVal = productB?.itemName || productB?.name || ''; break;
+                                case 'price': aVal = productA?.price || 0; bVal = productB?.price || 0; break;
+                                case 'fromStore': aVal = a.fromStore; bVal = b.fromStore; break;
+                                case 'toStore': aVal = a.toStore; bVal = b.toStore; break;
+                                case 'qty': aVal = a.qty; bVal = b.qty; break;
+                                case 'invQty': 
+                                  aVal = rows.find(r=> r.sku === a.sku)?.invByStore?.[a.fromStoreId] || 0;
+                                  bVal = rows.find(r=> r.sku === b.sku)?.invByStore?.[b.fromStoreId] || 0;
+                                  break;
+                                default: aVal = 0; bVal = 0;
+                              }
+                              
+                              if (typeof aVal === 'string') {
+                                return sortOrder === 'asc' ? aVal.localeCompare(bVal) : bVal.localeCompare(aVal);
+                              } else {
+                                return sortOrder === 'asc' ? aVal - bVal : bVal - aVal;
+                              }
+                            });
+                          }
+                          
+                          // 初期化時に全てチェック
+                          React.useEffect(() => {
+                            if (globalPlan.length > 0 && previewChecked.size === 0) {
+                              setPreviewChecked(new Set(globalPlan.map((p,i) => i)));
+                            }
+                          }, [globalPlan.length]);
+                          
+                          return filteredPlan.map((p,i)=>{
+                            const originalIndex = globalPlan.indexOf(p);
+                            const product = PRODUCTS.find(pr=> pr.sku === p.sku);
+                            const itemName = product?.itemName || product?.name || '';
+                            const price = product?.price || 0;
+                            
+                            // 元店舗の在庫と販売数
+                            const fromStoreInvBefore = rows.find(r=> r.sku === p.sku)?.invByStore?.[p.fromStoreId] || 0;
+                            const fromStoreSales = rows.find(r=> r.sku === p.sku)?.salesByStore?.[p.fromStoreId] || 0;
+                            
+                            // 移管先店舗の在庫と販売数
+                            const toStoreInvBefore = rows.find(r=> r.sku === p.sku)?.invByStore?.[p.toStoreId] || 0;
+                            const toStoreSales = rows.find(r=> r.sku === p.sku)?.salesByStore?.[p.toStoreId] || 0;
+                            
+                            // 移管後在庫
+                            const fromStoreInvAfter = fromStoreInvBefore - p.qty;
+                            const toStoreInvAfter = toStoreInvBefore + p.qty;
+                            
+                            return (
+                              <TableRow key={originalIndex}>
+                                <TableCell padding="checkbox">
+                                  <Checkbox 
+                                    size="small" 
+                                    checked={previewChecked.has(originalIndex)}
+                                    onChange={(e) => {
+                                      const newChecked = new Set(previewChecked);
+                                      if (e.target.checked) {
+                                        newChecked.add(originalIndex);
+                                      } else {
+                                        newChecked.delete(originalIndex);
+                                      }
+                                      setPreviewChecked(newChecked);
+                                      setPreviewAllChecked(newChecked.size === globalPlan.length);
+                                    }}
+                                  />
+                                </TableCell>
+                                <TableCell align="right">{originalIndex + 1}</TableCell>
+                                <TableCell style={{fontFamily:'monospace'}}>{p.sku}</TableCell>
+                                <TableCell>{itemName}</TableCell>
+                                <TableCell align="right">¥{price.toLocaleString()}</TableCell>
+                                <TableCell>{p.fromStore}</TableCell>
+                                <TableCell align="right">{fromStoreInvBefore.toLocaleString()}</TableCell>
+                                <TableCell align="right" style={{fontWeight:700, color:'#d32f2f'}}>{p.qty}</TableCell>
+                                <TableCell>{p.toStore}</TableCell>
+                                <TableCell align="right" style={{fontSize:'0.85em', backgroundColor:'#fff3e0'}}>{fromStoreSales.toLocaleString()}</TableCell>
+                                <TableCell align="right" style={{fontSize:'0.85em', backgroundColor:'#fff3e0', color:'#666'}}>{fromStoreInvBefore.toLocaleString()}</TableCell>
+                                <TableCell align="right" style={{fontSize:'0.85em', backgroundColor:'#fff3e0', fontWeight:700}}>{fromStoreInvAfter.toLocaleString()}</TableCell>
+                                <TableCell align="right" style={{fontSize:'0.85em', backgroundColor:'#e3f2fd'}}>{toStoreSales.toLocaleString()}</TableCell>
+                                <TableCell align="right" style={{fontSize:'0.85em', backgroundColor:'#e3f2fd', color:'#666'}}>{toStoreInvBefore.toLocaleString()}</TableCell>
+                                <TableCell align="right" style={{fontSize:'0.85em', backgroundColor:'#e3f2fd', fontWeight:700}}>{toStoreInvAfter.toLocaleString()}</TableCell>
+                              </TableRow>
+                            );
+                          });
+                        })()}
                       </TableBody>
                     </Table>
                   </div>
