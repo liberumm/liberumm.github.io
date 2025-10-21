@@ -400,7 +400,9 @@
       // アクションパネル連携（App側）
       filterAction, searchTerm, columnFilters,
       checkedRows, setCheckedRows,
-      roiVisible
+      roiVisible,
+      // AxisSelectorの選択情報
+      selectedProdItems, selectedStoreItems
     } = props;
 
     const STORES   = window.MASTERS.STORES;
@@ -412,6 +414,8 @@
 
     // 展開
     const [expandedRows, setExpandedRows] = React.useState(new Set());
+    const [localColumnFilters, setLocalColumnFilters] = React.useState({});
+    const [tempColumnFilters, setTempColumnFilters] = React.useState({});
 
     // ユーザーが手動でソートしたか（初期自動同期の上書き防止）
     const userSortedRef = React.useRef(false);
@@ -498,11 +502,81 @@
         rows = rows.filter(r=> r.label.toLowerCase().includes(q));
       }
 
+      // AxisSelectorの選択でフィルタリング
+      if(selectedProdItems && selectedProdItems.size > 0){
+        rows = rows.filter(r => {
+          // 行のラベルで直接マッチング
+          if(selectedProdItems.has(r.label)) return true;
+          
+          // 各アイテムでマッチングをチェック
+          return r.items.some(item => {
+            // SKU、商品名、アイテム名、部門で直接マッチング
+            if(selectedProdItems.has(item.sku) || 
+               selectedProdItems.has(item.name) || 
+               selectedProdItems.has(item.itemName) ||
+               selectedProdItems.has(item.dept)) return true;
+            
+            // P_TAXOデータでマッチング
+            const taxo = P_TAXO[item.id];
+            if(taxo) {
+              if(selectedProdItems.has(taxo.corner) ||
+                 selectedProdItems.has(taxo.line) ||
+                 selectedProdItems.has(taxo.category)) return true;
+            }
+            
+            // アイテムコード形式でのマッチング（アイテム軸の場合）
+            if(prodAxis === 'アイテム') {
+              const itemCode8 = itemCodeFromSku(item.sku);
+              const itemName = item.itemName || taxo?.item || item.name || '';
+              const itemLabel = `${itemCode8}｜${itemName}`;
+              if(selectedProdItems.has(itemLabel)) return true;
+              
+              // アイテムコード+名前形式でもチェック
+              selectedProdItems.forEach(selected => {
+                if(selected.includes(' ')) {
+                  const selectedCode = selected.split(' ')[0];
+                  if(itemCode8.startsWith(selectedCode)) return true;
+                }
+              });
+            }
+            
+            // 階層関係マッピングを使用したマッチング
+            const CORNER_LINE_MAP = window.MASTERS.CORNER_LINE_MAP || {};
+            const CATEGORY_ITEM_MAP = window.MASTERS.CATEGORY_ITEM_MAP || {};
+            
+            // 選択されたアイテムがコーナーの場合、関連ラインをチェック
+            selectedProdItems.forEach(selected => {
+              if(CORNER_LINE_MAP[selected] && taxo?.line) {
+                if(CORNER_LINE_MAP[selected].includes(taxo.line)) return true;
+              }
+              
+              // 選択されたアイテムがラインの場合、関連カテゴリをチェック
+              const lineCategories = window.MASTERS.getRelatedCategories?.(selected);
+              if(lineCategories && taxo?.category) {
+                if(lineCategories.includes(taxo.category)) return true;
+              }
+              
+              // 選択されたアイテムがカテゴリの場合、関連アイテムをチェック
+              const categoryCode = selected.split(' ')[0];
+              if(CATEGORY_ITEM_MAP[categoryCode]) {
+                const relatedItems = CATEGORY_ITEM_MAP[categoryCode];
+                if(relatedItems.includes(item.itemName) || relatedItems.includes(item.name)) {
+                  return true;
+                }
+              }
+            });
+            
+            return false;
+          });
+        });
+      }
+
       // 列フィルタ
-      if (columnFilters && Object.keys(columnFilters).length){
+      const allFilters = {...columnFilters, ...localColumnFilters};
+      if (allFilters && Object.keys(allFilters).length){
         rows = rows.filter(r=>{
-          for(const k in columnFilters){
-            const v = String(columnFilters[k]||'').trim();
+          for(const k in allFilters){
+            const v = String(allFilters[k]||'').trim();
             if(!v) continue;
             if(k==='inv' && String(r.inv).indexOf(v)===-1) return false;
             if(k==='price' && String(r.price||'').indexOf(v)===-1) return false;
@@ -516,6 +590,10 @@
                 return r.label;
               })();
               if(String(code).indexOf(v)===-1) return false;
+            }
+            if(k==='name'){
+              const name = getRowNameByAxis(r);
+              if(String(name).toLowerCase().indexOf(v.toLowerCase())===-1) return false;
             }
           }
           return true;
@@ -541,7 +619,8 @@
 
       return rows;
     }, [deptFilter, prodAxis, buckets, metric, targetStoreIds, range, idx, STORES,
-        searchTerm, JSON.stringify(columnFilters), filterAction]);
+        searchTerm, JSON.stringify(columnFilters), filterAction, 
+        Array.from(selectedProdItems || []).join(','), Array.from(selectedStoreItems || []).join(',')]);
 
     // 合計行（ヘッダー直下に表示）＆ “最新列” 判定
     const summaryRow = React.useMemo(()=>{
@@ -682,11 +761,11 @@
               <tr>
                 <th style={th}></th>
                 <th style={th}></th>
-                <th style={th}><TextField size="small" placeholder="コード" /></th>
-                <th style={th}><TextField size="small" placeholder="商品名" /></th>
-                {showMoneyCols && <th style={th}><TextField size="small" placeholder="売価" /></th>}
-                {showMoneyCols && <th style={th}><TextField size="small" placeholder="原価" /></th>}
-                <th style={th}><TextField size="small" placeholder="在庫" /></th>
+                <th style={th}><TextField size="small" placeholder="コード" value={tempColumnFilters.code||localColumnFilters.code||''} onChange={(e)=>setTempColumnFilters(prev=>({...prev, code:e.target.value}))} onBlur={(e)=>setLocalColumnFilters(prev=>({...prev, code:e.target.value}))} /></th>
+                <th style={th}><TextField size="small" placeholder="商品名" value={tempColumnFilters.name||localColumnFilters.name||''} onChange={(e)=>setTempColumnFilters(prev=>({...prev, name:e.target.value}))} onBlur={(e)=>setLocalColumnFilters(prev=>({...prev, name:e.target.value}))} /></th>
+                {showMoneyCols && <th style={th}><TextField size="small" placeholder="売価" value={tempColumnFilters.price||localColumnFilters.price||''} onChange={(e)=>setTempColumnFilters(prev=>({...prev, price:e.target.value}))} onBlur={(e)=>setLocalColumnFilters(prev=>({...prev, price:e.target.value}))} /></th>}
+                {showMoneyCols && <th style={th}><TextField size="small" placeholder="原価" value={tempColumnFilters.cost||localColumnFilters.cost||''} onChange={(e)=>setTempColumnFilters(prev=>({...prev, cost:e.target.value}))} onBlur={(e)=>setLocalColumnFilters(prev=>({...prev, cost:e.target.value}))} /></th>}
+                <th style={th}><TextField size="small" placeholder="在庫" value={tempColumnFilters.inv||localColumnFilters.inv||''} onChange={(e)=>setTempColumnFilters(prev=>({...prev, inv:e.target.value}))} onBlur={(e)=>setLocalColumnFilters(prev=>({...prev, inv:e.target.value}))} /></th>
                 <th style={th}><TextField size="small" placeholder="在庫回転日数" /></th>
                 {roiVisible && (
                   <>
@@ -700,8 +779,8 @@
                 <th style={th}><TextField size="small" placeholder="総評" /></th>
                 <th style={th}><TextField size="small" placeholder="累計" /></th>
                 {displayBuckets.map((b,i)=>(<th key={i} style={th}><TextField size="small" placeholder={showBuckets?b.label:(i===0?'直近-1':'直近')} /></th>))}
-                <th style={th}><TextField size="small" placeholder="計画終了日" /></th>
-                <th style={th}><TextField size="small" placeholder="予測終了日" /></th>
+                <th style={th}><TextField size="small" placeholder="計画終了日" value={tempColumnFilters.planEnd||localColumnFilters.planEnd||''} onChange={(e)=>setTempColumnFilters(prev=>({...prev, planEnd:e.target.value}))} onBlur={(e)=>setLocalColumnFilters(prev=>({...prev, planEnd:e.target.value}))} /></th>
+                <th style={th}><TextField size="small" placeholder="予測終了日" value={tempColumnFilters.forecastEnd||localColumnFilters.forecastEnd||''} onChange={(e)=>setTempColumnFilters(prev=>({...prev, forecastEnd:e.target.value}))} onBlur={(e)=>setLocalColumnFilters(prev=>({...prev, forecastEnd:e.target.value}))} /></th>
                 <th style={th}></th>
                 <th style={th}></th>
               </tr>

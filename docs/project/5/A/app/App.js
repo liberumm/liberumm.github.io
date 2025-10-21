@@ -49,6 +49,8 @@ function App(){
   const [prodAxis,setProdAxis]=React.useState('SKU');
   const [storeAxis,setStoreAxis]=React.useState('全店舗');
   const [storeGroup,setStoreGroup]=React.useState('全店舗');
+  const [selectedProdItems, setSelectedProdItems] = React.useState(new Set());
+  const [selectedStoreItems, setSelectedStoreItems] = React.useState(new Set());
 
   // 店舗間比較
   const [compareMode, setCompareMode] = React.useState(true);
@@ -314,6 +316,8 @@ function App(){
             prodAxis={prodAxis} setProdAxis={setProdAxis}
             storeAxis={storeAxis} setStoreAxis={setStoreAxis}
             storeGroup={storeGroup} setStoreGroup={setStoreGroup}
+            selectedProdItems={selectedProdItems} setSelectedProdItems={setSelectedProdItems}
+            selectedStoreItems={selectedStoreItems} setSelectedStoreItems={setSelectedStoreItems}
           />
           <Box sx={{mt:1}}>
             <span className="pill">
@@ -426,6 +430,10 @@ function App(){
 
             // レスポンシブフラグ（子コンポーネント側で列削減等に利用）
             smallScreen={isSm}
+            
+            // AxisSelectorの選択情報
+            selectedProdItems={selectedProdItems}
+            selectedStoreItems={selectedStoreItems}
           />
         </Section>
 

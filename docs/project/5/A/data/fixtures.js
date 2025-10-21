@@ -31,15 +31,14 @@
   // ─────────────────────────────
   // アイテムコード(8桁) / SKUコード(10桁)
   // ─────────────────────────────
-  const makeItemCode8 = (itemIdx) => {
-    const a = String(1000 + itemIdx).slice(-4);
+  const makeItemCode8 = (categoryCode, itemIdx) => {
+    // カテゴリコードを先頭4桁、連番を後ろ4桁として使用
     const b = String(2000 + itemIdx).slice(-4);
-    return `${a}-${b}`;                 // 例: 1001-2001
+    return `${categoryCode}-${b}`;       // 例: 0001-2001
   };
-  const makeSkuCode10 = (itemIdx, skuNo0based) => {
-    const item8 = makeItemCode8(itemIdx);
+  const makeSkuCode10 = (item8, skuNo0based) => {
     const branch = String(10 + skuNo0based).padStart(2,'0'); // 10,11,12...
-    return `${item8}-${branch}`;       // 例: 1001-2001-10
+    return `${item8}-${branch}`;       // 例: 0001-2001-10
   };
 
   // ─────────────────────────────
@@ -94,7 +93,18 @@
     const corner   = CORNERS[(itemIdx-1) % CORNERS.length];
     const { base: baseName, variants } = pickNameForCorner(corner, itemIdx-1);
 
-    const itemCode8 = makeItemCode8(itemIdx);
+    // コーナーに対応するラインとカテゴリを取得してアイテムコードを生成
+    const CORNER_LINE_MAP = window.MASTERS.CORNER_LINE_MAP || {};
+    
+    const cornerLines = CORNER_LINE_MAP[corner] || [];
+    const selectedLine = cornerLines.length > 0 ? cornerLines[(itemIdx - 1) % cornerLines.length] : `${LINE_MASTER[0].code} ${LINE_MASTER[0].name}`;
+    
+    // ラインに属するカテゴリを取得
+    const lineCategories = window.MASTERS.getRelatedCategories(selectedLine);
+    const selectedCategory = lineCategories.length > 0 ? lineCategories[(itemIdx - 1) % lineCategories.length] : `${CATEGORY_MASTER[0].code} ${CATEGORY_MASTER[0].name}`;
+    
+    const [categoryCode] = selectedCategory.split(' ', 1);
+    const itemCode8 = makeItemCode8(categoryCode, itemIdx);
     const itemEOL   = makePlannedEOLForItemByCode(itemCode8);
 
     // 防御的: nullのときは90日後で補完（SKUは必ずEOLを持つ）
@@ -111,7 +121,7 @@
     for (let k=0; k<skusForItem; k++) {
       const skuIndex = NUM_SKUS - remaining + 1; // 1-based通番
       const skuId    = 'SKU' + String(skuIndex).padStart(4,'0');
-      const skuCode  = makeSkuCode10(itemIdx, k);
+      const skuCode  = makeSkuCode10(itemCode8, k);
 
       const basePrice     = 1000 + ((itemIdx % 5) * 100) + ((k%3)*50);
       const price         = Math.round(basePrice/10)*10;
@@ -131,16 +141,17 @@
       };
       PRODUCTS.push(prod);
 
-      // タクソノミー
-      const lineM = LINE_MASTER[(itemIdx - 1) % LINE_MASTER.length];
-      const catM  = CATEGORY_MASTER[(itemIdx - 1) % CATEGORY_MASTER.length];
+      // タクソノミー（既に取得済みの値を使用）
+      const [lineCode, lineName] = selectedLine.split(' ', 2);
+      const [categoryCode, categoryName] = selectedCategory.split(' ', 2);
+      
       const taxo = {
         productId: skuId,
         corner,
-        line: `${lineM.code} ${lineM.name}`,
-        lineCode: lineM.code, lineName: lineM.name,
-        category: `${catM.code} ${catM.name}`,
-        categoryCode: catM.code, categoryName: catM.name,
+        line: selectedLine,
+        lineCode, lineName,
+        category: selectedCategory,
+        categoryCode, categoryName,
         item: baseName
       };
       P_TAXO.push(taxo);
@@ -157,23 +168,46 @@
   // ─────────────────────────────
   const INVENTORY = [];
   PRODUCTS.forEach(p=>{
-    // 商品ごとに店舗間でアンバランスな在庫分布を生成
-    const totalInv = 500 + Math.round(rand() * 200); // 総在庫 500-700
+    // 商品ごとに店舗間で大きなアンバランスな在庫分布を生成（移管計算用）
+    const totalInv = 300 + Math.round(rand() * 400); // 総在庫 300-700
+    const productHash = hashStr(p.id) % 100;
+    
     const storeWeights = STORES.map(s => {
-      // 一部の商品で意図的にアンバランスな在庫配分を作る
-      if (p.id.charAt(3) === '1') { // 約10%の商品
-        return s.id === 'S01' ? 2.0 : // 本店に過剰在庫
-               s.id === 'S02' ? 0.3 : // 支店は少なめ
-               1.0;
+      // 60%の商品で極端なアンバランスを作る
+      if (productHash < 15) { // 15%: 本店過剰パターン
+        return s.id === 'S01' ? 4.0 :  // 本店に大量在庫
+               s.id === 'S02' ? 0.2 :  // 渋谷店は極少
+               s.id === 'S03' ? 0.3 :  // 名古屋店も少ない
+               0.5;                 // ECも少ない
       }
-      if (p.id.charAt(3) === '2') { // 別の10%
-        return s.id === 'S05' ? 2.5 : // ECに過剰在庫
-               0.8;                    // 他店舗は少なめ
+      if (productHash >= 15 && productHash < 30) { // 15%: EC過剰パターン
+        return s.id === 'S05' ? 5.0 :  // ECに大量在庫
+               s.id === 'S01' ? 0.3 :  // 本店は少ない
+               s.id === 'S02' ? 0.2 :  // 渋谷店も少ない
+               0.5;                 // 名古屋店も少ない
       }
-      // その他の商品は比較的バランスの取れた配分
-      return s.id === 'S05' ? 1.2 : // ECはやや多め
-             s.id === 'S01' ? 1.1 : // 本店もやや多め
-             1.0;                    // その他は標準
+      if (productHash >= 30 && productHash < 45) { // 15%: 渋谷店過剰パターン
+        return s.id === 'S02' ? 3.5 :  // 渋谷店に大量在庫
+               s.id === 'S01' ? 0.4 :  // 本店は少ない
+               s.id === 'S03' ? 0.6 :  // 名古屋店も少ない
+               1.0;                 // ECは標準
+      }
+      if (productHash >= 45 && productHash < 60) { // 15%: 名古屋店過剰パターン
+        return s.id === 'S03' ? 4.2 :  // 名古屋店に大量在庫
+               s.id === 'S01' ? 0.3 :  // 本店は少ない
+               s.id === 'S02' ? 0.5 :  // 渋谷店も少ない
+               1.0;                 // ECは標準
+      }
+      // 残り40%の商品は中程度のアンバランス
+      if (productHash >= 60 && productHash < 80) {
+        return s.id === 'S01' ? 1.8 :  // 本店やや多め
+               s.id === 'S05' ? 0.6 :  // EC少なめ
+               1.0;                 // 他は標準
+      }
+      // 最後の20%は比較的バランスの取れた配分
+      return s.id === 'S05' ? 1.3 :  // ECやや多め
+             s.id === 'S01' ? 1.1 :  // 本店もやや多め
+             1.0;                 // その他は標準
     });
     
     const totalWeight = storeWeights.reduce((a,b)=>a+b, 0);
@@ -182,9 +216,9 @@
     STORES.forEach((s, idx) => {
       if (idx === STORES.length - 1) {
         // 最後の店舗は残り全部（丸め誤差対策）
-        INVENTORY.push({ productId: p.id, storeId: s.id, qty: remaining });
+        INVENTORY.push({ productId: p.id, storeId: s.id, qty: Math.max(0, remaining) });
       } else {
-        const qty = Math.round((storeWeights[idx] / totalWeight) * totalInv);
+        const qty = Math.max(0, Math.round((storeWeights[idx] / totalWeight) * totalInv));
         INVENTORY.push({ productId: p.id, storeId: s.id, qty });
         remaining -= qty;
       }
@@ -222,11 +256,38 @@
     const wFactor = dowFactor(date.getDay());
 
     PRODUCTS.forEach((p, idxP)=>{
+      const productHash = hashStr(p.id) % 100;
+      
       STORES.forEach(s=>{
+        // 在庫配分と逆のパターンで販売実績を作る（移管計算用）
+        let storeSalesFactor = 1.0;
+        
+        if (productHash < 15) { // 本店過剰在庫パターン → 他店でよく売れる
+          storeSalesFactor = s.id === 'S01' ? 0.4 :  // 本店は売れない
+                            s.id === 'S02' ? 2.5 :  // 渋谷店でよく売れる
+                            s.id === 'S03' ? 2.2 :  // 名古屋店でもよく売れる
+                            1.8;                 // ECでも売れる
+        } else if (productHash >= 15 && productHash < 30) { // EC過剰在庫パターン
+          storeSalesFactor = s.id === 'S05' ? 0.3 :  // ECは売れない
+                            s.id === 'S01' ? 2.8 :  // 本店でよく売れる
+                            s.id === 'S02' ? 2.4 :  // 渋谷店でもよく売れる
+                            2.0;                 // 名古屋店でも売れる
+        } else if (productHash >= 30 && productHash < 45) { // 渋谷店過剰在庫パターン
+          storeSalesFactor = s.id === 'S02' ? 0.5 :  // 渋谷店は売れない
+                            s.id === 'S01' ? 2.2 :  // 本店でよく売れる
+                            s.id === 'S03' ? 1.8 :  // 名古屋店でも売れる
+                            2.5;                 // ECでよく売れる
+        } else if (productHash >= 45 && productHash < 60) { // 名古屋店過剰在庫パターン
+          storeSalesFactor = s.id === 'S03' ? 0.4 :  // 名古屋店は売れない
+                            s.id === 'S01' ? 2.6 :  // 本店でよく売れる
+                            s.id === 'S02' ? 2.0 :  // 渋谷店でも売れる
+                            2.3;                 // ECでも売れる
+        }
+        
         const baseUnits =
           (s.channel==='オンライン'? 7.5 : 4.0) *
           itemPopularity(idxP) *
-          mSeason * wFactor * yTrend * storeFactor(s);
+          mSeason * wFactor * yTrend * storeFactor(s) * storeSalesFactor;
 
         const noise = 0.70 + rand()*0.60; // 0.7〜1.3
         let units = Math.max(0, Math.round(baseUnits * noise));
