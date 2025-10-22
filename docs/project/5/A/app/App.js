@@ -3,7 +3,7 @@ const {
   AppBar, Toolbar, Typography, Paper, Box, Stack, Button,
   Card, CardContent, Grid, TextField, Chip, Switch, FormControlLabel, Tooltip, Avatar, List, ListItem, ListItemAvatar, ListItemText,
   Dialog, DialogTitle, DialogContent, DialogActions,
-  Table, TableHead, TableRow, TableCell, TableBody, Checkbox, Tabs, Tab
+  Table, TableHead, TableRow, TableCell, TableBody, Checkbox, Tabs, Tab, CircularProgress, Backdrop
 } = MaterialUI;
 
 function App(){
@@ -30,20 +30,39 @@ function App(){
   // 行選択・モーダル
   const [selectedRow,setSelectedRow]=React.useState(null);
   const [actionModal,setActionModal]=React.useState({open:false,type:null,row:null});
+  const [modalLoading,setModalLoading]=React.useState(false);
+
   const openActionModal=(type,row)=> {
-    // 移管の場合、TransferPlannerを表示
-    if(type === '移管' && row?.action?.detail?.transfers) {
-      setActionModal({
-        open: true,
-        type: '移管',
-        row: row,
-        transfers: row.action.detail.transfers
-      });
-      return;
-    }
-    setActionModal({open:true,type,row});
+    setModalLoading(true);
+    
+    // 短時間でモーダルが開けばローディングを表示しない
+    const loadingTimer = setTimeout(() => {
+      // 100ms経ってもモーダルが開かない場合のみローディング表示
+    }, 100);
+    
+    // モーダル表示処理
+    const showModal = () => {
+      clearTimeout(loadingTimer);
+      if(type === '移管' && row?.action?.detail?.transfers) {
+        setActionModal({
+          open: true,
+          type: '移管',
+          row: row,
+          transfers: row.action.detail.transfers
+        });
+      } else {
+        setActionModal({open:true,type,row});
+      }
+      setModalLoading(false);
+    };
+    
+    // 実際の処理時間をシミュレート（実際のアプリでは非同期処理の完了を待つ）
+    setTimeout(showModal, 0);
   };
-  const closeActionModal=()=> setActionModal({open:false,type:null,row:null});
+  const closeActionModal=()=> {
+    setActionModal({open:false,type:null,row:null});
+    setModalLoading(false);
+  };
 
   // 分類軸・店舗軸
   const [prodAxis,setProdAxis]=React.useState('SKU');
@@ -295,13 +314,10 @@ function App(){
             selectedProdItems={selectedProdItems} setSelectedProdItems={setSelectedProdItems}
             selectedStoreItems={selectedStoreItems} setSelectedStoreItems={setSelectedStoreItems}
           />
-          <Box sx={{mt:1}}>
-            <span className="pill">
-              <span className="material-icons" style={{fontSize:16}}>info</span>
-              商品コードの体系：<b>4桁＋4桁＋2桁</b>（4桁＝カテゴリ／8桁＝アイテム／10桁＝SKU）
-              <span className="mini">※SKU＝サイズ×色の最小管理単位</span>
-            </span>
-          </Box>
+          <div className="mini" style={{marginTop:4,padding:'4px 8px',backgroundColor:'#f5f5f5',borderRadius:4,fontSize:'0.75em'}}>
+            <span className="material-icons" style={{fontSize:12,verticalAlign:'middle',marginRight:4}}>info</span>
+            商品コードの体系：<b>4桁＋4桁＋2桁</b>（4桁＝カテゴリ／8桁＝アイテム／10桁＝SKU） ※SKU＝サイズ×色の最小管理単位
+          </div>
         </Section>
 
         {/* アクション操作：検索/アクション絞り/列フィルタ */}
@@ -387,7 +403,7 @@ function App(){
             targetStoreIds={targetStoreIds}
             selectedRow={selectedRow}
             setSelectedRow={setSelectedRow}
-            openActionModal={(type,row)=> setActionModal({open:true,type,row})}
+            openActionModal={openActionModal}
 
             // 年次系表示制御
             yoyShow={yoyShow}
@@ -412,6 +428,14 @@ function App(){
             selectedStoreItems={selectedStoreItems}
           />
         </Section>
+
+        {/* ローディング表示 */}
+        <Backdrop open={modalLoading} style={{zIndex:9999}}>
+          <div style={{display:'flex',flexDirection:'column',alignItems:'center',gap:16}}>
+            <CircularProgress size={48} color="inherit" />
+            <Typography variant="body1" style={{color:'white'}}>読み込み中...</Typography>
+          </div>
+        </Backdrop>
 
         {/* アクションモーダル */}
         {actionModal.type === '移管' && (
@@ -445,7 +469,7 @@ function App(){
             setActionForm={setActionForm}
             checkedRows={checkedRows}
             setCheckedRows={setCheckedRows}
-            onOpenTransfer={(row)=> setActionModal({open:true, type:'移管', row: {...row, label: row.name, sku: row.sku, totalInv: row.invQty}, transfers: actionModal.transfers})}
+            onOpenTransfer={(row)=> openActionModal('移管', {...row, label: row.name, sku: row.sku, totalInv: row.invQty})}
             onSubmitBatch={(mode)=>{
               const rows = batchRows.map(r=>({ sku: r.sku, productId: r.productId, desiredQty: actionForm.rows?.[r.sku]?.desiredQty, desiredDate: actionForm.rows?.[r.sku]?.desiredDate, plannedQty: actionForm.rows?.[r.sku]?.plannedQty, plannedDate: actionForm.rows?.[r.sku]?.plannedDate, confirmer: actionForm.rows?.[r.sku]?.confirmer, byStore: actionForm.rows?.[r.sku]?.byStore }));
               addTask({ type: '発注', rowLabel: `${rows.length}件`, detail: { rows } }, mode==='承認' ? 'approved' : 'hq_pending');
@@ -467,7 +491,7 @@ function App(){
             setActionForm={setActionForm}
             checkedRows={checkedRows}
             setCheckedRows={setCheckedRows}
-            onOpenTransfer={(row)=> setActionModal({open:true, type:'移管', row: {...row, label: row.name, sku: row.sku, totalInv: row.invQty}, transfers: actionModal.transfers})}
+            onOpenTransfer={(row)=> openActionModal('移管', {...row, label: row.name, sku: row.sku, totalInv: row.invQty})}
             onSubmitBatch={(mode)=>{
               const rows = batchRows.map(r=>({ sku: r.sku, productId: r.productId, qty: actionForm.rows?.[r.sku]?.qty, discountAmount: actionForm.rows?.[r.sku]?.discountAmount, newPrice: actionForm.rows?.[r.sku]?.newPrice, byStore: actionForm.rows?.[r.sku]?.byStore }));
               addTask({ type: '値下', rowLabel: `${rows.length}件`, detail: { rows } }, mode==='承認' ? 'approved' : 'hq_pending');
@@ -607,3 +631,5 @@ function App(){
 function DividerDot(){
   return <span style={{width:6,height:6,background:'#cbd5e1',display:'inline-block',borderRadius:99,margin:'0 8px'}} />;
 }
+
+
