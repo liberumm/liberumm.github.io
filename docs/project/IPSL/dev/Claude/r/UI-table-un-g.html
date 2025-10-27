@@ -1,0 +1,1612 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, viewport-fit=cover"/>
+<title>Dense Data Table (Column-Config + Rich Features)</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Roboto:wght@300;400;500;700&display=swap"/>
+<link rel="stylesheet" href="https://fonts.googleapis.com/icon?family=Material+Icons"/>
+<style>
+  html,body,#root{height:100%;margin:0}
+  .col-resizer{position:absolute;top:0;right:-4px;width:8px;height:100%;cursor:col-resize;z-index:999}
+  .col-resizer:hover{background:rgba(25,118,210,.5)}
+  body.resizing,body.resizing *{cursor:col-resize!important;user-select:none!important}
+  body.resizing .col-resizer{background:rgba(25,118,210,.7)}
+</style>
+</head>
+<body>
+  <script src="https://cdn.jsdelivr.net/npm/react@18.2.0/umd/react.development.js" crossorigin></script>
+  <script src="https://cdn.jsdelivr.net/npm/react-dom@18.2.0/umd/react-dom.development.js" crossorigin></script>
+  <script src="https://cdn.jsdelivr.net/npm/@babel/standalone@7.23.8/babel.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@mui/material@5.15.3/umd/material-ui.production.min.js" crossorigin></script>
+  <script src="https://cdn.plot.ly/plotly-2.27.0.min.js"></script>
+
+  <div id="root"></div>
+
+  <script type="text/babel">
+    const {
+      AppBar,Toolbar,Typography,IconButton,Box,Container,TextField,InputAdornment,Button,Stack,Chip,Divider,Menu,MenuItem,
+      FormControlLabel,Switch,Tooltip,Paper,useMediaQuery,createTheme,ThemeProvider,CssBaseline,Select,FormControl,InputLabel,
+      OutlinedInput,ListItemText,Checkbox,Slider,Table,TableHead,TableRow,TableCell,TableBody,TableContainer,TableFooter,
+      TablePagination, Pagination, Alert, Snackbar, ToggleButton, ToggleButtonGroup, Card, CardContent, Dialog, DialogTitle, DialogContent, DialogActions, TableSortLabel
+    } = MaterialUI;
+
+    // ========= 共通ユーティリティ =========
+    const matchNumber=(v,expr)=>{
+      if(expr==null||expr==='') return true; const s=String(expr).trim();
+      const r=s.match(/^\s*(\d+)\s*[-~]\s*(\d+)\s*$/); if(r){const a=+r[1],b=+r[2]; return v>=Math.min(a,b)&&v<=Math.max(a,b);}
+      const o=s.match(/^\s*([<>]=?|=)\s*(\d+)\s*$/);
+      if(o){const op=o[1],n=+o[2]; if(op==='>')return v>n; if(op==='>=')return v>=n; if(op==='<')return v<n; if(op==='<=')return v<=n; return v===n;}
+      const n=+s; return Number.isNaN(n)?true:v===n;
+    };
+    const toDate=(s)=>{ if(!s) return null; const t=Date.parse(String(s).replaceAll('/', '-')); return Number.isNaN(t)?null:new Date(t); };
+    const matchDate=(v,expr)=>{
+      if(!expr) return true; const s=String(expr).trim(); const vd=toDate(v); if(!vd) return true;
+      const rng=s.match(/^\s*([0-9\-\/]+)\s*[-~]\s*([0-9\-\/]+)\s*$/); if(rng){ const a=toDate(rng[1]), b=toDate(rng[2]); if(!a||!b) return true; return vd>=a && vd<=b; }
+      const cmp=s.match(/^\s*([<>]=?|=)\s*([0-9\-\/]+)\s*$/); if(cmp){ const op=cmp[1], d=toDate(cmp[2]); if(!d) return true; if(op==='>')return vd>d; if(op==='>=')return vd>=d; if(op==='<')return vd<d; if(op==='<=')return vd<=d; return +vd===+d; }
+      const d=toDate(s); return d? (+vd===+d) : true;
+    };
+    const toCSV=(rows, cols)=>[
+      cols.map(c=>`"${c.label.replaceAll('"','""')}"`).join(','),
+      ...rows.map((r,i)=>cols.map(c=>{
+        const val = c.raw? c.raw(r,i) : (c.value? c.value(r,i) : r[c.key]);
+        const s = val==null? '' : String(val);
+        return `"${s.replaceAll('"','""')}"`;
+      }).join(',')),
+    ].join('\n');
+    const download=(name,content,type='text/csv;charset=utf-8;')=>{
+      const a=document.createElement('a'); a.href=URL.createObjectURL(new Blob([content],{type})); a.download=name; a.click(); URL.revokeObjectURL(a.href);
+    };
+
+    // ========= モックデータ（列定義のmock設定から自動生成） =========
+    const createMockData=(n=20000)=>{
+      const pick=(arr)=>arr[Math.floor(Math.random()*arr.length)];
+      const toDateStr=(d)=>d.toISOString().slice(0,10);
+      const genValue=(col,id,row,total)=>{
+        if(!col.mock) {
+          if(col.nullable && Math.random()<0.1) return '';
+          if(col.kind==='text') return `${col.label||col.key}${id}`;
+          if(col.kind==='number') return Math.floor(Math.random()*1000);
+          if(col.kind==='date') return toDateStr(new Date(Date.now()-Math.random()*365*864e5));
+          return '';
+        }
+        const m = col.mock;
+        if(m.calc) return m.calc(row,id,total);
+        if(m.choices) return pick(m.choices);
+        if(m.pattern) return m.pattern.replace(/{id:(\d+)}/g,(_,len)=>String(id).padStart(+len,'0')).replace(/{id}/g,id);
+        if(col.kind==='number'){
+          if(m.range) return Math.floor(Math.random()*(m.range[1]-m.range[0]+1))+m.range[0];
+          return Math.floor(Math.random()*1000);
+        }
+        if(col.kind==='date'){
+          if(col.nullable && m.empty && Math.random()<m.empty) return '';
+          if(m.range){
+            const days = Math.floor(Math.random()*(m.range[1]-m.range[0]+1))+m.range[0];
+            return toDateStr(new Date(Date.now()+days*864e5));
+          }
+          return toDateStr(new Date(Date.now()-Math.random()*365*864e5));
+        }
+        if(col.kind==='text') return `${col.label||col.key}${id}`;
+        return '';
+      };
+      return Array.from({length:n},(_,i)=>{
+        const id=i+1, row={id};
+        COLUMN_DEFS.forEach(col=>{ 
+          if(col.key==='select' || col.raw) return;
+          Object.keys(col.mock||{}).forEach(k=>{ if(k!=='calc'&&k!=='choices'&&k!=='range'&&k!=='pattern'&&k!=='empty') row[`_mock_${k}`]=col.mock[k]; });
+          if(!col.mock?.calc) row[col.key]=genValue(col,id,row,n); 
+        });
+        row.no = id;
+        COLUMN_DEFS.forEach(col=>{ 
+          if(col.mock?.calc) row[col.key]=col.mock.calc(row,id,n);
+        });
+        Object.keys(row).forEach(k=>{ if(k.startsWith('_mock_')) delete row[k]; });
+        return row;
+      });
+    };
+
+    // ========= 列定義（ここを書き換えるだけでOK） =========
+    // mock: サンプルデータ生成用 - choices:選択肢, range:[min,max], pattern:パターン, calc:計算式, nullable:null許可
+    const COLUMN_DEFS = [
+      { key:'select', label:'',   kind:'checkbox', width:44,  min:40, max:80, sticky:true },
+      { key:'no',     label:'No', kind:'number',   width:72,  min:60, max:120, numeric:true },
+      { key:'yearWeek', label:'年度週', kind:'text', width:100, min:80, max:160, editable:true, required:true, mock:{weekRange:[40,44], year:2025, calc:(r,id,total)=>{
+        const [startWeek,endWeek] = r._mock_weekRange || [40,44];
+        const year = r._mock_year || 2025;
+        const weekCount = endWeek - startWeek + 1;
+        const weekIndex = Math.floor((id-1) / (total/weekCount));
+        const targetWeek = startWeek + weekIndex;
+        return `${year}-W${String(targetWeek).padStart(2,'0')}`;
+      }} },
+      { key:'store',  label:'店舗', kind:'text', width:120, min:100, max:240, editable:true, required:true, mock:{choices:['本店','東店','西店','南店','北店']} },
+      { key:'dept',   label:'部門', kind:'text', width:120, min:100, max:240, editable:true, required:true, mock:{choices:['食品','日用品','衣料','家電','雑貨']} },
+      { key:'name',   label:'品名', kind:'text',   width:220, min:140, max:600, editable:true, required:true, mock:{pattern:'品名{id}'} },
+      { key:'code',   label:'コード', kind:'text', width:120, min:100, max:240, editable:true, required:true, mock:{pattern:'P{id:6}'} },
+      { key:'corner', label:'コーナー', kind:'text', width:120, min:100, max:240, editable:true, required:true, mock:{choices:['菓子','飲料','惣菜','精肉','鮮魚','日配','日用品']} },
+      { key:'line',   label:'ライン',   kind:'text', width:120, min:100, max:240, editable:true, required:true, mock:{choices:['和菓子','洋菓子','スナック','コーヒー','お茶','弁当','サラダ']} },
+      { key:'category', label:'カテゴリ', kind:'text', width:120, min:100, max:240, editable:true, required:true, mock:{choices:['食品','日用品','衣料','家電']} },
+      { key:'partner',  label:'取引先',   kind:'text', width:140, min:120, max:320, editable:true, required:true, mock:{choices:['Acme商事','Globex物産','Soylent食品','Initech','Umbrella','Stark']} },
+      { key:'sellPrice', label:'売価', kind:'number', width:110, min:90,  max:200, numeric:true, editable:true, required:true, mock:{range:[100,2600]} },
+      { key:'costPrice', label:'原価', kind:'number', width:110, min:90,  max:200, numeric:true, editable:true, required:true, mock:{calc:r=>Math.floor(r.sellPrice*(0.5+Math.random()*0.3))} },
+      { key:'totalSales', label:'累計販売数', kind:'number', width:120, min:100, max:220, numeric:true, editable:true, required:true, mock:{range:[0,5000]} },
+      { key:'sales28d', label:'販売数(28日)', kind:'number', width:120, min:100, max:220, numeric:true, editable:true, required:true, mock:{range:[0,300]} },
+      { key:'sales7d',  label:'販売数(7日)',  kind:'number', width:120, min:100, max:220, numeric:true, editable:true, required:true, mock:{range:[0,120]} },
+      { key:'stockQty', label:'在庫数', kind:'number', width:110, min:90,  max:200, numeric:true, editable:true, required:true, mock:{range:[0,500]} },
+      { key:'stockQty7d', label:'在庫数(7日前)', kind:'number', width:120, min:100, max:220, numeric:true, editable:true, required:true, mock:{calc:r=>(r.stockQty||0)+Math.floor(Math.random()*100)-50} },
+      { key:'stockQty28d', label:'在庫数(28日前)', kind:'number', width:130, min:110, max:230, numeric:true, editable:true, required:true, mock:{calc:r=>(r.stockQty||0)+Math.floor(Math.random()*150)-75} },
+      { key:'totalStockValue', label:'合計在庫金額', kind:'number', width:140, min:120, max:240, numeric:true, calc:r=>(r.sellPrice??0)*(r.stockQty??0) },
+      { key:'saleStartDate', label:'販売開始日', kind:'date', width:120, min:110, max:220, editable:true, required:true, mock:{range:[-400,0]} },
+      { key:'saleEndDate',   label:'販売終了日', kind:'date', width:120, min:110, max:220, editable:true, nullable:true, mock:{range:[0,200]} },
+    ];
+
+    // ========= 仮想リスト & 自動高さ =========
+    const useVirtualList=({total,rowHeight,overscan=50})=>{
+      const ref=React.useRef(null); const [top,setTop]=React.useState(0);
+      const rafRef=React.useRef(null);
+      const onScroll=e=>{
+        const scrollTop=e.currentTarget.scrollTop;
+        if(rafRef.current) cancelAnimationFrame(rafRef.current);
+        rafRef.current=requestAnimationFrame(()=>setTop(scrollTop));
+      };
+      const h=ref.current?.clientHeight??600, si=Math.max(0,Math.floor(top/rowHeight)-overscan),
+            ei=Math.min(total,Math.ceil((top+h)/rowHeight)+overscan);
+      return {ref,onScroll,startIndex:si,endIndex:ei,topPad:si*rowHeight,bottomPad:(total-ei)*rowHeight};
+    };
+    const useAutoHeight = (ref, deps=[], bottomOffset=0)=>{
+      React.useLayoutEffect(()=>{
+        if(!ref.current) return;
+        const el=ref.current;
+        const resize=()=>{
+          const top=el.getBoundingClientRect().top;
+          const h=window.innerHeight - top - bottomOffset - 4;
+          el.style.height = (h>0? h : 0) + 'px';
+        };
+        resize();
+        requestAnimationFrame(()=>{ resize(); requestAnimationFrame(resize); });
+        const ro=new ResizeObserver(resize);
+        ro.observe(document.body);
+        window.addEventListener('resize',resize);
+        return ()=>{ ro.disconnect(); window.removeEventListener('resize',resize); };
+      }, deps);
+    };
+
+    function App(){
+      const [dark,setDark]=React.useState(false);
+      const theme=React.useMemo(()=>createTheme({palette:{mode:dark?'dark':'light'}}),[dark]);
+      const isMobile=useMediaQuery(theme.breakpoints.down('sm'));
+
+      // 表示モード: auto / table / card
+      const [viewMode,setViewMode]=React.useState('auto');
+      const useCard = viewMode==='auto' ? isMobile : (viewMode==='card');
+
+      // リストモード: virtual / paging
+      const [listMode,setListMode]=React.useState('virtual');
+
+      const [pageSize,setPageSize]=React.useState(25);
+      const [pageIndex,setPageIndex]=React.useState(0);
+
+      const [rows,setRows]=React.useState(()=>createMockData(20000));
+
+      // 列状態
+      const initialWidths=React.useMemo(()=>{ const m={}; COLUMN_DEFS.forEach(c=>m[c.key]=c.width||120); return m; },[]);
+      const [colWidths,setColWidths]=React.useState(initialWidths);
+      const [visibleCols,setVisibleCols]=React.useState(COLUMN_DEFS.map(c=>c.key));
+      
+      // 検索/フィルタ/ソート
+      const [q,setQ]=React.useState('');
+      const [colFilters,setColFilters]=React.useState({});
+      const [sortKey,setSortKey]=React.useState('no');
+      const [sortDir,setSortDir]=React.useState('asc');
+
+      // 選択
+      const [selected,setSelected]=React.useState(()=>new Set());
+      const toggleRow=(id)=> setSelected(s=>{ const n=new Set(s); n.has(id)? n.delete(id): n.add(id); return n; });
+      const toggleAll=(list)=> setSelected(s=>{ const n=new Set(s); const allOn = list.every(r=>n.has(r.id)); list.forEach(r=>{ if(allOn) n.delete(r.id); else n.add(r.id); }); return n; });
+
+      // 編集モード & スナック
+      const [editMode,setEditMode]=React.useState(false);
+      const [snack,setSnack]=React.useState({open:false,msg:''});
+      const [settingsOpen,setSettingsOpen]=React.useState(false);
+      const [dataCount,setDataCount]=React.useState(20000);
+      const [csvPreview,setCsvPreview]=React.useState(null);
+      const [chartOpen,setChartOpen]=React.useState(false);
+      const [chartType,setChartType]=React.useState('line');
+      const [chartXAxis,setChartXAxis]=React.useState(['yearWeek']);
+      const [chartYAxis,setChartYAxis]=React.useState(['sales7d']);
+      const [chartY2Axis,setChartY2Axis]=React.useState(['stockQty','stockQty7d']);
+      const [chartSeries,setChartSeries]=React.useState([]);
+      const [chartGroupBy,setChartGroupBy]=React.useState('sum');
+      const [chartHeight,setChartHeight]=React.useState(400);
+      const [chartResizing,setChartResizing]=React.useState(null);
+      const previewBarRef=React.useRef(null);
+
+      // 集計クエリー
+      const [aggOpen,setAggOpen]=React.useState(false);
+      const [aggConfig,setAggConfig]=React.useState(()=>{
+        const cfg={};
+        COLUMN_DEFS.filter(c=>c.key!=='select'&&c.key!=='no'&&c.kind!=='checkbox').forEach(c=>{
+          if(c.kind==='number') {
+            cfg[c.key]={mode:'agg',func:'sum'};
+          } else if(c.key==='category') {
+            cfg[c.key]={mode:'group'};
+          } else {
+            cfg[c.key]={mode:'hide'};
+          }
+        });
+        return cfg;
+      });
+      const [aggActive,setAggActive]=React.useState(false);
+      const [aggResult,setAggResult]=React.useState(null);
+      const [aggResultColumns,setAggResultColumns]=React.useState([]);
+      
+      // aggActiveが変更された時のログ
+      React.useEffect(()=>{
+        console.log('aggActiveが変更されました:', aggActive);
+        if(aggActive) {
+          console.log('集計モードがアクティブになりました');
+        }
+      }, [aggActive]);
+      const [aggGroupBy,setAggGroupBy]=React.useState(['category']);
+      const [aggMetrics,setAggMetrics]=React.useState([{col:'sellPrice',func:'sum'}]);
+
+      // ---- フィルタ ----
+      const filtered=React.useMemo(()=>rows.filter((r,idx)=>{
+        if(q){ const s=q.toLowerCase(); const hit=[r.name,r.code,r.partner,r.corner,r.line,r.category].some(v=>String(v||'').toLowerCase().includes(s)); if(!hit) return false; }
+        for(const col of COLUMN_DEFS){
+          const v = col.raw? col.raw(r,idx) : (col.value? col.value(r,idx) : r[col.key]);
+          const f = colFilters[col.key]; if(!f) continue;
+          if(col.kind==='number'){ if(!matchNumber(Number(v||0), f)) return false; }
+          else if(col.kind==='date'){ if(!matchDate(v, f)) return false; }
+          else { if(!String(v??'').toLowerCase().includes(String(f).toLowerCase())) return false; }
+        }
+        return true;
+      }),[rows,q,colFilters]);
+      
+      // ---- 集計実行（高速化版） ----
+      const {aggregated,aggColumns}=React.useMemo(()=>{
+        console.log('=== useMemoが実行されました ===');
+        console.log('aggActive:', aggActive);
+        console.log('aggConfig:', aggConfig);
+        console.log('filtered.length:', filtered?.length);
+        
+        if(!aggActive) {
+          console.log('aggActiveがfalseのため集計をスキップ');
+          return {aggregated:null,aggColumns:[]};
+        }
+        
+        if(!aggConfig) {
+          console.log('aggConfigがないため集計をスキップ');
+          return {aggregated:null,aggColumns:[]};
+        }
+        
+        const groupCols=Object.keys(aggConfig).filter(k=>aggConfig[k]?.mode==='group');
+        const aggCols=Object.keys(aggConfig).filter(k=>aggConfig[k]?.mode==='agg');
+        
+        console.log('集計処理開始:', {groupCols, aggCols, aggConfig, filtered: filtered.length});
+        
+        if(groupCols.length===0 && aggCols.length===0) {
+          console.log('グループ列と集計列がありません');
+          return {aggregated:null,aggColumns:[]};
+        }
+        
+        // グループ列がない場合は全体集計
+        if(groupCols.length===0 && aggCols.length>0) {
+          console.log('全体集計を実行');
+          const totalRow={id:'agg_total',_count:filtered.length};
+          
+          aggCols.forEach(col=>{
+            const values=filtered.map(r=>Number(r[col])||0);
+            const func=aggConfig[col]?.func||'sum';
+            
+            if(func==='sum') totalRow[col]=values.reduce((a,b)=>a+b,0);
+            else if(func==='avg') totalRow[col]=values.length>0?Math.round(values.reduce((a,b)=>a+b,0)/values.length*100)/100:0;
+            else if(func==='max') totalRow[col]=values.length>0?Math.max(...values):0;
+            else if(func==='min') totalRow[col]=values.length>0?Math.min(...values):0;
+            else if(func==='count') totalRow[col]=values.length;
+            else totalRow[col]=values.reduce((a,b)=>a+b,0);
+          });
+          
+          const cols=[
+            {key:'select',label:'',kind:'checkbox',width:44,min:40,max:80},
+            {key:'no',label:'No',kind:'number',width:72,min:60,max:120,numeric:true,raw:(r,i)=>i+1},
+            {key:'_count',label:'件数',kind:'number',width:100,min:80,max:200,numeric:true}
+          ];
+          
+          aggCols.forEach(k=>{
+            const orig=COLUMN_DEFS.find(c=>c.key===k);
+            const func=aggConfig[k]?.func||'sum';
+            const funcLabel={sum:'合計',avg:'平均',max:'最大',min:'最小',count:'件数'}[func]||func;
+            if(orig) cols.push({...orig,label:`全体${orig.label}(${funcLabel})`,key:k});
+          });
+          
+          console.log('全体集計結果:', totalRow);
+          console.log('全体集計列定義:', cols);
+          console.log('全体集計データ:', [totalRow]);
+          return {aggregated:[totalRow],aggColumns:cols};
+        }
+        // グループ列がある場合のグループ集計
+        console.log('グループ集計を実行');
+        
+        const groups=new Map();
+        const getKey=groupCols.length===1?r=>String(r[groupCols[0]]||'(空)'):r=>groupCols.map(k=>String(r[k]||'(空)')).join(' | ');
+        
+        for(let i=0,len=filtered.length;i<len;i++){
+          const r=filtered[i];
+          const key=getKey(r);
+          let g=groups.get(key);
+          if(!g){
+            g={_count:0,stats:{},raw:{}};
+            groupCols.forEach(k=>g.raw[k]=r[k]);
+            groups.set(key,g);
+          }
+          g._count++;
+          
+          for(let j=0;j<aggCols.length;j++){
+            const col=aggCols[j];
+            const val=Number(r[col])||0;
+            let s=g.stats[col];
+            if(!s){s={sum:0,count:0,max:-Infinity,min:Infinity};g.stats[col]=s;}
+            s.sum+=val;
+            s.count++;
+            if(val>s.max)s.max=val;
+            if(val<s.min)s.min=val;
+          }
+        }
+        
+        const result=[];
+        let idx=0;
+        groups.forEach(g=>{
+          const row={id:`agg_${idx++}`,_count:g._count};
+          groupCols.forEach(k=>row[k]=g.raw[k]);
+          aggCols.forEach(col=>{
+            const s=g.stats[col];
+            const func=aggConfig[col]?.func||'sum';
+            if(func==='sum')row[col]=s.sum;
+            else if(func==='avg')row[col]=s.count>0?Math.round(s.sum/s.count*100)/100:0;
+            else if(func==='max')row[col]=s.max===-Infinity?0:s.max;
+            else if(func==='min')row[col]=s.min===Infinity?0:s.min;
+            else if(func==='count')row[col]=s.count;
+            else row[col]=s.sum;
+          });
+          result.push(row);
+        });
+        
+        const cols=[
+          {key:'select',label:'',kind:'checkbox',width:44,min:40,max:80},
+          {key:'no',label:'No',kind:'number',width:72,min:60,max:120,numeric:true,raw:(r,i)=>i+1}
+        ];
+        
+        groupCols.forEach(k=>{
+          const orig=COLUMN_DEFS.find(c=>c.key===k);
+          if(orig) cols.push({...orig,label:orig.label});
+        });
+        
+        cols.push({key:'_count',label:'件数',kind:'number',width:100,min:80,max:200,numeric:true});
+        
+        aggCols.forEach(k=>{
+          const orig=COLUMN_DEFS.find(c=>c.key===k);
+          const func=aggConfig[k]?.func||'sum';
+          const funcLabel={sum:'合計',avg:'平均',max:'最大',min:'最小',count:'件数'}[func]||func;
+          if(orig) cols.push({...orig,label:`${orig.label}(${funcLabel})`,key:k});
+        });
+        
+        console.log('グループ集計結果:', {groups:result.length,columns:cols.length});
+        console.log('グループ集計列定義:', cols);
+        console.log('グループ集計データ:', result);
+        console.table(result);
+        return {aggregated:result,aggColumns:cols};
+      },[aggActive,aggConfig,filtered,rows]);
+      
+      // 集計結果のデバッグログ
+      React.useEffect(()=>{
+        console.log('集計結果が更新されました:', {aggregated: aggregated?.length, aggColumns: aggColumns?.length});
+        if(aggregated) {
+          console.log('集計データ:', aggregated);
+          console.table(aggregated);
+        }
+      }, [aggregated, aggColumns]);
+
+      const columns=React.useMemo(()=>{
+        console.log('columns useMemo実行:', {aggActive, aggResultColumnsLength: aggResultColumns.length});
+        if(aggActive && aggResultColumns.length > 0) {
+          console.log('集計用列定義を使用:', aggResultColumns);
+          return aggResultColumns;
+        }
+        console.log('通常の列定義を使用');
+        return COLUMN_DEFS.filter(c=>visibleCols.includes(c.key));
+      }, [visibleCols,aggActive,aggResultColumns,aggResult]);
+
+      const [resizing,setResizing]=React.useState(null);
+
+      // サンプルデータ再生成
+      const regenerateData=()=>{
+        setRows(createMockData(dataCount));
+        setSnack({open:true,msg:`サンプルデータを${dataCount.toLocaleString()}件再生成しました`});
+        setSettingsOpen(false);
+      };
+
+      // 列定義テンプレートエクスポート
+      const exportTemplate=()=>{
+        const template = COLUMN_DEFS.filter(c=>c.key!=='select').map(c=>({
+          key:c.key,label:c.label,kind:c.kind,width:c.width,editable:c.editable,required:c.required,nullable:c.nullable
+        }));
+        download('column_template.json', JSON.stringify(template,null,2), 'application/json');
+        setSnack({open:true,msg:'テンプレートをエクスポートしました'});
+      };
+
+      // 列定義インポート
+      const importTemplate=(e)=>{
+        const file=e.target.files[0];
+        if(!file) return;
+        const reader=new FileReader();
+        reader.onload=(ev)=>{
+          try{
+            const data=JSON.parse(ev.target.result);
+            setCsvPreview({type:'json',data,count:data.length});
+          }catch(err){
+            setSnack({open:true,msg:'列定義の読み込みに失敗しました'});
+          }
+        };
+        reader.readAsText(file);
+        e.target.value='';
+      };
+
+      const applyImport=()=>{
+        if(csvPreview){
+          setSnack({open:true,msg:`列定義を適用しました（${csvPreview.count}列）`});
+          setCsvPreview(null);
+          setSettingsOpen(false);
+        }
+      };
+
+
+
+      // ---- ソート ----
+      const sorted=React.useMemo(()=>{
+        let data = aggResult || filtered;
+        
+        // 集計結果に対してもフィルタを適用
+        if(aggResult && (q || Object.values(colFilters).some(v=>v))) {
+          data = aggResult.filter((r,idx)=>{
+            if(q){ 
+              const s=q.toLowerCase(); 
+              const hit=columns.filter(c=>c.key!=='select'&&c.key!=='no').some(col=>{
+                const v = col.raw? col.raw(r,idx) : (col.value? col.value(r,idx) : r[col.key]);
+                return String(v||'').toLowerCase().includes(s);
+              }); 
+              if(!hit) return false; 
+            }
+            for(const col of columns){
+              const v = col.raw? col.raw(r,idx) : (col.value? col.value(r,idx) : r[col.key]);
+              const f = colFilters[col.key]; if(!f) continue;
+              if(col.kind==='number'){ if(!matchNumber(Number(v||0), f)) return false; }
+              else if(col.kind==='date'){ if(!matchDate(v, f)) return false; }
+              else { if(!String(v??'').toLowerCase().includes(String(f).toLowerCase())) return false; }
+            }
+            return true;
+          });
+        }
+        
+        console.log('sorted useMemo実行:', {aggResult: aggResult?.length, filtered: filtered.length, dataUsed: data.length});
+        const def = columns.find(c=>c.key===sortKey) || columns[1] || columns[0];
+        const get = (r,i)=> def.raw? def.raw(r,i) : (def.value? def.value(r,i) : r[def.key]);
+        const mul = sortDir==='asc'? 1 : -1;
+        return [...data].sort((a,b)=>{
+          const va = get(a,0), vb = get(b,0);
+          if(va==null && vb==null) return 0; if(va==null) return -mul; if(vb==null) return mul;
+          if(def.kind==='number') return (Number(va)-Number(vb))*mul;
+          if(def.kind==='date')   return ((+new Date(va||0)) - (+new Date(vb||0))) * mul;
+          return String(va).localeCompare(String(vb),'ja') * mul;
+        });
+      },[aggResult,filtered,sortKey,sortDir,columns,q,colFilters]);
+
+      // ---- ページング適用 or 仮想 ----
+      const pageCount = Math.max(1, Math.ceil(sorted.length / pageSize));
+      React.useEffect(()=>{ if(pageIndex>pageCount-1) setPageIndex(pageCount-1); },[pageCount, pageIndex]);
+      const paged = React.useMemo(()=>{
+        if(listMode!=='paging') return sorted;
+        const start=pageIndex*pageSize;
+        return sorted.slice(start, start+pageSize);
+      },[sorted,listMode,pageIndex,pageSize]);
+
+      // 仮想スクロール（常に初期化）
+      const visibleFieldCount = columns.filter(c=>c.key!=='select').length;
+      const rowHeight = useCard ? 200 : 32;
+      const {ref,onScroll,startIndex,endIndex,topPad,bottomPad} =
+        useVirtualList({total: listMode==='virtual' ? sorted.length : paged.length, rowHeight});
+      const bottomOffset = (listMode==='paging' && !useCard) ? 56 : 0;
+      
+      // 自動高さ調整（常に実行）
+      React.useLayoutEffect(()=>{
+        if(!ref.current) return;
+        const el=ref.current;
+        const resize=()=>{
+          const top=el.getBoundingClientRect().top;
+          const h=window.innerHeight - top - bottomOffset - 4;
+          el.style.height = (h>0? h : 0) + 'px';
+        };
+        resize();
+        requestAnimationFrame(()=>{ resize(); requestAnimationFrame(resize); });
+        const ro=new ResizeObserver(resize);
+        ro.observe(document.body);
+        window.addEventListener('resize',resize);
+        return ()=>{ ro.disconnect(); window.removeEventListener('resize',resize); };
+      }, [listMode, useCard, sorted.length, visibleFieldCount, bottomOffset]);
+      const slice = React.useMemo(()=>{
+        if(listMode==='paging') return paged;
+        return sorted.slice(startIndex, endIndex);
+      },[listMode,paged,sorted,startIndex,endIndex]);
+
+      // ---- ヘッダ操作（常に初期化） ----
+      const wasResizing = React.useRef(false);
+      const onHeaderClick=(k)=>{ if(wasResizing.current) { wasResizing.current=false; return; } if(sortKey===k) setSortDir(d=>d==='asc'?'desc':'asc'); else { setSortKey(k); setSortDir('asc'); } };
+      
+      const autoFitColumn=(key)=>{
+        const def=COLUMN_DEFS.find(c=>c.key===key);
+        if(!def) return;
+        const cells=document.querySelectorAll(`td[data-col="${key}"], th[data-col="${key}"]`);
+        let maxW=def.min||60;
+        cells.forEach(cell=>{ const w=cell.scrollWidth+12; if(w>maxW) maxW=w; });
+        setColWidths(prev=>({...prev,[key]:Math.min(maxW, def.max||800)}));
+      };
+
+      // スクロールハンドル（常に初期化）
+      const [scrollHandle,setScrollHandle]=React.useState(null);
+      const scrollRef=React.useRef(null);
+      const scrollBarRef=React.useRef(null);
+      
+      const [scrollInfo,setScrollInfo]=React.useState({handleWidth:30,trackWidth:0,maxLeft:0,containerWidth:300,tableWidth:300});
+      
+      React.useEffect(()=>{
+        if(useCard) return;
+        const update=()=>{
+          if(!ref.current||!scrollBarRef.current) return;
+          const containerWidth=ref.current.clientWidth||300;
+          const tableWidth=ref.current.scrollWidth||containerWidth;
+          const barWidth=scrollBarRef.current.clientWidth||containerWidth;
+          const ratio=Math.min(1,containerWidth/tableWidth);
+          const handleWidth=Math.max(30,barWidth*ratio);
+          const trackWidth=barWidth-16;
+          const maxLeft=trackWidth-handleWidth;
+          setScrollInfo({handleWidth,trackWidth,maxLeft,containerWidth,tableWidth});
+        };
+        update();
+        const timer=setTimeout(update,100);
+        return ()=>clearTimeout(timer);
+      },[useCard,colWidths,columns]);
+      
+      React.useEffect(()=>{
+        if(useCard||!ref.current||!scrollRef.current||scrollInfo.maxLeft<=0) return;
+        const scrollRatio=ref.current.scrollLeft/(scrollInfo.tableWidth-scrollInfo.containerWidth)||0;
+        const handleLeft=scrollRatio*scrollInfo.maxLeft;
+        scrollRef.current.style.left=(handleLeft+8)+'px';
+        scrollRef.current.style.width=scrollInfo.handleWidth+'px';
+      },[scrollInfo,useCard]);
+      
+      React.useEffect(()=>{
+        if(useCard || !scrollHandle) return;
+        const {startX,startLeft} = scrollHandle;
+        const onMove=(e)=>{
+          const delta=e.clientX - startX;
+          const newLeft=Math.max(0,Math.min(scrollInfo.maxLeft,startLeft+delta));
+          if(scrollRef.current) {
+            scrollRef.current.style.left=(newLeft+8)+'px';
+            scrollRef.current.style.width=scrollInfo.handleWidth+'px';
+          }
+          if(ref.current && scrollInfo.maxLeft>0) {
+            const scrollRatio=newLeft/scrollInfo.maxLeft;
+            const maxScroll=scrollInfo.tableWidth-scrollInfo.containerWidth;
+            ref.current.scrollLeft=scrollRatio*maxScroll;
+          }
+        };
+        const onUp=()=>setScrollHandle(null);
+        window.addEventListener('mousemove',onMove);
+        window.addEventListener('mouseup',onUp);
+        return ()=>{
+          window.removeEventListener('mousemove',onMove);
+          window.removeEventListener('mouseup',onUp);
+        };
+      },[scrollHandle,scrollInfo,useCard]);
+
+      // 列リサイズ
+      React.useEffect(()=>{
+        if(!resizing) return;
+        console.log('Resize started:', resizing);
+        const {key,startX,startW} = resizing;
+        const def=COLUMN_DEFS.find(c=>c.key===key);
+        let moved = false;
+        document.body.classList.add('resizing');
+        const onMove=(e)=>{
+          moved = true;
+          const delta=e.clientX - startX;
+          const w=Math.max(def.min||60, Math.min(def.max||800, startW+delta));
+          console.log('Resizing:', key, 'width:', w);
+          setColWidths(prev=>({...prev,[key]:w}));
+        };
+        const onUp=()=>{
+          console.log('Resize ended, moved:', moved);
+          if(moved) wasResizing.current = true;
+          setResizing(null);
+          document.body.classList.remove('resizing');
+        };
+        window.addEventListener('mousemove',onMove);
+        window.addEventListener('mouseup',onUp);
+        return ()=>{
+          window.removeEventListener('mousemove',onMove);
+          window.removeEventListener('mouseup',onUp);
+          document.body.classList.remove('resizing');
+        };
+      },[resizing]);
+
+      // グラフリサイズ
+      React.useEffect(()=>{
+        if(!chartResizing) return;
+        const {startY,startHeight} = chartResizing;
+        const bar = previewBarRef.current;
+        if(bar) bar.style.display = 'block';
+        document.body.style.userSelect = 'none';
+        const onMove=(e)=>{
+          e.preventDefault();
+          if(bar) bar.style.top = (e.clientY-2) + 'px';
+        };
+        const onUp=(e)=>{
+          if(bar) bar.style.display = 'none';
+          document.body.style.userSelect = '';
+          const delta=e.clientY - startY;
+          const h=Math.max(200, Math.min(800, startHeight+delta));
+          setChartHeight(h);
+          setChartResizing(null);
+        };
+        window.addEventListener('mousemove',onMove);
+        window.addEventListener('mouseup',onUp);
+        return ()=>{
+          window.removeEventListener('mousemove',onMove);
+          window.removeEventListener('mouseup',onUp);
+          document.body.style.userSelect = '';
+        };
+      },[chartResizing]);
+
+      // CSV
+      const exportCSV=()=> download(
+        `export_${new Date().toISOString().slice(0,19).replace(/[:T]/g,'-')}.csv`,
+        toCSV(listMode==='paging'? paged : sorted, columns.filter(c=>c.kind!=='checkbox'))
+      );
+
+      // 列メニュー
+      const [anchorEl,setAnchorEl]=React.useState(null);
+
+      // 編集
+      const normalize=(k,val)=>{
+        const cd = COLUMN_DEFS.find(c=>c.key===k);
+        if(!cd) return val;
+        if(cd.kind==='number') return Math.max(0, Math.round(+val||0));
+        return String(val);
+      };
+      const updateCell=(id,key,val)=>{
+        const nv=normalize(key,val);
+        setRows(rs=>rs.map(r=>r.id===id?{...r,[key]:nv}:r));
+        setSnack({open:true,msg:`ID=${id} の「${key}」を更新しました`});
+      };
+
+      // セルクリック→即フィルタ
+      const onCellClick=(col,row,idx)=>{
+        if(editMode) return;
+        if(col.kind==='checkbox') return;
+        const v = col.raw? col.raw(row,idx) : (col.value? col.value(row,idx) : row[col.key]);
+        setColFilters(f=>({...f,[col.key]: String(v??'')})); 
+        if(listMode==='paging') setPageIndex(0);
+        if(useCard && ref.current){
+          const el=ref.current, prev=el.style.scrollBehavior; el.style.scrollBehavior='auto'; el.scrollTop=0;
+          requestAnimationFrame(()=>{ el.style.scrollBehavior=prev||'smooth'; });
+        }
+      };
+
+      // カード描画（シンプル実装）
+      const renderCard = React.useCallback((row, idx) => {
+        const getValue=(key)=>{
+          const col=COLUMN_DEFS.find(c=>c.key===key);
+          if(!col) return '';
+          const raw=col.calc? col.calc(row) : (col.raw? col.raw(row,idx) : row[key]);
+          if(col.kind==='number') return Number(raw??0).toLocaleString();
+          return String(raw??'');
+        };
+        const isVisible=(key)=>columns.some(c=>c.key===key);
+        
+        return (
+          <Card key={row.id} variant="outlined" sx={{position:'relative',transition:'box-shadow .2s','&:hover':{boxShadow:2}}}>
+            <CardContent sx={{p:2,'&:last-child':{pb:2}}}>
+              <Checkbox size="small" checked={selected.has(row.id)} onChange={()=>toggleRow(row.id)} sx={{position:'absolute',top:8,right:8,p:0}}/>
+              {isVisible('name') && <Typography variant="h6" sx={{mb:1.5,pr:4,fontWeight:600}}>{getValue('name')}</Typography>}
+              <Stack direction="row" spacing={2} sx={{mb:1.5,flexWrap:'wrap',gap:1}}>
+                {isVisible('code') && <Box sx={{flex:'1 1 45%',minWidth:120}}><Typography variant="caption" sx={{color:'text.secondary',fontSize:'.7rem',display:'block',mb:.25}}>コード</Typography><Typography variant="body2">{getValue('code')}</Typography></Box>}
+                {isVisible('sellPrice') && <Box sx={{flex:'1 1 45%',minWidth:100}}><Typography variant="caption" sx={{color:'text.secondary',fontSize:'.7rem',display:'block',mb:.25}}>売価</Typography><Typography variant="body2">{getValue('sellPrice')}</Typography></Box>}
+              </Stack>
+              <Stack direction="row" spacing={1} sx={{mb:1.5,flexWrap:'wrap',gap:.5}}>
+                {isVisible('corner') && <Chip label={getValue('corner')} size="small" variant="outlined" sx={{fontSize:'.7rem'}}/>}
+                {isVisible('line') && <Chip label={getValue('line')} size="small" variant="outlined" sx={{fontSize:'.7rem'}}/>}
+                {isVisible('category') && <Chip label={getValue('category')} size="small" variant="outlined" sx={{fontSize:'.7rem'}}/>}
+              </Stack>
+              {isVisible('partner') && <Box sx={{mb:1.5,pb:1.5,borderBottom:1,borderColor:'divider'}}><Typography variant="caption" sx={{color:'text.secondary',fontSize:'.7rem',display:'block',mb:.25}}>取引先</Typography><Typography variant="body2">{getValue('partner')}</Typography></Box>}
+              <Stack direction="row" spacing={1} sx={{mb:1}}>
+                {isVisible('stockQty') && <Box sx={{flex:1}}><Typography variant="caption" sx={{color:'text.secondary',fontSize:'.68rem',display:'block',mb:.25}}>在庫数</Typography><Typography variant="body2">{getValue('stockQty')}</Typography></Box>}
+                {isVisible('costPrice') && <Box sx={{flex:1}}><Typography variant="caption" sx={{color:'text.secondary',fontSize:'.68rem',display:'block',mb:.25}}>原価</Typography><Typography variant="body2">{getValue('costPrice')}</Typography></Box>}
+              </Stack>
+              <Stack direction="row" spacing={1} sx={{mb:1}}>
+                {isVisible('totalSales') && <Box sx={{flex:1}}><Typography variant="caption" sx={{color:'text.secondary',fontSize:'.68rem',display:'block',mb:.25}}>累計販売数</Typography><Typography variant="body2">{getValue('totalSales')}</Typography></Box>}
+                {isVisible('sales28d') && <Box sx={{flex:1}}><Typography variant="caption" sx={{color:'text.secondary',fontSize:'.68rem',display:'block',mb:.25}}>販売数(28日)</Typography><Typography variant="body2">{getValue('sales28d')}</Typography></Box>}
+                {isVisible('sales7d') && <Box sx={{flex:1}}><Typography variant="caption" sx={{color:'text.secondary',fontSize:'.68rem',display:'block',mb:.25}}>販売数(7日)</Typography><Typography variant="body2">{getValue('sales7d')}</Typography></Box>}
+              </Stack>
+              {(isVisible('saleStartDate')||isVisible('saleEndDate')) && <Stack direction="row" spacing={2} sx={{mt:1.5,pt:1,borderTop:1,borderColor:'divider'}}>
+                {isVisible('saleStartDate') && <Typography variant="caption" sx={{color:'text.secondary',fontSize:'.68rem'}}>販売開始日: {getValue('saleStartDate')||'-'}</Typography>}
+                {isVisible('saleEndDate') && <Typography variant="caption" sx={{color:'text.secondary',fontSize:'.68rem'}}>販売終了日: {getValue('saleEndDate')||'-'}</Typography>}
+              </Stack>}
+            </CardContent>
+          </Card>
+        );
+      },[columns,selected,editMode]);
+
+      const handleChangePage = (_e, newPage)=> setPageIndex(newPage);
+      const handleChangeRowsPerPage = (e)=>{ setPageSize(parseInt(e.target.value,10)); setPageIndex(0); };
+
+      // グラフ描画
+      const renderChart = React.useCallback(()=>{
+        if(!chartOpen) return;
+        const container = document.getElementById('chart-container');
+        if(!container) return;
+        
+        const xKeys = chartXAxis.length>0 ? chartXAxis : ['corner'];
+        const yKeys = chartYAxis.length>0 ? chartYAxis : ['sellPrice'];
+        const y2Keys = chartY2Axis.length>0 ? chartY2Axis : [];
+        const seriesKeys = chartSeries.length>0 ? chartSeries : [];
+        
+        let dataByY = {};
+        let dataByY2 = {};
+        
+        if(seriesKeys.length>0){
+          const seriesGroups = {};
+          sorted.forEach(d=>{
+            const seriesVal = seriesKeys.map(k=>d[k]).join(' - ');
+            if(!seriesGroups[seriesVal]) seriesGroups[seriesVal]=[];
+            seriesGroups[seriesVal].push(d);
+          });
+          
+          Object.entries(seriesGroups).forEach(([seriesVal,seriesData])=>{
+            yKeys.forEach(yKey=>{
+              const yLabel = COLUMN_DEFS.find(c=>c.key===yKey)?.label||yKey;
+              const key = yKeys.length>1 ? `${seriesVal} - ${yLabel}` : seriesVal;
+              if(chartGroupBy==='none'){
+                const xGroups = {};
+                seriesData.forEach(d=>{
+                  const xVal = xKeys.map(k=>d[k]).join(' - ');
+                  if(!xGroups[xVal]) xGroups[xVal] = [];
+                  xGroups[xVal].push(+d[yKey]||0);
+                });
+                dataByY[key] = Object.entries(xGroups).map(([k,vals])=>({x:k,y:vals[0]}));
+              }else{
+                const grouped = {};
+                seriesData.forEach(d=>{
+                  const xVal = xKeys.map(k=>d[k]).join(' - ');
+                  if(!grouped[xVal]) grouped[xVal]={sum:0,count:0};
+                  grouped[xVal].sum += (+d[yKey]||0);
+                  grouped[xVal].count++;
+                });
+                dataByY[key] = Object.entries(grouped).map(([k,v])=>{
+                  let y = v.sum;
+                  if(chartGroupBy==='avg') y = v.count>0 ? v.sum/v.count : 0;
+                  else if(chartGroupBy==='count') y = v.count;
+                  return {x:k,y:Math.round(y)};
+                });
+              }
+            });
+            
+            y2Keys.forEach(yKey=>{
+              const yLabel = COLUMN_DEFS.find(c=>c.key===yKey)?.label||yKey;
+              const key = y2Keys.length>1 ? `${seriesVal} - ${yLabel}` : seriesVal;
+              if(chartGroupBy==='none'){
+                const xGroups = {};
+                seriesData.forEach(d=>{
+                  const xVal = xKeys.map(k=>d[k]).join(' - ');
+                  if(!xGroups[xVal]) xGroups[xVal] = [];
+                  xGroups[xVal].push(+d[yKey]||0);
+                });
+                dataByY2[key] = Object.entries(xGroups).map(([k,vals])=>({x:k,y:vals[0]}));
+              }else{
+                const grouped = {};
+                seriesData.forEach(d=>{
+                  const xVal = xKeys.map(k=>d[k]).join(' - ');
+                  if(!grouped[xVal]) grouped[xVal]={sum:0,count:0};
+                  grouped[xVal].sum += (+d[yKey]||0);
+                  grouped[xVal].count++;
+                });
+                dataByY2[key] = Object.entries(grouped).map(([k,v])=>{
+                  let y = v.sum;
+                  if(chartGroupBy==='avg') y = v.count>0 ? v.sum/v.count : 0;
+                  else if(chartGroupBy==='count') y = v.count;
+                  return {x:k,y:Math.round(y)};
+                });
+              }
+            });
+          });
+        }else{
+          yKeys.forEach(yKey=>{
+            const yLabel = COLUMN_DEFS.find(c=>c.key===yKey)?.label||yKey;
+            if(chartGroupBy==='none'){
+              const xGroups = {};
+              sorted.forEach(d=>{
+                const xVal = xKeys.map(k=>d[k]).join(' - ');
+                if(!xGroups[xVal]) xGroups[xVal] = [];
+                xGroups[xVal].push(+d[yKey]||0);
+              });
+              dataByY[yLabel] = Object.entries(xGroups).map(([k,vals])=>({x:k,y:vals[0]}));
+            }else{
+              const grouped = {};
+              sorted.forEach(d=>{
+                const key = xKeys.map(k=>d[k]).join(' - ');
+                if(!grouped[key]) grouped[key]={sum:0,count:0};
+                grouped[key].sum += (+d[yKey]||0);
+                grouped[key].count++;
+              });
+              dataByY[yLabel] = Object.entries(grouped).map(([k,v])=>{
+                let y = v.sum;
+                if(chartGroupBy==='avg') y = v.count>0 ? v.sum/v.count : 0;
+                else if(chartGroupBy==='count') y = v.count;
+                return {x:k,y:Math.round(y)};
+              });
+            }
+          });
+          
+          y2Keys.forEach(yKey=>{
+            const yLabel = COLUMN_DEFS.find(c=>c.key===yKey)?.label||yKey;
+            if(chartGroupBy==='none'){
+              const xGroups = {};
+              sorted.forEach(d=>{
+                const xVal = xKeys.map(k=>d[k]).join(' - ');
+                if(!xGroups[xVal]) xGroups[xVal] = [];
+                xGroups[xVal].push(+d[yKey]||0);
+              });
+              dataByY2[yLabel] = Object.entries(xGroups).map(([k,vals])=>({x:k,y:vals[0]}));
+            }else{
+              const grouped = {};
+              sorted.forEach(d=>{
+                const key = xKeys.map(k=>d[k]).join(' - ');
+                if(!grouped[key]) grouped[key]={sum:0,count:0};
+                grouped[key].sum += (+d[yKey]||0);
+                grouped[key].count++;
+              });
+              dataByY2[yLabel] = Object.entries(grouped).map(([k,v])=>{
+                let y = v.sum;
+                if(chartGroupBy==='avg') y = v.count>0 ? v.sum/v.count : 0;
+                else if(chartGroupBy==='count') y = v.count;
+                return {x:k,y:Math.round(y)};
+              });
+            }
+          });
+        }
+        
+        const dataKeys = Object.keys(dataByY);
+        const dataKeys2 = Object.keys(dataByY2);
+        const traces = [
+          ...dataKeys.map(key=>{
+            const data = dataByY[key];
+            return {
+              x: data.map(d=>d.x),
+              y: data.map(d=>d.y),
+              name: key,
+              type: chartType === 'pie' ? 'pie' : (chartType === 'bar' ? 'bar' : 'scatter'),
+              mode: chartType === 'line' ? 'lines+markers' : undefined,
+              values: chartType === 'pie' ? data.map(d=>d.y) : undefined,
+              labels: chartType === 'pie' ? data.map(d=>d.x) : undefined
+            };
+          }),
+          ...dataKeys2.map(key=>{
+            const data = dataByY2[key];
+            return {
+              x: data.map(d=>d.x),
+              y: data.map(d=>d.y),
+              name: key + ' (右軸)',
+              type: chartType === 'pie' ? 'pie' : (chartType === 'bar' ? 'bar' : 'scatter'),
+              mode: chartType === 'line' ? 'lines+markers' : undefined,
+              yaxis: 'y2',
+              line: chartType === 'line' ? {dash: 'dash'} : undefined
+            };
+          })
+        ];
+        
+        const layout = {
+          title: 'データ可視化',
+          xaxis: { title: xKeys.map(k=>COLUMN_DEFS.find(c=>c.key===k)?.label||k).join(' - ') },
+          yaxis: { title: '値 (左軸)', separatethousands: true, tickformat: ',.0f' },
+          yaxis2: dataKeys2.length > 0 ? {
+            title: '値 (右軸)',
+            overlaying: 'y',
+            side: 'right',
+            separatethousands: true,
+            tickformat: ',.0f'
+          } : undefined,
+          showlegend: (dataKeys.length + dataKeys2.length) > 1,
+          responsive: true,
+          margin: { t: 50, r: 80, b: 80, l: 80 }
+        };
+        
+        Plotly.newPlot(container, traces, layout, {responsive: true});
+      },[chartOpen,chartType,chartXAxis,chartYAxis,chartY2Axis,chartSeries,chartGroupBy,sorted,chartHeight]);
+      
+      React.useEffect(()=>{
+        if(chartOpen) {
+          const timer = setTimeout(renderChart,150);
+          const resizeObserver = new ResizeObserver(()=>setTimeout(renderChart,100));
+          const container = document.getElementById('chart-container');
+          if(container) resizeObserver.observe(container);
+          return ()=>{ clearTimeout(timer); resizeObserver.disconnect(); };
+        }
+      },[renderChart]);
+
+      return (
+        <ThemeProvider theme={theme}><CssBaseline/>
+          <AppBar position="sticky" elevation={1}>
+            <Toolbar variant="dense" sx={{minHeight:48}}>
+              <Typography variant="h6" sx={{flexGrow:1,fontSize:16,letterSpacing:.2}}>列定義ドリブン Dense UI（リッチ機能復活）</Typography>
+
+              <FormControlLabel control={<Switch checked={dark} onChange={()=>setDark(v=>!v)} size="small" color="default"/>}
+                label={<span key="theme-icon" className="material-icons" style={{fontSize:18}}>{dark?'dark_mode':'light_mode'}</span>} sx={{ml:1,color:'inherit'}}/>
+
+              <Button color="inherit" size="small" startIcon={<span key="chart-icon" className="material-icons">bar_chart</span>}
+                      onClick={()=>setChartOpen(!chartOpen)}>グラフ</Button>
+
+              <Button color="inherit" size="small" startIcon={<span key="agg-icon" className="material-icons">functions</span>}
+                      onClick={()=>setAggOpen(!aggOpen)}>集計</Button>
+
+              <Tooltip title="設定"><span key="settings-wrapper">
+                <IconButton color="inherit" onClick={()=>setSettingsOpen(true)} size="small"><span key="settings-icon" className="material-icons">settings</span></IconButton>
+              </span></Tooltip>
+              <Menu anchorEl={anchorEl} open={!!anchorEl} onClose={()=>setAnchorEl(null)}>
+                {COLUMN_DEFS.filter(c=>c.key!=='select').map(c=> (
+                  <MenuItem key={c.key} onClick={()=> setVisibleCols(v=> v.includes(c.key)? v.filter(k=>k!==c.key) : [...v,c.key])}>
+                    <Checkbox checked={visibleCols.includes(c.key)}/><ListItemText primary={c.label}/>
+                  </MenuItem>
+                ))}
+              </Menu>
+            </Toolbar>
+
+
+          </AppBar>
+
+          {/* 検索・表示切替バー */}
+          <Box component={Paper} square elevation={0}
+               sx={{position:'sticky', top:48, zIndex:2, bgcolor: theme.palette.mode==='dark' ? 'rgba(50,50,50,0.95)' : 'rgba(240,240,240,0.95)'}}>
+            <Container maxWidth="xl">
+              <Toolbar variant="dense" sx={{gap:1,px:0,minHeight:52,py:0.5}}>
+                <TextField size="small" placeholder="全文検索（品名/コード/取引先 ほか）" value={q}
+                  onChange={e=>setQ(e.target.value)}
+                  onBlur={()=>{ if(listMode==='paging') setPageIndex(0); }}
+                  sx={{flex:1,maxWidth:560}}
+                  InputProps={{startAdornment:(<InputAdornment position="start"><span className="material-icons">search</span></InputAdornment>)}}/>
+
+                <Stack direction="row" spacing={1} alignItems="center">
+                  <Typography variant="caption" sx={{opacity:.8}}>表示</Typography>
+                  <ToggleButtonGroup size="small" exclusive value={viewMode} onChange={(_,v)=>v&&setViewMode(v)}
+                    sx={{'& .MuiToggleButton-root':{fontWeight:600},'& .Mui-selected':{borderWidth:2}}} color="secondary">
+                    <ToggleButton value="auto" title="自動"><span key="auto-icon" className="material-icons" style={{fontSize:18,marginRight:4}}>autorenew</span>自動</ToggleButton>
+                    <ToggleButton value="table" title="テーブル"><span key="table-icon" className="material-icons" style={{fontSize:18,marginRight:4}}>table_chart</span>表</ToggleButton>
+                    <ToggleButton value="card" title="カード"><span key="card-icon" className="material-icons" style={{fontSize:18,marginRight:4}}>view_agenda</span>カード</ToggleButton>
+                  </ToggleButtonGroup>
+                </Stack>
+
+                <Stack direction="row" spacing={1} alignItems="center">
+                  <Typography variant="caption" sx={{opacity:.8}}>リスト</Typography>
+                  <ToggleButtonGroup size="small" exclusive value={listMode} onChange={(_,v)=>v&&setListMode(v)}
+                    sx={{'& .MuiToggleButton-root':{fontWeight:600},'& .Mui-selected':{borderWidth:2}}} color="secondary">
+                    <ToggleButton value="virtual" title="連続（仮想スクロール）"><span key="virtual-icon" className="material-icons" style={{fontSize:18,marginRight:4}}>swap_vert</span>連続</ToggleButton>
+                    <ToggleButton value="paging" title="ページネーション"><span key="paging-icon" className="material-icons" style={{fontSize:18,marginRight:4}}>pages</span>ページ</ToggleButton>
+                  </ToggleButtonGroup>
+                </Stack>
+
+
+              </Toolbar>
+            </Container>
+          </Box>
+
+          {/* 集計エリア */}
+          {aggOpen && (
+            <Box component={Paper} square elevation={2} sx={{bgcolor: theme.palette.mode==='dark' ? 'background.paper' : 'grey.50'}}>
+              <Container maxWidth="xl">
+                <Box sx={{py:2,px:2}}>
+                  <Stack direction="row" spacing={2} alignItems="center" sx={{mb:2}}>
+                    <Typography variant="h6" sx={{fontSize:'1rem',fontWeight:600,flexGrow:1}}>集計クエリー設定</Typography>
+                    <Button size="small" variant="contained" color="primary" 
+                      onClick={()=>{
+                        console.log('確定ボタンがクリックされました');
+                        console.log('現在のaggConfig:', aggConfig);
+                        
+                        // 直接集計処理を実行
+                        const groupCols=Object.keys(aggConfig).filter(k=>aggConfig[k]?.mode==='group');
+                        const aggCols=Object.keys(aggConfig).filter(k=>aggConfig[k]?.mode==='agg');
+                        
+                        console.log('グループ列:', groupCols);
+                        console.log('集計列:', aggCols);
+                        console.log('フィルター済みデータ件数:', filtered.length);
+                        
+                        if(groupCols.length > 0 || aggCols.length > 0) {
+                          console.log('集計処理を開始します');
+                          
+                          if(groupCols.length === 0 && aggCols.length > 0) {
+                            // 全体集計
+                            const totalRow = {id: 'total', _count: filtered.length};
+                            aggCols.forEach(col => {
+                              const values = filtered.map(r => Number(r[col]) || 0);
+                              const func = aggConfig[col]?.func || 'sum';
+                              if(func === 'sum') totalRow[col] = values.reduce((a,b) => a+b, 0);
+                              else if(func === 'avg') totalRow[col] = values.length > 0 ? values.reduce((a,b) => a+b, 0) / values.length : 0;
+                              else if(func === 'max') totalRow[col] = Math.max(...values, 0);
+                              else if(func === 'min') totalRow[col] = Math.min(...values, 0);
+                              else if(func === 'count') totalRow[col] = values.length;
+                            });
+                            console.log('全体集計結果:', totalRow);
+                            console.table([totalRow]);
+                            
+                            // 列定義を作成
+                            const cols = [
+                              {key:'select',label:'',kind:'checkbox',width:44,min:40,max:80},
+                              {key:'no',label:'No',kind:'number',width:72,min:60,max:120,numeric:true,raw:(r,i)=>i+1},
+                              {key:'_count',label:'件数',kind:'number',width:100,min:80,max:200,numeric:true}
+                            ];
+                            aggCols.forEach(k=>{
+                              const orig=COLUMN_DEFS.find(c=>c.key===k);
+                              const func=aggConfig[k]?.func||'sum';
+                              const funcLabel={sum:'合計',avg:'平均',max:'最大',min:'最小',count:'件数'}[func]||func;
+                              if(orig) cols.push({...orig,label:`全体${orig.label}(${funcLabel})`,key:k,numeric:true});
+                            });
+                            
+                            setAggResult([totalRow]);
+                            setAggResultColumns(cols);
+                          } else if(groupCols.length > 0) {
+                            // グループ集計
+                            const groups = new Map();
+                            const getKey = groupCols.length === 1 ? r => String(r[groupCols[0]] || '(空)') : r => groupCols.map(k => String(r[k] || '(空)')).join(' | ');
+                            
+                            filtered.forEach(r => {
+                              const key = getKey(r);
+                              if(!groups.has(key)) {
+                                groups.set(key, {_count: 0, stats: {}, raw: {}});
+                                groupCols.forEach(k => groups.get(key).raw[k] = r[k]);
+                              }
+                              const g = groups.get(key);
+                              g._count++;
+                              
+                              aggCols.forEach(col => {
+                                const val = Number(r[col]) || 0;
+                                if(!g.stats[col]) g.stats[col] = {sum: 0, count: 0, max: -Infinity, min: Infinity};
+                                const s = g.stats[col];
+                                s.sum += val;
+                                s.count++;
+                                if(val > s.max) s.max = val;
+                                if(val < s.min) s.min = val;
+                              });
+                            });
+                            
+                            const result = [];
+                            groups.forEach((g, key) => {
+                              const row = {id: `group_${result.length}`, _count: g._count};
+                              groupCols.forEach(k => row[k] = g.raw[k]);
+                              aggCols.forEach(col => {
+                                const s = g.stats[col];
+                                const func = aggConfig[col]?.func || 'sum';
+                                if(func === 'sum') row[col] = s.sum;
+                                else if(func === 'avg') row[col] = s.count > 0 ? Math.round(s.sum / s.count * 100) / 100 : 0;
+                                else if(func === 'max') row[col] = s.max === -Infinity ? 0 : s.max;
+                                else if(func === 'min') row[col] = s.min === Infinity ? 0 : s.min;
+                                else if(func === 'count') row[col] = s.count;
+                              });
+                              result.push(row);
+                            });
+                            
+                            console.log('グループ集計結果:', result);
+                            console.table(result);
+                            
+                            // 列定義を作成
+                            const cols = [
+                              {key:'select',label:'',kind:'checkbox',width:44,min:40,max:80},
+                              {key:'no',label:'No',kind:'number',width:72,min:60,max:120,numeric:true,raw:(r,i)=>i+1}
+                            ];
+                            groupCols.forEach(k=>{
+                              const orig=COLUMN_DEFS.find(c=>c.key===k);
+                              if(orig) cols.push({...orig,label:orig.label});
+                            });
+                            aggCols.forEach(k=>{
+                              const orig=COLUMN_DEFS.find(c=>c.key===k);
+                              const func=aggConfig[k]?.func||'sum';
+                              const funcLabel={sum:'合計',avg:'平均',max:'最大',min:'最小',count:'件数'}[func]||func;
+                              if(orig) cols.push({...orig,label:`${orig.label}(${funcLabel})`,key:k,numeric:true});
+                            });
+                            
+                            setAggResult(result);
+                            setAggResultColumns(cols);
+                          }
+                        } else {
+                          console.log('集計列が設定されていません');
+                          setAggResult(null);
+                          setAggResultColumns([]);
+                        }
+                        
+                        setAggActive(true);
+                        setAggOpen(false);
+                        
+                        // 列幅の自動調整
+                        setTimeout(() => {
+                          const allCols = [...groupCols, ...aggCols];
+                          allCols.forEach(key => {
+                            const def = COLUMN_DEFS.find(c => c.key === key);
+                            if (!def) return;
+                            const cells = document.querySelectorAll(`td[data-col="${key}"], th[data-col="${key}"]`);
+                            let maxW = def.min || 60;
+                            cells.forEach(cell => {
+                              const w = cell.scrollWidth + 12;
+                              if (w > maxW) maxW = w;
+                            });
+                            setColWidths(prev => ({ ...prev, [key]: Math.min(maxW, def.max || 800) }));
+                          });
+                        }, 100);
+                        
+                        setSnack({open:true,msg:'集計結果をメインテーブルに表示しました'});
+                      }}
+                      startIcon={<span className="material-icons" style={{fontSize:16}}>check</span>}>
+                      確定
+                    </Button>
+                    {aggActive && (
+                      <Button size="small" variant="outlined" color="secondary"
+                        onClick={()=>{
+                          setAggActive(false);
+                          setAggResult(null);
+                          setAggResultColumns([]);
+                          setVisibleCols(COLUMN_DEFS.map(c=>c.key));
+                          setSnack({open:true,msg:'集計を解除しました'});
+                        }}
+                        startIcon={<span className="material-icons" style={{fontSize:16}}>close</span>}>
+                        解除
+                      </Button>
+                    )}
+                  </Stack>
+                  <Paper elevation={0} sx={{p:2,bgcolor:'background.paper',maxHeight:400,overflow:'auto'}}>
+                    <Table size="small" sx={{'& th':{fontWeight:600,bgcolor:'action.hover',p:'6px 8px'},'& td':{p:'6px 8px'}}}>
+                      <TableHead>
+                        <TableRow>
+                          <TableCell width="30%">列名</TableCell>
+                          <TableCell width="25%">モード</TableCell>
+                          <TableCell width="25%">集計方法</TableCell>
+                          <TableCell width="20%">状態</TableCell>
+                        </TableRow>
+                      </TableHead>
+                      <TableBody>
+                        {COLUMN_DEFS.filter(c=>c.key!=='select'&&c.key!=='no'&&c.kind!=='checkbox').map(col=>{
+                          const cfg=aggConfig[col.key]||{mode:col.kind==='number'?'agg':'group',func:'sum'};
+                          return (
+                            <TableRow key={col.key} hover sx={{height:40}}>  
+                              <TableCell><Typography variant="body2">{col.label}</Typography></TableCell>
+                              <TableCell>
+                                <Select size="small" fullWidth value={cfg.mode}
+                                  onChange={(e)=>{
+                                    const newMode = e.target.value;
+                                    setAggConfig(prev=>{
+                                      const current = prev[col.key] || {};
+                                      const newConfig = {mode: newMode};
+                                      if(newMode === 'agg') {
+                                        newConfig.func = current.func || 'sum';
+                                      }
+                                      return {
+                                        ...prev,
+                                        [col.key]: newConfig
+                                      };
+                                    });
+                                  }}>
+                                  <MenuItem value="hide">非表示</MenuItem>
+                                  <MenuItem value="ignore">非扱い</MenuItem>
+                                  <MenuItem value="group">グループ</MenuItem>
+                                  {col.kind==='number' && <MenuItem value="agg">集計</MenuItem>}
+                                </Select>
+                              </TableCell>
+                              <TableCell>
+                                {cfg.mode==='agg' ? (
+                                  <Select size="small" fullWidth value={cfg.func || 'sum'}
+                                    onChange={(e)=>{
+                                      const newFunc = e.target.value;
+                                      setAggConfig(prev=>{
+                                        const current = prev[col.key] || {};
+                                        return {
+                                          ...prev,
+                                          [col.key]: {
+                                            ...current,
+                                            func: newFunc
+                                          }
+                                        };
+                                      });
+                                    }}>
+                                    <MenuItem value="sum">合計</MenuItem>
+                                    <MenuItem value="avg">平均</MenuItem>
+                                    <MenuItem value="max">最大</MenuItem>
+                                    <MenuItem value="min">最小</MenuItem>
+                                    <MenuItem value="count">件数</MenuItem>
+                                  </Select>
+                                ) : <Typography variant="body2" color="text.disabled">-</Typography>}
+                              </TableCell>
+                              <TableCell>
+                                <Chip size="small" 
+                                  label={cfg.mode==='hide'?'非表示':cfg.mode==='ignore'?'非扱い':cfg.mode==='group'?'グループ':cfg.func}
+                                  color={cfg.mode==='hide'?'default':cfg.mode==='ignore'?'warning':cfg.mode==='group'?'primary':'secondary'}
+                                  variant={cfg.mode==='hide'||cfg.mode==='ignore'?'outlined':'filled'}/>
+                              </TableCell>
+                            </TableRow>
+                          );
+                        })}
+                      </TableBody>
+                    </Table>
+                  </Paper>
+                </Box>
+              </Container>
+            </Box>
+          )}
+
+          {/* グラフエリア */}
+          {chartOpen && (
+            <>
+              <Box component={Paper} square elevation={2} sx={{bgcolor: theme.palette.mode==='dark' ? 'background.paper' : 'grey.50'}}>
+                <Container maxWidth="xl">
+                  <Box sx={{py:3,px:2}}>
+                    <Stack direction="row" spacing={2} alignItems="center" sx={{mb:2,flexWrap:'wrap'}}>
+                      <Typography variant="h6" sx={{fontSize:'1rem',fontWeight:600,mr:'auto'}}>データ可視化</Typography>
+                    <FormControl size="small" sx={{minWidth:140}}>
+                      <InputLabel>グラフ種類</InputLabel>
+                      <Select value={chartType} onChange={(e)=>setChartType(e.target.value)} label="グラフ種類">
+                        <MenuItem value="bar">棒グラフ</MenuItem>
+                        <MenuItem value="line">線グラフ</MenuItem>
+                        <MenuItem value="pie">円グラフ</MenuItem>
+                      </Select>
+                    </FormControl>
+                    <FormControl size="small" sx={{minWidth:140}}>
+                      <InputLabel>X軸</InputLabel>
+                      <Select multiple value={chartXAxis} onChange={(e)=>setChartXAxis(e.target.value)} label="X軸"
+                        renderValue={(sel)=>sel.map(k=>COLUMN_DEFS.find(c=>c.key===k)?.label||k).join(', ')}>
+                        {COLUMN_DEFS.filter(c=>c.key!=='select'&&c.kind!=='checkbox').map(c=>(
+                          <MenuItem key={c.key} value={c.key}>
+                            <Checkbox checked={chartXAxis.indexOf(c.key)>-1} size="small"/>
+                            <ListItemText primary={c.label}/>
+                          </MenuItem>
+                        ))}
+                      </Select>
+                    </FormControl>
+                    <FormControl size="small" sx={{minWidth:140}}>
+                      <InputLabel>Y軸(左)</InputLabel>
+                      <Select multiple value={chartYAxis} onChange={(e)=>setChartYAxis(e.target.value)} label="Y軸(左)"
+                        renderValue={(sel)=>sel.map(k=>COLUMN_DEFS.find(c=>c.key===k)?.label||k).join(', ')}>
+                        {COLUMN_DEFS.filter(c=>c.key!=='select'&&c.kind!=='checkbox').map(c=>(
+                          <MenuItem key={c.key} value={c.key}>
+                            <Checkbox checked={chartYAxis.indexOf(c.key)>-1} size="small"/>
+                            <ListItemText primary={c.label}/>
+                          </MenuItem>
+                        ))}
+                      </Select>
+                    </FormControl>
+                    <FormControl size="small" sx={{minWidth:140}}>
+                      <InputLabel>Y軸(右)</InputLabel>
+                      <Select multiple value={chartY2Axis} onChange={(e)=>setChartY2Axis(e.target.value)} label="Y軸(右)"
+                        renderValue={(sel)=>sel.length>0?sel.map(k=>COLUMN_DEFS.find(c=>c.key===k)?.label||k).join(', '):'なし'}>
+                        {COLUMN_DEFS.filter(c=>c.key!=='select'&&c.kind!=='checkbox').map(c=>(
+                          <MenuItem key={c.key} value={c.key}>
+                            <Checkbox checked={chartY2Axis.indexOf(c.key)>-1} size="small"/>
+                            <ListItemText primary={c.label}/>
+                          </MenuItem>
+                        ))}
+                      </Select>
+                    </FormControl>
+                    <FormControl size="small" sx={{minWidth:140}}>
+                      <InputLabel>系列</InputLabel>
+                      <Select multiple value={chartSeries} onChange={(e)=>setChartSeries(e.target.value)} label="系列"
+                        renderValue={(sel)=>sel.length>0?sel.map(k=>COLUMN_DEFS.find(c=>c.key===k)?.label||k).join(', '):'なし'}>
+                        {COLUMN_DEFS.filter(c=>c.key!=='select'&&c.kind!=='checkbox').map(c=>(
+                          <MenuItem key={c.key} value={c.key}>
+                            <Checkbox checked={chartSeries.indexOf(c.key)>-1} size="small"/>
+                            <ListItemText primary={c.label}/>
+                          </MenuItem>
+                        ))}
+                      </Select>
+                    </FormControl>
+                    <FormControl size="small" sx={{minWidth:140}}>
+                      <InputLabel>集計</InputLabel>
+                      <Select value={chartGroupBy} onChange={(e)=>setChartGroupBy(e.target.value)} label="集計">
+                        <MenuItem value="none">なし</MenuItem>
+                        <MenuItem value="sum">合計</MenuItem>
+                        <MenuItem value="avg">平均</MenuItem>
+                        <MenuItem value="count">件数</MenuItem>
+                      </Select>
+                    </FormControl>
+                  </Stack>
+                    <Paper elevation={0} sx={{p:2,bgcolor:'background.paper',borderRadius:2}}>
+                      <Box id="chart-container" sx={{width:'100%',height:chartHeight,position:'relative'}}/>
+                    </Paper>
+                  </Box>
+                </Container>
+              </Box>
+              <Box sx={{height:8,cursor:'ns-resize',bgcolor:'divider','&:hover':{bgcolor:'primary.main'},position:'relative'}} 
+                onMouseDown={(e)=>setChartResizing({startY:e.clientY,startHeight:chartHeight})}>
+                <Box ref={previewBarRef} sx={{position:'fixed',left:0,right:0,height:4,bgcolor:'primary.main',zIndex:9999,pointerEvents:'none',display:'none'}}/>
+              </Box>
+            </>
+          )}
+
+
+          {/* アクティブフィルタバー（指定時のみ表示） */}
+          {(q || Object.values(colFilters).some(v=>v)) && (
+            <Box component={Paper} square elevation={0}
+                 sx={{position:'sticky', top:100, zIndex:1, bgcolor: theme.palette.mode==='dark' ? 'rgba(255,220,100,0.15)' : 'rgba(255,250,205,0.95)'}}>
+              <Container maxWidth="xl">
+                <Toolbar variant="dense" sx={{gap:1,px:0,minHeight:40,py:0.5}}>
+                  <Stack direction="row" spacing={.5} sx={{flexGrow:1,flexWrap:'wrap'}}>
+                    <Chip label="すべてクリア" size="small" color="warning" 
+                      onDelete={()=>{ setQ(''); setColFilters({}); }} 
+                      icon={<span className="material-icons" style={{fontSize:16}}>clear_all</span>}/>
+                    {q && <Chip label={`検索: ${q}`} size="small" onDelete={()=>setQ('')}/>}
+                    {Object.entries(colFilters).filter(([,v])=>v).map(([k,v])=>{
+                      const col = COLUMN_DEFS.find(c=>c.key===k); if(!col) return null;
+                      return <Chip key={k} label={`${col.label||k}: ${v}`} size="small" onDelete={()=>setColFilters(f=>({...f,[k]:''}))}/>;
+                    })}
+                  </Stack>
+                </Toolbar>
+              </Container>
+            </Box>
+          )}
+
+          <Box sx={{py:1.5,px:2}}>
+            <Stack direction="row" spacing={1} alignItems="center" sx={{mb:1}}>
+              <Typography variant="body2" sx={{opacity:.7,flexGrow:1}}>
+                表示件数: {sorted.length.toLocaleString()} 件
+                {listMode==='paging' && `（${pageIndex+1}/${pageCount} ページ・${pageSize}件/ページ）`}
+                {selected.size>0 && ` / 選択: ${selected.size.toLocaleString()} 件`}
+              </Typography>
+              <Button size="small" variant={editMode?'contained':'outlined'} 
+                startIcon={<span key="edit-icon" className="material-icons" style={{fontSize:16}}>edit</span>}
+                onClick={()=>setEditMode(v=>!v)} sx={{minWidth:'auto'}}>編集</Button>
+              <Button size="small" startIcon={<span key="column-icon" className="material-icons" style={{fontSize:16}}>view_column</span>}
+                onClick={(e)=>setAnchorEl(e.currentTarget)} sx={{minWidth:'auto'}}>列</Button>
+              <Button size="small" startIcon={<span key="csv-icon" className="material-icons" style={{fontSize:16}}>download</span>}
+                onClick={exportCSV} sx={{minWidth:'auto'}}>CSV</Button>
+            </Stack>
+
+            { useCard ? (
+              <Box ref={ref} onScroll={listMode==='virtual'?onScroll:undefined} sx={{overflow:'auto',WebkitOverflowScrolling:'touch'}}>
+                {listMode==='paging' && (
+                  <Box sx={{display:'flex',justifyContent:'center',p:1,position:'sticky',left:0,bgcolor:'inherit',zIndex:1}}>
+                    <TablePagination
+                      component="div"
+                      count={sorted.length}
+                      page={pageIndex}
+                      onPageChange={handleChangePage}
+                      rowsPerPage={pageSize}
+                      onRowsPerPageChange={handleChangeRowsPerPage}
+                      rowsPerPageOptions={[10,25,50,100]}
+                      showFirstButton showLastButton
+                    />
+                  </Box>
+                )}
+                {listMode==='virtual' && <Box sx={{height: topPad}}/> }
+                <Stack spacing={1} sx={{px:0.5}}>
+                  {slice.map((row, i)=> renderCard(row, (listMode==='virtual'? startIndex+i : pageIndex*pageSize + i)))}
+                </Stack>
+                {listMode==='virtual' && <Box sx={{height: bottomPad}}/> }
+                {listMode==='paging' && (
+                  <Box sx={{display:'flex',justifyContent:'center',py:1,position:'sticky',left:0,bgcolor:'inherit',zIndex:1}}>
+                    <TablePagination
+                      component="div"
+                      count={sorted.length}
+                      page={pageIndex}
+                      onPageChange={handleChangePage}
+                      rowsPerPage={pageSize}
+                      onRowsPerPageChange={handleChangeRowsPerPage}
+                      rowsPerPageOptions={[10,25,50,100]}
+                      showFirstButton showLastButton
+                    />
+                  </Box>
+                )}
+              </Box>
+            ) : (
+              <Paper variant="outlined">
+                <Box ref={scrollBarRef} sx={{position:'relative',height:16,borderBottom:1,borderColor:'divider',bgcolor:'grey.100'}}>
+                  <Box ref={scrollRef} sx={{position:'absolute',top:4,left:8,height:8,bgcolor:'primary.main',borderRadius:1,cursor:'grab','&:active':{cursor:'grabbing'}}}
+                    style={{width:scrollInfo.handleWidth}}
+                    onMouseDown={(e)=>setScrollHandle({startX:e.clientX,startLeft:parseInt(scrollRef.current?.style.left||'8')-8})}></Box>
+                </Box>
+                <TableContainer ref={ref} onScroll={(e)=>{if(listMode==='virtual')onScroll(e);if(scrollRef.current&&scrollInfo.maxLeft>0){const scrollRatio=e.target.scrollLeft/(scrollInfo.tableWidth-scrollInfo.containerWidth);const handleLeft=scrollRatio*scrollInfo.maxLeft;scrollRef.current.style.left=(handleLeft+8)+'px';}}} sx={{overflow:'auto',WebkitOverflowScrolling:'touch'}}>
+                  {listMode==='paging' && (
+                    <Box sx={{position:'sticky',left:0,bgcolor:'background.paper',zIndex:1}}>
+                      <Box sx={{display:'flex',justifyContent:'center',p:1,position:'sticky',left:0,bgcolor:'inherit',zIndex:1}}>
+                        <TablePagination
+                          component="div"
+                          count={sorted.length}
+                          page={pageIndex}
+                          onPageChange={handleChangePage}
+                          rowsPerPage={pageSize}
+                          onRowsPerPageChange={handleChangeRowsPerPage}
+                          rowsPerPageOptions={[10,25,50,100]}
+                          showFirstButton showLastButton
+                        />
+                      </Box>
+                    </Box>
+                  )}
+
+                  <Table size="small" sx={{tableLayout:'fixed','& thead th':{position:'sticky',zIndex:2,bgcolor:'inherit'}}}>
+                    <TableHead>
+                      {/* フィルタ行 */}
+                      <TableRow sx={{'& .MuiTableCell-root':{bgcolor:'action.hover',top:0}}}>
+                        {columns.map((col)=> {
+                          const w=colWidths[col.key];
+                          return (
+                            <TableCell key={col.key} data-col={col.key} sx={{p:'4px 6px',borderRight:1,borderColor:'divider',position:'relative',userSelect:'none','&:last-child':{borderRight:0},'& .MuiCheckbox-root':{p:'0 4px'}}}
+                                       style={{width:w, minWidth:col.min, maxWidth:col.max}}>
+                              {col.kind==='checkbox' ? (
+                                <Checkbox size="small" indeterminate={false} onChange={()=> toggleAll(sorted)} />
+                              ) : (
+                                <TextField size="small"
+                                  placeholder={col.kind==='number'?'=300, >100, 100-500 等': (col.kind==='date'? 'YYYY-MM-DD, >=2025-01-01, 2025-01-01~2025-12-31':'含む文字列')}
+                                  defaultValue={colFilters[col.key]??''}
+                                  onBlur={(e)=>{ setColFilters(f=>({...f,[col.key]: e.target.value})); if(listMode==='paging') setPageIndex(0); }}
+                                  sx={{'& .MuiInputBase-input':{p:'4px 8px',fontSize:'.85rem'}}} fullWidth/>
+                              )}
+                              {col.kind!=='checkbox' && (
+                                <span className="col-resizer" 
+                                  onMouseDown={(e)=>{ e.preventDefault(); e.stopPropagation(); setResizing({key:col.key,startX:e.clientX,startW:w}); }}
+                                  onDoubleClick={(e)=>{ e.preventDefault(); e.stopPropagation(); autoFitColumn(col.key); }}/>
+                              )}
+                            </TableCell>
+                          );
+                        })}
+                      </TableRow>
+
+                      {/* ラベル行 */}
+                      <TableRow sx={{'& .MuiTableCell-root':{top:40}}}>
+                        {columns.map(col=>{
+                          const active=sortKey===col.key; const w=colWidths[col.key];
+                          return (
+                            <TableCell key={col.key} align='center' data-col={col.key}
+                              sx={{p:'6px',borderRight:1,borderColor:'divider',position:'relative',userSelect:'none','&:last-child':{borderRight:0},'& .MuiCheckbox-root':{p:'0 4px'}}}
+                              style={{width:w, minWidth:col.min, maxWidth:col.max, whiteSpace:'nowrap'}}>
+                              {col.kind==='checkbox' ? (
+                                <span>{col.label}</span>
+                              ) : (
+                                <TableSortLabel
+                                  active={active}
+                                  direction={active ? sortDir : 'asc'}
+                                  onClick={()=>onHeaderClick(col.key)}>
+                                  {col.label}
+                                </TableSortLabel>
+                              )}
+                              {col.kind!=='checkbox' && (
+                                <span className="col-resizer" 
+                                  onMouseDown={(e)=>{ e.preventDefault(); e.stopPropagation(); setResizing({key:col.key,startX:e.clientX,startW:w}); }}
+                                  onDoubleClick={(e)=>{ e.preventDefault(); e.stopPropagation(); autoFitColumn(col.key); }}/>
+                              )}
+                            </TableCell>
+                          );
+                        })}
+                      </TableRow>
+                    </TableHead>
+
+                    <TableBody>
+                      {listMode==='virtual' && topPad>0 && <TableRow><TableCell colSpan={columns.length} style={{height:topPad,padding:0,border:0}}/></TableRow>}
+
+                      {slice.map((row,localIdx)=>{
+                        const globalIdx = (listMode==='virtual'? startIndex+localIdx : pageIndex*pageSize + localIdx);
+                        return (
+                          <TableRow key={row.id} hover sx={{height:32}}>
+                            {columns.map(col=>{
+                              if(col.kind==='checkbox'){
+                                return (
+                                  <TableCell key={col.key} sx={{p:'4px 6px',borderRight:1,borderColor:'divider','&:last-child':{borderRight:0},'& .MuiCheckbox-root':{p:'0 4px'}}}
+                                             style={{width:colWidths[col.key], minWidth:col.min, maxWidth:col.max}}>
+                                    <Checkbox size="small" checked={selected.has(row.id)} onChange={()=>toggleRow(row.id)}/>
+                                  </TableCell>
+                                );
+                              }
+                              const raw = col.calc? col.calc(row) : (col.raw? col.raw(row, globalIdx) : row[col.key]);
+                              const rawNum = Number(raw??0);
+                              const display = col.value? col.value(row, globalIdx) : (col.kind==='number'? Math.floor(rawNum).toLocaleString() : raw);
+                              const tooltip = col.kind==='number' && rawNum !== Math.floor(rawNum) ? rawNum.toLocaleString() : String(display??'');
+                              const align = col.numeric? 'right' : 'left';
+                              const editor = (editMode && col.editable) ? (
+                                <TextField size="small" type={col.kind==='number'?'number': (col.kind==='date'?'date':'text')}
+                                  value={raw||''}
+                                  onChange={(e)=> updateCell(row.id, col.key, e.target.value)}
+                                  inputProps={col.kind==='number'?{inputMode:'numeric',min:0,style:{textAlign:align}}:{}}
+                                  sx={{'& .MuiInputBase-input':{p:'6px 8px'}}} fullWidth/>
+                              ) : null;
+
+                              return (
+                                <TableCell key={col.key} align={align} data-col={col.key} title={tooltip}
+                                  onDoubleClick={()=>!editMode && onCellClick(col,row,globalIdx)}
+                                  sx={{p:'4px 6px',borderRight:1,borderColor:'divider','&:last-child':{borderRight:0},cursor:editMode?'default':'pointer',overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}
+                                  style={{width:colWidths[col.key], minWidth:col.min, maxWidth:col.max}}>
+                                  {editor || String(display??'')}
+                                </TableCell>
+                              );
+                            })}
+                          </TableRow>
+                        );
+                      })}
+
+                      {listMode==='virtual' && bottomPad>0 && <TableRow><TableCell colSpan={columns.length} style={{height:bottomPad,padding:0,border:0}}/></TableRow>}
+                    </TableBody>
+                  </Table>
+                </TableContainer>
+                {listMode==='paging' && (
+                  <Box sx={{position:'sticky',left:0,bgcolor:'background.paper',zIndex:1,borderTop:1,borderColor:'divider'}}>
+                    <Box sx={{display:'flex',justifyContent:'center',py:0.5,position:'sticky',left:0,bgcolor:'inherit',zIndex:1}}>
+                      <TablePagination
+                      
+                        component="div"
+                        count={sorted.length}
+                        page={pageIndex}
+                        onPageChange={handleChangePage}
+                        rowsPerPage={pageSize}
+                        onRowsPerPageChange={handleChangeRowsPerPage}
+                        rowsPerPageOptions={[10,25,50,100]}
+                        showFirstButton showLastButton
+                      />
+                    </Box>
+                  </Box>
+                )}
+              </Paper>
+            )}
+          </Box>
+
+
+
+          <Dialog open={settingsOpen} onClose={()=>setSettingsOpen(false)} maxWidth="md" fullWidth>
+            <DialogTitle>設定</DialogTitle>
+            <DialogContent>
+              <Stack spacing={2} sx={{pt:1}}>
+                <Box>
+                  <Typography variant="body2" sx={{mb:1}}>サンプルデータ生成件数</Typography>
+                  <Stack direction="row" spacing={1} alignItems="center">
+                    <TextField size="small" type="number" value={dataCount} onChange={(e)=>setDataCount(Math.max(1,parseInt(e.target.value)||1))} 
+                      inputProps={{min:1,max:100000}} sx={{width:150}}/>
+                    <Button variant="outlined" startIcon={<span className="material-icons">refresh</span>} onClick={regenerateData}>
+                      再生成
+                    </Button>
+                  </Stack>
+                </Box>
+                <Divider/>
+                <Button variant="outlined" startIcon={<span className="material-icons">upload</span>} component="label" fullWidth>
+                  列定義をインポート
+                  <input type="file" accept=".json" hidden onChange={importTemplate}/>
+                </Button>
+                {csvPreview && (
+                  <Paper variant="outlined" sx={{p:2}}>
+                    <Typography variant="subtitle2" sx={{mb:1}}>プレビュー: {csvPreview.count}列</Typography>
+                    <Box sx={{maxHeight:200,overflow:'auto',fontSize:'.85rem',fontFamily:'monospace',bgcolor:'grey.50',p:1,borderRadius:1}}>
+                      {JSON.stringify(csvPreview.data,null,2)}
+                    </Box>
+                    <Stack direction="row" spacing={1} sx={{mt:1}}>
+                      <Button size="small" variant="contained" onClick={applyImport}>適用</Button>
+                      <Button size="small" onClick={()=>setCsvPreview(null)}>キャンセル</Button>
+                    </Stack>
+                  </Paper>
+                )}
+                <Button variant="outlined" startIcon={<span className="material-icons">download</span>} onClick={exportTemplate} fullWidth>
+                  列定義テンプレートをエクスポート
+                </Button>
+              </Stack>
+            </DialogContent>
+            <DialogActions>
+              <Button onClick={()=>{setSettingsOpen(false);setCsvPreview(null);}}>閉じる</Button>
+            </DialogActions>
+          </Dialog>
+
+          <Snackbar open={snack.open} autoHideDuration={1200} onClose={()=>setSnack(s=>({...s,open:false}))}
+            anchorOrigin={{vertical:'bottom',horizontal:'right'}}>
+            <Alert severity="success" variant="filled" sx={{fontSize:12,py:.5}}>{snack.msg}</Alert>
+          </Snackbar>
+        </ThemeProvider>
+      );
+    }
+
+    ReactDOM.createRoot(document.getElementById('root')).render(<App/>);
+  </script>
+</body>
+</html>
