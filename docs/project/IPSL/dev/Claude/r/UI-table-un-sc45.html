@@ -1,0 +1,1551 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, viewport-fit=cover"/>
+<title>Dense Data Table (Column-Config + Rich Features)</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Roboto:wght@300;400;500;700&display=swap"/>
+<link rel="stylesheet" href="https://fonts.googleapis.com/icon?family=Material+Icons"/>
+<style>
+  html,body,#root{height:100%;margin:0}
+  .col-resizer{position:absolute;top:0;right:-4px;width:8px;height:100%;cursor:col-resize;z-index:999}
+  .col-resizer:hover{background:rgba(25,118,210,.5)}
+  body.resizing,body.resizing *{cursor:col-resize!important;user-select:none!important}
+  body.resizing .col-resizer{background:rgba(25,118,210,.7)}
+</style>
+</head>
+<body>
+  <script src="https://cdn.jsdelivr.net/npm/react@18.2.0/umd/react.development.js" crossorigin></script>
+  <script src="https://cdn.jsdelivr.net/npm/react-dom@18.2.0/umd/react-dom.development.js" crossorigin></script>
+  <script src="https://cdn.jsdelivr.net/npm/@babel/standalone@7.23.8/babel.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@mui/material@5.15.3/umd/material-ui.production.min.js" crossorigin></script>
+  <script src="https://cdn.plot.ly/plotly-2.27.0.min.js"></script>
+
+  <div id="root"></div>
+
+  <script type="text/babel">
+    const {
+      AppBar,Toolbar,Typography,IconButton,Box,Container,TextField,InputAdornment,Button,Stack,Chip,Divider,Menu,MenuItem,
+      FormControlLabel,Switch,Tooltip,Paper,useMediaQuery,createTheme,ThemeProvider,CssBaseline,Select,FormControl,InputLabel,
+      OutlinedInput,ListItemText,Checkbox,Slider,Table,TableHead,TableRow,TableCell,TableBody,TableContainer,TableFooter,
+      TablePagination, Pagination, Alert, Snackbar, ToggleButton, ToggleButtonGroup, Card, CardContent, Dialog, DialogTitle, DialogContent, DialogActions, TableSortLabel,
+      LinearProgress, Badge, Tabs, Tab
+    } = MaterialUI;
+
+    // ========= 共通ユーティリティ =========
+    const matchNumber=(v,expr)=>{
+      if(expr==null||expr==='') return true; const s=String(expr).trim();
+      const r=s.match(/^\s*(\d+)\s*[-~]\s*(\d+)\s*$/); if(r){const a=+r[1],b=+r[2]; return v>=Math.min(a,b)&&v<=Math.max(a,b);}
+      const o=s.match(/^\s*([<>]=?|=)\s*(\d+)\s*$/);
+      if(o){const op=o[1],n=+o[2]; if(op==='>')return v>n; if(op==='>=')return v>=n; if(op==='<')return v<n; if(op==='<=')return v<=n; return v===n;}
+      const n=+s; return Number.isNaN(n)?true:v===n;
+    };
+    const toDate=(s)=>{ if(!s) return null; const t=Date.parse(String(s).replaceAll('/', '-')); return Number.isNaN(t)?null:new Date(t); };
+    const matchDate=(v,expr)=>{
+      if(!expr) return true; const s=String(expr).trim(); const vd=toDate(v); if(!vd) return true;
+      const rng=s.match(/^\s*([0-9\-\/]+)\s*[-~]\s*([0-9\-\/]+)\s*$/); if(rng){ const a=toDate(rng[1]), b=toDate(rng[2]); if(!a||!b) return true; return vd>=a && vd<=b; }
+      const cmp=s.match(/^\s*([<>]=?|=)\s*([0-9\-\/]+)\s*$/); if(cmp){ const op=cmp[1], d=toDate(cmp[2]); if(!d) return true; if(op==='>')return vd>d; if(op==='>=')return vd>=d; if(op==='<')return vd<d; if(op==='<=')return vd<=d; return +vd===+d; }
+      const d=toDate(s); return d? (+vd===+d) : true;
+    };
+    const toCSV=(rows, cols)=>[
+      cols.map(c=>`"${c.label.replaceAll('"','""')}"`).join(','),
+      ...rows.map((r,i)=>cols.map(c=>{
+        const val = c.raw? c.raw(r,i) : (c.value? c.value(r,i) : r[c.key]);
+        const s = val==null? '' : String(val);
+        return `"${s.replaceAll('"','""')}"`;
+      }).join(',')),
+    ].join('\n');
+    const download=(name,content,type='text/csv;charset=utf-8;')=>{
+      const a=document.createElement('a'); a.href=URL.createObjectURL(new Blob([content],{type})); a.download=name; a.click(); URL.revokeObjectURL(a.href);
+    };
+
+    // ========= モックデータ（列定義のmock設定から自動生成） =========
+    const createMockData=(n=20000)=>{
+      const pick=(arr)=>arr[Math.floor(Math.random()*arr.length)];
+      const toDateStr=(d)=>d.toISOString().slice(0,10);
+      const genValue=(col,id,row,total)=>{
+        if(!col.mock) {
+          if(col.nullable && Math.random()<0.1) return '';
+          if(col.kind==='text') return `${col.label||col.key}${id}`;
+          if(col.kind==='number') return Math.floor(Math.random()*1000);
+          if(col.kind==='date') return toDateStr(new Date(Date.now()-Math.random()*365*864e5));
+          return '';
+        }
+        const m = col.mock;
+        if(m.calc) return m.calc(row,id,total);
+        if(m.choices) return pick(m.choices);
+        if(m.pattern) return m.pattern.replace(/{id:(\d+)}/g,(_,len)=>String(id).padStart(+len,'0')).replace(/{id}/g,id);
+        if(col.kind==='number'){
+          if(m.range) return Math.floor(Math.random()*(m.range[1]-m.range[0]+1))+m.range[0];
+          return Math.floor(Math.random()*1000);
+        }
+        if(col.kind==='date'){
+          if(col.nullable && m.empty && Math.random()<m.empty) return '';
+          if(m.range){
+            const days = Math.floor(Math.random()*(m.range[1]-m.range[0]+1))+m.range[0];
+            return toDateStr(new Date(Date.now()+days*864e5));
+          }
+          return toDateStr(new Date(Date.now()-Math.random()*365*864e5));
+        }
+        if(col.kind==='text') return `${col.label||col.key}${id}`;
+        return '';
+      };
+      return Array.from({length:n},(_,i)=>{
+        const id=i+1, row={id};
+        COLUMN_DEFS.forEach(col=>{ 
+          if(col.key==='select' || col.raw) return;
+          Object.keys(col.mock||{}).forEach(k=>{ if(k!=='calc'&&k!=='choices'&&k!=='range'&&k!=='pattern'&&k!=='empty') row[`_mock_${k}`]=col.mock[k]; });
+          if(!col.mock?.calc) row[col.key]=genValue(col,id,row,n); 
+        });
+        row.no = id;
+        COLUMN_DEFS.forEach(col=>{ 
+          if(col.mock?.calc) row[col.key]=col.mock.calc(row,id,n);
+        });
+        Object.keys(row).forEach(k=>{ if(k.startsWith('_mock_')) delete row[k]; });
+        return row;
+      });
+    };
+
+    // ========= 列定義（ここを書き換えるだけでOK） =========
+    const COLUMN_DEFS = [
+      { key:'select', label:'',   kind:'checkbox', width:44,  min:40, max:80, sticky:true },
+      { key:'no',     label:'No', kind:'number',   width:72,  min:60, max:120, numeric:true },
+      { key:'yearWeek', label:'年度週', kind:'text', width:100, min:80, max:160, editable:true, required:true, mock:{weekRange:[40,44], year:2025, calc:(r,id,total)=>{
+        const [startWeek,endWeek] = r._mock_weekRange || [40,44];
+        const year = r._mock_year || 2025;
+        const weekCount = endWeek - startWeek + 1;
+        const weekIndex = Math.floor((id-1) / (total/weekCount));
+        const targetWeek = startWeek + weekIndex;
+        return `${year}-W${String(targetWeek).padStart(2,'0')}`;
+      }} },
+      { key:'store',  label:'店舗', kind:'text', width:120, min:100, max:240, editable:true, required:true, mock:{choices:['本店','東店','西店','南店','北店']} },
+      { key:'dept',   label:'部門', kind:'text', width:120, min:100, max:240, editable:true, required:true, mock:{choices:['食品','日用品','衣料','家電','雑貨']} },
+      { key:'name',   label:'品名', kind:'text',   width:220, min:140, max:600, editable:true, required:true, mock:{pattern:'品名{id}'} },
+      { key:'code',   label:'コード', kind:'text', width:120, min:100, max:240, editable:true, required:true, mock:{pattern:'P{id:6}'} },
+      { key:'corner', label:'コーナー', kind:'text', width:120, min:100, max:240, editable:true, required:true, mock:{choices:['菓子','飲料','惣菜','精肉','鮮魚','日配','日用品']} },
+      { key:'line',   label:'ライン',   kind:'text', width:120, min:100, max:240, editable:true, required:true, mock:{choices:['和菓子','洋菓子','スナック','コーヒー','お茶','弁当','サラダ']} },
+      { key:'category', label:'カテゴリ', kind:'text', width:120, min:100, max:240, editable:true, required:true, mock:{choices:['食品','日用品','衣料','家電']} },
+      { key:'partner',  label:'取引先',   kind:'text', width:140, min:120, max:320, editable:true, required:true, mock:{choices:['Acme商事','Globex物産','Soylent食品','Initech','Umbrella','Stark']} },
+      { key:'sellPrice', label:'売価', kind:'number', width:110, min:90,  max:200, numeric:true, editable:true, required:true, mock:{range:[100,2600]} },
+      { key:'costPrice', label:'原価', kind:'number', width:110, min:90,  max:200, numeric:true, editable:true, required:true, mock:{calc:r=>Math.floor(r.sellPrice*(0.5+Math.random()*0.3))} },
+      { key:'totalSales', label:'累計販売数', kind:'number', width:120, min:100, max:220, numeric:true, editable:true, required:true, mock:{range:[0,5000]} },
+      { key:'sales28d', label:'販売数(28日)', kind:'number', width:120, min:100, max:220, numeric:true, editable:true, required:true, mock:{range:[0,300]} },
+      { key:'sales7d',  label:'販売数(7日)',  kind:'number', width:120, min:100, max:220, numeric:true, editable:true, required:true, mock:{range:[0,120]} },
+      { key:'stockQty', label:'在庫数', kind:'number', width:110, min:90,  max:200, numeric:true, editable:true, required:true, mock:{range:[0,500]} },
+      { key:'stockQty7d', label:'在庫数(7日前)', kind:'number', width:120, min:100, max:220, numeric:true, editable:true, required:true, mock:{calc:r=>(r.stockQty||0)+Math.floor(Math.random()*100)-50} },
+      { key:'stockQty28d', label:'在庫数(28日前)', kind:'number', width:130, min:110, max:230, numeric:true, editable:true, required:true, mock:{calc:r=>(r.stockQty||0)+Math.floor(Math.random()*150)-75} },
+      { key:'totalStockValue', label:'合計在庫金額', kind:'number', width:140, min:120, max:240, numeric:true, calc:r=>(r.sellPrice??0)*(r.stockQty??0) },
+      { key:'saleStartDate', label:'販売開始日', kind:'date', width:120, min:110, max:220, editable:true, required:true, mock:{range:[-400,0]} },
+      { key:'saleEndDate',   label:'販売終了日', kind:'date', width:120, min:110, max:220, editable:true, nullable:true, mock:{range:[0,200]} },
+    ];
+
+    const STORES = ['本店','東店','西店','南店','北店'];
+
+    // ========= 仮想リスト & 自動高さ =========
+    const useVirtualList=({total,rowHeight,overscan=50})=>{
+      const ref=React.useRef(null); const [top,setTop]=React.useState(0);
+      const rafRef=React.useRef(null);
+      const onScroll=e=>{
+        const scrollTop=e.currentTarget.scrollTop;
+        if(rafRef.current) cancelAnimationFrame(rafRef.current);
+        rafRef.current=requestAnimationFrame(()=>setTop(scrollTop));
+      };
+      const h=ref.current?.clientHeight??600, si=Math.max(0,Math.floor(top/rowHeight)-overscan),
+            ei=Math.min(total,Math.ceil((top+h)/rowHeight)+overscan);
+      return {ref,onScroll,startIndex:si,endIndex:ei,topPad:si*rowHeight,bottomPad:(total-ei)*rowHeight};
+    };
+
+    function App(){
+      const [dark,setDark]=React.useState(false);
+      const theme=React.useMemo(()=>createTheme({palette:{mode:dark?'dark':'light'}}),[dark]);
+      const isMobile=useMediaQuery(theme.breakpoints.down('sm'));
+
+      const [viewMode,setViewMode]=React.useState('auto');
+      const useCard = viewMode==='auto' ? isMobile : (viewMode==='card');
+
+      const [listMode,setListMode]=React.useState('virtual');
+      const [pageSize,setPageSize]=React.useState(25);
+      const [pageIndex,setPageIndex]=React.useState(0);
+
+      const [rows,setRows]=React.useState(()=>createMockData(20000));
+
+      const initialWidths=React.useMemo(()=>{ const m={}; COLUMN_DEFS.forEach(c=>m[c.key]=c.width||120); return m; },[]);
+      const [colWidths,setColWidths]=React.useState(initialWidths);
+      const [visibleCols,setVisibleCols]=React.useState(COLUMN_DEFS.map(c=>c.key));
+      
+      const [q,setQ]=React.useState('');
+      const [colFilters,setColFilters]=React.useState({});
+      const [sortKey,setSortKey]=React.useState('no');
+      const [sortDir,setSortDir]=React.useState('asc');
+
+      const [selected,setSelected]=React.useState(()=>new Set());
+      const toggleRow=(id)=> setSelected(s=>{ const n=new Set(s); n.has(id)? n.delete(id): n.add(id); return n; });
+      const toggleAll=(list)=> setSelected(s=>{ const n=new Set(s); const allOn = list.every(r=>n.has(r.id)); list.forEach(r=>{ if(allOn) n.delete(r.id); else n.add(r.id); }); return n; });
+
+      const [editMode,setEditMode]=React.useState(false);
+      const [snack,setSnack]=React.useState({open:false,msg:''});
+      const [settingsOpen,setSettingsOpen]=React.useState(false);
+      const [dataCount,setDataCount]=React.useState(20000);
+      const [csvPreview,setCsvPreview]=React.useState(null);
+      const [chartOpen,setChartOpen]=React.useState(false);
+      const [chartType,setChartType]=React.useState('bar');
+      const [chartXCol,setChartXCol]=React.useState('corner');
+      const [chartYCol,setChartYCol]=React.useState('sellPrice');
+
+      const [aggOpen,setAggOpen]=React.useState(false);
+      const [aggConfig,setAggConfig]=React.useState(()=>{
+        const cfg={};
+        COLUMN_DEFS.filter(c=>c.key!=='select'&&c.key!=='no'&&c.kind!=='checkbox').forEach(c=>{
+          if(c.kind==='number') {
+            cfg[c.key]={mode:'agg',func:'sum'};
+          } else if(c.key==='category') {
+            cfg[c.key]={mode:'group'};
+          } else {
+            cfg[c.key]={mode:'hide'};
+          }
+        });
+        return cfg;
+      });
+      const [aggActive,setAggActive]=React.useState(false);
+      const [aggResult,setAggResult]=React.useState(null);
+      const [aggResultColumns,setAggResultColumns]=React.useState([]);
+
+      // 発注管理
+      const [orderOpen,setOrderOpen]=React.useState(false);
+      const [orderMode,setOrderMode]=React.useState('all'); // 'all' or 'single'
+      const [selectedStore,setSelectedStore]=React.useState('本店');
+      const [orders,setOrders]=React.useState({});
+      const [orderTab,setOrderTab]=React.useState(0);
+
+      const filtered=React.useMemo(()=>rows.filter((r,idx)=>{
+        if(q){ const s=q.toLowerCase(); const hit=[r.name,r.code,r.partner,r.corner,r.line,r.category].some(v=>String(v||'').toLowerCase().includes(s)); if(!hit) return false; }
+        for(const col of COLUMN_DEFS){
+          const v = col.raw? col.raw(r,idx) : (col.value? col.value(r,idx) : r[col.key]);
+          const f = colFilters[col.key]; if(!f) continue;
+          if(col.kind==='number'){ if(!matchNumber(Number(v||0), f)) return false; }
+          else if(col.kind==='date'){ if(!matchDate(v, f)) return false; }
+          else { if(!String(v??'').toLowerCase().includes(String(f).toLowerCase())) return false; }
+        }
+        return true;
+      }),[rows,q,colFilters]);
+      
+      const {aggregated,aggColumns}=React.useMemo(()=>{
+        if(!aggActive) return {aggregated:null,aggColumns:[]};
+        if(!aggConfig) return {aggregated:null,aggColumns:[]};
+        
+        const groupCols=Object.keys(aggConfig).filter(k=>aggConfig[k]?.mode==='group');
+        const aggCols=Object.keys(aggConfig).filter(k=>aggConfig[k]?.mode==='agg');
+        
+        if(groupCols.length===0 && aggCols.length===0) return {aggregated:null,aggColumns:[]};
+        
+        if(groupCols.length===0 && aggCols.length>0) {
+          const totalRow={id:'agg_total',_count:filtered.length};
+          aggCols.forEach(col=>{
+            const values=filtered.map(r=>Number(r[col])||0);
+            const func=aggConfig[col]?.func||'sum';
+            if(func==='sum') totalRow[col]=values.reduce((a,b)=>a+b,0);
+            else if(func==='avg') totalRow[col]=values.length>0?Math.round(values.reduce((a,b)=>a+b,0)/values.length*100)/100:0;
+            else if(func==='max') totalRow[col]=values.length>0?Math.max(...values):0;
+            else if(func==='min') totalRow[col]=values.length>0?Math.min(...values):0;
+            else if(func==='count') totalRow[col]=values.length;
+            else totalRow[col]=values.reduce((a,b)=>a+b,0);
+          });
+          const cols=[
+            {key:'select',label:'',kind:'checkbox',width:44,min:40,max:80},
+            {key:'no',label:'No',kind:'number',width:72,min:60,max:120,numeric:true,raw:(r,i)=>i+1},
+            {key:'_count',label:'件数',kind:'number',width:100,min:80,max:200,numeric:true}
+          ];
+          aggCols.forEach(k=>{
+            const orig=COLUMN_DEFS.find(c=>c.key===k);
+            const func=aggConfig[k]?.func||'sum';
+            const funcLabel={sum:'合計',avg:'平均',max:'最大',min:'最小',count:'件数'}[func]||func;
+            if(orig) cols.push({...orig,label:`全体${orig.label}(${funcLabel})`,key:k});
+          });
+          return {aggregated:[totalRow],aggColumns:cols};
+        }
+
+        const groups=new Map();
+        const getKey=groupCols.length===1?r=>String(r[groupCols[0]]||'(空)'):r=>groupCols.map(k=>String(r[k]||'(空)')).join(' | ');
+        
+        for(let i=0,len=filtered.length;i<len;i++){
+          const r=filtered[i];
+          const key=getKey(r);
+          let g=groups.get(key);
+          if(!g){
+            g={_count:0,stats:{},raw:{}};
+            groupCols.forEach(k=>g.raw[k]=r[k]);
+            groups.set(key,g);
+          }
+          g._count++;
+          
+          for(let j=0;j<aggCols.length;j++){
+            const col=aggCols[j];
+            const val=Number(r[col])||0;
+            let s=g.stats[col];
+            if(!s){s={sum:0,count:0,max:-Infinity,min:Infinity};g.stats[col]=s;}
+            s.sum+=val;
+            s.count++;
+            if(val>s.max)s.max=val;
+            if(val<s.min)s.min=val;
+          }
+        }
+        
+        const result=[];
+        let idx=0;
+        groups.forEach(g=>{
+          const row={id:`agg_${idx++}`,_count:g._count};
+          groupCols.forEach(k=>row[k]=g.raw[k]);
+          aggCols.forEach(col=>{
+            const s=g.stats[col];
+            const func=aggConfig[col]?.func||'sum';
+            if(func==='sum')row[col]=s.sum;
+            else if(func==='avg')row[col]=s.count>0?Math.round(s.sum/s.count*100)/100:0;
+            else if(func==='max')row[col]=s.max===-Infinity?0:s.max;
+            else if(func==='min')row[col]=s.min===Infinity?0:s.min;
+            else if(func==='count')row[col]=s.count;
+            else row[col]=s.sum;
+          });
+          result.push(row);
+        });
+        
+        const cols=[
+          {key:'select',label:'',kind:'checkbox',width:44,min:40,max:80},
+          {key:'no',label:'No',kind:'number',width:72,min:60,max:120,numeric:true,raw:(r,i)=>i+1}
+        ];
+        groupCols.forEach(k=>{
+          const orig=COLUMN_DEFS.find(c=>c.key===k);
+          if(orig) cols.push({...orig,label:orig.label});
+        });
+        cols.push({key:'_count',label:'件数',kind:'number',width:100,min:80,max:200,numeric:true});
+        aggCols.forEach(k=>{
+          const orig=COLUMN_DEFS.find(c=>c.key===k);
+          const func=aggConfig[k]?.func||'sum';
+          const funcLabel={sum:'合計',avg:'平均',max:'最大',min:'最小',count:'件数'}[func]||func;
+          if(orig) cols.push({...orig,label:`${orig.label}(${funcLabel})`,key:k});
+        });
+        return {aggregated:result,aggColumns:cols};
+      },[aggActive,aggConfig,filtered,rows]);
+
+      const columns=React.useMemo(()=>{
+        if(aggActive && aggResultColumns.length > 0) return aggResultColumns;
+        return COLUMN_DEFS.filter(c=>visibleCols.includes(c.key));
+      }, [visibleCols,aggActive,aggResultColumns,aggResult]);
+
+      const [resizing,setResizing]=React.useState(null);
+
+      const regenerateData=()=>{
+        setRows(createMockData(dataCount));
+        setSnack({open:true,msg:`サンプルデータを${dataCount.toLocaleString()}件再生成しました`});
+        setSettingsOpen(false);
+      };
+
+      const exportTemplate=()=>{
+        const template = COLUMN_DEFS.filter(c=>c.key!=='select').map(c=>({
+          key:c.key,label:c.label,kind:c.kind,width:c.width,editable:c.editable,required:c.required,nullable:c.nullable
+        }));
+        download('column_template.json', JSON.stringify(template,null,2), 'application/json');
+        setSnack({open:true,msg:'テンプレートをエクスポートしました'});
+      };
+
+      const importTemplate=(e)=>{
+        const file=e.target.files[0];
+        if(!file) return;
+        const reader=new FileReader();
+        reader.onload=(ev)=>{
+          try{
+            const data=JSON.parse(ev.target.result);
+            setCsvPreview({type:'json',data,count:data.length});
+          }catch(err){
+            setSnack({open:true,msg:'列定義の読み込みに失敗しました'});
+          }
+        };
+        reader.readAsText(file);
+        e.target.value='';
+      };
+
+      const applyImport=()=>{
+        if(csvPreview){
+          setSnack({open:true,msg:`列定義を適用しました（${csvPreview.count}列）`});
+          setCsvPreview(null);
+          setSettingsOpen(false);
+        }
+      };
+
+      const sorted=React.useMemo(()=>{
+        let data = aggResult || filtered;
+        if(aggResult && (q || Object.values(colFilters).some(v=>v))) {
+          data = aggResult.filter((r,idx)=>{
+            if(q){ 
+              const s=q.toLowerCase(); 
+              const hit=columns.filter(c=>c.key!=='select'&&c.key!=='no').some(col=>{
+                const v = col.raw? col.raw(r,idx) : (col.value? col.value(r,idx) : r[col.key]);
+                return String(v||'').toLowerCase().includes(s);
+              }); 
+              if(!hit) return false; 
+            }
+            for(const col of columns){
+              const v = col.raw? col.raw(r,idx) : (col.value? col.value(r,idx) : r[col.key]);
+              const f = colFilters[col.key]; if(!f) continue;
+              if(col.kind==='number'){ if(!matchNumber(Number(v||0), f)) return false; }
+              else if(col.kind==='date'){ if(!matchDate(v, f)) return false; }
+              else { if(!String(v??'').toLowerCase().includes(String(f).toLowerCase())) return false; }
+            }
+            return true;
+          });
+        }
+        const def = columns.find(c=>c.key===sortKey) || columns[1] || columns[0];
+        const get = (r,i)=> def.raw? def.raw(r,i) : (def.value? def.value(r,i) : r[def.key]);
+        const mul = sortDir==='asc'? 1 : -1;
+        return [...data].sort((a,b)=>{
+          const va = get(a,0), vb = get(b,0);
+          if(va==null && vb==null) return 0; if(va==null) return -mul; if(vb==null) return mul;
+          if(def.kind==='number') return (Number(va)-Number(vb))*mul;
+          if(def.kind==='date')   return ((+new Date(va||0)) - (+new Date(vb||0))) * mul;
+          return String(va).localeCompare(String(vb),'ja') * mul;
+        });
+      },[aggResult,filtered,sortKey,sortDir,columns,q,colFilters]);
+
+      const pageCount = Math.max(1, Math.ceil(sorted.length / pageSize));
+      React.useEffect(()=>{ if(pageIndex>pageCount-1) setPageIndex(pageCount-1); },[pageCount, pageIndex]);
+      const paged = React.useMemo(()=>{
+        if(listMode!=='paging') return sorted;
+        const start=pageIndex*pageSize;
+        return sorted.slice(start, start+pageSize);
+      },[sorted,listMode,pageIndex,pageSize]);
+
+      const visibleFieldCount = columns.filter(c=>c.key!=='select').length;
+      const rowHeight = useCard ? 200 : 32;
+      const {ref,onScroll,startIndex,endIndex,topPad,bottomPad} =
+        useVirtualList({total: listMode==='virtual' ? sorted.length : paged.length, rowHeight});
+      const bottomOffset = (listMode==='paging' && !useCard) ? 56 : 0;
+      
+      React.useLayoutEffect(()=>{
+        if(!ref.current) return;
+        const el=ref.current;
+        const resize=()=>{
+          const top=el.getBoundingClientRect().top;
+          const h=window.innerHeight - top - bottomOffset - 4;
+          el.style.height = (h>0? h : 0) + 'px';
+        };
+        resize();
+        requestAnimationFrame(()=>{ resize(); requestAnimationFrame(resize); });
+        const ro=new ResizeObserver(resize);
+        ro.observe(document.body);
+        window.addEventListener('resize',resize);
+        return ()=>{ ro.disconnect(); window.removeEventListener('resize',resize); };
+      }, [listMode, useCard, sorted.length, visibleFieldCount, bottomOffset]);
+      
+      const slice = React.useMemo(()=>{
+        if(listMode==='paging') return paged;
+        return sorted.slice(startIndex, endIndex);
+      },[listMode,paged,sorted,startIndex,endIndex]);
+
+      const wasResizing = React.useRef(false);
+      const onHeaderClick=(k)=>{ if(wasResizing.current) { wasResizing.current=false; return; } if(sortKey===k) setSortDir(d=>d==='asc'?'desc':'asc'); else { setSortKey(k); setSortDir('asc'); } };
+      
+      const autoFitColumn=(key)=>{
+        const def=COLUMN_DEFS.find(c=>c.key===key);
+        if(!def) return;
+        const cells=document.querySelectorAll(`td[data-col="${key}"], th[data-col="${key}"]`);
+        let maxW=def.min||60;
+        cells.forEach(cell=>{ const w=cell.scrollWidth+12; if(w>maxW) maxW=w; });
+        setColWidths(prev=>({...prev,[key]:Math.min(maxW, def.max||800)}));
+      };
+
+      const [scrollHandle,setScrollHandle]=React.useState(null);
+      const scrollRef=React.useRef(null);
+      const scrollBarRef=React.useRef(null);
+      
+      const [scrollInfo,setScrollInfo]=React.useState({handleWidth:30,trackWidth:0,maxLeft:0,containerWidth:300,tableWidth:300});
+      
+      React.useEffect(()=>{
+        if(useCard) return;
+        const update=()=>{
+          if(!ref.current||!scrollBarRef.current) return;
+          const containerWidth=ref.current.clientWidth||300;
+          const tableWidth=ref.current.scrollWidth||containerWidth;
+          const barWidth=scrollBarRef.current.clientWidth||containerWidth;
+          const ratio=Math.min(1,containerWidth/tableWidth);
+          const handleWidth=Math.max(30,barWidth*ratio);
+          const trackWidth=barWidth-16;
+          const maxLeft=trackWidth-handleWidth;
+          setScrollInfo({handleWidth,trackWidth,maxLeft,containerWidth,tableWidth});
+        };
+        update();
+        const timer=setTimeout(update,100);
+        return ()=>clearTimeout(timer);
+      },[useCard,colWidths,columns]);
+      
+      React.useEffect(()=>{
+        if(useCard||!ref.current||!scrollRef.current||scrollInfo.maxLeft<=0) return;
+        const scrollRatio=ref.current.scrollLeft/(scrollInfo.tableWidth-scrollInfo.containerWidth)||0;
+        const handleLeft=scrollRatio*scrollInfo.maxLeft;
+        scrollRef.current.style.left=(handleLeft+8)+'px';
+        scrollRef.current.style.width=scrollInfo.handleWidth+'px';
+      },[scrollInfo,useCard]);
+      
+      React.useEffect(()=>{
+        if(useCard || !scrollHandle) return;
+        const {startX,startLeft} = scrollHandle;
+        const onMove=(e)=>{
+          const delta=e.clientX - startX;
+          const newLeft=Math.max(0,Math.min(scrollInfo.maxLeft,startLeft+delta));
+          if(scrollRef.current) {
+            scrollRef.current.style.left=(newLeft+8)+'px';
+            scrollRef.current.style.width=scrollInfo.handleWidth+'px';
+          }
+          if(ref.current && scrollInfo.maxLeft>0) {
+            const scrollRatio=newLeft/scrollInfo.maxLeft;
+            const maxScroll=scrollInfo.tableWidth-scrollInfo.containerWidth;
+            ref.current.scrollLeft=scrollRatio*maxScroll;
+          }
+        };
+        const onUp=()=>setScrollHandle(null);
+        window.addEventListener('mousemove',onMove);
+        window.addEventListener('mouseup',onUp);
+        return ()=>{
+          window.removeEventListener('mousemove',onMove);
+          window.removeEventListener('mouseup',onUp);
+        };
+      },[scrollHandle,scrollInfo,useCard]);
+
+      React.useEffect(()=>{
+        if(!resizing) return;
+        const {key,startX,startW} = resizing;
+        const def=COLUMN_DEFS.find(c=>c.key===key);
+        let moved = false;
+        document.body.classList.add('resizing');
+        const onMove=(e)=>{
+          moved = true;
+          const delta=e.clientX - startX;
+          const w=Math.max(def.min||60, Math.min(def.max||800, startW+delta));
+          setColWidths(prev=>({...prev,[key]:w}));
+        };
+        const onUp=()=>{
+          if(moved) wasResizing.current = true;
+          setResizing(null);
+          document.body.classList.remove('resizing');
+        };
+        window.addEventListener('mousemove',onMove);
+        window.addEventListener('mouseup',onUp);
+        return ()=>{
+          window.removeEventListener('mousemove',onMove);
+          window.removeEventListener('mouseup',onUp);
+          document.body.classList.remove('resizing');
+        };
+      },[resizing]);
+
+      const exportCSV=()=> download(
+        `export_${new Date().toISOString().slice(0,19).replace(/[:T]/g,'-')}.csv`,
+        toCSV(listMode==='paging'? paged : sorted, columns.filter(c=>c.kind!=='checkbox'))
+      );
+
+      const [anchorEl,setAnchorEl]=React.useState(null);
+
+      const normalize=(k,val)=>{
+        const cd = COLUMN_DEFS.find(c=>c.key===k);
+        if(!cd) return val;
+        if(cd.kind==='number') return Math.max(0, Math.round(+val||0));
+        return String(val);
+      };
+      const updateCell=(id,key,val)=>{
+        const nv=normalize(key,val);
+        setRows(rs=>rs.map(r=>r.id===id?{...r,[key]:nv}:r));
+        setSnack({open:true,msg:`ID=${id} の「${key}」を更新しました`});
+      };
+
+      const onCellClick=(col,row,idx)=>{
+        if(editMode) return;
+        if(col.kind==='checkbox') return;
+        const v = col.raw? col.raw(row,idx) : (col.value? col.value(row,idx) : row[col.key]);
+        setColFilters(f=>({...f,[col.key]: String(v??'')})); 
+        if(listMode==='paging') setPageIndex(0);
+        if(useCard && ref.current){
+          const el=ref.current, prev=el.style.scrollBehavior; el.style.scrollBehavior='auto'; el.scrollTop=0;
+          requestAnimationFrame(()=>{ el.style.scrollBehavior=prev||'smooth'; });
+        }
+      };
+
+      const renderCard = React.useCallback((row, idx) => {
+        const getValue=(key)=>{
+          const col=COLUMN_DEFS.find(c=>c.key===key);
+          if(!col) return '';
+          const raw=col.calc? col.calc(row) : (col.raw? col.raw(row,idx) : row[key]);
+          if(col.kind==='number') return Number(raw??0).toLocaleString();
+          return String(raw??'');
+        };
+        const isVisible=(key)=>columns.some(c=>c.key===key);
+        
+        return (
+          <Card key={row.id} variant="outlined" sx={{position:'relative',transition:'box-shadow .2s','&:hover':{boxShadow:2}}}>
+            <CardContent sx={{p:2,'&:last-child':{pb:2}}}>
+              <Checkbox size="small" checked={selected.has(row.id)} onChange={()=>toggleRow(row.id)} sx={{position:'absolute',top:8,right:8,p:0}}/>
+              {isVisible('name') && <Typography variant="h6" sx={{mb:1.5,pr:4,fontWeight:600}}>{getValue('name')}</Typography>}
+              <Stack direction="row" spacing={2} sx={{mb:1.5,flexWrap:'wrap',gap:1}}>
+                {isVisible('code') && <Box sx={{flex:'1 1 45%',minWidth:120}}><Typography variant="caption" sx={{color:'text.secondary',fontSize:'.7rem',display:'block',mb:.25}}>コード</Typography><Typography variant="body2">{getValue('code')}</Typography></Box>}
+                {isVisible('sellPrice') && <Box sx={{flex:'1 1 45%',minWidth:100}}><Typography variant="caption" sx={{color:'text.secondary',fontSize:'.7rem',display:'block',mb:.25}}>売価</Typography><Typography variant="body2">{getValue('sellPrice')}</Typography></Box>}
+              </Stack>
+              <Stack direction="row" spacing={1} sx={{mb:1.5,flexWrap:'wrap',gap:.5}}>
+                {isVisible('corner') && <Chip label={getValue('corner')} size="small" variant="outlined" sx={{fontSize:'.7rem'}}/>}
+                {isVisible('line') && <Chip label={getValue('line')} size="small" variant="outlined" sx={{fontSize:'.7rem'}}/>}
+                {isVisible('category') && <Chip label={getValue('category')} size="small" variant="outlined" sx={{fontSize:'.7rem'}}/>}
+              </Stack>
+              {isVisible('partner') && <Box sx={{mb:1.5,pb:1.5,borderBottom:1,borderColor:'divider'}}><Typography variant="caption" sx={{color:'text.secondary',fontSize:'.7rem',display:'block',mb:.25}}>取引先</Typography><Typography variant="body2">{getValue('partner')}</Typography></Box>}
+              <Stack direction="row" spacing={1} sx={{mb:1}}>
+                {isVisible('stockQty') && <Box sx={{flex:1}}><Typography variant="caption" sx={{color:'text.secondary',fontSize:'.68rem',display:'block',mb:.25}}>在庫数</Typography><Typography variant="body2">{getValue('stockQty')}</Typography></Box>}
+                {isVisible('costPrice') && <Box sx={{flex:1}}><Typography variant="caption" sx={{color:'text.secondary',fontSize:'.68rem',display:'block',mb:.25}}>原価</Typography><Typography variant="body2">{getValue('costPrice')}</Typography></Box>}
+              </Stack>
+              <Stack direction="row" spacing={1} sx={{mb:1}}>
+                {isVisible('totalSales') && <Box sx={{flex:1}}><Typography variant="caption" sx={{color:'text.secondary',fontSize:'.68rem',display:'block',mb:.25}}>累計販売数</Typography><Typography variant="body2">{getValue('totalSales')}</Typography></Box>}
+                {isVisible('sales28d') && <Box sx={{flex:1}}><Typography variant="caption" sx={{color:'text.secondary',fontSize:'.68rem',display:'block',mb:.25}}>販売数(28日)</Typography><Typography variant="body2">{getValue('sales28d')}</Typography></Box>}
+                {isVisible('sales7d') && <Box sx={{flex:1}}><Typography variant="caption" sx={{color:'text.secondary',fontSize:'.68rem',display:'block',mb:.25}}>販売数(7日)</Typography><Typography variant="body2">{getValue('sales7d')}</Typography></Box>}
+              </Stack>
+              {(isVisible('saleStartDate')||isVisible('saleEndDate')) && <Stack direction="row" spacing={2} sx={{mt:1.5,pt:1,borderTop:1,borderColor:'divider'}}>
+                {isVisible('saleStartDate') && <Typography variant="caption" sx={{color:'text.secondary',fontSize:'.68rem'}}>販売開始日: {getValue('saleStartDate')||'-'}</Typography>}
+                {isVisible('saleEndDate') && <Typography variant="caption" sx={{color:'text.secondary',fontSize:'.68rem'}}>販売終了日: {getValue('saleEndDate')||'-'}</Typography>}
+              </Stack>}
+            </CardContent>
+          </Card>
+        );
+      },[columns,selected,editMode]);
+
+      const handleChangePage = (_e, newPage)=> setPageIndex(newPage);
+      const handleChangeRowsPerPage = (e)=>{ setPageSize(parseInt(e.target.value,10)); setPageIndex(0); };
+
+      const renderChart = React.useCallback(()=>{
+        if(!chartOpen) return;
+        const container = document.getElementById('chart-container');
+        if(!container) return;
+        
+        const grouped = {};
+        sorted.forEach(d=>{
+          const x = String(d[chartXCol]||'');
+          if(!grouped[x]) grouped[x]={sum:0,count:0};
+          grouped[x].sum += (+d[chartYCol]||0);
+          grouped[x].count++;
+        });
+        
+        const data = Object.entries(grouped).map(([x,v])=>({x,y:Math.round(v.sum/v.count)}));
+        const xLabel = COLUMN_DEFS.find(c=>c.key===chartXCol)?.label||chartXCol;
+        const yLabel = COLUMN_DEFS.find(c=>c.key===chartYCol)?.label||chartYCol;
+        
+        const trace = {
+          x: data.map(d=>d.x),
+          y: data.map(d=>d.y),
+          type: chartType,
+          mode: chartType==='line'?'lines+markers':undefined
+        };
+        
+        const layout = {
+          xaxis: {title: xLabel},
+          yaxis: {title: yLabel},
+          showlegend: false,
+          margin: {t:30,r:30,b:60,l:60}
+        };
+        
+        Plotly.newPlot(container, [trace], layout, {responsive:true});
+      },[chartOpen,chartType,chartXCol,chartYCol,sorted]);
+      
+      React.useEffect(()=>{
+        if(chartOpen) {
+          const timer = setTimeout(renderChart,150);
+          const resizeObserver = new ResizeObserver(()=>setTimeout(renderChart,100));
+          const container = document.getElementById('chart-container');
+          if(container) resizeObserver.observe(container);
+          return ()=>{ clearTimeout(timer); resizeObserver.disconnect(); };
+        }
+      },[renderChart]);
+
+      // 発注管理機能
+      const selectedProducts = React.useMemo(()=>{
+        return rows.filter(r=>selected.has(r.id));
+      },[rows,selected]);
+
+      const getStoreData = React.useCallback((product, store)=>{
+        const storeRows = rows.filter(r=>r.code===product.code && r.store===store);
+        if(storeRows.length===0) return null;
+        const r = storeRows[0];
+        const sales7d = r.sales7d||0;
+        const sales28d = r.sales28d||0;
+        const stockQty = r.stockQty||0;
+        const stockQty7d = r.stockQty7d||0;
+        const stockQty28d = r.stockQty28d||0;
+        
+        const salesVelocity = sales7d>0 ? Math.round((sales7d/7)*10)/10 : 0;
+        const daysOfStock = salesVelocity>0 ? Math.round(stockQty/salesVelocity) : 999;
+        const stockChange7d = stockQty - stockQty7d;
+        const stockChange28d = stockQty - stockQty28d;
+        
+        let action = '✅ 適正在庫';
+        let actionColor = 'success';
+        if(daysOfStock<3 && salesVelocity>1) { action='🚀 即発注推奨'; actionColor='error'; }
+        else if(daysOfStock<7 && salesVelocity>0.5) { action='⚠️ 発注検討'; actionColor='warning'; }
+        else if(stockQty>50 && salesVelocity<0.3) { action='📦 移管検討（他店へ）'; actionColor='info'; }
+        else if(stockQty<10 && salesVelocity<0.2) { action='📦 移管検討（他店から）'; actionColor='info'; }
+        else if(stockQty>30 && daysOfStock>30) { action='🏷️ 値下げ推奨'; actionColor='secondary'; }
+        
+        return {
+          ...r,
+          salesVelocity,
+          daysOfStock,
+          stockChange7d,
+          stockChange28d,
+          action,
+          actionColor
+        };
+      },[rows]);
+
+      const getRecommendedQty = (storeData)=>{
+        if(!storeData) return 0;
+        const {salesVelocity,daysOfStock,stockQty} = storeData;
+        if(daysOfStock<7 && salesVelocity>0) {
+          return Math.max(0, Math.ceil(salesVelocity*14 - stockQty));
+        }
+        return 0;
+      };
+
+      const handleOrderChange = (productId, store, field, value)=>{
+        setOrders(prev=>({
+          ...prev,
+          [`${productId}_${store}`]: {
+            ...prev[`${productId}_${store}`],
+            [field]: value
+          }
+        }));
+      };
+
+      const applyBulkQty = (productId, qty)=>{
+        const stores = orderMode==='all' ? STORES : [selectedStore];
+        const newOrders = {...orders};
+        stores.forEach(store=>{
+          const key = `${productId}_${store}`;
+          newOrders[key] = {
+            ...newOrders[key],
+            qty: qty
+          };
+        });
+        setOrders(newOrders);
+      };
+
+      const applyRecommended = (productId, product)=>{
+        const stores = orderMode==='all' ? STORES : [selectedStore];
+        const newOrders = {...orders};
+        stores.forEach(store=>{
+          const storeData = getStoreData(product, store);
+          const recommended = getRecommendedQty(storeData);
+          const key = `${productId}_${store}`;
+          newOrders[key] = {
+            ...newOrders[key],
+            qty: recommended
+          };
+        });
+        setOrders(newOrders);
+      };
+
+      const submitOrders = ()=>{
+        const orderList = [];
+        Object.entries(orders).forEach(([key,value])=>{
+          if(value.qty && value.qty>0) {
+            const [productId, store] = key.split('_');
+            const product = rows.find(r=>r.id===parseInt(productId));
+            if(product) {
+              orderList.push({
+                product: product.name,
+                code: product.code,
+                store,
+                qty: value.qty,
+                deliveryDate: value.deliveryDate || new Date(Date.now()+7*864e5).toISOString().slice(0,10)
+              });
+            }
+          }
+        });
+        
+        if(orderList.length===0) {
+          setSnack({open:true,msg:'発注データがありません'});
+          return;
+        }
+        
+        console.log('発注データ:', orderList);
+        setSnack({open:true,msg:`${orderList.length}件の発注を送信しました`});
+        setOrders({});
+        setOrderOpen(false);
+      };
+
+      const renderOrderDialog = ()=>{
+        if(!orderOpen) return null;
+        
+        const stores = orderMode==='all' ? STORES : [selectedStore];
+        const defaultDelivery = new Date(Date.now()+7*864e5).toISOString().slice(0,10);
+        
+        return (
+          <Dialog open={orderOpen} onClose={()=>setOrderOpen(false)} maxWidth="xl" fullWidth
+            PaperProps={{sx:{height:'90vh'}}}>
+            <DialogTitle sx={{pb:1}}>
+              <Stack direction="row" alignItems="center" spacing={2}>
+                <span className="material-icons" style={{fontSize:28,color:theme.palette.primary.main}}>shopping_cart</span>
+                <Box sx={{flex:1}}>
+                  <Typography variant="h6">発注管理</Typography>
+                  <Typography variant="caption" color="text.secondary">
+                    選択商品: {selected.size}件 | {orderMode==='all'?'全店舗モード':'単店舗モード'}
+                  </Typography>
+                </Box>
+                <ToggleButtonGroup size="small" exclusive value={orderMode} 
+                  onChange={(_,v)=>v&&setOrderMode(v)} color="primary">
+                  <ToggleButton value="all">全店舗（SV）</ToggleButton>
+                  <ToggleButton value="single">単店舗</ToggleButton>
+                </ToggleButtonGroup>
+                {orderMode==='single' && (
+                  <FormControl size="small" sx={{minWidth:120}}>
+                    <Select value={selectedStore} onChange={(e)=>setSelectedStore(e.target.value)}>
+                      {STORES.map(s=><MenuItem key={s} value={s}>{s}</MenuItem>)}
+                    </Select>
+                  </FormControl>
+                )}
+              </Stack>
+            </DialogTitle>
+            <DialogContent sx={{p:0}}>
+              <Box sx={{borderBottom:1,borderColor:'divider'}}>
+                <Tabs value={orderTab} onChange={(_,v)=>setOrderTab(v)} variant="scrollable">
+                  {selectedProducts.map((p,i)=>(
+                    <Tab key={p.id} label={`${p.name}`} />
+                  ))}
+                </Tabs>
+              </Box>
+              
+              {selectedProducts.map((product,tabIndex)=>(
+                <Box key={product.id} sx={{display:orderTab===tabIndex?'block':'none',p:3}}>
+                  <Paper elevation={0} sx={{p:2,mb:3,bgcolor:'action.hover'}}>
+                    <Stack direction="row" spacing={3} flexWrap="wrap">
+                      <Box>
+                        <Typography variant="h5" sx={{fontWeight:600,mb:1}}>{product.name}</Typography>
+                        <Typography variant="body2" color="text.secondary">
+                          コード: {product.code} | 売価: ¥{(product.sellPrice||0).toLocaleString()} | 
+                          原価: ¥{(product.costPrice||0).toLocaleString()}
+                        </Typography>
+                      </Box>
+                      <Box sx={{ml:'auto'}}>
+                        <Stack direction="row" spacing={1}>
+                          <TextField size="small" type="number" label="一括数量" 
+                            inputProps={{min:0,style:{width:80}}}
+                            onChange={(e)=>{
+                              const qty = parseInt(e.target.value)||0;
+                              applyBulkQty(product.id, qty);
+                            }}/>
+                          <Button variant="outlined" size="small"
+                            onClick={()=>applyRecommended(product.id, product)}>
+                            推奨数量を適用
+                          </Button>
+                        </Stack>
+                      </Box>
+                    </Stack>
+                  </Paper>
+
+                  <Box sx={{display:'grid',gridTemplateColumns:`repeat(${stores.length},1fr)`,gap:2}}>
+                    {stores.map(store=>{
+                      const storeData = getStoreData(product, store);
+                      if(!storeData) return (
+                        <Card key={store} variant="outlined">
+                          <CardContent>
+                            <Typography variant="h6" sx={{mb:1}}>{store}</Typography>
+                            <Typography variant="body2" color="text.secondary">
+                              データなし
+                            </Typography>
+                          </CardContent>
+                        </Card>
+                      );
+                      
+                      const orderKey = `${product.id}_${store}`;
+                      const currentOrder = orders[orderKey]||{};
+                      const recommended = getRecommendedQty(storeData);
+                      
+                      return (
+                        <Card key={store} variant="outlined" sx={{
+                          borderColor: storeData.actionColor+'.main',
+                          borderWidth: 2
+                        }}>
+                          <CardContent sx={{p:2}}>
+                            <Stack spacing={2}>
+                              <Box>
+                                <Typography variant="h6" sx={{mb:0.5,display:'flex',alignItems:'center',gap:1}}>
+                                  {store}
+                                  <Chip label={storeData.action} size="small" 
+                                    color={storeData.actionColor} sx={{fontSize:'0.7rem'}}/>
+                                </Typography>
+                              </Box>
+
+                              <Box sx={{bgcolor:'background.default',p:1.5,borderRadius:1}}>
+                                <Typography variant="caption" color="text.secondary" 
+                                  sx={{display:'block',mb:1,fontWeight:600}}>
+                                  📊 販売速度
+                                </Typography>
+                                <Box sx={{display:'flex',alignItems:'center',gap:1,mb:0.5}}>
+                                  <Box sx={{flex:1}}>
+                                    <LinearProgress variant="determinate" 
+                                      value={Math.min(100, storeData.salesVelocity*10)}
+                                      sx={{height:8,borderRadius:1,
+                                        '& .MuiLinearProgress-bar':{
+                                          bgcolor: storeData.salesVelocity>2?'error.main':
+                                                   storeData.salesVelocity>1?'warning.main':'success.main'
+                                        }
+                                      }}/>
+                                  </Box>
+                                  <Typography variant="body2" sx={{fontWeight:600,minWidth:60}}>
+                                    {storeData.salesVelocity.toFixed(1)}/日
+                                  </Typography>
+                                </Box>
+                                <Stack direction="row" spacing={2} sx={{mt:1.5}}>
+                                  <Box sx={{flex:1}}>
+                                    <Typography variant="caption" color="text.secondary">7日販売</Typography>
+                                    <Typography variant="body2" sx={{fontWeight:600}}>
+                                      {storeData.sales7d}個
+                                    </Typography>
+                                  </Box>
+                                  <Box sx={{flex:1}}>
+                                    <Typography variant="caption" color="text.secondary">28日販売</Typography>
+                                    <Typography variant="body2" sx={{fontWeight:600}}>
+                                      {storeData.sales28d}個
+                                    </Typography>
+                                  </Box>
+                                </Stack>
+                              </Box>
+
+                              <Box sx={{bgcolor:'background.default',p:1.5,borderRadius:1}}>
+                                <Typography variant="caption" color="text.secondary" 
+                                  sx={{display:'block',mb:1,fontWeight:600}}>
+                                  📈 在庫推移
+                                </Typography>
+                                <Stack direction="row" spacing={2}>
+                                  <Box sx={{flex:1,textAlign:'center'}}>
+                                    <Typography variant="caption" color="text.secondary">28日前</Typography>
+                                    <Typography variant="h6" sx={{color:'text.secondary'}}>
+                                      {storeData.stockQty28d}
+                                    </Typography>
+                                    <Typography variant="caption" sx={{
+                                      color: storeData.stockChange28d<0?'error.main':'success.main'
+                                    }}>
+                                      {storeData.stockChange28d>0?'+':''}{storeData.stockChange28d}
+                                    </Typography>
+                                  </Box>
+                                  <Box sx={{flex:1,textAlign:'center'}}>
+                                    <Typography variant="caption" color="text.secondary">7日前</Typography>
+                                    <Typography variant="h6" sx={{color:'text.secondary'}}>
+                                      {storeData.stockQty7d}
+                                    </Typography>
+                                    <Typography variant="caption" sx={{
+                                      color: storeData.stockChange7d<0?'error.main':'success.main'
+                                    }}>
+                                      {storeData.stockChange7d>0?'+':''}{storeData.stockChange7d}
+                                    </Typography>
+                                  </Box>
+                                  <Box sx={{flex:1,textAlign:'center'}}>
+                                    <Typography variant="caption" color="text.secondary">現在</Typography>
+                                    <Typography variant="h6" sx={{fontWeight:700,
+                                      color: storeData.stockQty<10?'error.main':
+                                             storeData.stockQty<30?'warning.main':'success.main'
+                                    }}>
+                                      {storeData.stockQty}
+                                    </Typography>
+                                    <Typography variant="caption">
+                                      {storeData.daysOfStock<999?`${storeData.daysOfStock}日分`:'--'}
+                                    </Typography>
+                                  </Box>
+                                </Stack>
+                              </Box>
+
+                              <Divider/>
+
+                              <Box>
+                                <Typography variant="caption" sx={{display:'block',mb:1,fontWeight:600}}>
+                                  🎯 発注入力
+                                </Typography>
+                                <Stack spacing={1.5}>
+                                  <TextField size="small" type="number" label="発注数" fullWidth
+                                    value={currentOrder.qty||0}
+                                    onChange={(e)=>handleOrderChange(product.id, store, 'qty', parseInt(e.target.value)||0)}
+                                    inputProps={{min:0}}
+                                    helperText={recommended>0?`推奨: ${recommended}個`:null}
+                                    InputProps={{
+                                      endAdornment: recommended>0 && (
+                                        <InputAdornment position="end">
+                                          <IconButton size="small" 
+                                            onClick={()=>handleOrderChange(product.id, store, 'qty', recommended)}>
+                                            <span className="material-icons" style={{fontSize:18}}>lightbulb</span>
+                                          </IconButton>
+                                        </InputAdornment>
+                                      )
+                                    }}/>
+                                  <TextField size="small" type="date" label="納品日" fullWidth
+                                    value={currentOrder.deliveryDate||defaultDelivery}
+                                    onChange={(e)=>handleOrderChange(product.id, store, 'deliveryDate', e.target.value)}
+                                    InputLabelProps={{shrink:true}}/>
+                                </Stack>
+                              </Box>
+                            </Stack>
+                          </CardContent>
+                        </Card>
+                      );
+                    })}
+                  </Box>
+                </Box>
+              ))}
+            </DialogContent>
+            <DialogActions sx={{p:2,borderTop:1,borderColor:'divider'}}>
+              <Button onClick={()=>setOrderOpen(false)}>キャンセル</Button>
+              <Button variant="contained" startIcon={<span className="material-icons">send</span>}
+                onClick={submitOrders}>
+                発注確定
+              </Button>
+            </DialogActions>
+          </Dialog>
+        );
+      };
+
+      return (
+        <ThemeProvider theme={theme}><CssBaseline/>
+          <AppBar position="sticky" elevation={1}>
+            <Toolbar variant="dense" sx={{minHeight:48}}>
+              <Typography variant="h6" sx={{flexGrow:1,fontSize:16,letterSpacing:.2}}>列定義ドリブン Dense UI（発注管理機能付き）</Typography>
+
+              <Badge badgeContent={selected.size} color="error" sx={{mr:2}}>
+                <Button color="inherit" size="small" 
+                  startIcon={<span className="material-icons">shopping_cart</span>}
+                  onClick={()=>setOrderOpen(true)}
+                  disabled={selected.size===0}>
+                  発注管理
+                </Button>
+              </Badge>
+
+              <FormControlLabel control={<Switch checked={dark} onChange={()=>setDark(v=>!v)} size="small" color="default"/>}
+                label={<span className="material-icons" style={{fontSize:18}}>{dark?'dark_mode':'light_mode'}</span>} sx={{ml:1,color:'inherit'}}/>
+
+              <Button color="inherit" size="small" startIcon={<span className="material-icons">bar_chart</span>}
+                      onClick={()=>setChartOpen(!chartOpen)}>グラフ</Button>
+
+              <Button color="inherit" size="small" startIcon={<span className="material-icons">functions</span>}
+                      onClick={()=>setAggOpen(!aggOpen)}>集計</Button>
+
+              <Tooltip title="設定"><span>
+                <IconButton color="inherit" onClick={()=>setSettingsOpen(true)} size="small"><span className="material-icons">settings</span></IconButton>
+              </span></Tooltip>
+              <Menu anchorEl={anchorEl} open={!!anchorEl} onClose={()=>setAnchorEl(null)}>
+                {COLUMN_DEFS.filter(c=>c.key!=='select').map(c=> (
+                  <MenuItem key={c.key} onClick={()=> setVisibleCols(v=> v.includes(c.key)? v.filter(k=>k!==c.key) : [...v,c.key])}>
+                    <Checkbox checked={visibleCols.includes(c.key)}/><ListItemText primary={c.label}/>
+                  </MenuItem>
+                ))}
+              </Menu>
+            </Toolbar>
+          </AppBar>
+
+          <Box component={Paper} square elevation={0}
+               sx={{position:'sticky', top:48, zIndex:2, bgcolor: theme.palette.mode==='dark' ? 'rgba(50,50,50,0.95)' : 'rgba(240,240,240,0.95)'}}>
+            <Container maxWidth="xl">
+              <Toolbar variant="dense" sx={{gap:1,px:0,minHeight:52,py:0.5}}>
+                <TextField size="small" placeholder="全文検索（品名/コード/取引先 ほか）" value={q}
+                  onChange={e=>setQ(e.target.value)}
+                  onBlur={()=>{ if(listMode==='paging') setPageIndex(0); }}
+                  sx={{flex:1,maxWidth:560}}
+                  InputProps={{startAdornment:(<InputAdornment position="start"><span className="material-icons">search</span></InputAdornment>)}}/>
+
+                <Stack direction="row" spacing={1} alignItems="center">
+                  <Typography variant="caption" sx={{opacity:.8}}>表示</Typography>
+                  <ToggleButtonGroup size="small" exclusive value={viewMode} onChange={(_,v)=>v&&setViewMode(v)}
+                    sx={{'& .MuiToggleButton-root':{fontWeight:600},'& .Mui-selected':{borderWidth:2}}} color="secondary">
+                    <ToggleButton value="auto" title="自動"><span className="material-icons" style={{fontSize:18,marginRight:4}}>autorenew</span>自動</ToggleButton>
+                    <ToggleButton value="table" title="テーブル"><span className="material-icons" style={{fontSize:18,marginRight:4}}>table_chart</span>表</ToggleButton>
+                    <ToggleButton value="card" title="カード"><span className="material-icons" style={{fontSize:18,marginRight:4}}>view_agenda</span>カード</ToggleButton>
+                  </ToggleButtonGroup>
+                </Stack>
+
+                <Stack direction="row" spacing={1} alignItems="center">
+                  <Typography variant="caption" sx={{opacity:.8}}>リスト</Typography>
+                  <ToggleButtonGroup size="small" exclusive value={listMode} onChange={(_,v)=>v&&setListMode(v)}
+                    sx={{'& .MuiToggleButton-root':{fontWeight:600},'& .Mui-selected':{borderWidth:2}}} color="secondary">
+                    <ToggleButton value="virtual" title="連続（仮想スクロール）"><span className="material-icons" style={{fontSize:18,marginRight:4}}>swap_vert</span>連続</ToggleButton>
+                    <ToggleButton value="paging" title="ページネーション"><span className="material-icons" style={{fontSize:18,marginRight:4}}>pages</span>ページ</ToggleButton>
+                  </ToggleButtonGroup>
+                </Stack>
+              </Toolbar>
+            </Container>
+          </Box>
+
+          {aggOpen && (
+            <Box component={Paper} square elevation={2} sx={{bgcolor: theme.palette.mode==='dark' ? 'background.paper' : 'grey.50'}}>
+              <Container maxWidth="xl">
+                <Box sx={{py:2,px:2}}>
+                  <Stack direction="row" spacing={2} alignItems="center" sx={{mb:2}}>
+                    <Typography variant="h6" sx={{fontSize:'1rem',fontWeight:600,flexGrow:1}}>集計クエリー設定</Typography>
+                    <Button size="small" variant="contained" color="primary" 
+                      onClick={()=>{
+                        const groupCols=Object.keys(aggConfig).filter(k=>aggConfig[k]?.mode==='group');
+                        const aggCols=Object.keys(aggConfig).filter(k=>aggConfig[k]?.mode==='agg');
+                        
+                        if(groupCols.length > 0 || aggCols.length > 0) {
+                          if(groupCols.length === 0 && aggCols.length > 0) {
+                            const totalRow = {id: 'total', _count: filtered.length};
+                            aggCols.forEach(col => {
+                              const values = filtered.map(r => Number(r[col]) || 0);
+                              const func = aggConfig[col]?.func || 'sum';
+                              if(func === 'sum') totalRow[col] = values.reduce((a,b) => a+b, 0);
+                              else if(func === 'avg') totalRow[col] = values.length > 0 ? values.reduce((a,b) => a+b, 0) / values.length : 0;
+                              else if(func === 'max') totalRow[col] = Math.max(...values, 0);
+                              else if(func === 'min') totalRow[col] = Math.min(...values, 0);
+                              else if(func === 'count') totalRow[col] = values.length;
+                            });
+                            
+                            const cols = [
+                              {key:'select',label:'',kind:'checkbox',width:44,min:40,max:80},
+                              {key:'no',label:'No',kind:'number',width:72,min:60,max:120,numeric:true,raw:(r,i)=>i+1},
+                              {key:'_count',label:'件数',kind:'number',width:100,min:80,max:200,numeric:true}
+                            ];
+                            aggCols.forEach(k=>{
+                              const orig=COLUMN_DEFS.find(c=>c.key===k);
+                              const func=aggConfig[k]?.func||'sum';
+                              const funcLabel={sum:'合計',avg:'平均',max:'最大',min:'最小',count:'件数'}[func]||func;
+                              if(orig) cols.push({...orig,label:`全体${orig.label}(${funcLabel})`,key:k,numeric:true});
+                            });
+                            
+                            setAggResult([totalRow]);
+                            setAggResultColumns(cols);
+                          } else if(groupCols.length > 0) {
+                            const groups = new Map();
+                            const getKey = groupCols.length === 1 ? r => String(r[groupCols[0]] || '(空)') : r => groupCols.map(k => String(r[k] || '(空)')).join(' | ');
+                            
+                            filtered.forEach(r => {
+                              const key = getKey(r);
+                              if(!groups.has(key)) {
+                                groups.set(key, {_count: 0, stats: {}, raw: {}});
+                                groupCols.forEach(k => groups.get(key).raw[k] = r[k]);
+                              }
+                              const g = groups.get(key);
+                              g._count++;
+                              
+                              aggCols.forEach(col => {
+                                const val = Number(r[col]) || 0;
+                                if(!g.stats[col]) g.stats[col] = {sum: 0, count: 0, max: -Infinity, min: Infinity};
+                                const s = g.stats[col];
+                                s.sum += val;
+                                s.count++;
+                                if(val > s.max) s.max = val;
+                                if(val < s.min) s.min = val;
+                              });
+                            });
+                            
+                            const result = [];
+                            groups.forEach((g, key) => {
+                              const row = {id: `group_${result.length}`, _count: g._count};
+                              groupCols.forEach(k => row[k] = g.raw[k]);
+                              aggCols.forEach(col => {
+                                const s = g.stats[col];
+                                const func = aggConfig[col]?.func || 'sum';
+                                if(func === 'sum') row[col] = s.sum;
+                                else if(func === 'avg') row[col] = s.count > 0 ? Math.round(s.sum / s.count * 100) / 100 : 0;
+                                else if(func === 'max') row[col] = s.max === -Infinity ? 0 : s.max;
+                                else if(func === 'min') row[col] = s.min === Infinity ? 0 : s.min;
+                                else if(func === 'count') row[col] = s.count;
+                              });
+                              result.push(row);
+                            });
+                            
+                            const cols = [
+                              {key:'select',label:'',kind:'checkbox',width:44,min:40,max:80},
+                              {key:'no',label:'No',kind:'number',width:72,min:60,max:120,numeric:true,raw:(r,i)=>i+1}
+                            ];
+                            groupCols.forEach(k=>{
+                              const orig=COLUMN_DEFS.find(c=>c.key===k);
+                              if(orig) cols.push({...orig,label:orig.label});
+                            });
+                            aggCols.forEach(k=>{
+                              const orig=COLUMN_DEFS.find(c=>c.key===k);
+                              const func=aggConfig[k]?.func||'sum';
+                              const funcLabel={sum:'合計',avg:'平均',max:'最大',min:'最小',count:'件数'}[func]||func;
+                              if(orig) cols.push({...orig,label:`${orig.label}(${funcLabel})`,key:k,numeric:true});
+                            });
+                            
+                            setAggResult(result);
+                            setAggResultColumns(cols);
+                          }
+                        } else {
+                          setAggResult(null);
+                          setAggResultColumns([]);
+                        }
+                        
+                        setAggActive(true);
+                        setAggOpen(false);
+                        setSnack({open:true,msg:'集計結果をメインテーブルに表示しました'});
+                      }}
+                      startIcon={<span className="material-icons" style={{fontSize:16}}>check</span>}>
+                      確定
+                    </Button>
+                    {aggActive && (
+                      <Button size="small" variant="outlined" color="secondary"
+                        onClick={()=>{
+                          setAggActive(false);
+                          setAggResult(null);
+                          setAggResultColumns([]);
+                          setVisibleCols(COLUMN_DEFS.map(c=>c.key));
+                          setSnack({open:true,msg:'集計を解除しました'});
+                        }}
+                        startIcon={<span className="material-icons" style={{fontSize:16}}>close</span>}>
+                        解除
+                      </Button>
+                    )}
+                  </Stack>
+                  <Paper elevation={0} sx={{p:2,bgcolor:'background.paper',maxHeight:400,overflow:'auto'}}>
+                    <Table size="small" sx={{'& th':{fontWeight:600,bgcolor:'action.hover',p:'6px 8px'},'& td':{p:'6px 8px'}}}>
+                      <TableHead>
+                        <TableRow>
+                          <TableCell width="30%">列名</TableCell>
+                          <TableCell width="25%">モード</TableCell>
+                          <TableCell width="25%">集計方法</TableCell>
+                          <TableCell width="20%">状態</TableCell>
+                        </TableRow>
+                      </TableHead>
+                      <TableBody>
+                        {COLUMN_DEFS.filter(c=>c.key!=='select'&&c.key!=='no'&&c.kind!=='checkbox').map(col=>{
+                          const cfg=aggConfig[col.key]||{mode:col.kind==='number'?'agg':'group',func:'sum'};
+                          return (
+                            <TableRow key={col.key} hover sx={{height:40}}>  
+                              <TableCell><Typography variant="body2">{col.label}</Typography></TableCell>
+                              <TableCell>
+                                <Select size="small" fullWidth value={cfg.mode}
+                                  onChange={(e)=>{
+                                    const newMode = e.target.value;
+                                    setAggConfig(prev=>{
+                                      const current = prev[col.key] || {};
+                                      const newConfig = {mode: newMode};
+                                      if(newMode === 'agg') {
+                                        newConfig.func = current.func || 'sum';
+                                      }
+                                      return {
+                                        ...prev,
+                                        [col.key]: newConfig
+                                      };
+                                    });
+                                  }}>
+                                  <MenuItem value="hide">非表示</MenuItem>
+                                  <MenuItem value="ignore">非扱い</MenuItem>
+                                  <MenuItem value="group">グループ</MenuItem>
+                                  {col.kind==='number' && <MenuItem value="agg">集計</MenuItem>}
+                                </Select>
+                              </TableCell>
+                              <TableCell>
+                                {cfg.mode==='agg' ? (
+                                  <Select size="small" fullWidth value={cfg.func || 'sum'}
+                                    onChange={(e)=>{
+                                      const newFunc = e.target.value;
+                                      setAggConfig(prev=>{
+                                        const current = prev[col.key] || {};
+                                        return {
+                                          ...prev,
+                                          [col.key]: {
+                                            ...current,
+                                            func: newFunc
+                                          }
+                                        };
+                                      });
+                                    }}>
+                                    <MenuItem value="sum">合計</MenuItem>
+                                    <MenuItem value="avg">平均</MenuItem>
+                                    <MenuItem value="max">最大</MenuItem>
+                                    <MenuItem value="min">最小</MenuItem>
+                                    <MenuItem value="count">件数</MenuItem>
+                                  </Select>
+                                ) : <Typography variant="body2" color="text.disabled">-</Typography>}
+                              </TableCell>
+                              <TableCell>
+                                <Chip size="small" 
+                                  label={cfg.mode==='hide'?'非表示':cfg.mode==='ignore'?'非扱い':cfg.mode==='group'?'グループ':cfg.func}
+                                  color={cfg.mode==='hide'?'default':cfg.mode==='ignore'?'warning':cfg.mode==='group'?'primary':'secondary'}
+                                  variant={cfg.mode==='hide'||cfg.mode==='ignore'?'outlined':'filled'}/>
+                              </TableCell>
+                            </TableRow>
+                          );
+                        })}
+                      </TableBody>
+                    </Table>
+                  </Paper>
+                </Box>
+              </Container>
+            </Box>
+          )}
+
+          {chartOpen && (
+            <Box component={Paper} square elevation={2} sx={{bgcolor: theme.palette.mode==='dark' ? 'background.paper' : 'grey.50',py:2}}>
+              <Container maxWidth="xl">
+                <Stack direction="row" spacing={1} alignItems="center" sx={{mb:2,px:2}}>
+                  <FormControl size="small" sx={{minWidth:100}}>
+                    <InputLabel>種類</InputLabel>
+                    <Select value={chartType} onChange={(e)=>setChartType(e.target.value)} label="種類">
+                      <MenuItem value="bar">棒</MenuItem>
+                      <MenuItem value="line">線</MenuItem>
+                    </Select>
+                  </FormControl>
+                  <FormControl size="small" sx={{minWidth:120}}>
+                    <InputLabel>X軸</InputLabel>
+                    <Select value={chartXCol} onChange={(e)=>setChartXCol(e.target.value)} label="X軸">
+                      {COLUMN_DEFS.filter(c=>c.key!=='select'&&c.kind!=='checkbox').map(c=>(
+                        <MenuItem key={c.key} value={c.key}>{c.label}</MenuItem>
+                      ))}
+                    </Select>
+                  </FormControl>
+                  <FormControl size="small" sx={{minWidth:120}}>
+                    <InputLabel>Y軸</InputLabel>
+                    <Select value={chartYCol} onChange={(e)=>setChartYCol(e.target.value)} label="Y軸">
+                      {COLUMN_DEFS.filter(c=>c.key!=='select'&&c.kind!=='checkbox').map(c=>(
+                        <MenuItem key={c.key} value={c.key}>{c.label}</MenuItem>
+                      ))}
+                    </Select>
+                  </FormControl>
+                </Stack>
+                <Box id="chart-container" sx={{width:'100%',height:300,px:2}}/>
+              </Container>
+            </Box>
+          )}
+
+          {(q || Object.values(colFilters).some(v=>v)) && (
+            <Box component={Paper} square elevation={0}
+                 sx={{position:'sticky', top:100, zIndex:1, bgcolor: theme.palette.mode==='dark' ? 'rgba(255,220,100,0.15)' : 'rgba(255,250,205,0.95)'}}>
+              <Container maxWidth="xl">
+                <Toolbar variant="dense" sx={{gap:1,px:0,minHeight:40,py:0.5}}>
+                  <Stack direction="row" spacing={.5} sx={{flexGrow:1,flexWrap:'wrap'}}>
+                    <Chip label="すべてクリア" size="small" color="warning" 
+                      onDelete={()=>{ setQ(''); setColFilters({}); }} 
+                      icon={<span className="material-icons" style={{fontSize:16}}>clear_all</span>}/>
+                    {q && <Chip label={`検索: ${q}`} size="small" onDelete={()=>setQ('')}/>}
+                    {Object.entries(colFilters).filter(([,v])=>v).map(([k,v])=>{
+                      const col = COLUMN_DEFS.find(c=>c.key===k); if(!col) return null;
+                      return <Chip key={k} label={`${col.label||k}: ${v}`} size="small" onDelete={()=>setColFilters(f=>({...f,[k]:''}))}/>;
+                    })}
+                  </Stack>
+                </Toolbar>
+              </Container>
+            </Box>
+          )}
+
+          <Box sx={{py:1.5,px:2}}>
+            <Stack direction="row" spacing={1} alignItems="center" sx={{mb:1}}>
+              <Typography variant="body2" sx={{opacity:.7,flexGrow:1}}>
+                表示件数: {sorted.length.toLocaleString()} 件
+                {listMode==='paging' && `（${pageIndex+1}/${pageCount} ページ・${pageSize}件/ページ）`}
+                {selected.size>0 && ` / 選択: ${selected.size.toLocaleString()} 件`}
+              </Typography>
+              <Button size="small" variant={editMode?'contained':'outlined'} 
+                startIcon={<span className="material-icons" style={{fontSize:16}}>edit</span>}
+                onClick={()=>setEditMode(v=>!v)} sx={{minWidth:'auto'}}>編集</Button>
+              <Button size="small" startIcon={<span className="material-icons" style={{fontSize:16}}>view_column</span>}
+                onClick={(e)=>setAnchorEl(e.currentTarget)} sx={{minWidth:'auto'}}>列</Button>
+              <Button size="small" startIcon={<span className="material-icons" style={{fontSize:16}}>download</span>}
+                onClick={exportCSV} sx={{minWidth:'auto'}}>CSV</Button>
+            </Stack>
+
+            { useCard ? (
+              <Box ref={ref} onScroll={listMode==='virtual'?onScroll:undefined} sx={{overflow:'auto',WebkitOverflowScrolling:'touch'}}>
+                {listMode==='paging' && (
+                  <Box sx={{display:'flex',justifyContent:'center',p:1,position:'sticky',left:0,bgcolor:'inherit',zIndex:1}}>
+                    <TablePagination
+                      component="div"
+                      count={sorted.length}
+                      page={pageIndex}
+                      onPageChange={handleChangePage}
+                      rowsPerPage={pageSize}
+                      onRowsPerPageChange={handleChangeRowsPerPage}
+                      rowsPerPageOptions={[10,25,50,100]}
+                      showFirstButton showLastButton
+                    />
+                  </Box>
+                )}
+                {listMode==='virtual' && <Box sx={{height: topPad}}/> }
+                <Stack spacing={1} sx={{px:0.5}}>
+                  {slice.map((row, i)=> renderCard(row, (listMode==='virtual'? startIndex+i : pageIndex*pageSize + i)))}
+                </Stack>
+                {listMode==='virtual' && <Box sx={{height: bottomPad}}/> }
+                {listMode==='paging' && (
+                  <Box sx={{display:'flex',justifyContent:'center',py:1,position:'sticky',left:0,bgcolor:'inherit',zIndex:1}}>
+                    <TablePagination
+                      component="div"
+                      count={sorted.length}
+                      page={pageIndex}
+                      onPageChange={handleChangePage}
+                      rowsPerPage={pageSize}
+                      onRowsPerPageChange={handleChangeRowsPerPage}
+                      rowsPerPageOptions={[10,25,50,100]}
+                      showFirstButton showLastButton
+                    />
+                  </Box>
+                )}
+              </Box>
+            ) : (
+              <Paper variant="outlined">
+                <Box ref={scrollBarRef} sx={{position:'relative',height:16,borderBottom:1,borderColor:'divider',bgcolor:'grey.100'}}>
+                  <Box ref={scrollRef} sx={{position:'absolute',top:4,left:8,height:8,bgcolor:'primary.main',borderRadius:1,cursor:'grab','&:active':{cursor:'grabbing'}}}
+                    style={{width:scrollInfo.handleWidth}}
+                    onMouseDown={(e)=>setScrollHandle({startX:e.clientX,startLeft:parseInt(scrollRef.current?.style.left||'8')-8})}></Box>
+                </Box>
+                <TableContainer ref={ref} onScroll={(e)=>{if(listMode==='virtual')onScroll(e);if(scrollRef.current&&scrollInfo.maxLeft>0){const scrollRatio=e.target.scrollLeft/(scrollInfo.tableWidth-scrollInfo.containerWidth);const handleLeft=scrollRatio*scrollInfo.maxLeft;scrollRef.current.style.left=(handleLeft+8)+'px';}}} sx={{overflow:'auto',WebkitOverflowScrolling:'touch'}}>
+                  {listMode==='paging' && (
+                    <Box sx={{position:'sticky',left:0,bgcolor:'background.paper',zIndex:1}}>
+                      <Box sx={{display:'flex',justifyContent:'center',p:1,position:'sticky',left:0,bgcolor:'inherit',zIndex:1}}>
+                        <TablePagination
+                          component="div"
+                          count={sorted.length}
+                          page={pageIndex}
+                          onPageChange={handleChangePage}
+                          rowsPerPage={pageSize}
+                          onRowsPerPageChange={handleChangeRowsPerPage}
+                          rowsPerPageOptions={[10,25,50,100]}
+                          showFirstButton showLastButton
+                        />
+                      </Box>
+                    </Box>
+                  )}
+
+                  <Table size="small" sx={{tableLayout:'fixed','& thead th':{position:'sticky',zIndex:2,bgcolor:'inherit'}}}>
+                    <TableHead>
+                      <TableRow sx={{'& .MuiTableCell-root':{bgcolor:'action.hover',top:0}}}>
+                        {columns.map((col)=> {
+                          const w=colWidths[col.key];
+                          return (
+                            <TableCell key={col.key} data-col={col.key} sx={{p:'4px 6px',borderRight:1,borderColor:'divider',position:'relative',userSelect:'none','&:last-child':{borderRight:0},'& .MuiCheckbox-root':{p:'0 4px'}}}
+                                       style={{width:w, minWidth:col.min, maxWidth:col.max}}>
+                              {col.kind==='checkbox' ? (
+                                <Checkbox size="small" indeterminate={false} onChange={()=> toggleAll(sorted)} />
+                              ) : (
+                                <TextField size="small"
+                                  placeholder={col.kind==='number'?'=300, >100, 100-500 等': (col.kind==='date'? 'YYYY-MM-DD, >=2025-01-01, 2025-01-01~2025-12-31':'含む文字列')}
+                                  defaultValue={colFilters[col.key]??''}
+                                  onBlur={(e)=>{ setColFilters(f=>({...f,[col.key]: e.target.value})); if(listMode==='paging') setPageIndex(0); }}
+                                  sx={{'& .MuiInputBase-input':{p:'4px 8px',fontSize:'.85rem'}}} fullWidth/>
+                              )}
+                              {col.kind!=='checkbox' && (
+                                <span className="col-resizer" 
+                                  onMouseDown={(e)=>{ e.preventDefault(); e.stopPropagation(); setResizing({key:col.key,startX:e.clientX,startW:w}); }}
+                                  onDoubleClick={(e)=>{ e.preventDefault(); e.stopPropagation(); autoFitColumn(col.key); }}/>
+                              )}
+                            </TableCell>
+                          );
+                        })}
+                      </TableRow>
+                    </TableHead>
+
+                    <TableBody>
+                      {listMode==='virtual' && topPad>0 && <TableRow><TableCell colSpan={columns.length} style={{height:topPad,padding:0,border:0}}/></TableRow>}
+
+                      {slice.map((row,localIdx)=>{
+                        const globalIdx = (listMode==='virtual'? startIndex+localIdx : pageIndex*pageSize + localIdx);
+                        return (
+                          <TableRow key={row.id} hover sx={{height:32}}>
+                            {columns.map(col=>{
+                              if(col.kind==='checkbox'){
+                                return (
+                                  <TableCell key={col.key} sx={{p:'4px 6px',borderRight:1,borderColor:'divider','&:last-child':{borderRight:0},'& .MuiCheckbox-root':{p:'0 4px'}}}
+                                             style={{width:colWidths[col.key], minWidth:col.min, maxWidth:col.max}}>
+                                    <Checkbox size="small" checked={selected.has(row.id)} onChange={()=>toggleRow(row.id)}/>
+                                  </TableCell>
+                                );
+                              }
+                              const raw = col.calc? col.calc(row) : (col.raw? col.raw(row, globalIdx) : row[col.key]);
+                              const rawNum = Number(raw??0);
+                              const display = col.value? col.value(row, globalIdx) : (col.kind==='number'? Math.floor(rawNum).toLocaleString() : raw);
+                              const tooltip = col.kind==='number' && rawNum !== Math.floor(rawNum) ? rawNum.toLocaleString() : String(display??'');
+                              const align = col.numeric? 'right' : 'left';
+                              const editor = (editMode && col.editable) ? (
+                                <TextField size="small" type={col.kind==='number'?'number': (col.kind==='date'?'date':'text')}
+                                  value={raw||''}
+                                  onChange={(e)=> updateCell(row.id, col.key, e.target.value)}
+                                  inputProps={col.kind==='number'?{inputMode:'numeric',min:0,style:{textAlign:align}}:{}}
+                                  sx={{'& .MuiInputBase-input':{p:'6px 8px'}}} fullWidth/>
+                              ) : null;
+
+                              return (
+                                <TableCell key={col.key} align={align} data-col={col.key} title={tooltip}
+                                  onDoubleClick={()=>!editMode && onCellClick(col,row,globalIdx)}
+                                  sx={{p:'4px 6px',borderRight:1,borderColor:'divider','&:last-child':{borderRight:0},cursor:editMode?'default':'pointer',overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}
+                                  style={{width:colWidths[col.key], minWidth:col.min, maxWidth:col.max}}>
+                                  {editor || String(display??'')}
+                                </TableCell>
+                              );
+                            })}
+                          </TableRow>
+                        );
+                      })}
+
+                      {listMode==='virtual' && bottomPad>0 && <TableRow><TableCell colSpan={columns.length} style={{height:bottomPad,padding:0,border:0}}/></TableRow>}
+                    </TableBody>
+                  </Table>
+                </TableContainer>
+                {listMode==='paging' && (
+                  <Box sx={{position:'sticky',left:0,bgcolor:'background.paper',zIndex:1,borderTop:1,borderColor:'divider'}}>
+                    <Box sx={{display:'flex',justifyContent:'center',py:0.5,position:'sticky',left:0,bgcolor:'inherit',zIndex:1}}>
+                      <TablePagination
+                        component="div"
+                        count={sorted.length}
+                        page={pageIndex}
+                        onPageChange={handleChangePage}
+                        rowsPerPage={pageSize}
+                        onRowsPerPageChange={handleChangeRowsPerPage}
+                        rowsPerPageOptions={[10,25,50,100]}
+                        showFirstButton showLastButton
+                      />
+                    </Box>
+                  </Box>
+                )}
+              </Paper>
+            )}
+          </Box>
+
+          {renderOrderDialog()}
+
+          <Dialog open={settingsOpen} onClose={()=>setSettingsOpen(false)} maxWidth="md" fullWidth>
+            <DialogTitle>設定</DialogTitle>
+            <DialogContent>
+              <Stack spacing={2} sx={{pt:1}}>
+                <Box>
+                  <Typography variant="body2" sx={{mb:1}}>サンプルデータ生成件数</Typography>
+                  <Stack direction="row" spacing={1} alignItems="center">
+                    <TextField size="small" type="number" value={dataCount} onChange={(e)=>setDataCount(Math.max(1,parseInt(e.target.value)||1))} 
+                      inputProps={{min:1,max:100000}} sx={{width:150}}/>
+                    <Button variant="outlined" startIcon={<span className="material-icons">refresh</span>} onClick={regenerateData}>
+                      再生成
+                    </Button>
+                  </Stack>
+                </Box>
+                <Divider/>
+                <Button variant="outlined" startIcon={<span className="material-icons">upload</span>} component="label" fullWidth>
+                  列定義をインポート
+                  <input type="file" accept=".json" hidden onChange={importTemplate}/>
+                </Button>
+                {csvPreview && (
+                  <Paper variant="outlined" sx={{p:2}}>
+                    <Typography variant="subtitle2" sx={{mb:1}}>プレビュー: {csvPreview.count}列</Typography>
+                    <Box sx={{maxHeight:200,overflow:'auto',fontSize:'.85rem',fontFamily:'monospace',bgcolor:'grey.50',p:1,borderRadius:1}}>
+                      {JSON.stringify(csvPreview.data,null,2)}
+                    </Box>
+                    <Stack direction="row" spacing={1} sx={{mt:1}}>
+                      <Button size="small" variant="contained" onClick={applyImport}>適用</Button>
+                      <Button size="small" onClick={()=>setCsvPreview(null)}>キャンセル</Button>
+                    </Stack>
+                  </Paper>
+                )}
+                <Button variant="outlined" startIcon={<span className="material-icons">download</span>} onClick={exportTemplate} fullWidth>
+                  列定義テンプレートをエクスポート
+                </Button>
+              </Stack>
+            </DialogContent>
+            <DialogActions>
+              <Button onClick={()=>{setSettingsOpen(false);setCsvPreview(null);}}>閉じる</Button>
+            </DialogActions>
+          </Dialog>
+
+          <Snackbar open={snack.open} autoHideDuration={1200} onClose={()=>setSnack(s=>({...s,open:false}))}
+            anchorOrigin={{vertical:'bottom',horizontal:'right'}}>
+            <Alert severity="success" variant="filled" sx={{fontSize:12,py:.5}}>{snack.msg}</Alert>
+          </Snackbar>
+        </ThemeProvider>
+      );
+    }
+
+    ReactDOM.createRoot(document.getElementById('root')).render(<App/>);
+  </script>
+</body>
+</html>
