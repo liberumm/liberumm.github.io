@@ -1,0 +1,955 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>応援依頼フロー・モック（フル機能）</title>
+
+  <!-- Fonts / Icons -->
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Roboto:wght@300;400;500;700&display=swap"/>
+  <link rel="stylesheet" href="https://fonts.googleapis.com/icon?family=Material+Icons"/>
+
+  <!-- React / Babel / MUI (UMD) -->
+  <script src="https://cdn.jsdelivr.net/npm/react@18/umd/react.production.min.js" crossorigin></script>
+  <script src="https://cdn.jsdelivr.net/npm/react-dom@18/umd/react-dom.production.min.js" crossorigin></script>
+  <script src="https://cdn.jsdelivr.net/npm/@babel/standalone@7/babel.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@mui/material@5/umd/material-ui.production.min.js" crossorigin></script>
+
+  <style>
+    html, body, #root { height: 100%; margin: 0; }
+    .ellipsis { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .half-height { min-height: 48vh; max-height: 60vh; overflow: auto; }
+    .sticky-th { position: sticky; top: 0; z-index: 1; }
+    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+    .row-gap { display: grid; gap: 8px; }
+  </style>
+</head>
+<body>
+<div id="root"></div>
+
+<script type="text/babel">
+const {
+  AppBar, Toolbar, IconButton, Typography, CssBaseline, Container, Box, Stack, Button,
+  ThemeProvider, createTheme, useMediaQuery, Paper, Chip, Divider, TextField, Dialog,
+  DialogTitle, DialogContent, DialogActions, Grid, MenuItem, Select, InputLabel, FormControl,
+  Tabs, Tab, Card, CardContent, CardActions, Tooltip, Snackbar, Alert, Badge,
+  Stepper, Step, StepLabel, Drawer, List, ListItem, ListItemText, ListItemIcon, Switch,
+  Table, TableBody, TableCell, TableContainer, TableHead, TableRow, Checkbox, TablePagination,
+  FormControlLabel
+} = MaterialUI;
+
+/* ===== フロー定義 ===== */
+const STATUSES = [
+  { key: 'request',          label: '依頼',             phase: '事前',   color: 'default' },
+  { key: 'estimate',         label: '見積もり',         phase: '事前',   color: 'info'    },
+  { key: 'confirmed',        label: '確定',             phase: '事前',   color: 'primary' },
+  { key: 'supporter_check',  label: '応援者の確認',     phase: '当日',   color: 'warning' },
+  { key: 'finalize',         label: '終了時 確定登録',   phase: '当日',   color: 'warning' },
+  { key: 'invoice_wait',     label: '請求待ち',         phase: '—',     color: 'success' },
+];
+const STATUS_FLOW = STATUSES.map(s=>s.key);
+
+const NEXT_LABELS = {
+  '自社': {
+    request:'見積もり依頼を送付',
+    estimate:'見積もり合意（確定へ）',
+    confirmed:'当日：応援者の確認へ',
+    supporter_check:'終了後：確定登録へ',
+    finalize:'請求待ちへ'
+  },
+  '取引先': {
+    request:'見積もり作成・提示（見積へ）',
+    estimate:'見積り登録して確定へ',   // 独禁法同意必須
+    confirmed:'当日：応援者をアサイン',
+    supporter_check:'作業完了 → 確定登録へ',
+    finalize:'請求書送付準備（請求待ち）'
+  }
+};
+
+const mockPartners = ['株式会社アルタ','テクノリンクス','ACME合同会社','北斗ソリューションズ'];
+const mockCategories = ['開発支援','デザイン支援','運用サポート','コンサル'];
+const mockDepartments = ['営業企画部','店舗支援部','情報システム部','DX推進室'];
+const mockStores = ['新宿本店','大阪中央','名古屋栄','札幌駅前'];
+const mockTimes = ['9:00-12:00','12:00-15:00','15:00-18:00','18:00-21:00','22:00-翌2:00'];
+
+const meta = k => STATUSES.find(s=>s.key===k);
+const nextStatus = k => { const i = STATUS_FLOW.indexOf(k); return i>=0 && i<STATUS_FLOW.length-1 ? STATUS_FLOW[i+1] : null; };
+const prevStatus = k => { const i = STATUS_FLOW.indexOf(k); return i>0 ? STATUS_FLOW[i-1] : null; };
+const stepIndex = k => Math.max(0, STATUS_FLOW.indexOf(k));
+const randomId = () => Math.random().toString(36).slice(2,8);
+const fmtDate = iso => (iso ? new Date(iso).toISOString().slice(0,10) : '—');
+const yen = v => v?`¥${Number(v).toLocaleString()}`:'—';
+const chip = k => {
+  const m = meta(k);
+  if(!m) return <Chip size="small" label="不明" variant="outlined"/>;
+  const filled = k==='invoice_wait';
+  const p = m.phase==='—' ? '' : m.phase+'：';
+  return <Chip size="small" color={m.color} label={`${p}${m.label}`} variant={filled?'filled':'outlined'} />;
+};
+
+/* ===== Header、Drawer ===== */
+function Header({role, setRole, onOpenCreate, dark, toggleDark, pendingCount, openDrawer}){
+  return (
+    <AppBar position="sticky">
+      <Toolbar>
+        <IconButton color="inherit" onClick={openDrawer} sx={{mr:1, display:{xs:'inline-flex', md:'none'}}}>
+          <span className="material-icons">menu</span>
+        </IconButton>
+        <Typography variant="h6" sx={{flexGrow:1}}>応援依頼フロー</Typography>
+        <FormControl size="small" sx={{mr:1, minWidth:120}}>
+          <InputLabel>ロール</InputLabel>
+          <Select label="ロール" value={role} onChange={e=>setRole(e.target.value)}>
+            <MenuItem value="自社">自社</MenuItem>
+            <MenuItem value="取引先">取引先</MenuItem>
+          </Select>
+        </FormControl>
+        {role==='自社' && (
+          <Tooltip title="新規依頼">
+            <Button color="inherit" startIcon={<span className="material-icons">add</span>} onClick={onOpenCreate} sx={{display:{xs:'none', sm:'inline-flex'}}}>
+              新規依頼
+            </Button>
+          </Tooltip>
+        )}
+        <Tooltip title="テーマ切替">
+          <IconButton color="inherit" onClick={toggleDark}><span className="material-icons">{dark?'dark_mode':'light_mode'}</span></IconButton>
+        </Tooltip>
+        <Tooltip title="請求待ち件数">
+          <IconButton color="inherit"><Badge color="success" badgeContent={pendingCount}><span className="material-icons">receipt_long</span></Badge></IconButton>
+        </Tooltip>
+      </Toolbar>
+    </AppBar>
+  );
+}
+function DrawerNav({open,onClose,role,setRole,onOpenCreate,dark,toggleDark}){
+  return (
+    <Drawer open={open} onClose={onClose}>
+      <Box sx={{width:260}} onClick={onClose}>
+        <List>
+          <ListItem><ListItemText primary="メニュー" secondary="操作を選択"/></ListItem>
+          <Divider/>
+          <ListItem>
+            <ListItemIcon><span className="material-icons">person</span></ListItemIcon>
+            <FormControl fullWidth size="small">
+              <InputLabel>ロール</InputLabel>
+              <Select label="ロール" value={role} onChange={e=>setRole(e.target.value)}>
+                <MenuItem value="自社">自社</MenuItem>
+                <MenuItem value="取引先">取引先</MenuItem>
+              </Select>
+            </FormControl>
+          </ListItem>
+          {role==='自社' && (
+            <ListItem button onClick={onOpenCreate}>
+              <ListItemIcon><span className="material-icons">add</span></ListItemIcon>
+              <ListItemText primary="新規依頼"/>
+            </ListItem>
+          )}
+          <ListItem>
+            <ListItemIcon><span className="material-icons">{dark?'dark_mode':'light_mode'}</span></ListItemIcon>
+            <ListItemText primary="ダークモード"/><Switch edge="end" checked={dark} onChange={toggleDark}/>
+          </ListItem>
+        </List>
+      </Box>
+    </Drawer>
+  );
+}
+
+/* ===== Create Dialog（依頼：指定項目すべて） ===== */
+function CreateDialog({open,onClose,onCreate}){
+  const [partner,setPartner]=React.useState(mockPartners[0]);        // 取引先
+  const [partnerCode,setPartnerCode]=React.useState('P-' + Math.floor(Math.random()*900+100)); // 取引先コード
+  const [store,setStore]=React.useState(mockStores[0]);              // 応援店舗
+  const [date,setDate]=React.useState('');                           // 応援日
+  const [timeslot,setTimeslot]=React.useState(mockTimes[0]);         // 時間帯
+  const [heads,setHeads]=React.useState(1);                          // 人数
+  const [dept,setDept]=React.useState(mockDepartments[0]);           // 部門
+  const [content,setContent]=React.useState('');                     // 内容
+  const [memo,setMemo]=React.useState('');                           // 備考
+  const [category,setCategory]=React.useState(mockCategories[2]);    // 任意（表示用）
+
+  const canSave = partner && store && date && timeslot && heads>0 && dept && content;
+
+  const save=()=>{
+    onCreate({
+      id: randomId(),
+      title: `${store} 商品陳列応援`,
+      partner, partnerCode,
+      store, date, timeslot, heads, department: dept,
+      content, memo, category,
+      budget: '—',
+      owner: '担当A',
+      status: 'request',
+      createdAt: new Date().toISOString(),
+      confirmedAt: null,
+      estimate: null, // { amount, note, supporters:[{date,timeslot,name,transport}] }
+      logs: [{at:new Date().toISOString(), text:'[自社] 依頼を登録'}]
+    });
+  };
+
+  return (
+    <Dialog open={open} onClose={onClose} fullWidth maxWidth="md">
+      <DialogTitle>新規依頼（自社）</DialogTitle>
+      <DialogContent dividers>
+        <Grid container spacing={2}>
+          <Grid item xs={12} sm={6}>
+            <FormControl fullWidth><InputLabel>取引先</InputLabel>
+              <Select label="取引先" value={partner} onChange={e=>setPartner(e.target.value)}>
+                {mockPartners.map(p=><MenuItem key={p} value={p}>{p}</MenuItem>)}
+              </Select>
+            </FormControl>
+          </Grid>
+          <Grid item xs={12} sm={3}><TextField label="取引先コード" value={partnerCode} onChange={e=>setPartnerCode(e.target.value)} fullWidth/></Grid>
+          <Grid item xs={12} sm={3}>
+            <FormControl fullWidth><InputLabel>部門</InputLabel>
+              <Select label="部門" value={dept} onChange={e=>setDept(e.target.value)}>
+                {mockDepartments.map(d=><MenuItem key={d} value={d}>{d}</MenuItem>)}
+              </Select>
+            </FormControl>
+          </Grid>
+
+          <Grid item xs={12} sm={6}>
+            <FormControl fullWidth><InputLabel>応援店舗</InputLabel>
+              <Select label="応援店舗" value={store} onChange={e=>setStore(e.target.value)}>
+                {mockStores.map(s=><MenuItem key={s} value={s}>{s}</MenuItem>)}
+              </Select>
+            </FormControl>
+          </Grid>
+          <Grid item xs={12} sm={3}><TextField type="date" label="応援日" InputLabelProps={{shrink:true}} value={date} onChange={e=>setDate(e.target.value)} fullWidth/></Grid>
+          <Grid item xs={12} sm={3}>
+            <FormControl fullWidth><InputLabel>時間帯</InputLabel>
+              <Select label="時間帯" value={timeslot} onChange={e=>setTimeslot(e.target.value)}>
+                {mockTimes.map(t=><MenuItem key={t} value={t}>{t}</MenuItem>)}
+              </Select>
+            </FormControl>
+          </Grid>
+
+          <Grid item xs={12} sm={3}><TextField type="number" label="人数" value={heads} onChange={e=>setHeads(Math.max(1, Number(e.target.value)))} fullWidth/></Grid>
+          <Grid item xs={12} sm={3}>
+            <FormControl fullWidth><InputLabel>カテゴリ</InputLabel>
+              <Select label="カテゴリ" value={category} onChange={e=>setCategory(e.target.value)}>
+                {mockCategories.map(c=><MenuItem key={c} value={c}>{c}</MenuItem>)}
+              </Select>
+            </FormControl>
+          </Grid>
+          <Grid item xs={12}><TextField label="内容" value={content} onChange={e=>setContent(e.target.value)} fullWidth multiline minRows={2}/></Grid>
+          <Grid item xs={12}><TextField label="備考" value={memo} onChange={e=>setMemo(e.target.value)} fullWidth multiline minRows={2}/></Grid>
+        </Grid>
+      </DialogContent>
+      <DialogActions>
+        <Button onClick={onClose}>キャンセル</Button>
+        <Button onClick={save} variant="contained" disabled={!canSave}>作成</Button>
+      </DialogActions>
+    </Dialog>
+  );
+}
+
+/* ===== 独禁法 注意事項 ===== */
+function AntitrustNotice() {
+  return (
+    <Paper variant="outlined" sx={{p:1.5, mb:1.5, bgcolor: 'background.default'}}>
+      <Typography variant="subtitle2" gutterBottom>独占禁止法に関する注意事項（要旨）</Typography>
+      <ul style={{marginTop:0}}>
+        <li>価格・見積金額・割引率等を他社と共同で決定・調整・情報交換しないこと。</li>
+        <li>入札・選定等で他社と割当や談合を行わないこと。</li>
+        <li>取引条件として不当な抱き合わせ・排除・優越的地位の濫用を行わないこと。</li>
+        <li>本見積りは自社の独立した判断に基づいて提示してください。</li>
+      </ul>
+      <Typography variant="caption" color="text.secondary">※モック用の一般留意点であり、法的助言ではありません。</Typography>
+    </Paper>
+  );
+}
+
+/* ===== 見積り登録（取引先）：依頼引継ぎ＋応援者複数追加 ===== */
+function EstimateDialog({open,onClose,onSubmit, item}) {
+  const [amount,setAmount] = React.useState(item?.estimate?.amount || '');
+  const [note,setNote] = React.useState(item?.estimate?.note || '');
+  const [agree,setAgree] = React.useState(false);
+  const [supporters, setSupporters] = React.useState(item?.estimate?.supporters || [
+    { date: item?.date||'', timeslot: item?.timeslot||'', name:'', transport:'' }
+  ]);
+
+  const addRow = ()=> setSupporters(prev => [...prev, {date:item?.date||'', timeslot:item?.timeslot||'', name:'', transport:''}]);
+  const removeRow = (idx)=> setSupporters(prev => prev.filter((_,i)=>i!==idx));
+  const updateRow = (idx, patch)=> setSupporters(prev => prev.map((r,i)=> i===idx ? {...r, ...patch} : r));
+
+  const okAmount = String(amount).trim() !== '';
+  const okSupporters = supporters.length>0 && supporters.every(s=>s.date && s.timeslot && s.name);
+  const ok = okAmount && okSupporters && agree;
+
+  const handleSubmit = ()=>{
+    onSubmit({amount, note, supporters});
+  };
+
+  return (
+    <Dialog open={open} onClose={onClose} fullWidth maxWidth="md">
+      <DialogTitle>見積り登録（{item?.partner} → {item?.title}）</DialogTitle>
+      <DialogContent dividers>
+        <AntitrustNotice/>
+
+        <Typography variant="subtitle2" gutterBottom>依頼からの引継ぎ（参照）</Typography>
+        <Paper variant="outlined" sx={{p:1.5, mb:2}}>
+          <Grid container spacing={1}>
+            <Grid item xs={6}><b>応援店舗：</b> {item?.store}</Grid>
+            <Grid item xs={6}><b>応援日：</b> {item?.date}</Grid>
+            <Grid item xs={6}><b>時間帯：</b> {item?.timeslot}</Grid>
+            <Grid item xs={6}><b>人数：</b> {item?.heads}</Grid>
+            <Grid item xs={6}><b>部門：</b> {item?.department}</Grid>
+            <Grid item xs={12}><b>内容：</b> {item?.content}</Grid>
+            <Grid item xs={12}><b>備考：</b> {item?.memo||'—'}</Grid>
+          </Grid>
+        </Paper>
+
+        <Grid container spacing={2}>
+          <Grid item xs={12} sm={6}>
+            <TextField
+              label="見積金額（税抜）"
+              placeholder="例）180000"
+              value={amount}
+              onChange={e=>setAmount(e.target.value.replace(/[^\d]/g,''))}
+              fullWidth inputProps={{inputMode:'numeric', className:'mono'}}
+            />
+          </Grid>
+          <Grid item xs={12} sm={6}>
+            <TextField label="見積メモ（任意）" value={note} onChange={e=>setNote(e.target.value)} fullWidth/>
+          </Grid>
+        </Grid>
+
+        <Box sx={{mt:2}}>
+          <Stack direction="row" alignItems="center" spacing={1}>
+            <Typography variant="subtitle2">応援者（複数名）</Typography>
+            <Button size="small" onClick={addRow} startIcon={<span className="material-icons">add</span>}>行を追加</Button>
+          </Stack>
+
+          <Paper variant="outlined" sx={{p:1.5, mt:1}}>
+            <Grid container spacing={1}>
+              {supporters.map((s,idx)=>(
+                <React.Fragment key={idx}>
+                  <Grid item xs={12} sm={3}><TextField type="date" label="応援日" InputLabelProps={{shrink:true}} value={s.date} onChange={e=>updateRow(idx,{date:e.target.value})} fullWidth/></Grid>
+                  <Grid item xs={12} sm={3}>
+                    <FormControl fullWidth><InputLabel>時間帯</InputLabel>
+                      <Select label="時間帯" value={s.timeslot} onChange={e=>updateRow(idx,{timeslot:e.target.value})}>
+                        {mockTimes.map(t=><MenuItem key={t} value={t}>{t}</MenuItem>)}
+                      </Select>
+                    </FormControl>
+                  </Grid>
+                  <Grid item xs={12} sm={3}><TextField label="応援者氏名" value={s.name} onChange={e=>updateRow(idx,{name:e.target.value})} fullWidth/></Grid>
+                  <Grid item xs={10} sm={2}><TextField label="交通費" placeholder="例）800" value={s.transport} onChange={e=>updateRow(idx,{transport:e.target.value.replace(/[^\d]/g,'')})} fullWidth inputProps={{inputMode:'numeric', className:'mono'}}/></Grid>
+                  <Grid item xs={2} sm={1}><Button color="error" onClick={()=>removeRow(idx)}><span className="material-icons">delete</span></Button></Grid>
+                </React.Fragment>
+              ))}
+            </Grid>
+          </Paper>
+        </Box>
+
+        <FormControlLabel
+          sx={{mt:1}}
+          control={<Checkbox checked={agree} onChange={e=>setAgree(e.target.checked)} />}
+          label="独占禁止法の注意事項を読み、遵守のうえ見積ります"
+        />
+      </DialogContent>
+      <DialogActions>
+        <Button onClick={onClose}>キャンセル</Button>
+        <Button variant="contained" disabled={!ok} onClick={handleSubmit}>見積りを登録して確定</Button>
+      </DialogActions>
+    </Dialog>
+  );
+}
+
+/* ===== 差し戻し ===== */
+function ReturnDialog({open,onClose,onReturn,item}) {
+  const [reason,setReason] = React.useState('');
+  const prev = item ? prevStatus(item.status) : null;
+  const can = !!prev && reason.trim().length>0;
+
+  return (
+    <Dialog open={open} onClose={onClose} fullWidth maxWidth="sm">
+      <DialogTitle>差し戻し</DialogTitle>
+      <DialogContent dividers>
+        <Typography gutterBottom>
+          現在のステップ：<b>{meta(item?.status)?.label}</b> → <b>{meta(prev)?.label}</b> に戻します。
+        </Typography>
+        <TextField
+          label="差し戻し理由（必須）"
+          value={reason}
+          onChange={e=>setReason(e.target.value)}
+          fullWidth multiline minRows={3} placeholder="例）条件の再確認が必要"
+        />
+      </DialogContent>
+      <DialogActions>
+        <Button onClick={onClose}>キャンセル</Button>
+        <Button variant="outlined" color="warning" disabled={!can} onClick={()=>onReturn(reason)}>差し戻す</Button>
+      </DialogActions>
+    </Dialog>
+  );
+}
+
+/* ===== 当日：予定外応援者 追加（臨時依頼を即時作成） ===== */
+function AdhocSupporterDialog({open,onClose,onSubmit, base}) {
+  const [name,setName]=React.useState('');
+  const [date,setDate]=React.useState(base?.date||'');
+  const [timeslot,setTimeslot]=React.useState(base?.timeslot||mockTimes[0]);
+  const [transport,setTransport]=React.useState('');
+  const can = name && date && timeslot;
+
+  const submit = ()=> onSubmit({name,date,timeslot,transport});
+
+  return (
+    <Dialog open={open} onClose={onClose} fullWidth maxWidth="sm">
+      <DialogTitle>予定外の応援者を追加（臨時依頼を作成）</DialogTitle>
+      <DialogContent dividers>
+        <Grid container spacing={2}>
+          <Grid item xs={12}><TextField label="応援者氏名" value={name} onChange={e=>setName(e.target.value)} fullWidth/></Grid>
+          <Grid item xs={12} sm={6}><TextField type="date" label="応援日" InputLabelProps={{shrink:true}} value={date} onChange={e=>setDate(e.target.value)} fullWidth/></Grid>
+          <Grid item xs={12} sm={6}>
+            <FormControl fullWidth><InputLabel>時間帯</InputLabel>
+              <Select label="時間帯" value={timeslot} onChange={e=>setTimeslot(e.target.value)}>
+                {mockTimes.map(t=><MenuItem key={t} value={t}>{t}</MenuItem>)}
+              </Select>
+            </FormControl>
+          </Grid>
+          <Grid item xs={12} sm={6}><TextField label="交通費" placeholder="例）800" value={transport} onChange={e=>setTransport(e.target.value.replace(/[^\d]/g,''))} fullWidth inputProps={{inputMode:'numeric', className:'mono'}}/></Grid>
+          <Grid item xs={12}><Typography variant="body2" color="text.secondary">※保存と同時に「依頼」ステップの案件を自動作成します。</Typography></Grid>
+        </Grid>
+      </DialogContent>
+      <DialogActions>
+        <Button onClick={onClose}>キャンセル</Button>
+        <Button onClick={submit} variant="contained" disabled={!can}>臨時依頼を作成</Button>
+      </DialogActions>
+    </Dialog>
+  );
+}
+
+/* ===== 詳細ダイアログ（当日確認を含む） ===== */
+function DetailDialog({open,onClose,item,onAdvance,onReturn,role,onOpenEstimate,onAddAdhoc}) {
+  if(!item) return null;
+  const steps = STATUSES.map(s => (s.phase==='—' ? s.label : `${s.phase}：${s.label}`));
+  theActiveStep = stepIndex(item.status); // variable to avoid React dev warnings if needed
+  const ns = nextStatus(item.status);
+  const canReturn = !!prevStatus(item.status);
+  const showEstimateButton = role==='取引先' && item.status==='estimate';
+  const nextLabel = ns ? (NEXT_LABELS[role][item.status] || '次へ') : null;
+
+  const supporters = item.estimate?.supporters || [];
+
+  return (
+    <Dialog open={open} onClose={onClose} fullWidth maxWidth="md">
+      <DialogTitle>
+        {item.title}
+        <Box sx={{float:'right'}}>{chip(item.status)}</Box>
+      </DialogTitle>
+      <DialogContent dividers>
+        <Grid container spacing={2}>
+          <Grid item xs={12} md={7}>
+            <Typography variant="subtitle2" gutterBottom>進行状況</Typography>
+            <Stepper activeStep={theActiveStep} alternativeLabel>
+              {steps.map((label,i)=>(<Step key={i}><StepLabel>{label}</StepLabel></Step>))}
+            </Stepper>
+            <Box sx={{mt:2}}>
+              <Typography variant="subtitle2" gutterBottom>依頼の概要</Typography>
+              <Paper variant="outlined" sx={{p:2}}>
+                <Grid container spacing={1}>
+                  <Grid item xs={6}><b>取引先：</b>{item.partner}（{item.partnerCode||'—'}）</Grid>
+                  <Grid item xs={6}><b>部門：</b>{item.department}</Grid>
+                  <Grid item xs={6}><b>応援店舗：</b>{item.store}</Grid>
+                  <Grid item xs={6}><b>応援日：</b>{item.date}</Grid>
+                  <Grid item xs={6}><b>時間帯：</b>{item.timeslot}</Grid>
+                  <Grid item xs={6}><b>人数：</b>{item.heads}</Grid>
+                  <Grid item xs={12}><b>内容：</b>{item.content}</Grid>
+                  <Grid item xs={12}><b>備考：</b>{item.memo || '—'}</Grid>
+                </Grid>
+                <Divider sx={{my:1.5}}/>
+                <Grid container spacing={1}>
+                  <Grid item xs={6}><b>依頼日：</b>{fmtDate(item.createdAt)}</Grid>
+                  <Grid item xs={6}><b>確定日：</b>{fmtDate(item.confirmedAt)}</Grid>
+                  <Grid item xs={12}><b>見積：</b>{item.estimate? yen(item.estimate.amount) : '—'} {item.estimate?.note? ` / ${item.estimate.note}`:''}</Grid>
+                </Grid>
+              </Paper>
+            </Box>
+          </Grid>
+
+          <Grid item xs={12} md={5}>
+            <Typography variant="subtitle2" gutterBottom>ログ</Typography>
+            <Stack spacing={1}>
+              {item.logs?.slice().reverse().map((l,i)=>(
+                <Paper key={i} variant="outlined" sx={{p:1.2}}>
+                  <Typography variant="body2" className="ellipsis">{l.text}</Typography>
+                  <Typography variant="caption" color="text.secondary">{new Date(l.at).toLocaleString()}</Typography>
+                </Paper>
+              ))}
+            </Stack>
+
+            {/* 当日：応援者確認 */}
+            {item.status==='supporter_check' && (
+              <Box sx={{mt:2}}>
+                <Typography variant="subtitle2" gutterBottom>当日 応援者リスト（見積登録から）</Typography>
+                <Paper variant="outlined" sx={{p:1.5}}>
+                  {supporters.length===0 ? (
+                    <Typography variant="body2" color="text.secondary">見積に応援者が未登録です。</Typography>
+                  ) : (
+                    <div className="row-gap">
+                      {supporters.map((s,idx)=>(
+                        <Paper key={idx} variant="outlined" sx={{p:1}}>
+                          <Typography variant="body2"><b>{s.name}</b>（{s.date} / {s.timeslot}） 交通費：{s.transport? yen(s.transport):'—'}</Typography>
+                        </Paper>
+                      ))}
+                    </div>
+                  )}
+                  <Stack direction="row" spacing={1} sx={{mt:1}}>
+                    <Button size="small" variant="outlined" onClick={onAddAdhoc} startIcon={<span className="material-icons">person_add</span>}>予定外を追加（臨時依頼）</Button>
+                  </Stack>
+                </Paper>
+              </Box>
+            )}
+          </Grid>
+        </Grid>
+      </DialogContent>
+      <DialogActions>
+        {canReturn && (
+          <Tooltip title="1ステップ戻します（理由必須）">
+            <span><Button color="warning" variant="outlined" onClick={onReturn} startIcon={<span className="material-icons">undo</span>}>差し戻し</Button></span>
+          </Tooltip>
+        )}
+        <Box sx={{flexGrow:1}}/>
+        <Button onClick={onClose}>閉じる</Button>
+        {showEstimateButton ? (
+          <Button variant="contained" color="primary" onClick={onOpenEstimate} startIcon={<span className="material-icons">request_quote</span>}>
+            見積り登録して確定へ
+          </Button>
+        ) : (
+          item.status!=='invoice_wait' && (
+            <Button variant="contained" onClick={()=>onAdvance(item.id)} startIcon={<span className="material-icons">arrow_forward</span>}>
+              {nextLabel || '次へ'}
+            </Button>
+          )
+        )}
+      </DialogActions>
+    </Dialog>
+  );
+}
+
+/* ===== カード ===== */
+function CardItem({item,onOpen,onAdvance,onReturn,role,onOpenEstimate,onAddAdhoc}){
+  const ns = nextStatus(item.status);
+  const nextLabel = ns ? (NEXT_LABELS[role][item.status] || '次へ') : null;
+  const showEstimateButton = role==='取引先' && item.status==='estimate';
+  const canReturn = !!prevStatus(item.status);
+  return (
+    <Card variant="outlined" sx={{height:'100%', display:'flex', flexDirection:'column'}}>
+      <CardContent sx={{flexGrow:1}}>
+        <Stack direction="row" justifyContent="space-between" alignItems="center" sx={{mb:1}}>
+          <Typography variant="subtitle2" color="text.secondary">{item.partner}</Typography>
+          {chip(item.status)}
+        </Stack>
+        <Typography variant="h6" gutterBottom className="ellipsis">{item.title}</Typography>
+        <Typography variant="body2" color="text.secondary" className="ellipsis">{item.store} / {item.date}（{item.timeslot}）</Typography>
+        <Typography variant="body2" className="ellipsis">人数：{item.heads}・部門：{item.department}</Typography>
+        {item.estimate && <Typography variant="body2" color="text.secondary" className="ellipsis">見積：{yen(item.estimate.amount)}</Typography>}
+      </CardContent>
+      <CardActions sx={{pt:0, pb:1.5, px:2}}>
+        <Button size="small" onClick={()=>onOpen(item)}>詳細</Button>
+        {item.status==='supporter_check' && <Button size="small" onClick={onAddAdhoc}>予定外追加</Button>}
+        {canReturn && <Button size="small" color="warning" onClick={()=>onReturn(item)}>差し戻し</Button>}
+        <Box sx={{flexGrow:1}}/>
+        {ns && (
+          showEstimateButton
+          ? <Button size="small" variant="contained" onClick={()=>onOpenEstimate(item)}>見積り登録</Button>
+          : <Button size="small" variant="contained" onClick={()=>onAdvance(item.id)}>{nextLabel || '次へ'}</Button>
+        )}
+      </CardActions>
+    </Card>
+  );
+}
+
+/* ===== 下半分テーブル（指定列＋拡張） ===== */
+function ItemsTable({rows, selected, setSelected, dense}){
+  const [page, setPage] = React.useState(0);
+  const [rowsPerPage, setRowsPerPage] = React.useState(10);
+
+  const paged = rows.slice(page*rowsPerPage, page*rowsPerPage + rowsPerPage);
+  const isSelected = (id)=> selected.indexOf(id) !== -1;
+  const allChecked = rows.length>0 && selected.length===rows.length;
+  const indeterminate = selected.length>0 && selected.length<rows.length;
+
+  const handleSelectAll = (e)=>{ if(e.target.checked){ setSelected(rows.map(r=>r.id)); } else { setSelected([]); } };
+  const handleClick = (id)=>{ const idx = selected.indexOf(id); if(idx===-1) setSelected([...selected, id]); else setSelected(selected.filter(x=>x!==id)); };
+
+  const headerCell = (children)=>(<TableCell className="sticky-th" sx={{bgcolor:'background.paper', top:0}}>{children}</TableCell>);
+
+  return (
+    <Paper variant="outlined" sx={{mt:2}}>
+      <Box sx={{px:2, py:1, display:'flex', alignItems:'center', gap:1}}>
+        <Typography variant="subtitle1">一覧</Typography>
+        <Chip label={`件数：${rows.length}`} size="small"/>
+        <Box sx={{flexGrow:1}}/>
+        <Typography variant="body2" color="text.secondary">{selected.length} 件選択</Typography>
+      </Box>
+      <TableContainer className="half-height">
+        <Table size={dense ? 'small' : 'medium'} stickyHeader>
+          <TableHead>
+            <TableRow>
+              <TableCell padding="checkbox" className="sticky-th" sx={{bgcolor:'background.paper'}}>
+                <Checkbox color="primary" indeterminate={indeterminate} checked={allChecked} onChange={handleSelectAll}/>
+              </TableCell>
+              {headerCell('No')}
+              {headerCell('ステータス')}
+              {headerCell('ステップ')}
+              {headerCell('応援日')}
+              {headerCell('時間帯')}
+              {headerCell('人数')}
+              {headerCell('部門')}
+              {headerCell('取引先コード')}
+              {headerCell('取引先名')}
+              {headerCell('応援店舗')}
+              {headerCell('依頼日')}
+              {headerCell('確定日')}
+              {headerCell('見積金額')}
+            </TableRow>
+          </TableHead>
+          <TableBody>
+            {paged.map((r, idx)=> {
+              const selectedRow = isSelected(r.id);
+              const no = page*rowsPerPage + idx + 1;
+              const stepText = (()=> {
+                const m = meta(r.status);
+                if(!m) return '—';
+                return m.phase==='—' ? m.label : `${m.phase}：${m.label}`;
+              })();
+              return (
+                <TableRow hover key={r.id} role="checkbox" selected={selectedRow} onClick={()=>handleClick(r.id)}>
+                  <TableCell padding="checkbox"><Checkbox color="primary" checked={selectedRow}/></TableCell>
+                  <TableCell>{no}</TableCell>
+                  <TableCell>{chip(r.status)}</TableCell>
+                  <TableCell>{stepText}</TableCell>
+                  <TableCell>{r.date}</TableCell>
+                  <TableCell>{r.timeslot}</TableCell>
+                  <TableCell>{r.heads}</TableCell>
+                  <TableCell>{r.department}</TableCell>
+                  <TableCell>{r.partnerCode || '—'}</TableCell>
+                  <TableCell className="ellipsis" title={r.partner}>{r.partner}</TableCell>
+                  <TableCell>{r.store}</TableCell>
+                  <TableCell>{fmtDate(r.createdAt)}</TableCell>
+                  <TableCell>{fmtDate(r.confirmedAt)}</TableCell>
+                  <TableCell>{r.estimate? yen(r.estimate.amount) : '—'}</TableCell>
+                </TableRow>
+              );
+            })}
+          </TableBody>
+        </Table>
+      </TableContainer>
+      <TablePagination
+        component="div"
+        count={rows.length}
+        page={page}
+        onPageChange={(e, p)=>setPage(p)}
+        rowsPerPage={rowsPerPage}
+        onRowsPerPageChange={(e)=>{ setRowsPerPage(parseInt(e.target.value,10)); setPage(0); }}
+        rowsPerPageOptions={[5,10,25,50]}
+      />
+    </Paper>
+  );
+}
+
+/* ===== 乱数ユーティリティとサンプル生成 ===== */
+function randPick(arr){ return arr[Math.floor(Math.random()*arr.length)]; }
+function randInt(min,max){ return Math.floor(Math.random()*(max-min+1))+min; }
+function daysFromNow(d){ return new Date(Date.now()+86400000*d).toISOString().slice(0,10); }
+function makeDummyItem() {
+  const status = randPick(['request','estimate','confirmed','supporter_check']);
+  const heads = randInt(1,3);
+  const amount = randInt(8,50)*10000;
+  const base = {
+    id: randomId(),
+    title: `${randPick(mockStores)} 商品陳列応援`,
+    partner: randPick(mockPartners),
+    partnerCode: 'P-' + randInt(100,999),
+    store: randPick(mockStores),
+    date: daysFromNow(randInt(1,14)),
+    timeslot: randPick(mockTimes),
+    heads,
+    department: randPick(mockDepartments),
+    content: '棚替え・ラベル差替え',
+    memo: '',
+    category: randPick(mockCategories),
+    budget: '—',
+    owner: '担当A',
+    status,
+    createdAt: new Date().toISOString(),
+    confirmedAt: status==='confirmed' ? new Date().toISOString() : null,
+    estimate: null,
+    logs: [{at:new Date().toISOString(), text:'[自社] 依頼を登録'}]
+  };
+  if (status==='confirmed' || status==='supporter_check') {
+    base.estimate = {
+      amount,
+      note:'2名×2h、交通費別',
+      at: new Date().toISOString(),
+      supporters: [
+        {date: base.date, timeslot: base.timeslot, name:'山田 太郎', transport:'800'},
+        {date: base.date, timeslot: base.timeslot, name:'佐藤 花子', transport:'600'}
+      ].slice(0, heads)
+    };
+    base.logs.push({at:new Date().toISOString(), text:`[取引先] 見積り登録（${yen(amount)}）→ 確定`});
+  } else if (status==='estimate') {
+    base.logs.push({at:new Date().toISOString(), text:'[自社] 見積依頼を送付'});
+  }
+  return base;
+}
+
+/* ===== App（全要件実装） ===== */
+function App(){
+  const prefersDark = useMediaQuery('(prefers-color-scheme: dark)');
+  const [dark,setDark] = React.useState(prefersDark);
+  const theme = React.useMemo(()=>createTheme({palette:{mode: dark?'dark':'light'}}),[dark]);
+
+  const [role, setRole] = React.useState('自社');
+
+  // 初期：ランダム3件
+  const [items,setItems] = React.useState(()=> Array.from({length:3}, ()=>makeDummyItem()));
+
+  const [tab,setTab]=React.useState('all');
+  const [q,setQ]=React.useState('');
+  const [dlgCreate,setDlgCreate]=React.useState(false);
+  const [detail,setDetail]=React.useState(null);
+  const [snack,setSnack]=React.useState(null);
+  const [drawerOpen,setDrawerOpen]=React.useState(false);
+  const [selected, setSelected] = React.useState([]);
+  const [denseTable, setDenseTable] = React.useState(false);
+
+  const [returnTarget, setReturnTarget] = React.useState(null);
+  const [estimateTarget, setEstimateTarget] = React.useState(null);
+  const [adhocTarget, setAdhocTarget] = React.useState(null);
+
+  // 自動サンプル生成トグル
+  const [autoGen, setAutoGen] = React.useState(true);
+  const genRef = React.useRef(null);
+  React.useEffect(()=>{
+    if (!autoGen) { if (genRef.current) { clearInterval(genRef.current); genRef.current=null; } return; }
+    if (genRef.current) return;
+    genRef.current = setInterval(()=>{
+      setItems(prev => [makeDummyItem(), ...prev].slice(0,200));
+    }, randInt(7000,12000));
+    return ()=>{ if (genRef.current) { clearInterval(genRef.current); genRef.current=null; } };
+  }, [autoGen]);
+
+  const pendingCount = React.useMemo(()=>items.filter(i=>i.status==='invoice_wait').length,[items]);
+  const filtered = React.useMemo(()=>items
+    .filter(i => tab==='all' ? true : i.status===tab)
+    .filter(i => (i.title+i.partner+i.partnerCode+i.category+(i.content||'')+(i.department||'')+(i.store||'')+(i.timeslot||'')).toLowerCase().includes(q.toLowerCase()))
+    .sort((a,b)=> new Date(b.createdAt) - new Date(a.createdAt))
+  ,[items,tab,q]);
+
+  // 次へ（ロール依存の文言、遷移は共通）
+  const advance = (id)=>{
+    setItems(prev => prev.map(i=>{
+      if(i.id!==id) return i;
+      const ns = nextStatus(i.status);
+      if(!ns) return i;
+      const logText = ({
+        'request':'[自社] 見積もり依頼を送付',
+        'estimate':'[自社] 見積合意 → 確定',
+        'confirmed':'[自社] 当日：応援者の確認へ',
+        'supporter_check':'[自社] 作業完了 → 確定登録へ',
+        'finalize':'[自社] 請求待ちへ'
+      })[i.status] || '[自社] 進行';
+      const becameConfirmed = (ns === 'confirmed' && i.confirmedAt==null) ? new Date().toISOString() : i.confirmedAt;
+      return {...i, status: ns, confirmedAt: becameConfirmed, logs:[...(i.logs||[]), {at:new Date().toISOString(), text:logText}]};
+    }));
+    setSnack({severity:'info', msg:'フローを更新しました'});
+  };
+
+  // 取引先の見積り登録→確定（独禁法同意必須）
+  const submitEstimate = (id, payload)=>{
+    setItems(prev => prev.map(i=>{
+      if(i.id!==id) return i;
+      return {
+        ...i,
+        status: 'confirmed',
+        confirmedAt: i.confirmedAt ?? new Date().toISOString(),
+        estimate: {
+          amount: Number(payload.amount),
+          note: payload.note,
+          at: new Date().toISOString(),
+          supporters: payload.supporters
+        },
+        heads: payload.supporters?.length || i.heads,
+        logs: [...(i.logs||[]), {at:new Date().toISOString(), text:`[取引先] 見積登録（${yen(payload.amount)}）＆応援者${payload.supporters.length}名 → 確定`}]
+      };
+    }));
+    setSnack({severity:'success', msg:'見積り・応援者を登録し、確定しました'});
+  };
+
+  // 差し戻し（1ステップ戻す）
+  const doReturn = (id, reason)=>{
+    setItems(prev => prev.map(i=>{
+      if(i.id!==id) return i;
+      const prevS = prevStatus(i.status);
+      if(!prevS) return i;
+      return {
+        ...i,
+        status: prevS,
+        logs: [...(i.logs||[]), {at:new Date().toISOString(), text:`[${role}] 差し戻し：${meta(i.status)?.label} → ${meta(prevS)?.label}（理由：${reason}）`}]
+      };
+    }));
+    setSnack({severity:'warning', msg:'差し戻しました'});
+  };
+
+  // 当日：予定外の応援者を追加 → 臨時依頼を作成（requestから開始）
+  const addAdhocSupporter = (baseId, adhoc)=>{
+    const base = items.find(x=>x.id===baseId);
+    if(!base) return;
+    const newItem = {
+      id: randomId(),
+      title: `${base.store} 臨時応援（${adhoc.name}）`,
+      partner: base.partner,
+      partnerCode: base.partnerCode,
+      store: base.store,
+      date: adhoc.date,
+      timeslot: adhoc.timeslot,
+      heads: 1,
+      department: base.department,
+      content: `${base.content}（予定外追加：${adhoc.name}）`,
+      memo: `交通費申告：${adhoc.transport? yen(adhoc.transport):'—'}`,
+      category: base.category,
+      budget: '—',
+      owner: '担当A',
+      status: 'request',
+      createdAt: new Date().toISOString(),
+      confirmedAt: null,
+      estimate: { amount: 0, note: '臨時', supporters:[{date:adhoc.date, timeslot:adhoc.timeslot, name: adhoc.name, transport: adhoc.transport}] },
+      logs: [
+        {at:new Date().toISOString(), text:`[自社] 当日 予定外応援者を検知：${adhoc.name}`},
+        {at:new Date().toISOString(), text:'[自社] 臨時依頼を作成'}
+      ]
+    };
+    setItems(prev => [newItem, ...prev.map(i=>{
+      if(i.id!==baseId) return i;
+      return {...i, logs:[...(i.logs||[]), {at:new Date().toISOString(), text:`[自社] 予定外応援者（${adhoc.name}）→ 臨時依頼を起票`} ]};
+    })]);
+    setSnack({severity:'info', msg:'予定外応援者の臨時依頼を作成しました'});
+  };
+
+  const create = (data)=>{
+    setItems(p=>[data,...p]);
+    setDlgCreate(false);
+    setSnack({severity:'success', msg:'依頼を作成しました'});
+  };
+
+  const isMobile = useMediaQuery(theme.breakpoints.down('sm'));
+
+  return (
+    <ThemeProvider theme={theme}>
+      <CssBaseline/>
+      <Header role={role} setRole={setRole} onOpenCreate={()=>setDlgCreate(true)} dark={dark} toggleDark={()=>setDark(v=>!v)} pendingCount={pendingCount} openDrawer={()=>setDrawerOpen(true)}/>
+      <DrawerNav open={drawerOpen} onClose={()=>setDrawerOpen(false)} role={role} setRole={setRole} onOpenCreate={()=>setDlgCreate(true)} dark={dark} toggleDark={()=>setDark(v=>!v)}/>
+
+      <Container maxWidth="lg" sx={{py:2}}>
+        {/* 上半分：フィルタ＋カード */}
+        <Paper variant="outlined" sx={{p: isMobile?1.5:2}}>
+          <Stack direction={{xs:'column', sm:'row'}} spacing={1.5} alignItems={{xs:'stretch', sm:'center'}}>
+            <TextField placeholder="検索（店舗・日付・時間帯・部門・取引先・内容・コード…）" value={q} onChange={e=>setQ(e.target.value)} fullWidth
+              InputProps={{ startAdornment: <span className="material-icons" style={{marginRight:8}}>search</span> }} />
+            <Box sx={{flexGrow:1}}/>
+            {role==='自社' && (
+              <Tooltip title="新規依頼">
+                <Button variant="contained" startIcon={<span className="material-icons">add</span>} onClick={()=>setDlgCreate(true)}>新規依頼</Button>
+              </Tooltip>
+            )}
+          </Stack>
+          <Tabs value={tab} onChange={(_,v)=>{ setTab(v); setSelected([]);} } variant="scrollable" allowScrollButtonsMobile sx={{mt:1}}>
+            <Tab value="all" label={`すべて (${items.length})`}/>
+            {STATUSES.map(s=>{
+              const count = items.filter(i=>i.status===s.key).length;
+              const lbl = s.phase==='—' ? s.label : `${s.phase}：${s.label}`;
+              return <Tab key={s.key} value={s.key} label={`${lbl} (${count})`}/>;
+            })}
+          </Tabs>
+        </Paper>
+
+        <Box sx={{mt:2}}>
+          {filtered.length===0 ? (
+            <Paper variant="outlined" sx={{p:4, textAlign:'center'}}>
+              <Typography variant="h6" gutterBottom>該当データがありません</Typography>
+              <Typography color="text.secondary" gutterBottom>条件を変えるか、新規依頼を作成してください。</Typography>
+              {role==='自社' && <Button variant="contained" startIcon={<span className="material-icons">add</span>} onClick={()=>setDlgCreate(true)}>新規依頼</Button>}
+            </Paper>
+          ) : (
+            <Grid container spacing={2}>
+              {filtered.slice(0,6).map(it=>(
+                <Grid key={it.id} item xs={12} sm={6} md={4}>
+                  <CardItem
+                    item={it}
+                    onOpen={setDetail}
+                    onAdvance={advance}
+                    onReturn={(item)=>{ setReturnTarget(item); }}
+                    role={role}
+                    onOpenEstimate={(item)=>{ setEstimateTarget(item); }}
+                    onAddAdhoc={()=>{ setAdhocTarget(it); }}
+                  />
+                </Grid>
+              ))}
+            </Grid>
+          )}
+        </Box>
+
+        {/* KPI ＋ 自動生成トグル */}
+        <Box sx={{mt:2}}>
+          <Paper variant="outlined" sx={{p:2}}>
+            <Stack direction={{xs:'column', sm:'row'}} spacing={2} alignItems={{xs:'flex-start', sm:'center'}}>
+              <Typography variant="subtitle1">KPIスナップショット</Typography>
+              <Chip label={`今月作成：${items.filter(i=>new Date(i.createdAt).getMonth()===new Date().getMonth()).length}`}/>
+              <Chip color="warning" label={`当日進行：${items.filter(i=>['supporter_check','finalize'].includes(i.status)).length}`}/>
+              <Chip color="success" label={`請求待ち：${pendingCount}`}/>
+              <Box sx={{flexGrow:1}}/>
+              <FormControlLabel control={<Switch checked={autoGen} onChange={e=>setAutoGen(e.target.checked)} />} label="サンプル自動生成" />
+              <Button size="small" onClick={()=>setItems(p=>[makeDummyItem(),...p])} startIcon={<span className="material-icons">bolt</span>}>今すぐ1件追加</Button>
+              <Button size="small" color="error" onClick={()=>setItems([])} startIcon={<span className="material-icons">delete</span>}>全クリア</Button>
+              <FormControlLabel control={<Checkbox checked={denseTable} onChange={e=>setDenseTable(e.target.checked)} />} label="テーブルをコンパクト表示" />
+            </Stack>
+          </Paper>
+        </Box>
+
+        {/* 下半分：テーブル */}
+        <ItemsTable rows={filtered} selected={selected} setSelected={setSelected} dense={denseTable}/>
+      </Container>
+
+      {/* ダイアログ群 */}
+      <CreateDialog open={dlgCreate && role==='自社'} onClose={()=>setDlgCreate(false)} onCreate={create}/>
+      <DetailDialog
+        open={!!detail}
+        onClose={()=>setDetail(null)}
+        item={detail}
+        role={role}
+        onAdvance={(id)=>advance(id)}
+        onReturn={()=>{ setReturnTarget(detail); }}
+        onOpenEstimate={()=>{ setEstimateTarget(detail); }}
+        onAddAdhoc={()=>{ setAdhocTarget(detail); }}
+      />
+      <ReturnDialog
+        open={!!returnTarget}
+        onClose={()=>setReturnTarget(null)}
+        item={returnTarget}
+        onReturn={(reason)=>{ doReturn(returnTarget.id, reason); setReturnTarget(null); setDetail(null); }}
+      />
+      <EstimateDialog
+        open={!!estimateTarget}
+        onClose={()=>setEstimateTarget(null)}
+        item={estimateTarget}
+        onSubmit={(payload)=>{ submitEstimate(estimateTarget.id, payload); setEstimateTarget(null); setDetail(null); }}
+      />
+      <AdhocSupporterDialog
+        open={!!adhocTarget}
+        onClose={()=>setAdhocTarget(null)}
+        base={adhocTarget}
+        onSubmit={(payload)=>{ addAdhocSupporter(adhocTarget.id, payload); setAdhocTarget(null); }}
+      />
+
+      <Snackbar open={!!snack} autoHideDuration={2300} onClose={()=>setSnack(null)} anchorOrigin={{vertical:'bottom', horizontal:'center'}}>
+        {snack && <Alert severity={snack.severity} onClose={()=>setSnack(null)} variant="filled">{snack.msg}</Alert>}
+      </Snackbar>
+    </ThemeProvider>
+  );
+}
+const root = ReactDOM.createRoot(document.getElementById('root'));
+root.render(<App/>);
+</script>
+</body>
+</html>
