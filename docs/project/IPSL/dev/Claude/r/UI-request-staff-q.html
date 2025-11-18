@@ -1,0 +1,1038 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>応援依頼フロー</title>
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Roboto:wght@300;400;500;700&display=swap"/>
+  <link rel="stylesheet" href="https://fonts.googleapis.com/icon?family=Material+Icons"/>
+  <script src="https://cdn.jsdelivr.net/npm/react@18/umd/react.production.min.js" crossorigin></script>
+  <script src="https://cdn.jsdelivr.net/npm/react-dom@18/umd/react-dom.production.min.js" crossorigin></script>
+  <script src="https://cdn.jsdelivr.net/npm/@babel/standalone@7/babel.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@mui/material@5/umd/material-ui.production.min.js" crossorigin></script>
+  <style>
+    html, body, #root { height: 100%; margin: 0; }
+    .mono { font-family: ui-monospace, monospace; }
+    .resizable { position: relative; }
+    .resizer {
+      position: absolute;
+      right: 0;
+      top: 0;
+      height: 100%;
+      width: 5px;
+      cursor: col-resize;
+      user-select: none;
+      touch-action: none;
+    }
+    .resizer:hover { background: rgba(0,0,0,0.1); }
+  </style>
+</head>
+<body>
+<div id="root"></div>
+
+<script type="text/babel">
+const {
+  AppBar, Toolbar, Typography, CssBaseline, Container, Box, Stack, Button,
+  ThemeProvider, createTheme, useMediaQuery, Paper, Chip, TextField, Dialog,
+  DialogTitle, DialogContent, DialogActions, Grid, MenuItem, Select, InputLabel, FormControl,
+  Snackbar, Alert, Table, TableBody, TableCell, TableContainer, TableHead, TableRow, Checkbox,
+  FormControlLabel, Divider, IconButton, Tooltip, Badge, Collapse, TableSortLabel
+} = MaterialUI;
+
+/* ===== データ定義 ===== */
+const STATUSES = [
+  { key: 'request', label: '依頼', color: 'default', actor: '自社' },
+  { key: 'estimate', label: '見積登録', color: 'info', actor: '取引先' },
+  { key: 'confirmed', label: '確定', color: 'primary', actor: '自社' },
+  { key: 'supporter_check', label: '確認', color: 'warning', actor: '取引先' },
+  { key: 'acceptance', label: '受入確認', color: 'warning', actor: '自社' },
+  { key: 'complete', label: '完了登録', color: 'warning', actor: '自社' },
+  { key: 'content_check', label: '内容確認', color: 'secondary', actor: '取引先' },
+  { key: 'invoice_wait', label: '請求待ち', color: 'success', actor: '両社' },
+];
+
+const mockPartners = ['株式会社アルタ','テクノリンクス','ACME合同会社','北斗ソリューションズ'];
+const mockStores = ['新宿本店','大阪中央','名古屋栄','札幌駅前'];
+const mockDepartments = ['営業企画部','店舗支援部','情報システム部','DX推進室'];
+
+const randomId = () => Math.random().toString(36).slice(2,8);
+const yen = v => v ? `¥${Number(v).toLocaleString()}` : '—';
+const fmtDate = iso => iso ? new Date(iso).toISOString().slice(0,10) : '—';
+
+function nextStatus(key) {
+  const idx = STATUSES.findIndex(s => s.key === key);
+  return idx >= 0 && idx < STATUSES.length - 1 ? STATUSES[idx + 1].key : null;
+}
+
+function getStepIndex(key) {
+  return STATUSES.findIndex(s => s.key === key);
+}
+
+function randPick(arr){ return arr[Math.floor(Math.random()*arr.length)]; }
+function randInt(min,max){ return Math.floor(Math.random()*(max-min+1))+min; }
+function daysFromNow(d){ return new Date(Date.now()+86400000*d).toISOString().slice(0,10); }
+
+function makeDummyItem(status = null) {
+  const st = status || randPick(['request','estimate','confirmed']);
+  const heads = randInt(1,3);
+  const schedules = [{
+    date: daysFromNow(randInt(1,14)),
+    startTime: `${randInt(9,15)}:00`,
+    endTime: `${randInt(16,21)}:00`
+  }];
+  return {
+    id: randomId(),
+    title: `${randPick(mockStores)} 商品陳列応援`,
+    partner: randPick(mockPartners),
+    partnerCode: 'P-' + randInt(100,999),
+    store: randPick(mockStores),
+    schedules,
+    heads,
+    department: randPick(mockDepartments),
+    content: '棚替え・ラベル差替え',
+    memo: '',
+    status: st,
+    createdAt: new Date().toISOString(),
+    confirmedAt: st === 'confirmed' ? new Date().toISOString() : null,
+    estimate: st === 'confirmed' ? {
+      amount: randInt(8,50)*10000,
+      note: '2名×2h',
+      supporters: [{date: schedules[0].date, startTime: schedules[0].startTime, endTime: schedules[0].endTime, name:'山田太郎', transport:'800'}]
+    } : null,
+  };
+}
+
+/* ===== CSV出力 ===== */
+function exportCSV(items) {
+  const headers = ['No','ステータス','応援日','開始時刻','終了時刻','人数','部門','取引先コード','取引先名','応援店舗','依頼日','確定日','見積金額'];
+  const rows = items.map((item, idx) => [
+    idx + 1,
+    STATUSES.find(s => s.key === item.status)?.label || '',
+    item.schedules?.map(s => s.date).join('、') || '',
+    item.schedules?.[0]?.startTime || '',
+    item.schedules?.[0]?.endTime || '',
+    item.heads,
+    item.department,
+    item.partnerCode,
+    item.partner,
+    item.store,
+    fmtDate(item.createdAt),
+    fmtDate(item.confirmedAt),
+    item.estimate ? item.estimate.amount : '',
+  ]);
+  
+  const csv = [headers, ...rows].map(row => 
+    row.map(cell => `"${String(cell).replace(/"/g, '""')}"`).join(',')
+  ).join('\n');
+  
+  const bom = '\uFEFF';
+  const blob = new Blob([bom + csv], { type: 'text/csv;charset=utf-8;' });
+  const link = document.createElement('a');
+  link.href = URL.createObjectURL(blob);
+  link.download = `応援依頼_${new Date().toISOString().slice(0,10)}.csv`;
+  link.click();
+}
+
+/* ===== ヘッダー ===== */
+function Header({role, setRole, onNew, dark, toggleDark, count, onHelp}) {
+  return (
+    <AppBar position="sticky">
+      <Toolbar>
+        <Typography variant="h6" sx={{flexGrow:1}}>応援依頼フロー管理</Typography>
+        <FormControl size="small" sx={{mr:2, minWidth:100, bgcolor:'rgba(255,255,255,0.15)', borderRadius:1}}>
+          <Select value={role} onChange={e=>setRole(e.target.value)} sx={{color:'white'}}>
+            <MenuItem value="自社">自社</MenuItem>
+            <MenuItem value="取引先">取引先</MenuItem>
+          </Select>
+        </FormControl>
+        {role === '自社' && (
+          <Button color="inherit" startIcon={<span className="material-icons">add</span>} onClick={onNew}>
+            新規依頼
+          </Button>
+        )}
+        <IconButton color="inherit" onClick={onHelp} sx={{ml:1}}>
+          <span className="material-icons">help_outline</span>
+        </IconButton>
+        <IconButton color="inherit" onClick={toggleDark} sx={{ml:1}}>
+          <span className="material-icons">{dark?'dark_mode':'light_mode'}</span>
+        </IconButton>
+        <IconButton color="inherit">
+          <Badge badgeContent={count} color="error">
+            <span className="material-icons">notifications</span>
+          </Badge>
+        </IconButton>
+      </Toolbar>
+    </AppBar>
+  );
+}
+
+/* ===== ヘルプパネル ===== */
+function HelpPanel({open}) {
+  return (
+    <Collapse in={open}>
+      <Paper sx={{p:2, mb:2}}>
+        <Typography variant="h6" gutterBottom>📖 使い方ガイド</Typography>
+        <Divider sx={{my:1}}/>
+        <Grid container spacing={2}>
+          <Grid item xs={12} md={6}>
+            <Typography variant="subtitle2" gutterBottom>🏢 自社の操作</Typography>
+            <Typography variant="body2" component="div">
+              ① 新規依頼ボタンから依頼を作成<br/>
+              ② 取引先が見積もりを登録するまで待機<br/>
+              ③ 確定後、当日確認→完了登録→請求待ち へ進める<br/>
+              ④ テーブルヘッダーをクリックで並び替え<br/>
+              ⑤ 列の境界をドラッグで列幅調整
+            </Typography>
+          </Grid>
+          <Grid item xs={12} md={6}>
+            <Typography variant="subtitle2" gutterBottom>🤝 取引先の操作</Typography>
+            <Typography variant="body2" component="div">
+              ① 見積もりステータスの案件を開く<br/>
+              ② 見積もり登録ボタンから金額・応援者を入力<br/>
+              ③ 独禁法注意事項に同意して登録<br/>
+              ④ ステータスフィルターで効率的に管理
+            </Typography>
+          </Grid>
+        </Grid>
+      </Paper>
+    </Collapse>
+  );
+}
+
+/* ===== 新規依頼ダイアログ ===== */
+/* ===== 詳細モーダル ===== */
+function DetailDialog({open, onClose, item, role, onAction}) {
+  if (!item) return null;
+  const currentStep = getStepIndex(item.status);
+  const statusInfo = STATUSES[currentStep];
+  const canAct = statusInfo.actor === role || statusInfo.actor === '両社';
+
+  return (
+    <Dialog open={open} onClose={onClose} fullWidth maxWidth="xl">
+      <DialogTitle>
+        <Box display="flex" justifyContent="space-between" alignItems="center">
+          <Typography variant="h6">{item.title}</Typography>
+          <IconButton onClick={onClose}><span className="material-icons">close</span></IconButton>
+        </Box>
+      </DialogTitle>
+      <DialogContent>
+        <Box sx={{width:'100%', mb:4, mt:2}}>
+          <Stack direction="row" spacing={1} justifyContent="space-between" position="relative">
+            {STATUSES.map((st, idx) => (
+              <Box key={st.key} sx={{flex:1, textAlign:'center', position:'relative'}}>
+                <Box sx={{
+                  width:40, height:40, borderRadius:'50%', margin:'0 auto',
+                  bgcolor: idx <= currentStep ? 'primary.main' : 'grey.300',
+                  color: idx <= currentStep ? 'white' : 'grey.600',
+                  display:'flex', alignItems:'center', justifyContent:'center',
+                  fontWeight:'bold', zIndex:2, position:'relative'
+                }}>
+                  {idx < currentStep ? <span className="material-icons">check</span> : idx + 1}
+                </Box>
+                <Typography variant="caption" display="block" mt={1} fontWeight={idx === currentStep ? 'bold' : 'normal'}>
+                  {st.label}
+                </Typography>
+                <Typography variant="caption" color="text.secondary" display="block">
+                  ({st.actor})
+                </Typography>
+                {idx < STATUSES.length - 1 && (
+                  <Box sx={{
+                    position:'absolute', top:20, left:'50%', width:'100%', height:2,
+                    bgcolor: idx < currentStep ? 'primary.main' : 'grey.300', zIndex:1
+                  }}/>
+                )}
+              </Box>
+            ))}
+          </Stack>
+        </Box>
+
+        <Divider sx={{my:2}}/>
+
+        <Grid container spacing={2}>
+          <Grid item xs={6}><Typography variant="body2" color="text.secondary">取引先</Typography><Typography>{item.partner} ({item.partnerCode})</Typography></Grid>
+          <Grid item xs={6}><Typography variant="body2" color="text.secondary">応援店舗</Typography><Typography>{item.store}</Typography></Grid>
+          <Grid item xs={6}><Typography variant="body2" color="text.secondary">部門</Typography><Typography>{item.department}</Typography></Grid>
+          <Grid item xs={6}><Typography variant="body2" color="text.secondary">人数</Typography><Typography>{item.heads}名</Typography></Grid>
+          <Grid item xs={12}><Typography variant="body2" color="text.secondary">作業内容</Typography><Typography>{item.content}</Typography></Grid>
+          {item.schedules?.map((sch, i) => (
+            <Grid item xs={12} key={i}>
+              <Typography variant="body2" color="text.secondary">日程 {i+1}</Typography>
+              <Typography>{sch.date} {sch.startTime} 〜 {sch.endTime}</Typography>
+            </Grid>
+          ))}
+          {item.memo && <Grid item xs={12}><Typography variant="body2" color="text.secondary">メモ</Typography><Typography>{item.memo}</Typography></Grid>}
+          {item.estimate && (
+            <>
+              <Grid item xs={6}><Typography variant="body2" color="text.secondary">見積金額</Typography><Typography variant="h6" color="primary">{yen(item.estimate.amount)}</Typography></Grid>
+              <Grid item xs={6}><Typography variant="body2" color="text.secondary">備考</Typography><Typography>{item.estimate.note}</Typography></Grid>
+            </>
+          )}
+        </Grid>
+      </DialogContent>
+      <DialogActions sx={{p:2, gap:1}}>
+        <Button onClick={() => onAction(item.id, 'cancel')} color="error" variant="outlined" startIcon={<span className="material-icons">cancel</span>}>
+          キャンセル
+        </Button>
+        <Button onClick={() => onAction(item.id, 'reject')} color="warning" variant="outlined" startIcon={<span className="material-icons">undo</span>}>
+          差し戻し
+        </Button>
+        <Box flex={1}/>
+        {role === '取引先' && item.status === 'estimate' && (
+          <Button onClick={() => onAction(item.id, 'estimate')} variant="contained" size="large" color="info" startIcon={<span className="material-icons">request_quote</span>}>
+            見積登録
+          </Button>
+        )}
+        {canAct && nextStatus(item.status) && item.status !== 'estimate' && (
+          <Button onClick={() => onAction(item.id, 'next')} variant="contained" size="large" startIcon={<span className="material-icons">arrow_forward</span>}>
+            {STATUSES[currentStep + 1]?.label}へ進む
+          </Button>
+        )}
+      </DialogActions>
+    </Dialog>
+  );
+}
+
+/* ===== 新規依頼ダイアログ ===== */
+function CreateDialog({open, onClose, onCreate}) {
+  const [requests, setRequests] = React.useState([{date:'', startTime:'09:00', endTime:'18:00', store:mockStores[0], heads:1, partnerCode:'P-'+randInt(100,999), partner:mockPartners[0], department:mockDepartments[0], content:'', memo:''}]);
+
+  const addRequest = () => setRequests(prev => [...prev, {date:'', startTime:'09:00', endTime:'18:00', store:mockStores[0], heads:1, partnerCode:'P-'+randInt(100,999), partner:mockPartners[0], department:mockDepartments[0], content:'', memo:''}]);
+  const removeRequest = (idx) => setRequests(prev => prev.filter((_,i) => i !== idx));
+  const updateRequest = (idx, patch) => setRequests(prev => prev.map((r,i) => i===idx ? {...r,...patch} : r));
+
+  const canSave = requests.length > 0 && requests.every(r => r.date && r.startTime && r.endTime && r.store && r.heads > 0 && r.partner && r.department && r.content);
+
+  const save = () => {
+    requests.forEach(req => {
+      onCreate({
+        id: randomId(),
+        title: `${req.store} 商品陳列応援`,
+        partner: req.partner,
+        partnerCode: req.partnerCode,
+        store: req.store,
+        schedules: [{date: req.date, startTime: req.startTime, endTime: req.endTime}],
+        heads: req.heads,
+        department: req.department,
+        content: req.content,
+        memo: req.memo,
+        status: 'request',
+        createdAt: new Date().toISOString(),
+        confirmedAt: null,
+        estimate: null,
+      });
+    });
+    setRequests([{date:'', startTime:'09:00', endTime:'18:00', store:mockStores[0], heads:1, partnerCode:'P-'+randInt(100,999), partner:mockPartners[0], department:mockDepartments[0], content:'', memo:''}]);
+    onClose();
+  };
+
+  return (
+    <Dialog open={open} onClose={onClose} fullWidth maxWidth="xl">
+      <DialogTitle>
+        <Box display="flex" justifyContent="space-between" alignItems="center">
+          <Typography variant="h6">新規依頼作成</Typography>
+          <Button size="small" variant="outlined" onClick={addRequest} startIcon={<span className="material-icons">add</span>}>行追加</Button>
+        </Box>
+      </DialogTitle>
+      <DialogContent dividers sx={{p:1}}>
+        <TableContainer sx={{maxHeight:500}}>
+          <Table size="small" stickyHeader>
+            <TableHead>
+              <TableRow>
+                <TableCell padding="checkbox" sx={{bgcolor:'grey.100', width:40}}>#</TableCell>
+                <TableCell sx={{bgcolor:'grey.100', minWidth:130}}>応援日</TableCell>
+                <TableCell sx={{bgcolor:'grey.100', minWidth:90}}>開始</TableCell>
+                <TableCell sx={{bgcolor:'grey.100', minWidth:90}}>終了</TableCell>
+                <TableCell sx={{bgcolor:'grey.100', minWidth:110}}>店舗</TableCell>
+                <TableCell sx={{bgcolor:'grey.100', width:60}}>人数</TableCell>
+                <TableCell sx={{bgcolor:'grey.100', minWidth:100}}>コード</TableCell>
+                <TableCell sx={{bgcolor:'grey.100', minWidth:140}}>取引先</TableCell>
+                <TableCell sx={{bgcolor:'grey.100', minWidth:110}}>部門</TableCell>
+                <TableCell sx={{bgcolor:'grey.100', minWidth:180}}>内容</TableCell>
+                <TableCell sx={{bgcolor:'grey.100', minWidth:120}}>備考</TableCell>
+                <TableCell sx={{bgcolor:'grey.100', width:40}}></TableCell>
+              </TableRow>
+            </TableHead>
+            <TableBody>
+              {requests.map((req, idx) => (
+                <TableRow key={idx} hover>
+                  <TableCell padding="checkbox">{idx+1}</TableCell>
+                  <TableCell><TextField type="date" InputLabelProps={{shrink:true}} value={req.date} onChange={e=>updateRequest(idx, {date:e.target.value})} size="small" fullWidth/></TableCell>
+                  <TableCell><TextField type="time" InputLabelProps={{shrink:true}} value={req.startTime} onChange={e=>updateRequest(idx, {startTime:e.target.value})} size="small" fullWidth/></TableCell>
+                  <TableCell><TextField type="time" InputLabelProps={{shrink:true}} value={req.endTime} onChange={e=>updateRequest(idx, {endTime:e.target.value})} size="small" fullWidth/></TableCell>
+                  <TableCell><Select value={req.store} onChange={e=>updateRequest(idx, {store:e.target.value})} size="small" fullWidth>{mockStores.map(s => <MenuItem key={s} value={s}>{s}</MenuItem>)}</Select></TableCell>
+                  <TableCell><TextField type="number" value={req.heads} onChange={e=>updateRequest(idx, {heads:Math.max(1, Number(e.target.value))})} size="small" fullWidth/></TableCell>
+                  <TableCell><TextField value={req.partnerCode} onChange={e=>updateRequest(idx, {partnerCode:e.target.value})} size="small" fullWidth/></TableCell>
+                  <TableCell><Select value={req.partner} onChange={e=>updateRequest(idx, {partner:e.target.value})} size="small" fullWidth>{mockPartners.map(p => <MenuItem key={p} value={p}>{p}</MenuItem>)}</Select></TableCell>
+                  <TableCell><Select value={req.department} onChange={e=>updateRequest(idx, {department:e.target.value})} size="small" fullWidth>{mockDepartments.map(d => <MenuItem key={d} value={d}>{d}</MenuItem>)}</Select></TableCell>
+                  <TableCell><TextField value={req.content} onChange={e=>updateRequest(idx, {content:e.target.value})} size="small" fullWidth/></TableCell>
+                  <TableCell><TextField value={req.memo} onChange={e=>updateRequest(idx, {memo:e.target.value})} size="small" fullWidth/></TableCell>
+                  <TableCell padding="checkbox">
+                    {requests.length > 1 && (
+                      <IconButton color="error" onClick={() => removeRequest(idx)} size="small">
+                        <span className="material-icons">delete</span>
+                      </IconButton>
+                    )}
+                  </TableCell>
+                </TableRow>
+              ))}
+            </TableBody>
+          </Table>
+        </TableContainer>
+      </DialogContent>
+      <DialogActions sx={{px:2, py:1.5}}>
+        <Typography variant="caption" color="text.secondary" sx={{flex:1}}>複数日・複数取引先・複数店舗の一括登録可能</Typography>
+        <Button onClick={onClose}>キャンセル</Button>
+        <Button onClick={save} variant="contained" disabled={!canSave}>作成 ({requests.length}件)</Button>
+      </DialogActions>
+    </Dialog>
+  );
+}
+
+/* ===== 見積もりダイアログ ===== */
+function EstimateDialog({open, onClose, item, onSubmit}) {
+  const [amount, setAmount] = React.useState('');
+  const [note, setNote] = React.useState('');
+  const [agree, setAgree] = React.useState(false);
+  const [supporters, setSupporters] = React.useState([]);
+
+  React.useEffect(() => {
+    if (item?.schedules && item?.heads) {
+      const rows = [];
+      for (let i = 0; i < item.heads; i++) {
+        item.schedules.forEach(s => {
+          rows.push({date: s.date, startTime: s.startTime, endTime: s.endTime, name:'', transport:''});
+        });
+      }
+      setSupporters(rows);
+    }
+  }, [item]);
+
+  const addRow = () => setSupporters(prev => [...prev, {date:'', startTime:'09:00', endTime:'18:00', name:'', transport:''}]);
+  const removeRow = (idx) => setSupporters(prev => prev.filter((_,i)=>i!==idx));
+  const updateRow = (idx, patch) => setSupporters(prev => prev.map((r,i)=> i===idx ? {...r, ...patch} : r));
+
+  const ok = amount && supporters.length>0 && supporters.every(s=>s.date && s.startTime && s.endTime && s.name) && agree;
+
+  const submit = () => {
+    onSubmit({amount, note, supporters});
+  };
+
+  return (
+    <Dialog open={open} onClose={onClose} fullWidth maxWidth="md">
+      <DialogTitle>見積もり登録</DialogTitle>
+      <DialogContent dividers>
+        <Paper variant="outlined" sx={{p:2, mb:2, bgcolor:'warning.light', color:'warning.contrastText'}}>
+          <Typography variant="subtitle2" gutterBottom><strong>独占禁止法 注意事項</strong></Typography>
+          <Typography variant="body2">価格・見積金額を他社と共同決定・情報交換しないこと。本見積りは自社の独立した判断に基づいて提示してください。</Typography>
+        </Paper>
+
+        <Stack spacing={2}>
+          <TextField label="見積金額（税抜）" placeholder="例: 180000" value={amount} 
+            onChange={e=>setAmount(e.target.value.replace(/[^\d]/g,''))} fullWidth/>
+          <TextField label="見積メモ" value={note} onChange={e=>setNote(e.target.value)} fullWidth/>
+          
+          <Box>
+            <Stack direction="row" justifyContent="space-between" alignItems="center" sx={{mb:1}}>
+              <Typography variant="subtitle2">応援者リスト</Typography>
+              <Button size="small" onClick={addRow} startIcon={<span className="material-icons">add</span>}>追加</Button>
+            </Stack>
+            {supporters.map((s, idx) => (
+              <Paper key={idx} variant="outlined" sx={{p:1.5, mb:1}}>
+                <Grid container spacing={1}>
+                  <Grid item xs={12} sm={3}>
+                    <TextField type="date" label="日付" InputLabelProps={{shrink:true}} value={s.date} onChange={e=>updateRow(idx,{date:e.target.value})} fullWidth size="small"/>
+                  </Grid>
+                  <Grid item xs={6} sm={2}>
+                    <TextField type="time" label="開始" InputLabelProps={{shrink:true}} value={s.startTime} onChange={e=>updateRow(idx,{startTime:e.target.value})} fullWidth size="small"/>
+                  </Grid>
+                  <Grid item xs={6} sm={2}>
+                    <TextField type="time" label="終了" InputLabelProps={{shrink:true}} value={s.endTime} onChange={e=>updateRow(idx,{endTime:e.target.value})} fullWidth size="small"/>
+                  </Grid>
+                  <Grid item xs={12} sm={2}>
+                    <TextField label="氏名" value={s.name} onChange={e=>updateRow(idx,{name:e.target.value})} fullWidth size="small"/>
+                  </Grid>
+                  <Grid item xs={10} sm={2}>
+                    <TextField label="交通費" value={s.transport} onChange={e=>updateRow(idx,{transport:e.target.value.replace(/[^\d]/g,'')})} fullWidth size="small"/>
+                  </Grid>
+                  <Grid item xs={2} sm={1}>
+                    <IconButton color="error" onClick={()=>removeRow(idx)} size="small">
+                      <span className="material-icons">delete</span>
+                    </IconButton>
+                  </Grid>
+                </Grid>
+              </Paper>
+            ))}
+          </Box>
+
+          <FormControlLabel
+            control={<Checkbox checked={agree} onChange={e=>setAgree(e.target.checked)}/>}
+            label="独占禁止法の注意事項を読み、遵守のうえ見積ります"
+          />
+        </Stack>
+      </DialogContent>
+      <DialogActions>
+        <Button onClick={onClose}>キャンセル</Button>
+        <Button variant="contained" disabled={!ok} onClick={submit}>見積もり登録</Button>
+      </DialogActions>
+    </Dialog>
+  );
+}
+
+
+
+/* ===== ステータス別サンプル追加ダイアログ ===== */
+function AddSampleDialog({open, onClose, onAdd}) {
+  const [status, setStatus] = React.useState('request');
+  
+  const handleAdd = () => {
+    onAdd(status);
+    onClose();
+  };
+
+  return (
+    <Dialog open={open} onClose={onClose} maxWidth="xs" fullWidth>
+      <DialogTitle>サンプル追加</DialogTitle>
+      <DialogContent>
+        <FormControl fullWidth sx={{mt:1}}>
+          <InputLabel>ステータス</InputLabel>
+          <Select label="ステータス" value={status} onChange={e=>setStatus(e.target.value)}>
+            {STATUSES.map(s => (
+              <MenuItem key={s.key} value={s.key}>{s.label}</MenuItem>
+            ))}
+          </Select>
+        </FormControl>
+      </DialogContent>
+      <DialogActions>
+        <Button onClick={onClose}>キャンセル</Button>
+        <Button variant="contained" onClick={handleAdd}>追加</Button>
+      </DialogActions>
+    </Dialog>
+  );
+}
+
+/* ===== メインApp ===== */
+function App() {
+  const prefersDark = useMediaQuery('(prefers-color-scheme: dark)');
+  const [dark, setDark] = React.useState(prefersDark);
+  const theme = React.useMemo(() => createTheme({palette:{mode: dark?'dark':'light'}}), [dark]);
+
+  const [role, setRole] = React.useState('自社');
+  const [items, setItems] = React.useState(() => Array.from({length:5}, () => makeDummyItem()));
+  const [filter, setFilter] = React.useState('all');
+  const [search, setSearch] = React.useState('');
+  const [dlgCreate, setDlgCreate] = React.useState(false);
+  const [dlgSample, setDlgSample] = React.useState(false);
+  const [detail, setDetail] = React.useState(null);
+  const [estimateTarget, setEstimateTarget] = React.useState(null);
+  const [snack, setSnack] = React.useState(null);
+  const [selected, setSelected] = React.useState([]);
+  const [autoGen, setAutoGen] = React.useState(true);
+  const [page, setPage] = React.useState(0);
+  const [rowsPerPage, setRowsPerPage] = React.useState(25);
+  const [helpOpen, setHelpOpen] = React.useState(false);
+  const [orderBy, setOrderBy] = React.useState('createdAt');
+  const [order, setOrder] = React.useState('desc');
+  const [columnWidths, setColumnWidths] = React.useState({});
+
+  // 自動サンプル生成
+  const genRef = React.useRef(null);
+  React.useEffect(() => {
+    if (!autoGen) {
+      if (genRef.current) {
+        clearInterval(genRef.current);
+        genRef.current = null;
+      }
+      return;
+    }
+    if (genRef.current) return;
+    genRef.current = setInterval(() => {
+      setItems(prev => [makeDummyItem(), ...prev].slice(0, 100));
+    }, randInt(8000, 15000));
+    return () => {
+      if (genRef.current) {
+        clearInterval(genRef.current);
+        genRef.current = null;
+      }
+    };
+  }, [autoGen]);
+
+  const handleSort = (property) => {
+    const isAsc = orderBy === property && order === 'asc';
+    setOrder(isAsc ? 'desc' : 'asc');
+    setOrderBy(property);
+  };
+
+  const getComparator = (order, orderBy) => {
+    return order === 'desc'
+      ? (a, b) => descendingComparator(a, b, orderBy)
+      : (a, b) => -descendingComparator(a, b, orderBy);
+  };
+
+  const descendingComparator = (a, b, orderBy) => {
+    let aVal = a[orderBy];
+    let bVal = b[orderBy];
+    
+    if (orderBy === 'schedules') {
+      aVal = a.schedules?.[0]?.date || '';
+      bVal = b.schedules?.[0]?.date || '';
+    }
+    
+    if (bVal < aVal) return -1;
+    if (bVal > aVal) return 1;
+    return 0;
+  };
+
+  const filtered = React.useMemo(() => {
+    return items
+      .filter(i => filter === 'all' || i.status === filter)
+      .filter(i => {
+        const text = `${i.title}${i.partner}${i.partnerCode}${i.store}${i.department}${i.content}`.toLowerCase();
+        return text.includes(search.toLowerCase());
+      })
+      .sort(getComparator(order, orderBy));
+  }, [items, filter, search, order, orderBy]);
+
+  const paged = filtered.slice(page * rowsPerPage, page * rowsPerPage + rowsPerPage);
+  const pendingCount = items.filter(i => i.status === 'invoice_wait').length;
+
+  const createItem = (data) => {
+    setItems(prev => [data, ...prev]);
+    setDlgCreate(false);
+    setSnack({severity:'success', msg:'依頼を作成しました'});
+  };
+
+  const addSample = (status) => {
+    setItems(prev => [makeDummyItem(status), ...prev]);
+    setSnack({severity:'info', msg:`${STATUSES.find(s=>s.key===status)?.label} のサンプルを追加しました`});
+  };
+
+  const handleAction = (id, action) => {
+    if (action === 'next') {
+      setItems(prev => prev.map(i => {
+        if (i.id !== id) return i;
+        const ns = nextStatus(i.status);
+        if (!ns) return i;
+        return {
+          ...i,
+          status: ns,
+          confirmedAt: ns === 'confirmed' && !i.confirmedAt ? new Date().toISOString() : i.confirmedAt
+        };
+      }));
+      setDetail(null);
+      setSnack({severity:'info', msg:'ステータスを更新しました'});
+    } else if (action === 'estimate') {
+      setEstimateTarget(detail);
+    } else if (action === 'reject') {
+      setItems(prev => prev.map(i => {
+        if (i.id !== id) return i;
+        const currentIdx = getStepIndex(i.status);
+        if (currentIdx <= 0) return i;
+        return {...i, status: STATUSES[currentIdx - 1].key};
+      }));
+      setDetail(null);
+      setSnack({severity:'warning', msg:'前のステップに差し戻しました'});
+    } else if (action === 'cancel') {
+      setItems(prev => prev.filter(i => i.id !== id));
+      setDetail(null);
+      setSnack({severity:'error', msg:'依頼をキャンセルしました'});
+    }
+  };
+
+  const submitEstimate = (id, payload) => {
+    setItems(prev => prev.map(i => {
+      if (i.id !== id) return i;
+      return {
+        ...i,
+        status: 'confirmed',
+        confirmedAt: new Date().toISOString(),
+        estimate: {
+          amount: Number(payload.amount),
+          note: payload.note,
+          supporters: payload.supporters
+        },
+        heads: payload.supporters.length
+      };
+    }));
+    setEstimateTarget(null);
+    setDetail(null);
+    setSnack({severity:'success', msg:'見積もりを登録しました'});
+  };
+
+  const handleSelectAll = (e) => {
+    if (e.target.checked) {
+      setSelected(filtered.map(i => i.id));
+    } else {
+      setSelected([]);
+    }
+  };
+
+  const handleSelect = (id) => {
+    if (selected.includes(id)) {
+      setSelected(selected.filter(x => x !== id));
+    } else {
+      setSelected([...selected, id]);
+    }
+  };
+
+  const handleResize = (columnKey, delta) => {
+    setColumnWidths(prev => ({
+      ...prev,
+      [columnKey]: Math.max(50, (prev[columnKey] || 100) + delta)
+    }));
+  };
+
+  const ResizableCell = ({children, columnKey, ...props}) => {
+    const [isResizing, setIsResizing] = React.useState(false);
+    const startX = React.useRef(0);
+
+    const handleMouseDown = (e) => {
+      setIsResizing(true);
+      startX.current = e.clientX;
+      e.preventDefault();
+    };
+
+    React.useEffect(() => {
+      if (!isResizing) return;
+
+      const handleMouseMove = (e) => {
+        const delta = e.clientX - startX.current;
+        handleResize(columnKey, delta);
+        startX.current = e.clientX;
+      };
+
+      const handleMouseUp = () => {
+        setIsResizing(false);
+      };
+
+      document.addEventListener('mousemove', handleMouseMove);
+      document.addEventListener('mouseup', handleMouseUp);
+
+      return () => {
+        document.removeEventListener('mousemove', handleMouseMove);
+        document.removeEventListener('mouseup', handleMouseUp);
+      };
+    }, [isResizing]);
+
+    return (
+      <TableCell 
+        {...props} 
+        sx={{
+          ...props.sx,
+          width: columnWidths[columnKey] || 'auto',
+          minWidth: columnWidths[columnKey] || 'auto',
+          position: 'relative'
+        }}
+        className="resizable"
+      >
+        {children}
+        <div 
+          className="resizer" 
+          onMouseDown={handleMouseDown}
+          style={{cursor: isResizing ? 'col-resize' : 'col-resize'}}
+        />
+      </TableCell>
+    );
+  };
+
+  return (
+    <ThemeProvider theme={theme}>
+      <CssBaseline/>
+      <Header 
+        role={role} 
+        setRole={setRole} 
+        onNew={()=>setDlgCreate(true)} 
+        dark={dark} 
+        toggleDark={()=>setDark(v=>!v)} 
+        count={pendingCount}
+        onHelp={()=>setHelpOpen(v=>!v)}
+      />
+      
+      <Container maxWidth={false} sx={{py:3}}>
+        <HelpPanel open={helpOpen} />
+
+        {/* 検索・フィルター */}
+        <Paper sx={{p:2, mb:2}}>
+          <Stack spacing={2}>
+            <TextField
+              placeholder="検索（取引先、店舗、日付、部門、内容...）"
+              value={search}
+              onChange={e=>setSearch(e.target.value)}
+              fullWidth
+              InputProps={{
+                startAdornment: <span className="material-icons" style={{marginRight:8, color:'gray'}}>search</span>
+              }}
+            />
+            <Stack direction="row" spacing={1} flexWrap="wrap">
+              <Button variant={filter==='all'?'contained':'outlined'} onClick={()=>setFilter('all')}>
+                すべて ({items.length})
+              </Button>
+              {STATUSES.map(s => (
+                <Button key={s.key} variant={filter===s.key?'contained':'outlined'} onClick={()=>setFilter(s.key)}>
+                  {s.label} ({items.filter(i=>i.status===s.key).length})
+                </Button>
+              ))}
+            </Stack>
+          </Stack>
+        </Paper>
+
+        {/* アクションエリア */}
+        <Paper sx={{p:2, mb:2}}>
+          <Stack direction="row" spacing={1} justifyContent="flex-end">
+            {role === '自社' && (
+              <Button variant="contained" startIcon={<span className="material-icons">add</span>} onClick={()=>setDlgCreate(true)}>
+                新規依頼
+              </Button>
+            )}
+            <Button variant="outlined" onClick={()=>setDlgSample(true)} startIcon={<span className="material-icons">add_circle_outline</span>}>
+              サンプル追加
+            </Button>
+            <Button variant="outlined" color="error" onClick={()=>{setItems([]); setSelected([]);}} startIcon={<span className="material-icons">delete_sweep</span>}>
+              全削除
+            </Button>
+          </Stack>
+        </Paper>
+
+        {/* 統計情報 */}
+        <Paper sx={{p:2, mb:2}}>
+          <Stack direction={{xs:'column', sm:'row'}} spacing={2}>
+            <Box sx={{flex:1}}>
+              <Typography variant="h4" color="primary">{items.length}</Typography>
+              <Typography variant="body2" color="text.secondary">総件数</Typography>
+            </Box>
+            <Box sx={{flex:1}}>
+              <Typography variant="h4" color="warning.main">{items.filter(i=>['supporter_check','finalize'].includes(i.status)).length}</Typography>
+              <Typography variant="body2" color="text.secondary">当日進行中</Typography>
+            </Box>
+            <Box sx={{flex:1}}>
+              <Typography variant="h4" color="success.main">{pendingCount}</Typography>
+              <Typography variant="body2" color="text.secondary">請求待ち</Typography>
+            </Box>
+            <Box sx={{flex:1, display:'flex', flexDirection:'column', gap:1}}>
+              <FormControlLabel
+                control={<Checkbox checked={autoGen} onChange={e=>setAutoGen(e.target.checked)} size="small"/>}
+                label={<Typography variant="caption">自動生成</Typography>}
+              />
+            </Box>
+          </Stack>
+        </Paper>
+
+        {/* テーブル */}
+        <Paper sx={{mb:2}}>
+          <Box sx={{p:2, display:'flex', justifyContent:'space-between', alignItems:'center'}}>
+            <Typography variant="h6">依頼一覧（{filtered.length}件）</Typography>
+            <Stack direction="row" spacing={1}>
+              <Typography variant="body2" color="text.secondary" sx={{alignSelf:'center'}}>
+                {selected.length}件選択中
+              </Typography>
+              <Button
+                variant="contained"
+                startIcon={<span className="material-icons">download</span>}
+                onClick={() => exportCSV(filtered)}
+                disabled={filtered.length === 0}
+              >
+                CSV出力
+              </Button>
+            </Stack>
+          </Box>
+          <TableContainer sx={{maxHeight: 600}}>
+            <Table stickyHeader size="small">
+              <TableHead>
+                <TableRow>
+                  <ResizableCell padding="checkbox" columnKey="checkbox" sx={{bgcolor:'grey.100'}}>
+                    <Checkbox
+                      checked={filtered.length > 0 && selected.length === filtered.length}
+                      indeterminate={selected.length > 0 && selected.length < filtered.length}
+                      onChange={handleSelectAll}
+                    />
+                  </ResizableCell>
+                  <ResizableCell columnKey="no" sx={{bgcolor:'grey.100'}}>
+                    <TableSortLabel
+                      active={orderBy === 'id'}
+                      direction={orderBy === 'id' ? order : 'asc'}
+                      onClick={() => handleSort('id')}
+                    >
+                      No
+                    </TableSortLabel>
+                  </ResizableCell>
+                  <ResizableCell columnKey="action" sx={{bgcolor:'grey.100'}}>操作</ResizableCell>
+                  <ResizableCell columnKey="status" sx={{bgcolor:'grey.100'}}>
+                    <TableSortLabel
+                      active={orderBy === 'status'}
+                      direction={orderBy === 'status' ? order : 'asc'}
+                      onClick={() => handleSort('status')}
+                    >
+                      ステータス
+                    </TableSortLabel>
+                  </ResizableCell>
+                  <ResizableCell columnKey="date" sx={{bgcolor:'grey.100'}}>
+                    <TableSortLabel
+                      active={orderBy === 'schedules'}
+                      direction={orderBy === 'schedules' ? order : 'asc'}
+                      onClick={() => handleSort('schedules')}
+                    >
+                      応援日
+                    </TableSortLabel>
+                  </ResizableCell>
+                  <ResizableCell columnKey="startTime" sx={{bgcolor:'grey.100'}}>開始時刻</ResizableCell>
+                  <ResizableCell columnKey="endTime" sx={{bgcolor:'grey.100'}}>終了時刻</ResizableCell>
+                  <ResizableCell columnKey="heads" sx={{bgcolor:'grey.100'}}>
+                    <TableSortLabel
+                      active={orderBy === 'heads'}
+                      direction={orderBy === 'heads' ? order : 'asc'}
+                      onClick={() => handleSort('heads')}
+                    >
+                      人数
+                    </TableSortLabel>
+                  </ResizableCell>
+                  <ResizableCell columnKey="department" sx={{bgcolor:'grey.100'}}>
+                    <TableSortLabel
+                      active={orderBy === 'department'}
+                      direction={orderBy === 'department' ? order : 'asc'}
+                      onClick={() => handleSort('department')}
+                    >
+                      部門
+                    </TableSortLabel>
+                  </ResizableCell>
+                  <ResizableCell columnKey="partnerCode" sx={{bgcolor:'grey.100'}}>
+                    <TableSortLabel
+                      active={orderBy === 'partnerCode'}
+                      direction={orderBy === 'partnerCode' ? order : 'asc'}
+                      onClick={() => handleSort('partnerCode')}
+                    >
+                      取引先コード
+                    </TableSortLabel>
+                  </ResizableCell>
+                  <ResizableCell columnKey="partner" sx={{bgcolor:'grey.100'}}>
+                    <TableSortLabel
+                      active={orderBy === 'partner'}
+                      direction={orderBy === 'partner' ? order : 'asc'}
+                      onClick={() => handleSort('partner')}
+                    >
+                      取引先名
+                    </TableSortLabel>
+                  </ResizableCell>
+                  <ResizableCell columnKey="store" sx={{bgcolor:'grey.100'}}>
+                    <TableSortLabel
+                      active={orderBy === 'store'}
+                      direction={orderBy === 'store' ? order : 'asc'}
+                      onClick={() => handleSort('store')}
+                    >
+                      応援店舗
+                    </TableSortLabel>
+                  </ResizableCell>
+                  <ResizableCell columnKey="createdAt" sx={{bgcolor:'grey.100'}}>
+                    <TableSortLabel
+                      active={orderBy === 'createdAt'}
+                      direction={orderBy === 'createdAt' ? order : 'asc'}
+                      onClick={() => handleSort('createdAt')}
+                    >
+                      依頼日
+                    </TableSortLabel>
+                  </ResizableCell>
+                  <ResizableCell columnKey="confirmedAt" sx={{bgcolor:'grey.100'}}>
+                    <TableSortLabel
+                      active={orderBy === 'confirmedAt'}
+                      direction={orderBy === 'confirmedAt' ? order : 'asc'}
+                      onClick={() => handleSort('confirmedAt')}
+                    >
+                      確定日
+                    </TableSortLabel>
+                  </ResizableCell>
+                  <ResizableCell columnKey="estimate" sx={{bgcolor:'grey.100'}}>見積金額</ResizableCell>
+                </TableRow>
+              </TableHead>
+              <TableBody>
+                {paged.map((item, idx) => (
+                  <TableRow key={item.id} hover>
+                    <TableCell padding="checkbox">
+                      <Checkbox
+                        checked={selected.includes(item.id)}
+                        onChange={() => handleSelect(item.id)}
+                      />
+                    </TableCell>
+                    <TableCell>{page * rowsPerPage + idx + 1}</TableCell>
+                    <TableCell>
+                      <Button size="small" onClick={()=>setDetail(item)}>詳細</Button>
+                    </TableCell>
+                    <TableCell>
+                      <Chip label={STATUSES.find(s=>s.key===item.status)?.label} color={STATUSES.find(s=>s.key===item.status)?.color} size="small"/>
+                    </TableCell>
+                    <TableCell>{item.schedules?.map(s => s.date).join('、')}</TableCell>
+                    <TableCell>{item.schedules?.[0]?.startTime || '—'}</TableCell>
+                    <TableCell>{item.schedules?.[0]?.endTime || '—'}</TableCell>
+                    <TableCell>{item.heads}</TableCell>
+                    <TableCell>{item.department}</TableCell>
+                    <TableCell className="mono">{item.partnerCode}</TableCell>
+                    <TableCell>{item.partner}</TableCell>
+                    <TableCell>{item.store}</TableCell>
+                    <TableCell>{fmtDate(item.createdAt)}</TableCell>
+                    <TableCell>{fmtDate(item.confirmedAt)}</TableCell>
+                    <TableCell>{item.estimate ? yen(item.estimate.amount) : '—'}</TableCell>
+                  </TableRow>
+                ))}
+              </TableBody>
+            </Table>
+          </TableContainer>
+          <Box component="div" sx={{display:'flex', justifyContent:'flex-end'}}>
+            <Stack direction="row" spacing={1} alignItems="center" sx={{py:1, px:2}}>
+              <Typography variant="body2">ページあたりの行数:</Typography>
+              <Select
+                value={rowsPerPage}
+                onChange={(e) => { setRowsPerPage(Number(e.target.value)); setPage(0); }}
+                size="small"
+                sx={{minWidth:80}}
+              >
+                <MenuItem value={10}>10</MenuItem>
+                <MenuItem value={25}>25</MenuItem>
+                <MenuItem value={50}>50</MenuItem>
+                <MenuItem value={100}>100</MenuItem>
+              </Select>
+              <Typography variant="body2" sx={{ml:2}}>
+                {filtered.length === 0 ? '0件' : `${page * rowsPerPage + 1}–${Math.min((page + 1) * rowsPerPage, filtered.length)} / ${filtered.length}件`}
+              </Typography>
+              <IconButton
+                onClick={() => setPage(p => Math.max(0, p - 1))}
+                disabled={page === 0}
+                size="small"
+              >
+                <span className="material-icons">chevron_left</span>
+              </IconButton>
+              <IconButton
+                onClick={() => setPage(p => Math.min(Math.ceil(filtered.length / rowsPerPage) - 1, p + 1))}
+                disabled={page >= Math.ceil(filtered.length / rowsPerPage) - 1}
+                size="small"
+              >
+                <span className="material-icons">chevron_right</span>
+              </IconButton>
+            </Stack>
+          </Box>
+        </Paper>
+      </Container>
+
+      <CreateDialog open={dlgCreate} onClose={()=>setDlgCreate(false)} onCreate={createItem}/>
+      <AddSampleDialog open={dlgSample} onClose={()=>setDlgSample(false)} onAdd={addSample}/>
+      <DetailDialog
+        open={!!detail}
+        onClose={()=>setDetail(null)}
+        item={detail}
+        role={role}
+        onAction={handleAction}
+      />
+      <EstimateDialog
+        open={!!estimateTarget}
+        onClose={()=>setEstimateTarget(null)}
+        item={estimateTarget}
+        onSubmit={(payload)=>submitEstimate(estimateTarget.id, payload)}
+      />
+      <Snackbar open={!!snack} autoHideDuration={3000} onClose={()=>setSnack(null)} anchorOrigin={{vertical:'bottom', horizontal:'center'}}>
+        {snack && <Alert severity={snack.severity} onClose={()=>setSnack(null)} variant="filled">{snack.msg}</Alert>}
+      </Snackbar>
+    </ThemeProvider>
+  );
+}
+
+const root = ReactDOM.createRoot(document.getElementById('root'));
+root.render(<App/>);
+</script>
+</body>
+</html>
