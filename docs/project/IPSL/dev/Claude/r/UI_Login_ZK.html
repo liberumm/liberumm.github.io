@@ -1,0 +1,722 @@
+<!DOCTYPE html>
+<html lang="ja">
+  <head>
+    <meta charset="UTF-8" />
+    <title>行動指紋 ABV デモ - 9点選択版（React 19 + MUI）</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+
+    <!-- Roboto -->
+    <link
+      rel="stylesheet"
+      href="https://fonts.googleapis.com/css2?family=Roboto:wght@300;400;600;700&display=swap"
+    />
+
+    <!-- Material Icons -->
+    <link
+      rel="stylesheet"
+      href="https://fonts.googleapis.com/icon?family=Material+Icons"
+    />
+  </head>
+  <body>
+    <div id="root"></div>
+
+    <!-- Babel Standalone -->
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+
+    <!-- React 19 / MUI 7.3.5 / Icons (ESM) -->
+    <script type="module">
+      import React from "https://esm.sh/react@19.2.0";
+      import { createRoot } from "https://esm.sh/react-dom@19.2.0/client";
+      import * as MaterialUI from "https://esm.sh/@mui/material@7.3.5?deps=react@19.2.0,react-dom@19.2.0";
+      import * as MaterialIcons from "https://esm.sh/@mui/icons-material@7.3.5?deps=react@19.2.0,react-dom@19.2.0";
+
+      const appCode = `
+        const { useState, useRef } = React;
+        const rootElement = document.getElementById("root");
+
+        const {
+          ThemeProvider,
+          createTheme,
+          CssBaseline,
+          Container,
+          Box,
+          Stack,
+          TextField,
+          Button,
+          Typography,
+          Card,
+          CardContent,
+          Chip,
+          Divider,
+        } = MaterialUI;
+
+        const { Fingerprint, DeleteOutline } = MaterialIcons;
+
+        // ====== ABV 設定値 ======
+        const ENROLL_ROUNDS = 5;
+        const VERIFY_ROUNDS = 3;
+        const PASS_THRESHOLD = 0.93;
+
+        const ROUND_PROMPT =
+          '9個の点の中で、なんとなく気になった点を好きな数だけタップしてONにし、「このラウンドを確定」を押してください。0個でも9個でもOKで、正解はありません。';
+
+        // ====== ユーティリティ ======
+        function meanVector(vectors) {
+          if (!vectors || !vectors.length) return null;
+          const dim = vectors[0].length;
+          const sum = new Array(dim).fill(0);
+          for (let i = 0; i < vectors.length; i++) {
+            const v = vectors[i];
+            for (let j = 0; j < dim; j++) {
+              sum[j] += v[j];
+            }
+          }
+          return sum.map((x) => x / vectors.length);
+        }
+
+        function cosineSimilarity(a, b) {
+          if (!a || !b || a.length !== b.length) return 0;
+          let dot = 0;
+          let na = 0;
+          let nb = 0;
+          for (let i = 0; i < a.length; i++) {
+            dot += a[i] * b[i];
+            na += a[i] * a[i];
+            nb += b[i] * b[i];
+          }
+          if (na === 0 || nb === 0) return 0;
+          return dot / (Math.sqrt(na) * Math.sqrt(nb));
+        }
+
+        function saveABV(userId, vector) {
+          try {
+            const key = 'abv_demo:' + userId;
+            const payload = { abv: vector, createdAt: Date.now() };
+            window.localStorage.setItem(key, JSON.stringify(payload));
+          } catch (e) {
+            // noop
+          }
+        }
+
+        function loadABV(userId) {
+          try {
+            const key = 'abv_demo:' + userId;
+            const raw = window.localStorage.getItem(key);
+            if (!raw) return null;
+            const obj = JSON.parse(raw);
+            return obj && obj.abv ? obj.abv : null;
+          } catch (e) {
+            return null;
+          }
+        }
+
+        function clearAllABV() {
+          try {
+            const storage = window.localStorage;
+            const prefix = 'abv_demo:';
+            const keys = [];
+            for (let i = 0; i < storage.length; i++) {
+              const k = storage.key(i);
+              if (k && k.indexOf(prefix) === 0) keys.push(k);
+            }
+            keys.forEach((k) => storage.removeItem(k));
+            return keys.length;
+          } catch (e) {
+            return 0;
+          }
+        }
+
+        // ====== テーマ（ライト＋コントラスト高め） ======
+        const theme = createTheme({
+          palette: {
+            mode: 'light',
+            primary: { main: '#2563eb' },
+            background: {
+              default: '#f3f4f6',
+              paper: '#ffffff',
+            },
+          },
+          typography: {
+            fontFamily: '"Roboto", "Helvetica", "Arial", sans-serif',
+          },
+          shape: {
+            borderRadius: 16,
+          },
+        });
+
+        // ====== メインコンポーネント ======
+        function App() {
+          const [mode, setMode] = useState('enroll'); // 'enroll' | 'verify'
+          const [userId, setUserId] = useState('');
+          const [round, setRound] = useState(0);
+          const [totalRounds, setTotalRounds] = useState(0);
+          const [similarity, setSimilarity] = useState(null);
+          const [questionText, setQuestionText] = useState(
+            'IDを入力し、「登録を開始」を押すと、5回、9個の点の中から好きな数だけONにしてもらいます。正解はありません。'
+          );
+          const [status, setStatus] = useState({
+            message: '待機中',
+            type: 'info', // 'info' | 'ok' | 'error'
+          });
+          const [logLines, setLogLines] = useState([]);
+          const [roundStartTime, setRoundStartTime] = useState(null);
+          const [selectedDots, setSelectedDots] = useState(
+            () => new Array(9).fill(false)
+          );
+
+          const roundRef = useRef(0);
+          const vectorsRef = useRef([]);
+
+          function log(msg) {
+            const time = new Date().toLocaleTimeString();
+            setLogLines((prev) => ['[' + time + '] ' + msg].concat(prev));
+          }
+
+          function updateStatus(message, type) {
+            setStatus({ message, type: type || 'info' });
+          }
+
+          function handleModeChange(newMode) {
+            if (newMode === mode) return;
+            const isEnroll = newMode === 'enroll';
+            setMode(newMode);
+            setRound(0);
+            setTotalRounds(0);
+            roundRef.current = 0;
+            vectorsRef.current = [];
+            setSimilarity(null);
+            setSelectedDots(new Array(9).fill(false));
+            setQuestionText(
+              isEnroll
+                ? 'IDを入力し、「登録を開始」を押すと、5回、9個の点の中から好きな数だけONにしてもらいます。正解はありません。'
+                : 'IDを入力し、「ログインを開始」を押すと、登録時と同じルールで3回点をON/OFFしてもらい、そのクセをABVと照合します。'
+            );
+            updateStatus('待機中', 'info');
+          }
+
+          function requireUserId() {
+            const trimmed = (userId || '').trim();
+            if (!trimmed) {
+              updateStatus('IDを入力してください。', 'error');
+              window.alert('IDを入力してください。');
+              return null;
+            }
+            return trimmed;
+          }
+
+          function startNextRound() {
+            if (roundRef.current >= totalRounds) return;
+            roundRef.current += 1;
+            setRound(roundRef.current);
+            setSelectedDots(new Array(9).fill(false));
+            setQuestionText(ROUND_PROMPT);
+            setRoundStartTime(window.performance ? window.performance.now() : Date.now());
+
+            updateStatus(
+              (mode === 'enroll' ? '登録' : 'ログイン') +
+                'ラウンド ' +
+                roundRef.current +
+                ' / ' +
+                totalRounds +
+                '：点を自由にON/OFFしてから「このラウンドを確定」を押してください。',
+              'info'
+            );
+          }
+
+          function buildVectorFromSelection(sel, dt) {
+            // sel: boolean[9], true=選択
+            const count = sel.reduce((acc, v) => acc + (v ? 1 : 0), 0);
+            // 各点: 選択=+1, 非選択=-1
+            const pointDims = sel.map((v) => (v ? 1 : -1));
+            // 選択数 0〜9 -> [-1, 1] にマッピング
+            const countNorm = (count / 4.5) - 1; // 0 -> -1, 9 -> +1
+            // 速度：ラウンド開始から確定までの時間
+            let speed;
+            if (dt < 1500) speed = 1;
+            else if (dt < 4000) speed = 0;
+            else speed = -1;
+            // 11次元：9(点) + 1(数) + 1(速度)
+            return {
+              vec: [...pointDims, countNorm, speed],
+              count,
+              speed,
+            };
+          }
+
+          function finalizeSession() {
+            const baseVec = meanVector(vectorsRef.current);
+            if (!baseVec) {
+              updateStatus('有効なデータがありません。', 'error');
+              return;
+            }
+
+            if (mode === 'enroll') {
+              const id = requireUserId();
+              if (!id) return;
+
+              saveABV(id, baseVec);
+              updateStatus('登録完了。ABV_base を保存しました。', 'ok');
+              setQuestionText(
+                '登録が完了しました。このIDで「ログイン」モードを選び、同じルールで点をON/OFFしてみてください。'
+              );
+              setSimilarity(null);
+              log(
+                '登録完了: ABV_base = [' +
+                  baseVec.map((x) => x.toFixed(3)).join(', ') +
+                  ']'
+              );
+            } else {
+              const id = requireUserId();
+              if (!id) return;
+
+              const stored = loadABV(id);
+              if (!stored) {
+                updateStatus('このIDのABVが登録されていません。先に登録してください。', 'error');
+                window.alert('ABVが未登録です。このIDでまず「登録」を行ってください。');
+                return;
+              }
+              const sim = cosineSimilarity(stored, baseVec);
+              setSimilarity(sim);
+              const ok = sim >= PASS_THRESHOLD;
+              updateStatus(
+                ok
+                  ? '本人っぽい行動パターンです。ログイン成功（デモ）。'
+                  : 'いつもと違う選び方です。ログイン失敗（デモ）。',
+                ok ? 'ok' : 'error'
+              );
+              setQuestionText(
+                ok
+                  ? '類似度が閾値以上のため、「いつものあなたらしい点の選び方」と判定しました。'
+                  : '類似度が低く、「いつもの点の選び方」とは違うと判定しました。'
+              );
+              log(
+                'ログイン試行: similarity=' +
+                  sim.toFixed(3) +
+                  ', result=' +
+                  (ok ? 'PASS' : 'FAIL')
+              );
+            }
+          }
+
+          function handleStart() {
+            const id = requireUserId();
+            if (!id) return;
+
+            if (mode === 'verify') {
+              const existing = loadABV(id);
+              if (!existing) {
+                updateStatus('このIDのABVが見つかりません。先に「登録」を実行してください。', 'error');
+                window.alert('ABVが未登録です。このIDでまず「登録」を行ってください。');
+                return;
+              }
+            }
+
+            const rounds = mode === 'enroll' ? ENROLL_ROUNDS : VERIFY_ROUNDS;
+            setTotalRounds(rounds);
+            roundRef.current = 0;
+            setRound(0);
+            vectorsRef.current = [];
+            setSimilarity(null);
+            setSelectedDots(new Array(9).fill(false));
+            log(
+              (mode === 'enroll' ? '登録' : 'ログイン') +
+                'セッション開始（userId=' +
+                id +
+                ', rounds=' +
+                rounds +
+                '）'
+            );
+            startNextRound();
+          }
+
+          function handleDotClick(index) {
+            if (roundRef.current === 0 || roundRef.current > totalRounds) {
+              // まだセッション開始前
+              return;
+            }
+            setSelectedDots((prev) => {
+              const next = prev.slice();
+              next[index] = !next[index];
+              return next;
+            });
+          }
+
+          function handleConfirmRound() {
+            if (roundRef.current === 0 || roundRef.current > totalRounds) {
+              return;
+            }
+            const now = window.performance ? window.performance.now() : Date.now();
+            const dt = roundStartTime != null ? now - roundStartTime : 0;
+
+            const { vec, count, speed } = buildVectorFromSelection(selectedDots, dt);
+            vectorsRef.current = vectorsRef.current.concat([vec]);
+
+            const selectedIndices = selectedDots
+              .map((v, idx) => (v ? idx : null))
+              .filter((v) => v !== null);
+
+            log(
+              'ラウンド' +
+                roundRef.current +
+                ': selectedIndices=[' +
+                selectedIndices.join(',') +
+                '], count=' +
+                count +
+                ', speed=' +
+                speed +
+                ' (dt=' +
+                Math.round(dt) +
+                'ms), vec=[' +
+                vec.map((x) => x.toFixed(2)).join(', ') +
+                ']'
+            );
+
+            if (roundRef.current >= totalRounds) {
+              finalizeSession();
+            } else {
+              startNextRound();
+            }
+          }
+
+          function handleClearClick() {
+            const ok = window.confirm(
+              'このブラウザに保存された ABV データ（abv_demo:*）を削除しますか？'
+            );
+            if (!ok) return;
+            const count = clearAllABV();
+            log('localStorage から ABV データを削除しました（' + count + ' 件）');
+            window.alert('ABV データを削除しました。');
+          }
+
+          const startLabel = mode === 'enroll' ? '登録を開始' : 'ログインを開始';
+          const modeLabel = mode === 'enroll' ? '登録' : 'ログイン';
+
+          let statusColor = 'text.secondary';
+          if (status.type === 'ok') statusColor = 'success.main';
+          else if (status.type === 'error') statusColor = 'error.main';
+
+          const confirmDisabled = roundRef.current === 0 || totalRounds === 0;
+
+          return (
+            <ThemeProvider theme={theme}>
+              <CssBaseline />
+              <Box
+                sx={{
+                  minHeight: '100vh',
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'center',
+                  bgcolor: 'background.default',
+                  p: { xs: 2, sm: 3 },
+                }}
+              >
+                <Container maxWidth="md">
+                  <Card
+                    sx={{
+                      borderRadius: 3,
+                      bgcolor: 'background.paper',
+                      border: '1px solid #e5e7eb',
+                      boxShadow: '0 18px 45px rgba(15,23,42,0.12)',
+                      color: 'text.primary',
+                    }}
+                  >
+                    <CardContent>
+                      <Stack spacing={2.5}>
+                        {/* ヘッダー */}
+                        <Stack direction="row" spacing={1.5} alignItems="center">
+                          <Box
+                            sx={{
+                              width: 32,
+                              height: 32,
+                              borderRadius: '50%',
+                              display: 'flex',
+                              alignItems: 'center',
+                              justifyContent: 'center',
+                              background:
+                                'radial-gradient(circle at 30% 0%, #38bdf8, #6366f1)',
+                              boxShadow: '0 0 12px rgba(37,99,235,0.55)',
+                              color: '#ffffff',
+                            }}
+                          >
+                            <Fingerprint fontSize="small" />
+                          </Box>
+                          <Box>
+                            <Typography variant="h6" sx={{ fontWeight: 600 }}>
+                              行動指紋 ABV デモ（9点選択版）
+                            </Typography>
+                            <Typography variant="body2" color="text.secondary">
+                              3×3の9点のON/OFFパターンと完了までの速度からABVを作り、「どんな風に点を選びがちか」のクセで本人っぽさをざっくり推定します。
+                            </Typography>
+                          </Box>
+                        </Stack>
+
+                        {/* モード切り替え */}
+                        <Stack
+                          direction={{ xs: 'column', sm: 'row' }}
+                          spacing={1}
+                          alignItems={{ xs: 'stretch', sm: 'center' }}
+                          justifyContent="space-between"
+                        >
+                          <Stack direction="row" spacing={1}>
+                            <Button
+                              size="small"
+                              variant={mode === 'enroll' ? 'contained' : 'outlined'}
+                              color="primary"
+                              onClick={() => handleModeChange('enroll')}
+                            >
+                              登録（行動指紋を学習）
+                            </Button>
+                            <Button
+                              size="small"
+                              variant={mode === 'verify' ? 'contained' : 'outlined'}
+                              color="primary"
+                              onClick={() => handleModeChange('verify')}
+                            >
+                              ログイン（照合）
+                            </Button>
+                          </Stack>
+                          <Chip
+                            label={'現在モード: ' + modeLabel}
+                            size="small"
+                            variant="outlined"
+                            sx={{ borderColor: '#cbd5f5' }}
+                          />
+                        </Stack>
+
+                        <Divider />
+
+                        {/* 上段：説明 + ID + 開始 */}
+                        <Stack
+                          direction={{ xs: 'column', sm: 'row' }}
+                          spacing={2}
+                          alignItems={{ xs: 'stretch', sm: 'flex-end' }}
+                        >
+                          <Box sx={{ flex: 1 }}>
+                            <Typography variant="body2" sx={{ mb: 1 }}>
+                              {questionText}
+                            </Typography>
+                            <Stack
+                              direction="row"
+                              spacing={1}
+                              alignItems="center"
+                              flexWrap="wrap"
+                            >
+                              <TextField
+                                size="small"
+                                label="ID"
+                                variant="outlined"
+                                value={userId}
+                                onChange={(e) => setUserId(e.target.value)}
+                                sx={{ maxWidth: 220 }}
+                              />
+                              <Chip
+                                label={'ラウンド ' + round + ' / ' + totalRounds}
+                                size="small"
+                                variant="outlined"
+                                sx={{ borderColor: '#cbd5f5' }}
+                              />
+                              <Chip
+                                label={
+                                  '類似度: ' +
+                                  (similarity == null ? '-' : similarity.toFixed(3))
+                                }
+                                size="small"
+                                variant="outlined"
+                                sx={{ borderColor: '#cbd5f5' }}
+                              />
+                            </Stack>
+                          </Box>
+                          <Button
+                            variant="contained"
+                            color="primary"
+                            onClick={handleStart}
+                            sx={{ minWidth: 140 }}
+                          >
+                            {startLabel}
+                          </Button>
+                        </Stack>
+
+                        {/* 中段：9点パネル + 確定ボタン */}
+                        <Box>
+                          <Typography variant="caption" color="text.secondary">
+                            各ラウンドで、気になった点を0〜9個タップしてONにし、「このラウンドを確定」を押してください。
+                          </Typography>
+                          <Box
+                            sx={{
+                              mt: 1,
+                              borderRadius: 2,
+                              border: '1px solid #e5e7eb',
+                              bgcolor: '#f9fafb',
+                              p: 2,
+                            }}
+                          >
+                            <Box
+                              sx={{
+                                display: 'grid',
+                                gridTemplateColumns: 'repeat(3, 1fr)',
+                                gap: 2,
+                                maxWidth: 320,
+                                mx: 'auto',
+                              }}
+                            >
+                              {selectedDots.map((on, idx) => (
+                                <Box
+                                  key={idx}
+                                  onClick={() => handleDotClick(idx)}
+                                  sx={{
+                                    aspectRatio: '1 / 1',
+                                    display: 'flex',
+                                    alignItems: 'center',
+                                    justifyContent: 'center',
+                                    cursor:
+                                      roundRef.current > 0 && totalRounds > 0
+                                        ? 'pointer'
+                                        : 'default',
+                                  }}
+                                >
+                                  <Box
+                                    sx={{
+                                      width: 40,
+                                      height: 40,
+                                      borderRadius: '50%',
+                                      border: '2px solid',
+                                      borderColor: on ? '#2563eb' : '#cbd5f5',
+                                      bgcolor: on ? '#dbeafe' : '#ffffff',
+                                      boxShadow: on
+                                        ? '0 0 6px rgba(37,99,235,0.7)'
+                                        : 'none',
+                                      transition:
+                                        'background-color 0.12s ease, border-color 0.12s ease, box-shadow 0.12s ease',
+                                    }}
+                                  />
+                                </Box>
+                              ))}
+                            </Box>
+
+                            <Stack
+                              direction={{ xs: 'column', sm: 'row' }}
+                              spacing={1}
+                              alignItems={{ xs: 'stretch', sm: 'center' }}
+                              justifyContent="space-between"
+                              sx={{ mt: 2 }}
+                            >
+                              <Typography variant="caption" color="text.secondary">
+                                ラウンド中は何度でもON/OFFを切り替えられます。しっくりきた状態で「このラウンドを確定」を押してください。
+                              </Typography>
+                              <Button
+                                variant="outlined"
+                                color="primary"
+                                onClick={handleConfirmRound}
+                                disabled={confirmDisabled}
+                              >
+                                このラウンドを確定
+                              </Button>
+                            </Stack>
+                          </Box>
+                        </Box>
+
+                        {/* ステータス */}
+                        <Stack
+                          direction={{ xs: 'column', sm: 'row' }}
+                          spacing={1}
+                          alignItems={{ xs: 'flex-start', sm: 'center' }}
+                          justifyContent="space-between"
+                        >
+                          <Typography variant="body2" sx={{ color: statusColor }}>
+                            ステータス: {status.message}
+                          </Typography>
+                          <Typography variant="caption" color="text.secondary">
+                            localStorage キー: abv_demo:&lt;userId&gt;
+                          </Typography>
+                        </Stack>
+
+                        {/* ログ */}
+                        <Box>
+                          <Typography variant="caption" color="text.secondary">
+                            ログ（新しい順）
+                          </Typography>
+                          <Box
+                            sx={{
+                              mt: 0.5,
+                              borderRadius: 1,
+                              border: '1px dashed #e5e7eb',
+                              bgcolor: '#f9fafb',
+                              p: 1,
+                              maxHeight: 160,
+                              overflow: 'auto',
+                              fontFamily:
+                                'ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace',
+                              fontSize: 12,
+                              whiteSpace: 'pre-wrap',
+                              wordBreak: 'break-all',
+                            }}
+                          >
+                            {logLines.length === 0 ? (
+                              <Typography variant="caption" color="text.secondary">
+                                ここに ABV の登録・ログインログ（点のON/OFFパターンと速度）が表示されます。
+                              </Typography>
+                            ) : (
+                              logLines.map((line, idx) => (
+                                <Typography key={idx} variant="caption" sx={{ display: 'block' }}>
+                                  {line}
+                                </Typography>
+                              ))
+                            )}
+                          </Box>
+                        </Box>
+
+                        <Divider />
+
+                        {/* フッター */}
+                        <Stack
+                          direction={{ xs: 'column', sm: 'row' }}
+                          spacing={1}
+                          alignItems={{ xs: 'flex-start', sm: 'center' }}
+                          justifyContent="space-between"
+                        >
+                          <Typography variant="caption" color="text.secondary">
+                            ※これは概念デモです。実際の認証・暗号安全性は保証しません。
+                          </Typography>
+                          <Button
+                            size="small"
+                            color="inherit"
+                            startIcon={<DeleteOutline fontSize="small" />}
+                            onClick={handleClearClick}
+                          >
+                            このブラウザの ABV データを削除
+                          </Button>
+                        </Stack>
+                      </Stack>
+                    </CardContent>
+                  </Card>
+                </Container>
+              </Box>
+            </ThemeProvider>
+          );
+        }
+
+        const root = createRoot(rootElement);
+        root.render(
+          <React.StrictMode>
+            <App />
+          </React.StrictMode>
+        );
+      `;
+
+      const { code } = Babel.transform(appCode, {
+        presets: ["react"],
+      });
+
+      const runApp = new Function(
+        "React",
+        "createRoot",
+        "MaterialUI",
+        "MaterialIcons",
+        code
+      );
+
+      runApp(React, createRoot, MaterialUI, MaterialIcons);
+    </script>
+  </body>
+</html>
+

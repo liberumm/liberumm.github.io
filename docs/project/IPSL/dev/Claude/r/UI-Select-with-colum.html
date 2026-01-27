@@ -1,0 +1,719 @@
+<!DOCTYPE html>
+<html lang="ja">
+  <head>
+    <meta charset="UTF-8" />
+    <title>React 19 + MUI 7.3.5 - Dense UI + Leaf Direct + Sticky Confirm (Accordion Stable + Breadcrumb Labels)</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+
+    <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Roboto:wght@300;400;600;700&display=swap" />
+    <link rel="stylesheet" href="https://fonts.googleapis.com/icon?family=Material+Icons" />
+  </head>
+
+  <body>
+    <div id="root"></div>
+
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+
+    <script type="module">
+      import React from "https://esm.sh/react@19.2.0";
+      import { createRoot } from "https://esm.sh/react-dom@19.2.0/client";
+      import * as MaterialUI from "https://esm.sh/@mui/material@7.3.5?deps=react@19.2.0,react-dom@19.2.0";
+      import * as MaterialIcons from "https://esm.sh/@mui/icons-material@7.3.5?deps=react@19.2.0,react-dom@19.2.0";
+
+      const appCode = `
+const { useMemo, useState, useEffect, useRef } = React;
+
+const {
+  ThemeProvider, createTheme, CssBaseline, Container, Box, Stack, Button, Typography,
+  Dialog, DialogTitle, DialogContent, Divider, IconButton, Tooltip, TextField,
+  List, ListItemButton, ListItemText, Grid, Paper, useMediaQuery,
+  Accordion, AccordionSummary, AccordionDetails, AppBar, Toolbar,
+} = MaterialUI;
+
+const { Close, RestartAlt, ExpandMore, ArrowUpward } = MaterialIcons;
+
+/* =========================
+   DATA：ここだけ差し替えればOK
+========================= */
+const RAW_ROWS = [
+  { smtBushoCd:"101", smtBushoNm:"SMT東京", kanjoCd:"100001", kanjoNm:"現金及び預金", meisaiCd:"10000101", meisaiNm:"普通預金", naiwakeCd:"0000000001", naiwakeNm:"三菱UFJ", naiwakeShort:"MUFG" },
+  { smtBushoCd:"101", smtBushoNm:"SMT東京", kanjoCd:"100001", kanjoNm:"現金及び預金", meisaiCd:"10000101", meisaiNm:"普通預金", naiwakeCd:"0000000002", naiwakeNm:"みずほ", naiwakeShort:"MIZUHO" },
+  { smtBushoCd:"102", smtBushoNm:"SMT大阪", kanjoCd:"200010", kanjoNm:"買掛金", meisaiCd:"20001001", meisaiNm:"国内買掛金", naiwakeCd:"0000000101", naiwakeNm:"仕入先A", naiwakeShort:"A" },
+];
+
+/* =========================
+   TREE BUILD：SMT → 勘定 → 明細 → 内訳(leaf)
+========================= */
+const S = (v) => String(v ?? "");
+const safeLabel = (nm, cd) => (S(nm).trim() ? S(nm).trim() : S(cd));
+
+function buildOptionsFromRows(rows) {
+  const rootMap = new Map();
+  const up = (m, id, label, extra = {}) =>
+    m.get(id) ?? (m.set(id, { id, label, ...extra, children: [] }), m.get(id));
+
+  for (const r of rows) {
+    const smtCd = S(r.smtBushoCd), smtNm = safeLabel(r.smtBushoNm, smtCd);
+    const kanjoCd = S(r.kanjoCd),  kanjoNm = safeLabel(r.kanjoNm, kanjoCd);
+    const meisaiCd = S(r.meisaiCd), meisaiNm = safeLabel(r.meisaiNm, meisaiCd);
+    const naiwakeCd = S(r.naiwakeCd), naiwakeNm = safeLabel(r.naiwakeNm, naiwakeCd);
+
+    const smtId = smtCd;
+    const kanjoId = \`\${smtCd}|\${kanjoCd}\`;
+    const meisaiId = \`\${smtCd}|\${kanjoCd}|\${meisaiCd}\`;
+    const leafId = \`\${smtCd}|\${kanjoCd}|\${meisaiCd}|\${naiwakeCd}\`;
+
+    const smt = up(rootMap, smtId, smtNm, { code: smtCd });
+    const kanjoMap = (smt.__m ??= new Map());
+    const kanjo = up(kanjoMap, kanjoId, kanjoNm, { code: kanjoCd });
+    const meisaiMap = (kanjo.__m ??= new Map());
+    const meisai = up(meisaiMap, meisaiId, meisaiNm, { code: meisaiCd });
+
+    meisai.children.push({
+      id: leafId, label: naiwakeNm, code: naiwakeCd,
+      smtBushoCd: smtCd, smtBushoNm: smtNm,
+      kanjoCd, kanjoNm,
+      meisaiCd, meisaiNm,
+      naiwakeCd, naiwakeNm,
+      naiwakeShort: S(r.naiwakeShort),
+      _raw: r,
+    });
+  }
+
+  const roots = [];
+  for (const smt of rootMap.values()) {
+    const km = smt.__m ?? new Map();
+    smt.children = Array.from(km.values()).map((kanjo) => {
+      const mm = kanjo.__m ?? new Map();
+      kanjo.children = Array.from(mm.values()).map((meisai) => {
+        meisai.children = Array.from(new Map(meisai.children.map((x) => [x.id, x])).values());
+        return meisai;
+      });
+      delete kanjo.__m;
+      return kanjo;
+    });
+    delete smt.__m;
+    roots.push(smt);
+  }
+  return roots;
+}
+
+const OPTIONS = buildOptionsFromRows(RAW_ROWS);
+
+/* =========================
+   UTIL
+========================= */
+const findById = (pool, id) => pool?.find((x) => x.id === id) ?? null;
+
+function flattenAll(nodes) {
+  const out = [];
+  (function walk(pool) {
+    for (const n of pool) {
+      out.push(n);
+      if (n.children) walk(n.children);
+    }
+  })(nodes);
+  return out;
+}
+
+const LEAVES = flattenAll(OPTIONS).filter((n) => !n.children?.length);
+const ALL_KANJOS = OPTIONS.flatMap((s) => s.children ?? []);
+const ALL_MEISAIS = ALL_KANJOS.flatMap((k) => k.children ?? []);
+
+function filterByQuery(pool, q) {
+  const s = (q ?? "").trim().toLowerCase();
+  if (!s) return pool;
+  return pool.filter((x) => {
+    const hay = [
+      x.label, x.id, x.code,
+      x.smtBushoCd, x.smtBushoNm,
+      x.kanjoCd, x.kanjoNm,
+      x.meisaiCd, x.meisaiNm,
+      x.naiwakeCd, x.naiwakeNm,
+      x.naiwakeShort,
+    ].map(S).join(" ").toLowerCase();
+    return hay.includes(s);
+  });
+}
+
+/* =========================
+   THEME（dense）
+========================= */
+const theme = createTheme({
+  palette: { mode: "light", primary: { main: "#1976d2" } },
+  typography: { fontFamily: '"Roboto","Helvetica","Arial",sans-serif', fontSize: 12 },
+  components: { MuiListItemButton: { styleOverrides: { root: { paddingTop: 4, paddingBottom: 4 } } } },
+});
+
+/* =========================
+   TOP SUMMARY（パンくず：コード＋ラベル）
+========================= */
+function SummaryBar({ sel0, sel1, sel2, selLeaf }) {
+  const fmt = (x) => {
+    if (!x) return "";
+    const c = S(x.code).trim();
+    const l = S(x.label).trim();
+    if (c && l) return \`\${c} \${l}\`;
+    return c || l || "";
+  };
+  const parts = [sel0, sel1, sel2, selLeaf].map(fmt).filter(Boolean);
+  const crumb = parts.join(" > ");
+
+  return (
+    <Paper variant="outlined" sx={{ p: 1, bgcolor: "action.hover", borderColor: "primary.light" }}>
+      <Box sx={{ display: "flex", gap: 1, alignItems: "baseline", minWidth: 0 }}>
+        <Typography variant="caption" sx={{ color: "text.secondary", flex: "0 0 auto" }}>選択</Typography>
+        <Typography
+          sx={{ fontSize: 12, fontWeight: 900, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}
+          title={crumb}
+        >
+          {crumb || "未選択"}
+        </Typography>
+      </Box>
+    </Paper>
+  );
+}
+
+/* =========================
+   FINAL PICK（確定バー内）
+========================= */
+function FinalPickMini({ sel0, sel1, sel2, selLeaf }) {
+  const main = selLeaf ? \`\${selLeaf.code}　\${selLeaf.label}\` : "未選択";
+  const crumb = [sel0, sel1, sel2, selLeaf].map((x) => x?.code || x?.label).filter(Boolean).join(" > ");
+
+  return (
+    <Box sx={{ minWidth: 0, textAlign: "center" }}>
+      <Typography variant="caption" color="text.secondary" sx={{ display: "block" }}>最終選択（内訳）</Typography>
+      <Typography sx={{ fontSize: 13, fontWeight: 900, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }} title={main}>
+        {main}
+      </Typography>
+      <Typography variant="caption" color="text.secondary" sx={{ display: "block", minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }} title={crumb}>
+        {crumb || "上位は補助（任意）"}
+      </Typography>
+    </Box>
+  );
+}
+
+/* =========================
+   STICKY/FIXED CONFIRM BAR（情報中央＋ボタン右固定）
+========================= */
+function StickyConfirmBar({ isMobile, sel0, sel1, sel2, selLeaf, canConfirm, onReset, onConfirm, onGoTop }) {
+  return (
+    <Box
+      sx={{
+        position: isMobile ? "fixed" : "sticky",
+        left: 0, right: 0, bottom: 0,
+        bgcolor: "background.paper",
+        borderTop: "1px solid",
+        borderColor: "divider",
+        zIndex: 1301,
+        px: 1.25,
+        py: 1,
+      }}
+    >
+      <Box sx={{ width: "100%", maxWidth: 980, mx: "auto", position: "relative" }}>
+        <Stack
+          direction={{ xs: "column", sm: "row" }}
+          spacing={1}
+          alignItems={{ xs: "stretch", sm: "center" }}
+          sx={{ width: "100%" }}
+        >
+          {isMobile && (
+            <Box sx={{ display: "flex", justifyContent: "flex-end" }}>
+              <Button
+                variant="outlined"
+                onClick={onGoTop}
+                startIcon={<ArrowUpward />}
+                sx={{ fontWeight: 900, whiteSpace: "nowrap" }}
+              >
+                上へ
+              </Button>
+            </Box>
+          )}
+
+          <Box sx={{ flex: "1 1 auto", minWidth: 0, display: "flex", justifyContent: "center" }}>
+            <FinalPickMini sel0={sel0} sel1={sel1} sel2={sel2} selLeaf={selLeaf} />
+          </Box>
+
+          <Stack
+            direction="row"
+            spacing={1}
+            justifyContent="flex-end"
+            sx={{
+              ...(isMobile
+                ? {}
+                : { position: "absolute", right: 0, top: "50%", transform: "translateY(-50%)" }),
+            }}
+          >
+            <Button variant="outlined" onClick={onReset} sx={{ fontWeight: 900, whiteSpace: "nowrap" }}>
+              選びなおし
+            </Button>
+            <Button
+              variant="contained"
+              onClick={onConfirm}
+              disabled={!canConfirm}
+              sx={{ fontWeight: 900, whiteSpace: "nowrap" }}
+            >
+              確定
+            </Button>
+          </Stack>
+        </Stack>
+      </Box>
+
+      {isMobile && (
+        <Typography variant="caption" color="text.secondary" sx={{ display: "block", mt: 0.5, textAlign: "right" }}>
+          内訳を選ぶと確定できます（上位は補助）
+        </Typography>
+      )}
+    </Box>
+  );
+}
+
+/* =========================
+   DESKTOP COLUMN PANEL
+========================= */
+function ColumnPanel({ title, query, setQuery, items, selectedId, onPick, helper, mode }) {
+  return (
+    <Paper variant="outlined" sx={{ height: 450, display: "flex", flexDirection: "column" }}>
+      <Box sx={{ p: 1, borderBottom: "1px solid", borderColor: "divider" }}>
+        <Typography variant="subtitle2" noWrap sx={{ fontSize: 12, fontWeight: 800 }}>{title}</Typography>
+
+        <TextField
+          size="small"
+          fullWidth
+          value={query}
+          onChange={(e) => setQuery(e.target.value)}
+          placeholder="検索"
+          sx={{ mt: 0.75 }}
+          inputProps={{ style: { fontSize: 12, paddingTop: 6, paddingBottom: 6 } }}
+        />
+
+        {helper && (
+          <Typography
+            variant="caption"
+            color="text.secondary"
+            sx={{ display: "block", mt: 0.5, fontSize: 11, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}
+            title={helper}
+          >
+            {helper}
+          </Typography>
+        )}
+      </Box>
+
+      <Box sx={{ flex: 1, overflow: "auto" }}>
+        <List dense disablePadding>
+          {items.map((x) => {
+            const isSel = x.id === selectedId;
+            return (
+              <ListItemButton
+                key={x.id}
+                selected={isSel}
+                onClick={() => onPick(x.id)}
+                sx={{
+                  alignItems: "flex-start",
+                  px: 1,
+                  ...(isSel ? { bgcolor: "primary.50", borderLeft: "3px solid", borderLeftColor: "primary.main" } : null),
+                }}
+              >
+                <ListItemText
+                  primary={
+                    <Box sx={{ display: "flex", gap: 1, alignItems: "baseline", minWidth: 0 }}>
+                      <Typography
+                        sx={{
+                          fontSize: 12,
+                          fontWeight: 900,
+                          fontFamily:
+                            "ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', 'Courier New', monospace",
+                          flex: "0 0 auto",
+                        }}
+                      >
+                        {x.code ?? ""}
+                      </Typography>
+
+                      <Typography
+                        sx={{ fontSize: 12, fontWeight: 700, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}
+                        title={x.label}
+                      >
+                        {mode === "leaf" ? \`\${x.label}（\${x.meisaiNm} / \${x.kanjoNm}）\` : x.label}
+                      </Typography>
+                    </Box>
+                  }
+                  secondary={mode === "leaf" ? \`明細:\${x.meisaiCd} 勘定:\${x.kanjoCd} 部署:\${x.smtBushoCd}\` : ""}
+                  secondaryTypographyProps={{
+                    sx: { fontSize: 10.5, color: "text.secondary", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" },
+                  }}
+                />
+              </ListItemButton>
+            );
+          })}
+
+          {items.length === 0 && <Box sx={{ p: 1.5, color: "text.secondary", fontSize: 12 }}>候補がありません</Box>}
+        </List>
+      </Box>
+    </Paper>
+  );
+}
+
+/* =========================
+   MOBILE STAGE
+========================= */
+function MobileStage({ query, setQuery, items, selectedId, onPick, hint, mode }) {
+  return (
+    <Box>
+      <TextField
+        size="medium"
+        fullWidth
+        value={query}
+        onChange={(e) => setQuery(e.target.value)}
+        placeholder="検索（名称 / コード）"
+        sx={{ mt: 1 }}
+      />
+
+      {hint && (
+        <Typography variant="caption" color="text.secondary" sx={{ display: "block", mt: 1 }}>
+          {hint}
+        </Typography>
+      )}
+
+      <Paper variant="outlined" sx={{ mt: 1, maxHeight: 360, overflow: "auto" }}>
+        <List disablePadding>
+          {items.map((x) => (
+            <ListItemButton
+              key={x.id}
+              selected={x.id === selectedId}
+              onClick={() => onPick(x.id)}
+              sx={{ py: 1.0, px: 2, alignItems: "flex-start" }}
+            >
+              <ListItemText
+                primaryTypographyProps={{ sx: { fontSize: 15, fontWeight: 900 } }}
+                secondaryTypographyProps={{ sx: { fontSize: 12 } }}
+                primary={x.code ? \`\${x.code}　\${x.label}\` : x.label}
+                secondary={
+                  mode === "leaf"
+                    ? \`明細:\${x.meisaiCd} / 勘定:\${x.kanjoCd} / 部署:\${x.smtBushoCd}\`
+                    : \`ID: \${x.id}\`
+                }
+              />
+            </ListItemButton>
+          ))}
+          {items.length === 0 && <Box sx={{ p: 2, color: "text.secondary" }}>候補がありません</Box>}
+        </List>
+      </Paper>
+    </Box>
+  );
+}
+
+/* =========================
+   DIALOG（RESPONSIVE）
+========================= */
+function ResponsiveSelectDialog({ open, onClose, onConfirm }) {
+  const isMobile = useMediaQuery(theme.breakpoints.down("sm"));
+  const contentRef = useRef(null);
+
+  const [lvl0, setLvl0] = useState(null);
+  const [lvl1, setLvl1] = useState(null);
+  const [lvl2, setLvl2] = useState(null);
+  const [lvl3, setLvl3] = useState(null);
+
+  const [q0, setQ0] = useState("");
+  const [q1, setQ1] = useState("");
+  const [q2, setQ2] = useState("");
+  const [q3, setQ3] = useState("");
+
+  const [expanded, setExpanded] = useState("p0");
+
+  const resetAll = () => {
+    setLvl0(null); setLvl1(null); setLvl2(null); setLvl3(null);
+    setQ0(""); setQ1(""); setQ2(""); setQ3("");
+    setExpanded("p0");
+  };
+
+  useEffect(() => { if (!open) resetAll(); }, [open]);
+
+  const goTop = () => {
+    setExpanded("p0");
+    const el = contentRef.current;
+    if (el?.scrollTo) el.scrollTo({ top: 0, behavior: "smooth" });
+  };
+
+  /* pools */
+  const col0 = useMemo(() => filterByQuery(OPTIONS, q0), [q0]);
+  const col1Pool = useMemo(() => (lvl0 ? (findById(OPTIONS, lvl0)?.children ?? []) : ALL_KANJOS), [lvl0]);
+  const col1 = useMemo(() => filterByQuery(col1Pool, q1), [col1Pool, q1]);
+
+  const col2Pool = useMemo(() => {
+    if (lvl1) {
+      const n1 = lvl0 ? findById(findById(OPTIONS, lvl0)?.children ?? [], lvl1) : findById(ALL_KANJOS, lvl1);
+      return n1?.children ?? [];
+    }
+    return ALL_MEISAIS;
+  }, [lvl0, lvl1]);
+  const col2 = useMemo(() => filterByQuery(col2Pool, q2), [col2Pool, q2]);
+
+  const col3Pool = useMemo(() => {
+    let pool = LEAVES;
+    if (lvl0) pool = pool.filter((x) => S(x.smtBushoCd) === S(lvl0));
+    if (lvl1) {
+      const kanjoCd = S(lvl1).split("|")[1] ?? "";
+      pool = pool.filter((x) => S(x.kanjoCd) === kanjoCd);
+    }
+    if (lvl2) {
+      const meisaiCd = S(lvl2).split("|")[2] ?? "";
+      pool = pool.filter((x) => S(x.meisaiCd) === meisaiCd);
+    }
+    return pool;
+  }, [lvl0, lvl1, lvl2]);
+  const col3 = useMemo(() => filterByQuery(col3Pool, q3), [col3Pool, q3]);
+
+  /* selections */
+  const sel0 = useMemo(() => (lvl0 ? findById(OPTIONS, lvl0) : null), [lvl0]);
+  const sel1 = useMemo(() => {
+    if (!lvl1) return null;
+    if (lvl0) return findById(findById(OPTIONS, lvl0)?.children ?? [], lvl1);
+    return findById(ALL_KANJOS, lvl1);
+  }, [lvl0, lvl1]);
+  const sel2 = useMemo(() => {
+    if (!lvl2) return null;
+    if (lvl0 && lvl1) {
+      const n0 = findById(OPTIONS, lvl0);
+      const n1 = findById(n0?.children ?? [], lvl1);
+      return findById(n1?.children ?? [], lvl2);
+    }
+    return findById(ALL_MEISAIS, lvl2);
+  }, [lvl0, lvl1, lvl2]);
+  const selLeaf = useMemo(() => (lvl3 ? findById(LEAVES, lvl3) : null), [lvl3]);
+
+  /* pick */
+  const pick0 = (id) => {
+    setLvl0(id); setLvl1(null); setLvl2(null); setLvl3(null);
+    setQ1(""); setQ2(""); setQ3("");
+    if (isMobile) setExpanded("p1");
+  };
+  const pick1 = (id) => {
+    setLvl1(id); setLvl2(null); setLvl3(null);
+    setQ2(""); setQ3("");
+    if (isMobile) setExpanded("p2");
+  };
+  const pick2 = (id) => {
+    setLvl2(id); setLvl3(null);
+    setQ3("");
+    if (isMobile) setExpanded("p3");
+  };
+  const pick3 = (id) => {
+    const leaf = findById(LEAVES, id);
+    setLvl3(id);
+    if (leaf) {
+      const smt = S(leaf.smtBushoCd), kan = S(leaf.kanjoCd), mei = S(leaf.meisaiCd);
+      setLvl0(smt);
+      setLvl1(\`\${smt}|\${kan}\`);
+      setLvl2(\`\${smt}|\${kan}|\${mei}\`);
+    }
+    if (isMobile) setExpanded("p3");
+  };
+
+  const canConfirm = Boolean(lvl3);
+
+  const confirm = () => {
+    if (!canConfirm) return;
+    const leaf = selLeaf;
+    onConfirm({
+      ids: [lvl0, lvl1, lvl2, lvl3],
+      text: [leaf?.smtBushoNm, leaf?.kanjoNm, leaf?.meisaiNm, leaf?.naiwakeNm].filter(Boolean).join(" / "),
+      smtBushoCd: leaf?.smtBushoCd, smtBushoNm: leaf?.smtBushoNm,
+      kanjoCd: leaf?.kanjoCd,     kanjoNm: leaf?.kanjoNm,
+      meisaiCd: leaf?.meisaiCd,   meisaiNm: leaf?.meisaiNm,
+      naiwakeCd: leaf?.naiwakeCd, naiwakeNm: leaf?.naiwakeNm,
+      naiwakeShort: leaf?.naiwakeShort,
+      raw: leaf?._raw,
+    });
+    onClose();
+  };
+
+  const stages = useMemo(() => ([
+    { p: "p0", title: "1) SMT部署", sel: sel0, q: q0, setQ: setQ0, items: col0, sid: lvl0, pick: pick0, hint: "補助：部署で絞り込み（任意）", mode: "" },
+    { p: "p1", title: "2) 勘定",   sel: sel1, q: q1, setQ: setQ1, items: col1, sid: lvl1, pick: pick1, hint: "補助：勘定で絞り込み（任意）", mode: "" },
+    { p: "p2", title: "3) 明細",   sel: sel2, q: q2, setQ: setQ2, items: col2, sid: lvl2, pick: pick2, hint: "補助：明細で絞り込み（任意）", mode: "" },
+    { p: "p3", title: "4) 内訳",   sel: selLeaf, q: q3, setQ: setQ3, items: col3, sid: lvl3, pick: pick3, hint: "内訳はダイレクト選択（ここだけで確定可）", mode: "leaf" },
+  ]), [sel0,sel1,sel2,selLeaf,q0,q1,q2,q3,col0,col1,col2,col3,lvl0,lvl1,lvl2,lvl3]);
+
+  return (
+    <Dialog
+      open={open}
+      onClose={onClose}
+      fullWidth
+      maxWidth={isMobile ? "sm" : "xl"}
+      fullScreen={isMobile}
+      keepMounted
+      disableRestoreFocus
+    >
+      {isMobile ? (
+        <AppBar position="sticky" color="default" elevation={1}>
+          <Toolbar sx={{ gap: 1 }}>
+            <Box sx={{ flex: 1 }}>
+              <Typography variant="subtitle1" sx={{ fontWeight: 900, fontSize: 14 }}>内訳コード確定</Typography>
+              <Typography variant="caption" color="text.secondary">内訳はダイレクト選択可（上位は補助）</Typography>
+            </Box>
+            <Tooltip title="リセット"><IconButton onClick={resetAll}><RestartAlt /></IconButton></Tooltip>
+            <Tooltip title="閉じる"><IconButton onClick={onClose}><Close /></IconButton></Tooltip>
+          </Toolbar>
+        </AppBar>
+      ) : (
+        <DialogTitle sx={{ display: "flex", alignItems: "center", gap: 1 }}>
+          <Box sx={{ flex: 1 }}>
+            <Typography variant="h6" sx={{ lineHeight: 1.2, fontSize: 16, fontWeight: 900 }}>
+              勘定科目内訳コードを確定（内訳はダイレクト選択可 / 上位は補助）
+            </Typography>
+            <Typography variant="body2" color="text.secondary" sx={{ fontSize: 12 }}>
+              Tablet+：4カラムDense / 確定バーで最終選択を常時表示
+            </Typography>
+          </Box>
+          <Tooltip title="リセット"><IconButton onClick={resetAll}><RestartAlt /></IconButton></Tooltip>
+          <Tooltip title="閉じる"><IconButton onClick={onClose}><Close /></IconButton></Tooltip>
+        </DialogTitle>
+      )}
+
+      <Divider />
+
+      <DialogContent
+        ref={contentRef}
+        sx={{
+          pt: 2,
+          pb: isMobile ? 20 : 12,
+          overscrollBehavior: "contain",
+          WebkitOverflowScrolling: "touch",
+        }}
+      >
+        <Stack spacing={1.5}>
+          <SummaryBar sel0={sel0} sel1={sel1} sel2={sel2} selLeaf={selLeaf} />
+
+          {!isMobile && (
+            <Box sx={{ display: "flex", justifyContent: "center" }}>
+              <Box sx={{ width: "100%", maxWidth: 1280 }}>
+                <Grid container spacing={1.25} justifyContent="center">
+                  <Grid item xs={12} sm={6} md={3}>
+                    <ColumnPanel title="SMT所管店舗_部署（補助）" query={q0} setQuery={setQ0} items={col0} selectedId={lvl0} onPick={pick0} helper="部署で絞り込み（任意）" />
+                  </Grid>
+                  <Grid item xs={12} sm={6} md={3}>
+                    <ColumnPanel title="勘定科目（補助）" query={q1} setQuery={setQ1} items={col1} selectedId={lvl1} onPick={pick1} helper={lvl0 ? "部署配下のみ" : "全勘定（部署未選択）"} />
+                  </Grid>
+                  <Grid item xs={12} sm={6} md={3}>
+                    <ColumnPanel title="明細科目（補助）" query={q2} setQuery={setQ2} items={col2} selectedId={lvl2} onPick={pick2} helper={lvl1 ? "勘定配下のみ" : "全明細（勘定未選択）"} />
+                  </Grid>
+                  <Grid item xs={12} sm={6} md={3}>
+                    <ColumnPanel title="勘定科目内訳（ダイレクト確定）" query={q3} setQuery={setQ3} items={col3} selectedId={lvl3} onPick={pick3} mode="leaf" helper={lvl2 ? "上位選択で補助絞り込み中" : "全内訳（検索で直接選択）"} />
+                  </Grid>
+                </Grid>
+              </Box>
+            </Box>
+          )}
+
+          {isMobile && (
+            <Box>
+              {stages.map((st) => (
+                <Accordion
+                  key={st.p}
+                  expanded={expanded === st.p}
+                  onChange={() => {}}
+                  disableGutters
+                  TransitionProps={{ unmountOnExit: false }}
+                >
+                  <AccordionSummary
+                    expandIcon={<ExpandMore />}
+                    onClick={() => setExpanded(st.p)}
+                    sx={{ cursor: "pointer" }}
+                  >
+                    <Typography sx={{ fontWeight: 900 }}>
+                      {st.title}{st.sel ? \`：\${st.sel.code ?? ""} \${st.sel.label ?? ""}\` : ""}
+                    </Typography>
+                  </AccordionSummary>
+
+                  <AccordionDetails>
+                    <MobileStage
+                      query={st.q}
+                      setQuery={st.setQ}
+                      items={st.items}
+                      selectedId={st.sid}
+                      onPick={st.pick}
+                      hint={st.hint}
+                      mode={st.mode}
+                    />
+                  </AccordionDetails>
+                </Accordion>
+              ))}
+            </Box>
+          )}
+
+          <Typography variant="caption" color="text.secondary">
+            仕様：上位を選び直すと下位（内訳含む）は自動リセット。内訳を選ぶと上位は自動同期。
+          </Typography>
+        </Stack>
+      </DialogContent>
+
+      <StickyConfirmBar
+        isMobile={isMobile}
+        sel0={sel0}
+        sel1={sel1}
+        sel2={sel2}
+        selLeaf={selLeaf}
+        canConfirm={canConfirm}
+        onReset={resetAll}
+        onConfirm={confirm}
+        onGoTop={goTop}
+      />
+    </Dialog>
+  );
+}
+
+/* =========================
+   APP
+========================= */
+function App() {
+  const [open, setOpen] = useState(false);
+  const [result, setResult] = useState(null);
+
+  return (
+    <ThemeProvider theme={theme}>
+      <CssBaseline />
+      <Container maxWidth="xl">
+        <Box sx={{ mt: 4 }}>
+          <Typography variant="h5" gutterBottom sx={{ fontWeight: 900 }}>
+            Dense UI：内訳ダイレクト確定（モバイル：Accordion安定版 / パンくずはラベル表示）
+          </Typography>
+
+          <Stack spacing={2} sx={{ mt: 2 }}>
+            <Button variant="contained" onClick={() => setOpen(true)}>ダイアログを開く</Button>
+
+            <Box sx={{ p: 2, border: "1px solid", borderColor: "divider", borderRadius: 2 }}>
+              <Typography variant="subtitle2" color="text.secondary">選択結果（確定）</Typography>
+              <Typography sx={{ mt: 0.5, fontSize: 12 }}>{result?.text ?? "未確定"}</Typography>
+
+              {result && (
+                <Box sx={{ mt: 1 }}>
+                  <Typography variant="caption" color="text.secondary" component="div">SMT部署: {result.smtBushoNm}（{result.smtBushoCd}）</Typography>
+                  <Typography variant="caption" color="text.secondary" component="div">勘定: {result.kanjoNm}（{result.kanjoCd}）</Typography>
+                  <Typography variant="caption" color="text.secondary" component="div">明細: {result.meisaiNm}（{result.meisaiCd}）</Typography>
+                  <Typography variant="caption" color="text.secondary" component="div">
+                    内訳: {result.naiwakeNm}（{result.naiwakeCd}）{result.naiwakeShort ? \` / \${result.naiwakeShort}\` : ""}
+                  </Typography>
+                </Box>
+              )}
+            </Box>
+          </Stack>
+        </Box>
+
+        <ResponsiveSelectDialog open={open} onClose={() => setOpen(false)} onConfirm={(r) => setResult(r)} />
+      </Container>
+    </ThemeProvider>
+  );
+}
+
+const root = createRoot(document.getElementById("root"));
+root.render(<React.StrictMode><App /></React.StrictMode>);
+      `;
+
+      const { code } = Babel.transform(appCode, { presets: ["react"] });
+      const runApp = new Function("React", "createRoot", "MaterialUI", "MaterialIcons", code);
+      runApp(React, createRoot, MaterialUI, MaterialIcons);
+    </script>
+  </body>
+</html>
