@@ -1,0 +1,747 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8" />
+  <title>パスワードリセット（最小モック＋確認）</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Roboto:wght@400;700;900&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="https://fonts.googleapis.com/icon?family=Material+Icons" />
+  <style>
+    html, body, #root { margin:0; height:100%; font-family: Roboto, sans-serif; }
+    body { background: linear-gradient(180deg,#f7f9ff,#eef3fb); }
+  </style>
+</head>
+<body>
+<div id="root"></div>
+
+<script crossorigin src="https://unpkg.com/react@18.3.1/umd/react.development.js"></script>
+<script crossorigin src="https://unpkg.com/react-dom@18.3.1/umd/react-dom.development.js"></script>
+<script crossorigin src="https://unpkg.com/@emotion/react@11.11.4/dist/emotion-react.umd.min.js"></script>
+<script crossorigin src="https://unpkg.com/@emotion/styled@11.14.1/dist/emotion-styled.umd.min.js"></script>
+<script crossorigin src="https://unpkg.com/@mui/material@5.18.0/umd/material-ui.development.js"></script>
+<script src="https://unpkg.com/@babel/standalone@7.24.7/babel.min.js"></script>
+
+<script type="text/babel">
+  const {
+    CssBaseline, ThemeProvider, createTheme,
+    AppBar, Toolbar, Container, Box, Paper, Stack, Typography, Chip,
+    Button, Dialog, DialogTitle, DialogContent, DialogActions,
+    Tabs, Tab, Divider, Alert,
+    TextField, MenuItem,
+    Table, TableBody, TableCell, TableContainer, TableHead, TableRow,
+    RadioGroup, FormControlLabel, Radio,
+    List, ListItem, ListItemText,
+    InputAdornment, IconButton,
+    Accordion, AccordionSummary, AccordionDetails
+  } = MaterialUI;
+
+  // -----------------------------
+  // Data
+  // -----------------------------
+  // ref: 対象参照 / exec: 実行 / temp: 仮パス表示 / hist: 履歴参照
+  const PERM = [
+    { level:"プラットフォーム", role:"管理", ref:"all",  exec:"all",  temp:"all",         hist:"all"  },
+    { level:"プラットフォーム", role:"運用", ref:"all",  exec:"all",  temp:"all",         hist:"all"  },
+    { level:"サービス",       role:"管理", ref:"all",  exec:"all",  temp:"all",         hist:"all"  },
+    { level:"サービス",       role:"運用", ref:"all",  exec:"all",  temp:"all",         hist:"all"  },
+    { level:"利用組織",       role:"上長", ref:"team", exec:"team", temp:"justNowByMe", hist:"byMe" },
+    { level:"利用者",         role:"本人", ref:"self", exec:"none", temp:"none",        hist:"none" },
+  ];
+
+  const USERS = [
+    { id:"u001", name:"佐藤 太郎", dob:"19910423", managerId:"me", dept:"営業部", managerName:"自分（ログイン中）"  },
+    { id:"u002", name:"鈴木 花子", dob:"19881205", managerId:"me", dept:"企画部", managerName:"自分（ログイン中）"  },
+    { id:"u003", name:"高橋 健",   dob:"20000109", managerId:"u010", dept:"営業部", managerName:"山田（上長）" },
+    { id:"u010", name:"山田（上長）", dob:"19750730", managerId:null, dept:"経営層", managerName:null },
+    { id:"me",   name:"自分（ログイン中）", dob:"19930214", managerId:"u010", dept:"営業部", managerName:"山田（上長）" },
+  ];
+
+  // -----------------------------
+  // Utils (pure)
+  // -----------------------------
+  const uniq = (arr)=>[...new Set(arr)];
+  const isYYYYMMDD = (s)=>/^[0-9]{8}$/.test(s);
+
+  const pad2 = (n)=>String(n).padStart(2,"0");
+  const yyyymmddToday = ()=>{
+    const d=new Date();
+    return `${d.getFullYear()}${pad2(d.getMonth()+1)}${pad2(d.getDate())}`;
+  };
+  const nowHM = ()=>{
+    const d=new Date();
+    return `${d.getFullYear()}-${pad2(d.getMonth()+1)}-${pad2(d.getDate())} ${pad2(d.getHours())}:${pad2(d.getMinutes())}`;
+  };
+
+  const scopeLabel = (v)=>(
+    v==="all" ? "全員" :
+    v==="team" ? "自分の部下のみ" :
+    v==="self" ? "自分のみ" :
+    v==="justNowByMe" ? "実行後に1回だけ表示" :
+    v==="byMe" ? "自分が実行した分のみ" :
+    "表示なし"
+  );
+
+  const pwModeLabel = (m)=>(
+    m==="dob" ? "生年月日" :
+    m==="today" ? "リセットした日" :
+    "任意の値"
+  );
+
+  const getPerm = (sel)=>PERM.find(p=>p.level===sel.level && p.role===sel.role) || PERM[0];
+
+  const filterCandidates = ({ users, meId, permRef, q })=>{
+    if(permRef==="self") return [];
+    let list = users.filter(u=>u.id!=="me");
+    if(permRef==="team") list = users.filter(u=>u.managerId===meId);
+    const s = (q||"").trim();
+    if(!s) return list;
+    return list.filter(u=>`${u.id}${u.name}`.includes(s));
+  };
+
+  const resolveTarget = ({ permRef, users, me, targetId })=>{
+    if(permRef==="self") return me;
+    return users.find(u=>u.id===targetId) || null;
+  };
+
+  const canExecute = ({ permExec, target })=>{
+    if(permExec==="all" || permExec==="team") return !!target;
+    return false;
+  };
+
+  const buildTempPassword = ({ pwMode, pwCustom, target })=>{
+    if(pwMode==="today") return yyyymmddToday();
+    if(pwMode==="dob") {
+      const dob = target?.dob || "";
+      return (dob && isYYYYMMDD(dob)) ? dob : "";
+    }
+    if(pwMode==="custom") return pwCustom.length >= 8 ? pwCustom : "";
+    return "";
+  };
+
+  const nextMessage = ({ permExec, target })=>{
+    if(permExec==="none") return "現在の立場では、リセット操作は行えません。";
+    if(!target) return "リセットしたい方を選んでください。";
+    return "準備ができました。内容を確認してから実行できます。";
+  };
+
+  const filterHistory = ({ permHist, hist, actor })=>{
+    if(permHist==="none") return [];
+    if(permHist==="all") return hist;
+    if(permHist==="byMe") return hist.filter(h=>h.who===actor);
+    return hist;
+  };
+
+  // -----------------------------
+  // Sub-components
+  // -----------------------------
+  const ResetForm = ({ perm, me, candidates, target, canExec, friendlyNext, q, setQ, targetId, setTargetId, pwMode, setPwMode, pwCustom, setPwCustom, pwError, setPwError, openConfirm, setSearchOpen, setUserDetailOpen, setSelectedUser, searchQuery, setSearchQuery }) => (
+    <Box sx={{ p: { xs: 1, sm: 2 } }}>
+      <Stack spacing={{ xs: 1.5, sm: 3 }}>
+        {/* 0. 説明 */}
+        <Accordion defaultExpanded={false}>
+          <AccordionSummary expandIcon={<span className="material-icons">expand_more</span>} aria-label="説明展開">
+            <Typography sx={{ fontWeight: 700, fontSize: { xs: "0.9rem", sm: "1rem" } }}>説明</Typography>
+          </AccordionSummary>
+          <AccordionDetails>
+            <Typography variant="body2" sx={{ fontSize: { xs: "0.8rem", sm: "0.875rem" } }}>
+              このパスワードリセット機能は、ユーザーのパスワードを安全にリセットするためのツールです。以下の手順に従って操作してください。<br />
+              1. ユーザー選択: リセット対象のユーザーを検索・選択します。権限に基づき、対象ユーザーが制限されます。<br />
+              2. 仮パスワード設定: リセット後の仮パスワードの生成方式を選択します。生年月日、リセット日、または任意の値を指定できます。<br />
+              3. パスワードリセット: 内容を確認後、リセットを実行します。仮パスワードは指定された条件で表示されます。
+            </Typography>
+          </AccordionDetails>
+        </Accordion>
+
+        {/* 1. ユーザー選択 */}
+        <Box component="section" sx={{ border: "1px solid rgba(15,23,42,.08)", borderRadius: 1.5, overflow: "hidden" }}>
+          <Box sx={{ bgcolor: "#f3f4f6", color: "#374151", p: { xs: 1, sm: 1.5 }, mb: 0 }}>
+            <Typography sx={{ fontWeight: 700, fontSize: { xs: "0.9rem", sm: "1rem" } }}>1. ユーザー選択</Typography>
+          </Box>
+          <Box sx={{ p: { xs: 1, sm: 2 } }}>
+            <Stack spacing={{ xs: 1, sm: 2 }}>
+              {perm.ref==="self" ? (
+                <TextField
+                  size="small"
+                  fullWidth
+                  label="対象（この操作では変更できません）"
+                  value={`${me.id} ${me.name}`}
+                  InputProps={{ readOnly:true }}
+                  aria-label="対象ユーザー"
+                />
+              ) : (
+                <Stack spacing={1}>
+                  <Box sx={{ p: 1.5, bgcolor: targetId ? "#f0f9ff" : "#fef2f2", border: `1px solid ${targetId ? "#bfdbfe" : "#fecaca"}`, borderRadius: 1 }}>
+                    <Typography variant="body2" sx={{ fontWeight: 700, color: targetId ? "#1e40af" : "#dc2626" }}>
+                      {targetId ? "✓ 選択済み" : "⚠ 未選択"}
+                    </Typography>
+                    <Typography variant="body2" sx={{ color: targetId ? "#1e40af" : "#7f1d1d", mt: 0.5 }}>
+                      {targetId ? candidates.find(c=>c.id===targetId)?.name || "-" : "ユーザーがまだ選択されていません"}
+                    </Typography>
+                  </Box>
+                  <Button
+                    variant="contained"
+                    onClick={()=>setSearchOpen(true)}
+                    startIcon={<span className="material-icons">search</span>}
+                    aria-label="ユーザー検索"
+                    fullWidth
+                    sx={{ py: 1.2, fontSize: "1rem", fontWeight: 600 }}
+                  >
+                    ユーザーを検索・選択
+                  </Button>
+                </Stack>
+              )}
+            </Stack>
+          </Box>
+        </Box>
+
+        {/* 2. 仮パスワード設定 */}
+        <Box component="section" sx={{ border: "1px solid rgba(15,23,42,.08)", borderRadius: 1.5, overflow: "hidden" }}>
+          <Box sx={{ bgcolor: "#f3f4f6", color: "#374151", p: { xs: 1, sm: 1.5 }, mb: 0 }}>
+            <Typography sx={{ fontWeight: 700, fontSize: { xs: "0.9rem", sm: "1rem" } }}>2. 仮パスワード設定</Typography>
+          </Box>
+          <Box sx={{ p: { xs: 1, sm: 2 } }}>
+            <Stack spacing={{ xs: 1.5, sm: 2 }}>
+              <RadioGroup
+                row
+                value={pwMode}
+                onChange={(e)=>{ setPwMode(e.target.value); setPwError(""); }}
+                aria-label="仮パスワード方式"
+                sx={{ gap: { xs: 0.5, sm: 1 } }}
+              >
+                <FormControlLabel 
+                  value="dob" 
+                  control={<Radio size="small" />} 
+                  label="生年月日"
+                  sx={{ fontSize: { xs: "0.8rem", sm: "1rem" } }}
+                />
+                <FormControlLabel 
+                  value="today" 
+                  control={<Radio size="small" />} 
+                  label="リセット日"
+                  sx={{ fontSize: { xs: "0.8rem", sm: "1rem" } }}
+                />
+                <FormControlLabel 
+                  value="custom" 
+                  control={<Radio size="small" />} 
+                  label="任意の値"
+                  sx={{ fontSize: { xs: "0.8rem", sm: "1rem" } }}
+                />
+              </RadioGroup>
+
+              {pwMode === "custom" && (
+                <TextField
+                  size="small"
+                  fullWidth
+                  label="仮パスワード"
+                  value={pwCustom}
+                  onChange={(e)=>setPwCustom(e.target.value.slice(0,16))}
+                  helperText="8文字以上16文字以下で入力してください"
+                  aria-label="仮パスワード入力"
+                  sx={{ mt: 1 }}
+                />
+              )}
+
+              {pwError && <Alert severity="warning" sx={{ fontSize: { xs: "0.8rem", sm: "0.875rem" }, py: 0.5 }}>{pwError}</Alert>}
+            </Stack>
+          </Box>
+        </Box>
+
+        {/* 3. パスワードリセット */}
+        <Box component="section" sx={{ border: "1px solid rgba(15,23,42,.08)", borderRadius: 1.5, overflow: "hidden" }}>
+          <Box sx={{ bgcolor: "#f3f4f6", color: "#374151", p: { xs: 1, sm: 1.5 }, mb: 0 }}>
+            <Typography sx={{ fontWeight: 700, fontSize: { xs: "0.9rem", sm: "1rem" } }}>3. パスワードリセット</Typography>
+          </Box>
+          <Box sx={{ p: { xs: 1, sm: 2 } }}>
+            <Button
+              variant="contained"
+              disabled={!canExec}
+              onClick={openConfirm}
+              startIcon={<span className="material-icons" style={{ fontSize: "1.2rem" }}>check_circle</span>}
+              aria-label="内容確認"
+              fullWidth
+              sx={{ py: 1.2, fontSize: "1rem", fontWeight: 600 }}
+            >
+              内容を確認する
+            </Button>
+            <Alert severity={perm.exec==="none" ? "info" : (!target ? "warning" : "success")} sx={{ mt: 2, fontSize: { xs: "0.8rem", sm: "0.875rem" }, py: 0.75 }}>
+              {friendlyNext}
+            </Alert>
+          </Box>
+        </Box>
+      </Stack>
+    </Box>
+  );
+
+  const HistoryTab = ({ perm, visibleHist }) => {
+    const [historySearchQuery, setHistorySearchQuery] = React.useState("");
+    const filtered = visibleHist.filter(h => {
+      const s = (historySearchQuery || "").trim().toLowerCase();
+      if (!s) return true;
+      return `${h.target}${h.who}${h.t}`.toLowerCase().includes(s);
+    });
+
+    return (
+      <Box sx={{ p: 2 }}>
+        {perm.hist==="none" ? (
+          <Alert severity="info">現在の立場では、履歴の表示はありません。</Alert>
+        ) : (
+          <Stack spacing={2}>
+            <TextField
+              size="small"
+              fullWidth
+              placeholder="検索（対象者、実行者、日時）"
+              value={historySearchQuery}
+              onChange={(e)=>setHistorySearchQuery(e.target.value)}
+              InputProps={{
+                startAdornment: (
+                  <InputAdornment position="start">
+                    <span className="material-icons" style={{ fontSize: "1.2rem", color: "#9ca3af" }}>search</span>
+                  </InputAdornment>
+                ),
+                endAdornment: historySearchQuery ? (
+                  <InputAdornment position="end">
+                    <IconButton size="small" onClick={()=>setHistorySearchQuery("")} aria-label="検索クリア">
+                      <span className="material-icons">close</span>
+                    </IconButton>
+                  </InputAdornment>
+                ) : null
+              }}
+              aria-label="履歴検索"
+            />
+            <Typography variant="body2" sx={{ fontWeight: 700, color: "#6b7280" }}>
+              検索結果: {filtered.length}件
+            </Typography>
+            <List dense aria-label="リセット履歴">
+              {filtered.slice(0, 12).map((h,i)=>(
+                <ListItem key={i} divider>
+                  <ListItemText
+                    primary={`${h.t} / ${h.target}`}
+                    secondary={`${h.who} / 仮パス方法: 【${pwModeLabel(h.pwMode)}】`}
+                  />
+                </ListItem>
+              ))}
+              {filtered.length === 0 && (
+                <ListItem>
+                  <ListItemText primary="該当する履歴がありません" sx={{ color: "#9ca3af" }} />
+                </ListItem>
+              )}
+            </List>
+          </Stack>
+        )}
+      </Box>
+    );
+  };
+
+  const ConfirmDialog = ({ confirmOpen, setConfirmOpen, target, pwMode, previewPw, executeReset }) => (
+    <Dialog open={confirmOpen} onClose={()=>setConfirmOpen(false)} fullWidth maxWidth="xs" aria-labelledby="confirm-dialog-title">
+      <DialogTitle id="confirm-dialog-title" sx={{ fontWeight: 900 }}>この内容でよろしいですか？</DialogTitle>
+      <DialogContent dividers>
+        <Stack spacing={2}>
+          <Alert severity="info">念のため、対象が合っているか確認してください。</Alert>
+          
+          {/* 対象ユーザー情報 */}
+          <Box sx={{ p: 2, bgcolor: "#f9fafb", borderRadius: 1.5, border: "1px solid #e5e7eb" }}>
+            <Stack spacing={1.5}>
+              {/* 社員番号 */}
+              <Box>
+                <Typography variant="body2" sx={{ fontWeight: 700, color: "#6b7280", fontSize: "0.875rem", mb: 0.5 }}>社員番号</Typography>
+                <Typography variant="h6" sx={{ fontWeight: 600, color: "#111827", fontSize: "1rem", fontFamily: "monospace" }}>
+                  {target?.id || "-"}
+                </Typography>
+              </Box>
+              
+              {/* 名前 */}
+              <Box>
+                <Typography variant="body2" sx={{ fontWeight: 700, color: "#6b7280", fontSize: "0.875rem", mb: 0.5 }}>名前</Typography>
+                <Typography variant="h6" sx={{ fontWeight: 600, color: "#111827", fontSize: "1.1rem" }}>
+                  {target?.name || "-"}
+                </Typography>
+              </Box>
+              
+              {/* 所属 */}
+              <Box>
+                <Typography variant="body2" sx={{ fontWeight: 700, color: "#6b7280", fontSize: "0.875rem", mb: 0.5 }}>所属</Typography>
+                <Typography variant="h6" sx={{ fontWeight: 600, color: "#111827", fontSize: "1rem" }}>
+                  {target?.dept || "-"}
+                </Typography>
+              </Box>
+              
+              {/* 上長 */}
+              <Box>
+                <Typography variant="body2" sx={{ fontWeight: 700, color: "#6b7280", fontSize: "0.875rem", mb: 0.5 }}>上長</Typography>
+                <Typography variant="h6" sx={{ fontWeight: 600, color: "#111827", fontSize: "1rem" }}>
+                  {target?.managerName || "なし"}
+                </Typography>
+              </Box>
+            </Stack>
+          </Box>
+
+          {/* 仮パス方式 */}
+          <Box>
+            <Typography variant="body2" sx={{ fontWeight: 700, color: "#6b7280", fontSize: "0.875rem", mb: 0.75 }}>仮パスワード方式</Typography>
+            <Typography sx={{ fontWeight: 600, color: "#111827", fontSize: "0.95rem" }}>{pwModeLabel(pwMode)}</Typography>
+          </Box>
+        </Stack>
+      </DialogContent>
+      <DialogActions sx={{ p: 2, gap: 1 }}>
+        <Button onClick={()=>setConfirmOpen(false)} sx={{ fontSize: "0.95rem", py: 0.8 }}>戻る</Button>
+        <Button onClick={executeReset} variant="contained" startIcon={<span className="material-icons">lock_reset</span>} aria-label="リセット実行" sx={{ fontSize: "0.95rem", py: 0.8, px: 2, fontWeight: 600 }}>
+          この内容でリセット
+        </Button>
+      </DialogActions>
+    </Dialog>
+  );
+
+  const RoleMatrixDialog = ({ matrixOpen, setMatrixOpen, levels, roles, hasCell, sel, applyRole }) => (
+    <Dialog open={matrixOpen} onClose={()=>setMatrixOpen(false)} fullWidth maxWidth="md" aria-labelledby="role-dialog-title">
+      <DialogTitle id="role-dialog-title" sx={{ fontWeight: 900 }}>利用する立場を選んでください（モック用）</DialogTitle>
+      <DialogContent dividers>
+        <Alert severity="info" sx={{ mb: 1.5 }}>
+          「階層 × 役割」をクリックすると切り替わります。利用できない組み合わせは押せません。
+        </Alert>
+        <TableContainer component={Paper} sx={{ bgcolor:"#fff" }}>
+          <Table size="small" aria-label="立場選択マトリックス">
+            <TableHead>
+              <TableRow>
+                <TableCell sx={{ width: 160, fontWeight: 900 }}>階層＼役割</TableCell>
+                {roles.map(r=>(
+                  <TableCell key={r} align="center" sx={{ fontWeight: 900 }}>{r}</TableCell>
+                ))}
+              </TableRow>
+            </TableHead>
+            <TableBody>
+              {levels.map(l=>(
+                <TableRow key={l} hover>
+                  <TableCell sx={{ fontWeight: 900 }}>{l}</TableCell>
+                  {roles.map(r=>{
+                    const enabled = hasCell(l,r);
+                    const selected = sel.level===l && sel.role===r;
+                    return (
+                      <TableCell key={r} align="center">
+                        <Button
+                          size="small"
+                          variant={selected ? "contained" : "outlined"}
+                          disabled={!enabled}
+                          onClick={()=>applyRole(l,r)}
+                          sx={{ minWidth: 130 }}
+                          aria-label={`${l} ${r} 立場選択`}
+                        >
+                          {enabled ? (selected ? "選択中" : "この立場で操作する") : "利用できません"}
+                        </Button>
+                      </TableCell>
+                    );
+                  })}
+                </TableRow>
+              ))}
+            </TableBody>
+          </Table>
+        </TableContainer>
+      </DialogContent>
+      <DialogActions>
+        <Button onClick={()=>setMatrixOpen(false)}>閉じる</Button>
+      </DialogActions>
+    </Dialog>
+  );
+
+  const TempPasswordDialog = ({ tempOpen, setTempOpen, temp, pwMode }) => (
+    <Dialog open={tempOpen} onClose={()=>setTempOpen(false)} fullWidth maxWidth="xs" aria-labelledby="temp-dialog-title">
+      <DialogTitle id="temp-dialog-title" sx={{ fontWeight: 900 }}>仮パスワードのご案内（この画面のみ表示）</DialogTitle>
+      <DialogContent dividers>
+        {pwMode === "dob" ? (
+          <Alert severity="info" sx={{ fontSize: "0.95rem" }}>
+            生年月日を仮パスワードとして設定しました。個人情報保護のため、ここには表示されません。
+          </Alert>
+        ) : (
+          <TextField size="small" fullWidth label="仮パスワード" value={temp} InputProps={{ readOnly:true }} aria-label="仮パスワード" />
+        )}
+      </DialogContent>
+      <DialogActions sx={{ p: 2, gap: 1 }}>
+        {pwMode !== "dob" && (
+          <Button onClick={()=>{ try{navigator.clipboard.writeText(temp)}catch(e){} }} variant="outlined" aria-label="仮パスワードコピー" sx={{ fontSize: "0.95rem", py: 0.8 }}>コピーする</Button>
+        )}
+        <Button onClick={()=>setTempOpen(false)} variant="contained" aria-label="確認" sx={{ fontSize: "0.95rem", py: 0.8, fontWeight: 600 }}>確認しました</Button>
+      </DialogActions>
+    </Dialog>
+  );
+
+  const UserDetailDialog = ({ userDetailOpen, setUserDetailOpen, selectedUser, setTargetId }) => (
+    <Dialog open={userDetailOpen} onClose={()=>setUserDetailOpen(false)} fullWidth maxWidth="sm" aria-labelledby="user-detail-dialog-title">
+      <DialogTitle id="user-detail-dialog-title" sx={{ fontWeight: 900, fontSize: "1.25rem", pb: 2 }}>ユーザー情報の確認</DialogTitle>
+      <DialogContent dividers>
+        <Stack spacing={2.5}>
+          <Alert severity="info" sx={{ fontSize: "0.95rem" }}>以下の情報が正しいか確認してください。</Alert>
+          
+          <Box sx={{ p: 2, bgcolor: "#f9fafb", borderRadius: 1.5, border: "1px solid #e5e7eb" }}>
+            <Stack spacing={2}>
+              {/* 社員番号 */}
+              <Box>
+                <Typography variant="body2" sx={{ fontWeight: 700, color: "#6b7280", fontSize: "0.875rem", mb: 0.5 }}>社員番号</Typography>
+                <Typography variant="h6" sx={{ fontWeight: 600, color: "#111827", fontSize: "1.1rem", fontFamily: "monospace" }}>
+                  {selectedUser?.id || "-"}
+                </Typography>
+              </Box>
+              
+              {/* 名前 */}
+              <Box>
+                <Typography variant="body2" sx={{ fontWeight: 700, color: "#6b7280", fontSize: "0.875rem", mb: 0.5 }}>名前</Typography>
+                <Typography variant="h6" sx={{ fontWeight: 600, color: "#111827", fontSize: "1.2rem" }}>
+                  {selectedUser?.name || "-"}
+                </Typography>
+              </Box>
+              
+              {/* 所属 */}
+              <Box>
+                <Typography variant="body2" sx={{ fontWeight: 700, color: "#6b7280", fontSize: "0.875rem", mb: 0.5 }}>所属</Typography>
+                <Typography variant="h6" sx={{ fontWeight: 600, color: "#111827", fontSize: "1.05rem" }}>
+                  {selectedUser?.dept || "-"}
+                </Typography>
+              </Box>
+              
+              {/* 上長 */}
+              <Box>
+                <Typography variant="body2" sx={{ fontWeight: 700, color: "#6b7280", fontSize: "0.875rem", mb: 0.5 }}>上長</Typography>
+                <Typography variant="h6" sx={{ fontWeight: 600, color: "#111827", fontSize: "1.05rem" }}>
+                  {selectedUser?.managerName || "なし"}
+                </Typography>
+              </Box>
+            </Stack>
+          </Box>
+        </Stack>
+      </DialogContent>
+      <DialogActions sx={{ p: 2, gap: 1 }}>
+        <Button onClick={()=>setUserDetailOpen(false)} sx={{ fontSize: "0.95rem", py: 0.8 }}>戻る</Button>
+        <Button onClick={()=>{ setTargetId(selectedUser.id); setUserDetailOpen(false); }} variant="contained" sx={{ fontSize: "0.95rem", py: 0.8, px: 3, fontWeight: 600 }} aria-label="確認して選択">
+          このユーザーを選択
+        </Button>
+      </DialogActions>
+    </Dialog>
+  );
+
+  const SearchUserDialog = ({ searchOpen, setSearchOpen, candidates, setSelectedUser, setUserDetailOpen, setTargetId }) => {
+    const [localQ, setLocalQ] = React.useState("");
+    const [searchQ, setSearchQ] = React.useState("");
+    const filtered = candidates.filter(u=>`${u.id}${u.name}`.includes(searchQ));
+
+    const handleSearch = React.useCallback(()=>{
+      setSearchQ(localQ);
+    },[localQ]);
+
+    const handleKeyDown = React.useCallback((e)=>{
+      if(e.key==="Enter"){
+        handleSearch();
+      }
+    },[handleSearch]);
+
+    return (
+      <Dialog open={searchOpen} onClose={()=>{ setSearchOpen(false); setLocalQ(""); setSearchQ(""); }} fullWidth maxWidth="sm" aria-labelledby="search-dialog-title">
+        <DialogTitle id="search-dialog-title" sx={{ fontWeight: 900 }}>ユーザーを検索・選択</DialogTitle>
+        <DialogContent dividers>
+          <Stack spacing={2}>
+            <Stack direction="row" spacing={1}>
+              <TextField
+                autoFocus
+                fullWidth
+                size="small"
+                label="検索（IDまたはお名前）"
+                value={localQ}
+                onChange={(e)=>setLocalQ(e.target.value)}
+                onKeyDown={handleKeyDown}
+                placeholder="エンターキーまたはボタンで検索"
+                aria-label="検索キーワード入力"
+              />
+              <Button
+                variant="contained"
+                onClick={handleSearch}
+                startIcon={<span className="material-icons">search</span>}
+                sx={{ whiteSpace: "nowrap" }}
+                aria-label="検索実行"
+              >
+                検索
+              </Button>
+            </Stack>
+            <Typography variant="body2" sx={{ fontWeight: 700, mt: 1 }}>検索結果: {filtered.length}件</Typography>
+            <List sx={{ maxHeight: 300, overflow: "auto", border: "1px solid #e5e7eb", borderRadius: 1 }}>
+              {filtered.length > 0 ? (
+                filtered.map(u=>(
+                  <ListItem key={u.id} button onClick={()=>{ setSelectedUser(u); setUserDetailOpen(true); setSearchOpen(false); setLocalQ(""); setSearchQ(""); }} divider>
+                    <ListItemText
+                      primary={u.name}
+                      secondary={u.id}
+                    />
+                  </ListItem>
+                ))
+              ) : searchQ ? (
+                <ListItem>
+                  <ListItemText primary="該当するユーザーがありません" />
+                </ListItem>
+              ) : (
+                <ListItem>
+                  <ListItemText primary="検索キーワードを入力して検索してください" sx={{ color: "#9ca3af" }} />
+                </ListItem>
+              )}
+            </List>
+          </Stack>
+        </DialogContent>
+        <DialogActions sx={{ p: 2, gap: 1 }}>
+          <Button onClick={()=>{ setSearchOpen(false); setLocalQ(""); setSearchQ(""); }} sx={{ fontSize: "0.95rem", py: 0.8 }}>キャンセル</Button>
+        </DialogActions>
+      </Dialog>
+    );
+  };
+
+  // -----------------------------
+  // App
+  // -----------------------------
+  function App(){
+    const theme = React.useMemo(()=>createTheme({
+      palette:{ mode:"light", primary:{ main:"#2563eb" }, background:{ default:"#f4f7ff", paper:"#fff" } },
+      shape:{ borderRadius:12 },
+      typography:{ fontFamily:"Roboto, sans-serif" },
+      components:{ MuiPaper:{ styleOverrides:{ root:{ border:"1px solid rgba(15,23,42,.08)" } } } },
+    }),[]);
+
+    const me = React.useMemo(()=>USERS.find(u=>u.id==="me"),[]);
+    const levels = React.useMemo(()=>uniq(PERM.map(p=>p.level)),[]);
+    const roles  = React.useMemo(()=>uniq(PERM.map(p=>p.role)),[]);
+    const hasCell = React.useCallback((l,r)=>PERM.some(p=>p.level===l && p.role===r),[]);
+
+    // State: role
+    const [sel, setSel] = React.useState({ level:"利用組織", role:"上長" });
+    const perm = React.useMemo(()=>getPerm(sel),[sel]);
+    const actor = `${sel.level}/${sel.role}`;
+
+    // State: UI
+    const [matrixOpen, setMatrixOpen] = React.useState(false);
+    const [tab, setTab] = React.useState(0);
+
+    // State: reset form
+    const [q, setQ] = React.useState("");
+    const [searchQuery, setSearchQuery] = React.useState("");
+    const [targetId, setTargetId] = React.useState("");
+    const [pwMode, setPwMode] = React.useState("dob"); // dob | today | custom
+    const [pwCustom, setPwCustom] = React.useState("");
+    const [pwError, setPwError] = React.useState("");
+
+    // State: history
+    const [hist, setHist] = React.useState([
+      { t:"2026-01-22 14:25", who:"サービス/管理", target:"u001 佐藤 太郎", pw:"20260122", pwMode:"dob" },
+    ]);
+
+    // State: dialogs
+    const [tempOpen, setTempOpen] = React.useState(false);
+    const [temp, setTemp] = React.useState("");
+    const [confirmOpen, setConfirmOpen] = React.useState(false);
+    const [previewPw, setPreviewPw] = React.useState("");
+    const [userDetailOpen, setUserDetailOpen] = React.useState(false);
+    const [selectedUser, setSelectedUser] = React.useState(null);
+    const [searchOpen, setSearchOpen] = React.useState(false);
+
+    // Derivations
+    React.useEffect(()=>{ if(tab===1 && perm.hist==="none") setTab(0); }, [tab, perm.hist]);
+
+    const candidates = React.useMemo(()=>filterCandidates({
+      users: USERS, meId: me.id, permRef: perm.ref, q
+    }),[me.id, perm.ref, q]);
+
+    const target = React.useMemo(()=>resolveTarget({
+      permRef: perm.ref, users: USERS, me, targetId
+    }),[perm.ref, me, targetId]);
+
+    const canExec = React.useMemo(()=>canExecute({ permExec: perm.exec, target }),[perm.exec, target]);
+
+    const friendlyNext = React.useMemo(()=>nextMessage({ permExec: perm.exec, target }),[perm.exec, target]);
+
+    const visibleHist = React.useMemo(()=>filterHistory({
+      permHist: perm.hist, hist, actor
+    }),[perm.hist, hist, actor]);
+
+    // Actions
+    const resetFormForRoleChange = React.useCallback(()=>{
+      setQ(""); setSearchQuery(""); setTargetId(""); setPwError(""); setTab(0);
+      setConfirmOpen(false); setUserDetailOpen(false); setSelectedUser(null); setSearchOpen(false);
+    },[]);
+
+    const applyRole = React.useCallback((l,r)=>{
+      if(!hasCell(l,r)) return;
+      setSel({ level:l, role:r });
+      resetFormForRoleChange();
+      setMatrixOpen(false);
+    },[hasCell, resetFormForRoleChange]);
+
+    const openConfirm = React.useCallback(()=>{
+      if(!canExec) return;
+
+      const pw = buildTempPassword({ pwMode, pwCustom, target });
+      if(!pw){
+        setPwError(
+          pwMode==="custom"
+            ? "仮パスワードは8文字以上16文字以下で入力してください。"
+            : "対象の生年月日が未設定のため、生年月日を仮パスワードにできません。"
+        );
+        return;
+      }
+
+      setPwError("");
+      setPreviewPw(pw);
+      setConfirmOpen(true);
+    },[canExec, pwMode, pwCustom, target]);
+
+    const executeReset = React.useCallback(()=>{
+      const pw = previewPw;
+      const line = { t: nowHM(), who: actor, target: `${target.id} ${target.name}`, pw, pwMode };
+      setHist(h=>[line, ...h]);
+      setConfirmOpen(false);
+
+      if(perm.temp==="all" || perm.temp==="justNowByMe"){
+        setTemp(pw);
+        setTempOpen(true);
+      }
+    },[previewPw, actor, target, perm.temp, pwMode]);
+
+    return (
+      <ThemeProvider theme={theme}>
+        <CssBaseline />
+
+        <AppBar position="sticky" color="inherit" elevation={0} sx={{ borderBottom:"1px solid rgba(15,23,42,.08)" }}>
+          <Toolbar sx={{ py: { xs: 1, sm: 1.5 } }}>
+            <Stack direction="row" spacing={{ xs: 0.5, sm: 1 }} alignItems="center" sx={{ flex:1, minWidth:0 }}>
+              <span className="material-icons" style={{ color: theme.palette.primary.main, fontSize: "1.5rem" }}>lock_reset</span>
+              <Typography sx={{ fontWeight: 900, fontSize: { xs: "1rem", sm: "1.25rem" } }} noWrap>パスワードリセット</Typography>
+              <Chip size="small" label="モック" color="primary" variant="outlined" sx={{ fontSize: "0.7rem" }} />
+            </Stack>
+            <Chip size="small" label={actor} variant="outlined" sx={{ mr: { xs: 0.5, sm: 1 }, fontSize: "0.7rem" }} />
+            <Button variant="outlined" onClick={()=>setMatrixOpen(true)} startIcon={<span className="material-icons" style={{ fontSize: "1.2rem" }}>apps</span>} aria-label="立場選択" size="small" sx={{ fontSize: { xs: "0.75rem", sm: "0.875rem" } }}>
+              立場
+            </Button>
+          </Toolbar>
+        </AppBar>
+
+        <Container maxWidth="sm" sx={{ py: { xs: 1.5, sm: 3 }, px: { xs: 1, sm: 2 } }}>
+          <Paper sx={{ bgcolor:"#fff" }}>
+            <Tabs value={tab} onChange={(_,v)=>setTab(v)} variant="fullWidth" aria-label="タブ" sx={{ minHeight: "auto" }}>
+              <Tab label="リセット" sx={{ fontSize: { xs: "0.75rem", sm: "0.875rem" }, py: { xs: 0.5, sm: 1 } }} />
+              <Tab label="履歴" disabled={perm.hist==="none"} sx={{ fontSize: { xs: "0.75rem", sm: "0.875rem" }, py: { xs: 0.5, sm: 1 } }} />
+            </Tabs>
+            <Divider />
+
+            {tab===0 && <ResetForm {...{ perm, me, candidates, target, canExec, friendlyNext, q, setQ, targetId, setTargetId, pwMode, setPwMode, pwCustom, setPwCustom, pwError, setPwError, openConfirm, setSearchOpen, setUserDetailOpen, setSelectedUser, searchQuery, setSearchQuery }} />}
+            {tab===1 && <HistoryTab {...{ perm, visibleHist }} />}
+          </Paper>
+        </Container>
+
+        <ConfirmDialog {...{ confirmOpen, setConfirmOpen, target, pwMode, previewPw, executeReset }} />
+        <RoleMatrixDialog {...{ matrixOpen, setMatrixOpen, levels, roles, hasCell, sel, applyRole }} />
+        <TempPasswordDialog {...{ tempOpen, setTempOpen, temp, pwMode }} />
+        <UserDetailDialog {...{ userDetailOpen, setUserDetailOpen, selectedUser, setTargetId }} />
+        <SearchUserDialog {...{ searchOpen, setSearchOpen, candidates, setSelectedUser, setUserDetailOpen, setTargetId }} />
+
+      </ThemeProvider>
+    );
+  }
+
+  ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+</script>
+</body>
+</html>
