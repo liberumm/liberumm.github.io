@@ -1,0 +1,2513 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8" />
+  <title>HTML Modal Tester v2 - React 19 + MUI 7</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Roboto:wght@300;400;600;700&display=swap" />
+  <link rel="stylesheet" href="https://fonts.googleapis.com/icon?family=Material+Icons" />
+  <style>
+    html, body, #root {
+      margin: 0; padding: 0;
+      width: 100%; height: 100%;
+      overflow: hidden;
+      font-family: Roboto, sans-serif;
+      background: #f0f2f5;
+    }
+    * { box-sizing: border-box; }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <script type="module">
+    import React from "https://esm.sh/react@19.2.0";
+    import { createRoot } from "https://esm.sh/react-dom@19.2.0/client";
+    import * as MaterialUI from "https://esm.sh/@mui/material@7.3.5?deps=react@19.2.0,react-dom@19.2.0";
+
+    const appCode = `
+const { useState, useEffect, useCallback, useMemo, useRef } = React;
+
+const {
+  ThemeProvider, createTheme, CssBaseline, useMediaQuery,
+  Box, Button, Dialog, DialogActions, DialogContent,
+  DialogContentText, DialogTitle, Divider, IconButton,
+  Paper, Stack, TextField, Tooltip, Typography,
+  ToggleButton, ToggleButtonGroup, Snackbar, AppBar, Toolbar,
+} = MaterialUI;
+
+// ─── ドラッグハンドル ─────────────────────────────────────────────────────────
+
+const HANDLE_SIZE   = 6;   // px
+const RATIO_MIN     = 0.15;
+const RATIO_MAX     = 0.85;
+const RATIO_DEFAULT = 0.5;
+
+/**
+ * useSplitPane
+ * containerRef: ペイン領域全体の ref
+ * isHorizontal: true=左右分割, false=上下分割
+ * returns { ratio, handleProps, isDragging }
+ */
+function useSplitPane(containerRef, isHorizontal, initialRatio) {
+  const [ratio, setRatio]       = useState(initialRatio ?? RATIO_DEFAULT);
+  const [dragging, setDragging] = useState(false);
+  const draggingRef = useRef(false); // 同期的な判定用
+
+  const onPointerDown = useCallback((e) => {
+    e.preventDefault();
+    draggingRef.current = true;
+    setDragging(true);
+    e.currentTarget.setPointerCapture(e.pointerId);
+  }, []);
+
+  const onPointerMove = useCallback((e) => {
+    if (!draggingRef.current || !containerRef.current) return;
+    const rect = containerRef.current.getBoundingClientRect();
+    const r = isHorizontal
+      ? (e.clientX - rect.left) / rect.width
+      : (e.clientY - rect.top)  / rect.height;
+    setRatio(Math.min(RATIO_MAX, Math.max(RATIO_MIN, r)));
+  }, [containerRef, isHorizontal]);
+
+  const onPointerUp = useCallback(() => {
+    draggingRef.current = false;
+    setDragging(false);
+  }, []);
+
+  const onDoubleClick = useCallback(() => setRatio(RATIO_DEFAULT), []);
+
+  const handleProps = { onPointerDown, onPointerMove, onPointerUp, onDoubleClick };
+
+  return { ratio, setRatio, handleProps, dragging };
+}
+
+// ─── ドラッグハンドル UI ──────────────────────────────────────────────────────
+
+function SplitHandle({ isHorizontal, handleProps, dragging }) {
+  const [hover, setHover] = useState(false);
+  const active = dragging || hover;
+
+  return (
+    <Box
+      {...handleProps}
+      onMouseEnter={() => setHover(true)}
+      onMouseLeave={() => setHover(false)}
+      sx={{
+        flexShrink: 0,
+        position: "relative",
+        zIndex: 10,
+        width:  isHorizontal ? HANDLE_SIZE : "100%",
+        height: isHorizontal ? "100%"      : HANDLE_SIZE,
+        cursor: isHorizontal ? "col-resize" : "row-resize",
+        background: active ? "#1976d2" : "#d0d4db",
+        transition: "background 0.15s",
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "center",
+        userSelect: "none",
+        touchAction: "none",
+        "&:hover": { background: "#1976d2" },
+      }}
+    >
+      {/* グリップドット */}
+      <Box sx={{
+        display: "flex",
+        flexDirection: isHorizontal ? "column" : "row",
+        gap: "3px",
+        pointerEvents: "none",
+      }}>
+        {[0,1,2].map(i => (
+          <Box key={i} sx={{
+            width: isHorizontal ? 2 : 4,
+            height: isHorizontal ? 4 : 2,
+            borderRadius: 1,
+            background: active ? "#fff" : "#9aa0ab",
+            transition: "background 0.15s",
+          }} />
+        ))}
+      </Box>
+    </Box>
+  );
+}
+
+// ─── フローティングウィンドウ ────────────────────────────────────────────────
+
+const WIN_TITLEBAR_H = 36;
+const WIN_MIN_W      = 280;
+const WIN_MIN_H      = 180;
+const WIN_DEFAULT_W  = 640;
+const WIN_DEFAULT_H  = 480;
+
+let winIdCounter = 0;
+
+function createWin(overrides = {}) {
+  const id  = ++winIdCounter;
+  const tab = createTab();
+  // 画面サイズに合わせた初期サイズ（余白 40px）
+  const vw = window.innerWidth;
+  const vh = window.innerHeight;
+  const initW = Math.min(WIN_DEFAULT_W, vw - 40);
+  const initH = Math.min(WIN_DEFAULT_H, vh - 40);
+  const offset = ((id - 1) % 5) * 28;
+  return {
+    id,
+    tabs:      [tab],
+    activeTab: tab.id,
+    x:         Math.min(40 + offset, vw - initW - 8),
+    y:         Math.min(40 + offset, vh - initH - 8),
+    w:         initW,
+    h:         initH,
+    minimized: false,
+    maximized: false,
+    prevRect:  null,
+    zIndex:    1000 + id,
+    ...overrides,
+  };
+}
+
+// ドラッグ移動 + リサイズ共通フック
+function useWinDrag(onMove) {
+  const dragging = useRef(false);
+  const origin   = useRef({ px: 0, py: 0, ox: 0, oy: 0 });
+
+  const onPointerDown = useCallback((e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    dragging.current = true;
+    origin.current   = { px: e.clientX, py: e.clientY, ox: 0, oy: 0 };
+    e.currentTarget.setPointerCapture(e.pointerId);
+  }, []);
+
+  const onPointerMove = useCallback((e) => {
+    if (!dragging.current) return;
+    const dx = e.clientX - origin.current.px;
+    const dy = e.clientY - origin.current.py;
+    origin.current.px = e.clientX;
+    origin.current.py = e.clientY;
+    onMove(dx, dy);
+  }, [onMove]);
+
+  const onPointerUp = useCallback(() => { dragging.current = false; }, []);
+
+  return { onPointerDown, onPointerMove, onPointerUp };
+}
+
+// ── タブ・ウィンドウ状態ファクトリ ──
+let tabIdCounter = 0;
+function createTab(url) {
+  return { id: ++tabIdCounter, url: url || "", inputUrl: url || "", title: url ? url : "新しいタブ", history: url ? [url] : [], histIdx: 0, iframeKey: 0 };
+}
+
+function FloatingWindow({ win, onUpdate, onClose, onFocus }) {
+  const activeTab = win.tabs.find(t => t.id === win.activeTab) || win.tabs[0];
+
+  // ── タブ操作 ──
+  const updateTab = useCallback((tabId, patch) => {
+    onUpdate(win.id, w => ({
+      tabs: w.tabs.map(t => t.id === tabId
+        ? { ...t, ...(typeof patch === "function" ? patch(t) : patch) }
+        : t),
+    }));
+  }, [win.id, onUpdate]);
+
+  const addTab = useCallback((e) => {
+    e.stopPropagation();
+    const t = createTab();
+    onUpdate(win.id, w => ({ tabs: [...w.tabs, t], activeTab: t.id }));
+  }, [win.id, onUpdate]);
+
+  const closeTab = useCallback((e, tabId) => {
+    e.stopPropagation();
+    onUpdate(win.id, w => {
+      const next = w.tabs.filter(t => t.id !== tabId);
+      if (next.length === 0) { onClose(win.id); return w; }
+      const active = w.activeTab === tabId ? next[next.length - 1].id : w.activeTab;
+      return { tabs: next, activeTab: active };
+    });
+  }, [win.id, onUpdate, onClose]);
+
+  // ── ナビゲーション ──
+  const navigate = useCallback((raw) => {
+    let url = (raw || "").trim();
+    if (!url) return;
+    if (!new RegExp("^https?://", "i").test(url)) url = "https://" + url;
+    updateTab(activeTab.id, t => {
+      const hist = [...t.history.slice(0, t.histIdx + 1), url];
+      return { url, inputUrl: url, title: url, history: hist, histIdx: hist.length - 1, iframeKey: t.iframeKey + 1 };
+    });
+  }, [activeTab, updateTab]);
+
+  const goBack = useCallback((e) => {
+    e.stopPropagation();
+    updateTab(activeTab.id, t => {
+      if (t.histIdx <= 0) return t;
+      const idx = t.histIdx - 1;
+      return { url: t.history[idx], inputUrl: t.history[idx], histIdx: idx, iframeKey: t.iframeKey + 1 };
+    });
+  }, [activeTab, updateTab]);
+
+  const goForward = useCallback((e) => {
+    e.stopPropagation();
+    updateTab(activeTab.id, t => {
+      if (t.histIdx >= t.history.length - 1) return t;
+      const idx = t.histIdx + 1;
+      return { url: t.history[idx], inputUrl: t.history[idx], histIdx: idx, iframeKey: t.iframeKey + 1 };
+    });
+  }, [activeTab, updateTab]);
+
+  const reload = useCallback((e) => {
+    e.stopPropagation();
+    updateTab(activeTab.id, t => ({ iframeKey: t.iframeKey + 1 }));
+  }, [activeTab, updateTab]);
+
+  // ── ウィンドウ操作 ──
+  const minimize = useCallback((e) => {
+    e.stopPropagation();
+    onUpdate(win.id, { minimized: true });
+  }, [win.id, onUpdate]);
+
+  const toggleMaximize = useCallback((e) => {
+    e && e.stopPropagation();
+    onUpdate(win.id, w => w.maximized
+      ? { maximized: false, ...(w.prevRect || {}) }
+      : { maximized: true, prevRect: { x: w.x, y: w.y, w: w.w, h: w.h },
+          x: 0, y: 0, w: window.innerWidth, h: window.innerHeight });
+  }, [win.id, onUpdate]);
+
+  // 画面内に収める（はみ出し補正）
+  const fitToScreen = useCallback((e) => {
+    e.stopPropagation();
+    onUpdate(win.id, w => {
+      if (w.maximized) return w;
+      const vw = window.innerWidth;
+      const vh = window.innerHeight;
+      const newW = Math.min(w.w, vw - 16);
+      const newH = Math.min(w.h, vh - 16);
+      const newX = Math.max(0, Math.min(w.x, vw - newW - 8));
+      const newY = Math.max(0, Math.min(w.y, vh - WIN_TITLEBAR_H - 8));
+      return { x: newX, y: newY, w: newW, h: newH };
+    });
+  }, [win.id, onUpdate]);
+
+  const closeWin = useCallback((e) => {
+    e.stopPropagation();
+    onClose(win.id);
+  }, [win.id, onClose]);
+
+  // ── ドラッグ移動 ──
+  const moveDrag = useWinDrag(useCallback((dx, dy) => {
+    onUpdate(win.id, w => {
+      if (w.maximized) return w;
+      return {
+        x: Math.max(0, Math.min(window.innerWidth  - w.w, w.x + dx)),
+        y: Math.max(0, Math.min(window.innerHeight - WIN_TITLEBAR_H, w.y + dy)),
+      };
+    });
+  }, [win.id, onUpdate]));
+
+  // ── リサイズ（右下） ──
+  const resizeDrag = useWinDrag(useCallback((dx, dy) => {
+    onUpdate(win.id, w => {
+      if (w.maximized) return w;
+      return { w: Math.max(WIN_MIN_W, w.w + dx), h: Math.max(WIN_MIN_H, w.h + dy) };
+    });
+  }, [win.id, onUpdate]));
+
+  // ── アドレスバー入力（ローカル state） ──
+  const [addrInput, setAddrInput] = useState(activeTab.inputUrl);
+  useEffect(() => { setAddrInput(activeTab.inputUrl); }, [activeTab.id, activeTab.inputUrl]);
+
+  const canBack    = activeTab.histIdx > 0;
+  const canForward = activeTab.histIdx < activeTab.history.length - 1;
+  const winW = win.maximized ? window.innerWidth  : win.w;
+  const winH = win.maximized ? window.innerHeight : win.h;
+
+  return (
+    <Box
+      onPointerDown={() => onFocus(win.id)}
+      sx={{
+        position: "fixed",
+        left: win.maximized ? 0 : win.x,
+        top:  win.maximized ? 0 : win.y,
+        width:  winW,
+        height: winH,
+        zIndex: win.zIndex,
+        display: win.minimized ? "none" : "flex",
+        flexDirection: "column",
+        borderRadius: win.maximized ? 0 : "8px",
+        overflow: "hidden",
+        boxShadow: win.maximized ? "none" : "0 12px 40px rgba(0,0,0,0.32), 0 2px 8px rgba(0,0,0,0.16)",
+        border: win.maximized ? "none" : "1px solid rgba(0,0,0,0.14)",
+        background: "#fff",
+        userSelect: "none", touchAction: "none",
+      }}
+    >
+      {/* ── タイトルバー ── */}
+      <Box
+        onPointerDown={(e) => { onFocus(win.id); moveDrag.onPointerDown(e); }}
+        onPointerMove={moveDrag.onPointerMove}
+        onPointerUp={moveDrag.onPointerUp}
+        onDoubleClick={toggleMaximize}
+        sx={{
+          height: WIN_TITLEBAR_H, flexShrink: 0,
+          display: "flex", alignItems: "center", px: 1, gap: 0.5,
+          background: "linear-gradient(135deg,#1a237e,#1565c0)",
+          cursor: win.maximized ? "default" : "move",
+        }}
+      >
+        {/* macOS 風ボタン — stopPropagation でドラッグ開始を防ぐ */}
+        <Box sx={{ display: "flex", gap: "5px", mr: 0.5, flexShrink: 0 }}
+          onPointerDown={e => e.stopPropagation()}>
+          <Tooltip title="閉じる" arrow>
+            <Box onClick={closeWin}
+              sx={{ width: 12, height: 12, borderRadius: "50%", background: "#ff5f57", cursor: "pointer",
+                display:"flex", alignItems:"center", justifyContent:"center",
+                "&:hover": { filter: "brightness(0.8)" } }}>
+              <Icon name="close" size={8} style={{ color: "#900", opacity: 0 }}
+                className="dot-icon" />
+            </Box>
+          </Tooltip>
+          <Tooltip title="最小化" arrow>
+            <Box onClick={minimize}
+              sx={{ width: 12, height: 12, borderRadius: "50%", background: "#febc2e", cursor: "pointer",
+                display:"flex", alignItems:"center", justifyContent:"center",
+                "&:hover": { filter: "brightness(0.8)" } }}>
+              <Icon name="remove" size={8} style={{ color: "#7a5000", opacity: 0 }}
+                className="dot-icon" />
+            </Box>
+          </Tooltip>
+          <Tooltip title={win.maximized ? "元のサイズに戻す" : "最大化"} arrow>
+            <Box onClick={toggleMaximize}
+              sx={{ width: 12, height: 12, borderRadius: "50%", background: "#28c840", cursor: "pointer",
+                display:"flex", alignItems:"center", justifyContent:"center",
+                "&:hover": { filter: "brightness(0.8)" } }}>
+              <Icon name={win.maximized ? "fullscreen_exit" : "fullscreen"} size={8}
+                style={{ color: "#005a00", opacity: 0 }} className="dot-icon" />
+            </Box>
+          </Tooltip>
+          {/* 白丸: 画面内に収める */}
+          <Tooltip title="画面内に収める" arrow>
+            <Box onClick={fitToScreen}
+              sx={{ width: 12, height: 12, borderRadius: "50%",
+                background: "rgba(255,255,255,0.75)",
+                border: "1px solid rgba(0,0,0,0.15)",
+                cursor: "pointer",
+                display:"flex", alignItems:"center", justifyContent:"center",
+                "&:hover": { background: "#fff", filter: "brightness(0.92)" } }}>
+              <Icon name="fit_screen" size={8} style={{ color: "#444", opacity: 0 }} className="dot-icon" />
+            </Box>
+          </Tooltip>
+        </Box>
+
+        <Typography variant="caption" noWrap
+          sx={{ flex: 1, color: "rgba(255,255,255,0.88)", fontSize: 11, fontWeight: 600, textAlign: "center" }}>
+          {activeTab.title}
+        </Typography>
+
+        {/* minimized 時は FloatingWindow 自体が非表示のためここには何も不要 */}
+      </Box>
+
+      {!win.minimized && (<>
+
+        {/* ── タブバー ── */}
+        <Box sx={{
+          height: 30, flexShrink: 0,
+          display: "flex", alignItems: "flex-end",
+          background: "#1e3a6e", px: 0.5, gap: "2px",
+          overflowX: "auto", overflowY: "hidden",
+          "&::-webkit-scrollbar": { height: 3 },
+          "&::-webkit-scrollbar-thumb": { background: "rgba(255,255,255,0.3)", borderRadius: 2 },
+        }}>
+          {win.tabs.map(tab => {
+            const isActive = tab.id === win.activeTab;
+            return (
+              <Box key={tab.id}
+                onPointerDown={e => e.stopPropagation()}
+                onClick={() => onUpdate(win.id, { activeTab: tab.id })}
+                sx={{
+                  display: "flex", alignItems: "center", gap: 0.4,
+                  px: 1, minWidth: 80, maxWidth: 160, height: 24,
+                  borderRadius: "5px 5px 0 0", flexShrink: 0, cursor: "pointer",
+                  background: isActive ? "#fff" : "rgba(255,255,255,0.12)",
+                  "&:hover": { background: isActive ? "#fff" : "rgba(255,255,255,0.22)" },
+                }}>
+                <Icon name="language" size={11}
+                  style={{ color: isActive ? "#1565c0" : "rgba(255,255,255,0.7)", flexShrink: 0 }} />
+                <Typography noWrap variant="caption"
+                  sx={{ flex: 1, fontSize: 11, color: isActive ? "#1a1a2e" : "rgba(255,255,255,0.85)", lineHeight: 1 }}>
+                  {tab.title.length > 14 ? tab.title.slice(0, 14) + "…" : tab.title}
+                </Typography>
+                {win.tabs.length > 1 && (
+                  <Box onClick={(e) => closeTab(e, tab.id)}
+                    sx={{ width: 14, height: 14, borderRadius: "50%", flexShrink: 0,
+                      display: "flex", alignItems: "center", justifyContent: "center",
+                      "&:hover": { background: "rgba(0,0,0,0.15)" } }}>
+                    <Icon name="close" size={10} style={{ color: isActive ? "#555" : "rgba(255,255,255,0.7)" }} />
+                  </Box>
+                )}
+              </Box>
+            );
+          })}
+          <Tooltip title="新しいタブ" arrow>
+            <Box onClick={addTab} onPointerDown={e => e.stopPropagation()}
+              sx={{ width: 24, height: 24, borderRadius: "5px 5px 0 0", flexShrink: 0,
+                display: "flex", alignItems: "center", justifyContent: "center", cursor: "pointer",
+                "&:hover": { background: "rgba(255,255,255,0.2)" } }}>
+              <Icon name="add" size={15} style={{ color: "rgba(255,255,255,0.8)" }} />
+            </Box>
+          </Tooltip>
+        </Box>
+
+        {/* ── アドレスバー ── */}
+        <Box onPointerDown={e => e.stopPropagation()}
+          sx={{
+            height: 36, flexShrink: 0,
+            display: "flex", alignItems: "center", gap: 0.3,
+            px: 0.8, background: "#f5f6f8", borderBottom: "1px solid #e0e0e0",
+          }}>
+          <Tooltip title="戻る" arrow><span>
+            <IconButton size="small" onClick={goBack} disabled={!canBack} sx={{ p: 0.4 }}>
+              <Icon name="arrow_back" size={16} style={{ color: canBack ? "#444" : "#ccc" }} />
+            </IconButton>
+          </span></Tooltip>
+          <Tooltip title="進む" arrow><span>
+            <IconButton size="small" onClick={goForward} disabled={!canForward} sx={{ p: 0.4 }}>
+              <Icon name="arrow_forward" size={16} style={{ color: canForward ? "#444" : "#ccc" }} />
+            </IconButton>
+          </span></Tooltip>
+          <Tooltip title="再読み込み" arrow>
+            <IconButton size="small" onClick={reload} sx={{ p: 0.4 }}>
+              <Icon name="refresh" size={16} style={{ color: "#444" }} />
+            </IconButton>
+          </Tooltip>
+          <Box component="input"
+            value={addrInput}
+            onChange={e => setAddrInput(e.target.value)}
+            onKeyDown={e => { if (e.key === "Enter") navigate(addrInput); }}
+            onFocus={e => e.target.select()}
+            placeholder="URL を入力して Enter（例: example.com）"
+            sx={{
+              flex: 1, border: "1px solid #d0d0d0", borderRadius: "20px",
+              px: 1.5, py: 0.35, fontSize: 12, fontFamily: "inherit",
+              outline: "none", background: "#fff",
+              "&:focus": { borderColor: "#1976d2", boxShadow: "0 0 0 2px rgba(25,118,210,0.15)" },
+            }}
+          />
+          <Tooltip title="移動" arrow>
+            <IconButton size="small" onClick={() => navigate(addrInput)} sx={{ p: 0.4 }}>
+              <Icon name="send" size={15} style={{ color: "#1976d2" }} />
+            </IconButton>
+          </Tooltip>
+        </Box>
+
+        {/* ── コンテンツ ── */}
+        <Box sx={{ flex: 1, overflow: "hidden", position: "relative", background: "#fafafa" }}>
+          {activeTab.url ? (
+            <iframe key={activeTab.iframeKey} src={activeTab.url} title={activeTab.title}
+              style={{ width: "100%", height: "100%", border: "none", display: "block" }} />
+          ) : (
+            <Box sx={{ width: "100%", height: "100%", display: "flex", flexDirection: "column",
+              alignItems: "center", justifyContent: "center", gap: 2,
+              background: "linear-gradient(135deg,#f8f9ff,#fff)" }}>
+              <Icon name="language" size={48} style={{ color: "#d0d8f0" }} />
+              <Typography variant="body2" color="text.disabled" sx={{ textAlign: "center", px: 3 }}>
+                URL を入力して Enter を押してください
+              </Typography>
+              <Typography variant="caption" color="text.disabled"
+                sx={{ textAlign: "center", px: 3, fontSize: 10, lineHeight: 1.8 }}>
+                ※ X-Frame-Options が設定されたサイト（Google 等）は<br />
+                セキュリティ制限により表示できません
+              </Typography>
+            </Box>
+          )}
+        </Box>
+
+      </>)}
+
+      {/* ── リサイズハンドル（右下） ── */}
+      {!win.minimized && !win.maximized && (
+        <Box
+          onPointerDown={resizeDrag.onPointerDown}
+          onPointerMove={resizeDrag.onPointerMove}
+          onPointerUp={resizeDrag.onPointerUp}
+          sx={{ position: "absolute", right: 0, bottom: 0, width: 18, height: 18,
+            cursor: "se-resize", zIndex: 20,
+            display: "flex", alignItems: "flex-end", justifyContent: "flex-end", p: "3px" }}>
+          <svg width="10" height="10" viewBox="0 0 10 10">
+            <line x1="2" y1="10" x2="10" y2="2" stroke="#bbb" strokeWidth="1.5" strokeLinecap="round"/>
+            <line x1="5" y1="10" x2="10" y2="5" stroke="#bbb" strokeWidth="1.5" strokeLinecap="round"/>
+            <line x1="8" y1="10" x2="10" y2="8" stroke="#bbb" strokeWidth="1.5" strokeLinecap="round"/>
+          </svg>
+        </Box>
+      )}
+    </Box>
+  );
+}
+
+const TOOLBAR_H    = 52; // px
+
+// ─── ストレージキー ───────────────────────────────────────────────────────────
+
+const STORAGE_KEY          = "html-tester-code";
+const STORAGE_PROFILES_KEY = "html-tester-profiles";
+const STORAGE_ACTIVE_KEY   = "html-tester-active-profile";
+const MAX_PROFILES         = 20;
+const MAX_URL_HISTORY      = 200;
+
+// ─── デフォルト設定 ───────────────────────────────────────────────────────────
+
+const DEFAULT_SETTINGS = {
+  fontSize:      13,
+  darkMode:      false,
+  wordWrap:      false,
+  highlightMode: "plain",
+  previewScale:  100,
+  previewWidth:  "100%",
+  splitRatio:    0.5,
+};
+
+// ─── プロファイルユーティリティ ───────────────────────────────────────────────
+
+let profileIdCounter = 0;
+
+function newProfileId() {
+  return \`profile-\${Date.now()}-\${++profileIdCounter}\`;
+}
+
+function createProfile(name, data) {
+  return {
+    id:        newProfileId(),
+    name:      name || "新しいプロファイル",
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+    data: {
+      code:       data.code       ?? DEFAULT_HTML,
+      settings:   { ...DEFAULT_SETTINGS, ...(data.settings || {}) },
+      windows:    data.windows    ?? [],
+      urlHistory: data.urlHistory ?? [],
+    },
+  };
+}
+
+function loadProfiles() {
+  try {
+    const raw = localStorage.getItem(STORAGE_PROFILES_KEY);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed : [];
+  } catch { return []; }
+}
+
+function saveProfiles(profiles) {
+  try { localStorage.setItem(STORAGE_PROFILES_KEY, JSON.stringify(profiles)); } catch {}
+}
+
+function loadActiveProfileId() {
+  try { return localStorage.getItem(STORAGE_ACTIVE_KEY) || null; } catch { return null; }
+}
+
+function saveActiveProfileId(id) {
+  try { localStorage.setItem(STORAGE_ACTIVE_KEY, id); } catch {}
+}
+
+function validateSettings(s) {
+  if (!s || typeof s !== "object") return { ...DEFAULT_SETTINGS };
+  return {
+    fontSize:      (typeof s.fontSize === "number" && s.fontSize >= 10 && s.fontSize <= 24) ? s.fontSize : DEFAULT_SETTINGS.fontSize,
+    darkMode:      typeof s.darkMode === "boolean" ? s.darkMode : DEFAULT_SETTINGS.darkMode,
+    wordWrap:      typeof s.wordWrap === "boolean" ? s.wordWrap : DEFAULT_SETTINGS.wordWrap,
+    highlightMode: ["plain","prism"].includes(s.highlightMode) ? s.highlightMode : DEFAULT_SETTINGS.highlightMode,
+    previewScale:  (typeof s.previewScale === "number" && s.previewScale >= 25 && s.previewScale <= 200) ? s.previewScale : DEFAULT_SETTINGS.previewScale,
+    previewWidth:  typeof s.previewWidth === "string" ? s.previewWidth : DEFAULT_SETTINGS.previewWidth,
+    splitRatio:    (typeof s.splitRatio === "number" && s.splitRatio >= 0.15 && s.splitRatio <= 0.85) ? s.splitRatio : DEFAULT_SETTINGS.splitRatio,
+  };
+}
+
+function exportAllProfiles(profiles) {
+  const blob = new Blob([JSON.stringify({ version: "1.0", exportedAt: new Date().toISOString(), profiles }, null, 2)], { type: "application/json" });
+  const url  = URL.createObjectURL(blob);
+  const a    = document.createElement("a");
+  a.href = url; a.download = "ht-profiles.json"; a.click();
+  URL.revokeObjectURL(url);
+}
+
+function exportProfile(profile) {
+  const blob = new Blob([JSON.stringify({ version: "1.0", exportedAt: new Date().toISOString(), profiles: [profile] }, null, 2)], { type: "application/json" });
+  const url  = URL.createObjectURL(blob);
+  const a    = document.createElement("a");
+  a.href = url; a.download = \`ht-profile-\${profile.name}.json\`; a.click();
+  URL.revokeObjectURL(url);
+}
+
+const DEFAULT_HTML = \`<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8" />
+  <title>Sample</title>
+  <style>
+    body { margin:0; padding:24px; font-family:sans-serif; background:linear-gradient(135deg,#f5f7ff,#fff); }
+    .card { max-width:520px; margin:32px auto; padding:24px; border-radius:20px; background:#fff; box-shadow:0 10px 30px rgba(0,0,0,.08); }
+    h1 { margin-top:0; color:#222; }
+    p { color:#555; line-height:1.7; }
+    button { padding:12px 18px; border:none; border-radius:10px; background:#1976d2; color:#fff; cursor:pointer; font-size:14px; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>テスト HTML</h1>
+    <p>ここに好きな HTML/CSS/JS を貼ってプレビューできます。</p>
+    <button onclick="document.getElementById('msg').textContent='iframe 内で動作しています ✓'">クリック</button>
+    <p id="msg" style="color:#1976d2;font-weight:600;min-height:1.5em"></p>
+  </div>
+</body>
+</html>\`;
+
+const EMPTY_HTML = \`<!DOCTYPE html>
+<html lang="ja">
+<head><meta charset="UTF-8" />
+<style>
+  body { margin:0; font-family:sans-serif; display:grid; place-items:center; min-height:100vh; background:#fafafa; color:#aaa; }
+  .hint { padding:20px 28px; border:1.5px dashed #ddd; border-radius:14px; background:#fff; font-size:14px; text-align:center; }
+</style></head>
+<body><div class="hint">HTML を貼り付けてください</div></body>
+</html>\`;
+
+const WIDTH_PRESETS = [
+  { label: "PC",        value: "100%",  icon: "desktop_windows" },
+  { label: "タブレット", value: "768px", icon: "tablet_mac"      },
+  { label: "スマホ",     value: "375px", icon: "smartphone"      },
+];
+
+// ─── テーマ ───────────────────────────────────────────────────────────────────
+
+const theme = createTheme({
+  palette: { mode: "light", primary: { main: "#1976d2" } },
+  typography: { fontFamily: '"Roboto","Helvetica","Arial",sans-serif' },
+  shape: { borderRadius: 8 },
+});
+
+// ─── ユーティリティ ───────────────────────────────────────────────────────────
+
+// コンソール傍受スクリプト（iframe の srcDoc 先頭に注入）
+const CONSOLE_INTERCEPT = \`<script>
+(function(){
+  var _send = function(level, args) {
+    try {
+      var msg = Array.from(args).map(function(a){
+        try { return typeof a === 'object' ? JSON.stringify(a, null, 2) : String(a); }
+        catch(e) { return String(a); }
+      }).join(' ');
+      window.parent.postMessage({ type: '__ht_console__', level: level, msg: msg, ts: Date.now() }, '*');
+    } catch(e){}
+  };
+  ['log','warn','error','info','debug'].forEach(function(m){
+    var orig = console[m].bind(console);
+    console[m] = function(){ orig.apply(console, arguments); _send(m, arguments); };
+  });
+  window.addEventListener('error', function(e){
+    _send('error', [e.message + (e.filename ? ' (' + e.filename + ':' + e.lineno + ')' : '')]);
+  });
+  window.addEventListener('unhandledrejection', function(e){
+    _send('error', ['Unhandled Promise rejection: ' + (e.reason?.message || e.reason)]);
+  });
+})();
+<\/script>\`;
+
+function buildSrcDoc(html) {
+  const content = (html || "").trim();
+  if (!content) return EMPTY_HTML;
+  // <head> があれば直後に注入、なければ先頭に追加
+  if (content.includes("<head>")) {
+    return content.replace("<head>", "<head>" + CONSOLE_INTERCEPT);
+  }
+  return CONSOLE_INTERCEPT + content;
+}
+
+function useDebounce(value, delay) {
+  const [d, setD] = useState(value);
+  useEffect(() => {
+    const t = setTimeout(() => setD(value), delay);
+    return () => clearTimeout(t);
+  }, [value, delay]);
+  return d;
+}
+
+function Icon({ name, size = 20, style }) {
+  return <span className="material-icons" style={{ fontSize: size, lineHeight: 1, ...style }}>{name}</span>;
+}
+
+// ─── ProfileMenu コンポーネント ──────────────────────────────────────────────
+
+function ProfileMenu({
+  profiles, activeId, onSwitch, onSave, onNew, onRename, onDuplicate,
+  onDelete, onExport, onExportAll, onImport, onReset,
+}) {
+  const [anchorEl, setAnchorEl]   = useState(null);
+  const [renameId, setRenameId]   = useState(null);
+  const [renameName, setRenameName] = useState("");
+  const [confirmDel, setConfirmDel] = useState(null); // profile id
+  const fileInputRef = useRef(null);
+
+  const active = profiles.find(p => p.id === activeId);
+  const open   = Boolean(anchorEl);
+
+  const { Menu, MenuItem, ListItemIcon, ListItemText,
+          Divider: MuiDivider, TextField: MuiTextField,
+          Dialog, DialogTitle, DialogContent, DialogActions, Button } = MaterialUI;
+
+  return (
+    <>
+      {/* トリガーボタン */}
+      <Box
+        onClick={e => setAnchorEl(e.currentTarget)}
+        sx={{
+          display: "flex", alignItems: "center", gap: 0.5,
+          px: 1.2, py: 0.4, borderRadius: 1, cursor: "pointer",
+          border: "1px solid rgba(255,255,255,0.3)",
+          background: open ? "rgba(255,255,255,0.18)" : "rgba(255,255,255,0.1)",
+          "&:hover": { background: "rgba(255,255,255,0.2)" },
+          maxWidth: 160,
+        }}
+      >
+        <Icon name="manage_accounts" size={15} style={{ color: "#a5d6ff", flexShrink: 0 }} />
+        <Typography noWrap variant="caption"
+          sx={{ fontSize: 11, color: "#fff", fontWeight: 600, lineHeight: 1, flex: 1 }}>
+          {active ? active.name : "プロファイル"}
+        </Typography>
+        <Icon name="arrow_drop_down" size={16} style={{ color: "rgba(255,255,255,0.7)", flexShrink: 0 }} />
+      </Box>
+
+      {/* メニュー */}
+      <Menu
+        anchorEl={anchorEl}
+        open={open}
+        onClose={() => setAnchorEl(null)}
+        PaperProps={{ sx: { minWidth: 220, borderRadius: 2, mt: 0.5 } }}
+      >
+        {/* プロファイル一覧 */}
+        {profiles.map(p => (
+          <MenuItem
+            key={p.id}
+            selected={p.id === activeId}
+            onClick={() => { onSwitch(p.id); setAnchorEl(null); }}
+            sx={{ gap: 1 }}
+          >
+            <Icon name={p.id === activeId ? "radio_button_checked" : "radio_button_unchecked"}
+              size={14} style={{ color: p.id === activeId ? "#1976d2" : "#bbb" }} />
+            <ListItemText
+              primary={p.name}
+              secondary={new Date(p.updatedAt).toLocaleDateString("ja-JP")}
+              primaryTypographyProps={{ fontSize: 13, fontWeight: p.id === activeId ? 700 : 400 }}
+              secondaryTypographyProps={{ fontSize: 10 }}
+              sx={{ my: 0 }}
+            />
+            {/* 個別操作 */}
+            <Box sx={{ display: "flex", gap: 0.2, ml: "auto" }} onClick={e => e.stopPropagation()}>
+              <Tooltip title="名前変更" arrow>
+                <IconButton size="small" sx={{ p: 0.3 }}
+                  onClick={() => { setRenameId(p.id); setRenameName(p.name); }}>
+                  <Icon name="edit" size={13} />
+                </IconButton>
+              </Tooltip>
+              <Tooltip title="複製" arrow>
+                <IconButton size="small" sx={{ p: 0.3 }}
+                  onClick={() => { onDuplicate(p.id); setAnchorEl(null); }}>
+                  <Icon name="content_copy" size={13} />
+                </IconButton>
+              </Tooltip>
+              <Tooltip title="エクスポート" arrow>
+                <IconButton size="small" sx={{ p: 0.3 }}
+                  onClick={() => onExport(p.id)}>
+                  <Icon name="upload" size={13} />
+                </IconButton>
+              </Tooltip>
+              {profiles.length > 1 && (
+                <Tooltip title="削除" arrow>
+                  <IconButton size="small" sx={{ p: 0.3, color: "#e57373" }}
+                    onClick={() => setConfirmDel(p.id)}>
+                    <Icon name="delete_outline" size={13} />
+                  </IconButton>
+                </Tooltip>
+              )}
+            </Box>
+          </MenuItem>
+        ))}
+
+        <MuiDivider />
+
+        <MenuItem onClick={() => { onSave(); setAnchorEl(null); }}>
+          <Icon name="save" size={16} style={{ marginRight: 8, color: "#1976d2" }} />
+          <ListItemText primary="現在の状態を上書き保存" primaryTypographyProps={{ fontSize: 13 }} />
+        </MenuItem>
+        <MenuItem onClick={() => { onNew(); setAnchorEl(null); }}>
+          <Icon name="add_circle_outline" size={16} style={{ marginRight: 8, color: "#43a047" }} />
+          <ListItemText primary="新規プロファイルとして保存" primaryTypographyProps={{ fontSize: 13 }} />
+        </MenuItem>
+
+        <MuiDivider />
+
+        <MenuItem onClick={() => { onExportAll(); setAnchorEl(null); }}>
+          <Icon name="download" size={16} style={{ marginRight: 8, color: "#888" }} />
+          <ListItemText primary="全プロファイルをエクスポート" primaryTypographyProps={{ fontSize: 13 }} />
+        </MenuItem>
+        <MenuItem onClick={() => { fileInputRef.current?.click(); setAnchorEl(null); }}>
+          <Icon name="upload_file" size={16} style={{ marginRight: 8, color: "#888" }} />
+          <ListItemText primary="JSONからインポート" primaryTypographyProps={{ fontSize: 13 }} />
+        </MenuItem>
+
+        <MuiDivider />
+
+        <MenuItem onClick={() => { onReset(); setAnchorEl(null); }} sx={{ color: "#e57373" }}>
+          <Icon name="restart_alt" size={16} style={{ marginRight: 8, color: "#e57373" }} />
+          <ListItemText primary="初期設定に戻す" primaryTypographyProps={{ fontSize: 13, color: "#e57373" }} />
+        </MenuItem>
+      </Menu>
+
+      {/* 名前変更ダイアログ */}
+      <Dialog open={Boolean(renameId)} onClose={() => setRenameId(null)} maxWidth="xs" fullWidth
+        PaperProps={{ sx: { borderRadius: 3 } }}>
+        <DialogTitle sx={{ fontWeight: 700, pb: 1 }}>プロファイル名を変更</DialogTitle>
+        <DialogContent>
+          <MuiTextField
+            autoFocus fullWidth size="small"
+            value={renameName}
+            onChange={e => setRenameName(e.target.value)}
+            onKeyDown={e => { if (e.key === "Enter") { onRename(renameId, renameName); setRenameId(null); } }}
+          />
+        </DialogContent>
+        <DialogActions sx={{ px: 3, pb: 2, gap: 1 }}>
+          <Button onClick={() => setRenameId(null)} variant="outlined" fullWidth>キャンセル</Button>
+          <Button onClick={() => { onRename(renameId, renameName); setRenameId(null); }}
+            variant="contained" fullWidth>変更</Button>
+        </DialogActions>
+      </Dialog>
+
+      {/* 削除確認ダイアログ */}
+      <Dialog open={Boolean(confirmDel)} onClose={() => setConfirmDel(null)} maxWidth="xs" fullWidth
+        PaperProps={{ sx: { borderRadius: 3 } }}>
+        <DialogTitle sx={{ fontWeight: 700, pb: 1 }}>プロファイルを削除</DialogTitle>
+        <DialogContent>
+          <Typography variant="body2">
+            「{profiles.find(p => p.id === confirmDel)?.name}」を削除します。この操作は元に戻せません。
+          </Typography>
+        </DialogContent>
+        <DialogActions sx={{ px: 3, pb: 2, gap: 1 }}>
+          <Button onClick={() => setConfirmDel(null)} variant="outlined" fullWidth>キャンセル</Button>
+          <Button onClick={() => { onDelete(confirmDel); setConfirmDel(null); }}
+            variant="contained" color="error" fullWidth>削除</Button>
+        </DialogActions>
+      </Dialog>
+
+      {/* 非表示ファイル入力 */}
+      <input ref={fileInputRef} type="file" accept=".json" style={{ display: "none" }}
+        onChange={e => { const f = e.target.files?.[0]; if (f) onImport(f); e.target.value = ""; }} />
+    </>
+  );
+}
+
+// ─── 確認ダイアログ ───────────────────────────────────────────────────────────
+
+function ConfirmDialog({ open, title, message, confirmLabel = "実行", confirmColor = "error", onConfirm, onCancel }) {
+  return (
+    <Dialog open={open} onClose={onCancel} maxWidth="xs" fullWidth
+      PaperProps={{ sx: { borderRadius: 3, mx: 2 } }}>
+      <DialogTitle sx={{ fontWeight: 700, pb: 1 }}>{title}</DialogTitle>
+      <DialogContent>
+        <DialogContentText>{message}</DialogContentText>
+      </DialogContent>
+      <DialogActions sx={{ px: 3, pb: 2.5, gap: 1 }}>
+        <Button onClick={onCancel} variant="outlined" fullWidth>キャンセル</Button>
+        <Button onClick={onConfirm} variant="contained" color={confirmColor} fullWidth autoFocus>
+          {confirmLabel}
+        </Button>
+      </DialogActions>
+    </Dialog>
+  );
+}
+
+// ─── プレビュー幅セレクター ───────────────────────────────────────────────────
+
+function WidthSelector({ value, onChange }) {
+  return (
+    <ToggleButtonGroup value={value} exclusive size="small"
+      onChange={(_, v) => { if (v !== null) onChange(v); }}>
+      {WIDTH_PRESETS.map(p => (
+        <Tooltip key={p.value} title={p.label} arrow
+          disableFocusListener disableTouchListener>
+          <span>
+            <ToggleButton value={p.value} sx={{ px: 1.2, py: 0.5 }}>
+              <Icon name={p.icon} size={17} />
+            </ToggleButton>
+          </span>
+        </Tooltip>
+      ))}
+    </ToggleButtonGroup>
+  );
+}
+
+// ─── スナップショットパネル ───────────────────────────────────────────────────
+
+const MAX_SNAPSHOTS = 50;
+
+function SnapshotPanel({ open, onClose, snapshots, onRestore, onDelete, onClearAll, darkMode }) {
+  const [selected, setSelected] = useState(null);
+  const { Dialog, DialogTitle, DialogContent, DialogActions, Button, Chip, List,
+          ListItem, ListItemButton, ListItemText, Divider: MuiDivider } = MaterialUI;
+
+  const snap = snapshots.find(s => s.id === selected);
+
+  // パネルを開くたびに最新を選択
+  useEffect(() => {
+    if (open && snapshots.length > 0) setSelected(snapshots[0].id);
+  }, [open]);
+
+  const previewBg  = darkMode ? "#1e1e2e" : "#f8f9fb";
+  const previewFg  = darkMode ? "#cdd6f4" : "#1a1a2e";
+  const borderC    = darkMode ? "#313244" : "#e0e3e8";
+
+  return (
+    <Dialog open={open} onClose={onClose} maxWidth="lg" fullWidth
+      PaperProps={{ sx: { borderRadius: 3, height: "80vh", display: "flex", flexDirection: "column" } }}>
+      <DialogTitle sx={{ py: 1.5, display: "flex", alignItems: "center", gap: 1, borderBottom: \`1px solid \${borderC}\` }}>
+        <Icon name="photo_camera" size={18} style={{ color: "#555" }} />
+        <Typography variant="subtitle1" fontWeight={700} sx={{ flex: 1 }}>スナップショット</Typography>
+        <Chip label={\`\${snapshots.length} / \${MAX_SNAPSHOTS}\`} size="small" sx={{ fontSize: 11 }} />
+      </DialogTitle>
+
+      <Box sx={{ display: "flex", flex: 1, overflow: "hidden" }}>
+
+        {/* 左: スナップショット一覧 */}
+        <Box sx={{ width: 220, flexShrink: 0, borderRight: \`1px solid \${borderC}\`,
+          overflowY: "auto", background: darkMode ? "#181825" : "#f5f6f8" }}>
+          {snapshots.length === 0 ? (
+            <Box sx={{ p: 2, color: "#aaa", fontSize: 12, textAlign: "center" }}>
+              スナップショットなし
+            </Box>
+          ) : (
+            <List dense disablePadding>
+              {snapshots.map((s, i) => (
+                <ListItem key={s.id} disablePadding
+                  secondaryAction={
+                    <Tooltip title="削除" arrow>
+                      <IconButton size="small" edge="end" sx={{ p: 0.3 }}
+                        onClick={e => { e.stopPropagation(); onDelete(s.id); if (selected === s.id) setSelected(snapshots[i + 1]?.id ?? snapshots[i - 1]?.id ?? null); }}>
+                        <Icon name="close" size={12} style={{ color: "#bbb" }} />
+                      </IconButton>
+                    </Tooltip>
+                  }>
+                  <ListItemButton selected={selected === s.id} onClick={() => setSelected(s.id)}
+                    sx={{ py: 0.8, pr: 4 }}>
+                    <ListItemText
+                      primary={
+                        <Box sx={{ display: "flex", alignItems: "center", gap: 0.5 }}>
+                          {s.isLastGood && <Icon name="check_circle" size={12} style={{ color: "#43a047" }} />}
+                          {s.isAuto && !s.isLastGood && <Icon name="schedule" size={12} style={{ color: "#888" }} />}
+                          <Typography noWrap variant="caption" sx={{ fontSize: 11, fontWeight: 600 }}>
+                            {s.label}
+                          </Typography>
+                        </Box>
+                      }
+                      secondary={
+                        <Typography variant="caption" sx={{ fontSize: 10, color: "#aaa" }}>
+                          {new Date(s.ts).toLocaleString("ja-JP", { month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", second: "2-digit" })}
+                          {" · "}{s.code.length.toLocaleString()} 文字
+                        </Typography>
+                      }
+                    />
+                  </ListItemButton>
+                </ListItem>
+              ))}
+            </List>
+          )}
+        </Box>
+
+        {/* 右: プレビュー */}
+        <Box sx={{ flex: 1, display: "flex", flexDirection: "column", overflow: "hidden" }}>
+          {snap ? (
+            <>
+              <Box sx={{ px: 2, py: 1, borderBottom: \`1px solid \${borderC}\`, display: "flex", alignItems: "center", gap: 1 }}>
+                <Typography variant="caption" sx={{ fontSize: 11, color: "#888", flex: 1 }}>
+                  {snap.label} — {new Date(snap.ts).toLocaleString("ja-JP")}
+                </Typography>
+                {snap.isLastGood && <Chip label="最後の正常表示" size="small" color="success" sx={{ fontSize: 10, height: 18 }} />}
+                <Tooltip title="コードをコピー" arrow>
+                  <IconButton size="small" sx={{ p: 0.4 }}
+                    onClick={() => navigator.clipboard.writeText(snap.code).catch(() => {})}>
+                    <Icon name="content_copy" size={14} />
+                  </IconButton>
+                </Tooltip>
+              </Box>
+              <Box sx={{ flex: 1, overflow: "auto", background: previewBg, p: 0 }}>
+                <Box component="pre" sx={{
+                  m: 0, p: "12px 14px",
+                  fontFamily: "ui-monospace,SFMono-Regular,Menlo,Consolas,monospace",
+                  fontSize: 12, lineHeight: 1.65,
+                  color: previewFg, whiteSpace: "pre-wrap", wordBreak: "break-all",
+                }}>
+                  {snap.code}
+                </Box>
+              </Box>
+            </>
+          ) : (
+            <Box sx={{ flex: 1, display: "flex", alignItems: "center", justifyContent: "center", color: "#bbb" }}>
+              <Typography variant="body2" color="text.disabled">スナップショットを選択してください</Typography>
+            </Box>
+          )}
+        </Box>
+      </Box>
+
+      <DialogActions sx={{ px: 2, py: 1, borderTop: \`1px solid \${borderC}\`, gap: 1 }}>
+        <Button size="small" color="error" variant="outlined"
+          onClick={onClearAll} disabled={snapshots.length === 0}
+          startIcon={<Icon name="delete_sweep" size={14} />}>
+          全削除
+        </Button>
+        <Box sx={{ flex: 1 }} />
+        <Button size="small" onClick={onClose} variant="outlined">閉じる</Button>
+        <Button size="small" variant="contained" disabled={!snap}
+          startIcon={<Icon name="restore" size={14} />}
+          onClick={() => { if (snap) { onRestore(snap.code); onClose(); } }}>
+          このコードに復元
+        </Button>
+      </DialogActions>
+    </Dialog>
+  );
+}
+
+// ─── コンソールパネル ─────────────────────────────────────────────────────────
+
+const LOG_COLORS = {
+  log:   { bg: "transparent",  fg: "#1a1a2e", icon: "chevron_right",  ic: "#888"    },
+  info:  { bg: "#e3f2fd",      fg: "#0d47a1", icon: "info_outline",   ic: "#1976d2" },
+  warn:  { bg: "#fff8e1",      fg: "#e65100", icon: "warning_amber",  ic: "#f57c00" },
+  error: { bg: "#ffebee",      fg: "#b71c1c", icon: "error_outline",  ic: "#d32f2f" },
+  debug: { bg: "#f3e5f5",      fg: "#4a148c", icon: "bug_report",     ic: "#7b1fa2" },
+};
+
+function ConsolePanel({ open, onClose, logs, onClear }) {
+  const { Dialog, DialogTitle, DialogContent, DialogActions, Button,
+          Chip } = MaterialUI;
+
+  const copyAll = useCallback(async () => {
+    const text = logs.map(l => \`[\${l.level.toUpperCase()}] \${new Date(l.ts).toLocaleTimeString()} \${l.msg}\`).join("\\n");
+    try { await navigator.clipboard.writeText(text); } catch {}
+  }, [logs]);
+
+  return (
+    <Dialog open={open} onClose={onClose} maxWidth="md" fullWidth
+      PaperProps={{ sx: { borderRadius: 3, height: "70vh", display: "flex", flexDirection: "column" } }}>
+      <DialogTitle sx={{ py: 1.5, display: "flex", alignItems: "center", gap: 1, borderBottom: "1px solid #e0e0e0" }}>
+        <Icon name="terminal" size={18} style={{ color: "#555" }} />
+        <Typography variant="subtitle1" fontWeight={700} sx={{ flex: 1 }}>デバッグコンソール</Typography>
+        <Chip label={\`\${logs.length} 件\`} size="small" sx={{ fontSize: 11 }} />
+      </DialogTitle>
+
+      <DialogContent sx={{ p: 0, overflow: "auto", flex: 1, background: "#fafafa" }}>
+        {logs.length === 0 ? (
+          <Box sx={{ display: "flex", flexDirection: "column", alignItems: "center",
+            justifyContent: "center", height: "100%", color: "#bbb", gap: 1 }}>
+            <Icon name="terminal" size={40} style={{ color: "#ddd" }} />
+            <Typography variant="body2" color="text.disabled">ログはありません</Typography>
+          </Box>
+        ) : (
+          <Box sx={{ fontFamily: "ui-monospace,SFMono-Regular,Menlo,Consolas,monospace", fontSize: 12 }}>
+            {logs.map((log, i) => {
+              const c = LOG_COLORS[log.level] || LOG_COLORS.log;
+              return (
+                <Box key={i} sx={{
+                  display: "flex", alignItems: "flex-start", gap: 1,
+                  px: 1.5, py: 0.6,
+                  background: c.bg,
+                  borderBottom: "1px solid rgba(0,0,0,0.04)",
+                  "&:hover": { filter: "brightness(0.97)" },
+                }}>
+                  <Icon name={c.icon} size={14} style={{ color: c.ic, flexShrink: 0, marginTop: 1 }} />
+                  <Typography variant="caption"
+                    sx={{ color: "#aaa", flexShrink: 0, lineHeight: 1.6, fontFamily: "inherit", fontSize: 11 }}>
+                    {new Date(log.ts).toLocaleTimeString()}
+                  </Typography>
+                  <Typography component="pre"
+                    sx={{ m: 0, color: c.fg, lineHeight: 1.6, fontFamily: "inherit",
+                      fontSize: 12, whiteSpace: "pre-wrap", wordBreak: "break-all", flex: 1 }}>
+                    {log.msg}
+                  </Typography>
+                  <Tooltip title="コピー" arrow>
+                    <IconButton size="small" sx={{ p: 0.3, flexShrink: 0 }}
+                      onClick={() => navigator.clipboard.writeText(log.msg).catch(() => {})}>
+                      <Icon name="content_copy" size={12} />
+                    </IconButton>
+                  </Tooltip>
+                </Box>
+              );
+            })}
+          </Box>
+        )}
+      </DialogContent>
+
+      <DialogActions sx={{ px: 2, py: 1, borderTop: "1px solid #e0e0e0", gap: 1 }}>
+        <Button size="small" startIcon={<Icon name="content_copy" size={14} />}
+          onClick={copyAll} variant="outlined" disabled={logs.length === 0}>
+          全コピー
+        </Button>
+        <Button size="small" startIcon={<Icon name="delete_outline" size={14} />}
+          onClick={onClear} variant="outlined" color="error" disabled={logs.length === 0}>
+          クリア
+        </Button>
+        <Box sx={{ flex: 1 }} />
+        <Button size="small" onClick={onClose} variant="contained">閉じる</Button>
+      </DialogActions>
+    </Dialog>
+  );
+}
+
+// ─── プレビュー iframe ────────────────────────────────────────────────────────
+
+function PreviewFrame({ srcDoc, previewKey, width, scale, darkMode }) {
+  const constrained = width !== "100%";
+  const s = (scale || 100) / 100;
+  const iframeW = s !== 1 ? \`\${100 / s}%\` : "100%";
+  const iframeH = s !== 1 ? \`\${100 / s}%\` : "100%";
+  const outerBg = darkMode
+    ? (constrained ? "#2a2a3e" : "#1e1e2e")
+    : (constrained ? "#dde1e8" : (s < 1 ? "#e8eaf0" : "#fff"));
+  const innerBg = darkMode ? "#1e1e2e" : "#fff";
+
+  return (
+    <Box sx={{
+      flex: 1, overflow: "auto",
+      background: outerBg,
+      display: "flex", flexDirection: "column",
+      p: constrained ? 1 : 0,
+    }}>
+      <Box sx={{
+        width, mx: "auto", flex: 1,
+        border: constrained ? \`1px solid \${darkMode ? "#444" : "#c8cdd6"}\` : "none",
+        borderRadius: constrained ? 1 : 0,
+        overflow: "hidden",
+        background: innerBg,
+        transition: "width 0.25s ease",
+        minHeight: 0,
+        position: "relative",
+      }}>
+        <Box sx={{
+          width: iframeW,
+          height: iframeH,
+          transformOrigin: "top left",
+          transform: s !== 1 ? \`scale(\${s})\` : "none",
+          position: "absolute", top: 0, left: 0,
+        }}>
+          <iframe
+            key={previewKey}
+            title="preview"
+            srcDoc={srcDoc}
+            sandbox="allow-scripts allow-same-origin allow-forms allow-popups"
+            style={{ width: "100%", height: "100%", minHeight: 200, border: "none", display: "block" }}
+          />
+        </Box>
+      </Box>
+    </Box>
+  );
+}
+
+// ─── Prism.js 動的ロード ─────────────────────────────────────────────────────
+
+const PRISM_CSS_ID  = "prism-theme-css";
+const PRISM_JS_URL  = "https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/prism.min.js";
+const PRISM_HTML_URL = "https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-markup.min.js";
+
+function loadPrism() {
+  return new Promise((resolve) => {
+    if (window.Prism && window.Prism.languages && window.Prism.languages.markup) {
+      resolve(); return;
+    }
+    const loadScript = (src) => new Promise((res) => {
+      const s = document.createElement("script");
+      s.src = src; s.onload = res; document.head.appendChild(s);
+    });
+    loadScript(PRISM_JS_URL).then(() => loadScript(PRISM_HTML_URL)).then(resolve);
+  });
+}
+
+function injectPrismTheme(darkMode) {
+  let el = document.getElementById(PRISM_CSS_ID);
+  if (!el) { el = document.createElement("style"); el.id = PRISM_CSS_ID; document.head.appendChild(el); }
+  if (darkMode) {
+    // Catppuccin Mocha 風ダークテーマ
+    el.textContent = \`
+      .prism-mirror::-webkit-scrollbar { width: 0; height: 0; }
+      .prism-mirror { scrollbar-width: none; }
+      .prism-mirror .token.doctype,.prism-mirror .token.prolog { color: #6c7086; }
+      .prism-mirror .token.comment { color: #6c7086; font-style: italic; }
+      .prism-mirror .token.tag { color: #89b4fa; }
+      .prism-mirror .token.attr-name { color: #cba6f7; }
+      .prism-mirror .token.attr-value,.prism-mirror .token.string { color: #a6e3a1; }
+      .prism-mirror .token.punctuation { color: #9399b2; }
+      .prism-mirror .token.entity { color: #fab387; }
+      .prism-mirror .token.selector,.prism-mirror .token.property { color: #89dceb; }
+      .prism-mirror .token.function { color: #89b4fa; }
+      .prism-mirror .token.keyword { color: #cba6f7; }
+      .prism-mirror .token.number { color: #fab387; }
+      .prism-mirror .token.operator { color: #89dceb; }
+      .prism-mirror .token.boolean { color: #fab387; }
+      .prism-mirror .token.script { color: #cdd6f4; }
+      .prism-mirror .token.style { color: #cdd6f4; }
+    \`;
+  } else {
+    // ライトテーマ
+    el.textContent = \`
+      .prism-mirror::-webkit-scrollbar { width: 0; height: 0; }
+      .prism-mirror { scrollbar-width: none; }
+      .prism-mirror .token.doctype,.prism-mirror .token.prolog { color: #999; }
+      .prism-mirror .token.comment { color: #6a9955; font-style: italic; }
+      .prism-mirror .token.tag { color: #0070c1; }
+      .prism-mirror .token.attr-name { color: #9c5d27; }
+      .prism-mirror .token.attr-value,.prism-mirror .token.string { color: #a31515; }
+      .prism-mirror .token.punctuation { color: #555; }
+      .prism-mirror .token.entity { color: #e07400; }
+      .prism-mirror .token.selector,.prism-mirror .token.property { color: #0070c1; }
+      .prism-mirror .token.function { color: #795e26; }
+      .prism-mirror .token.keyword { color: #af00db; }
+      .prism-mirror .token.number { color: #098658; }
+      .prism-mirror .token.operator { color: #555; }
+      .prism-mirror .token.boolean { color: #0000ff; }
+      .prism-mirror .token.script { color: #1a1a2e; }
+      .prism-mirror .token.style { color: #1a1a2e; }
+    \`;
+  }
+}
+
+// ─── CodeEditor コンポーネント ────────────────────────────────────────────────
+
+const EDITOR_FONT = "ui-monospace,SFMono-Regular,Menlo,Consolas,monospace";
+const LINE_HEIGHT_RATIO = 1.65;
+
+/**
+ * 折り返しモード時の各論理行の表示行数を計算する。
+ * canvas.measureText で文字幅を測り、textarea の内側幅で何行に折り返されるかを算出。
+ */
+function calcWrappedHeights(lines, fontSize, taInnerWidth) {
+  if (taInnerWidth <= 0) return lines.map(() => 1);
+  const canvas = calcWrappedHeights._canvas || (calcWrappedHeights._canvas = document.createElement("canvas"));
+  const ctx = canvas.getContext("2d");
+  ctx.font = \`\${fontSize}px \${EDITOR_FONT}\`;
+  const lineH = fontSize * LINE_HEIGHT_RATIO;
+  return lines.map(line => {
+    if (line === "") return 1;
+    const w = ctx.measureText(line).width;
+    return Math.max(1, Math.ceil(w / taInnerWidth));
+  });
+}
+
+function CodeEditor({ value, onChange, fontSize, darkMode, wordWrap, highlightMode }) {
+  const taRef      = useRef(null);
+  const gutterRef  = useRef(null);
+  const wrapperRef = useRef(null);
+  const mirrorRef  = useRef(null); // <code> — innerHTML 書き換え用
+  const preRef     = useRef(null); // <pre>  — スクロール同期用
+  const [cursor, setCursor]       = useState({ line: 1, col: 1 });
+  const [taInnerW, setTaInnerW]   = useState(0);
+  const [prismReady, setPrismReady] = useState(false);
+
+  // ── Prism 動的ロード ──
+  useEffect(() => {
+    if (highlightMode !== "prism") return;
+    injectPrismTheme(darkMode);
+    loadPrism().then(() => setPrismReady(true));
+  }, [highlightMode]);
+
+  // ── ダークモード切り替え時にテーマ更新 ──
+  useEffect(() => {
+    if (highlightMode === "prism") injectPrismTheme(darkMode);
+  }, [darkMode, highlightMode]);
+
+  // ── Prism ハイライト適用 ──
+  useEffect(() => {
+    if (highlightMode !== "prism" || !prismReady || !mirrorRef.current) return;
+    if (!window.Prism || !window.Prism.languages.markup) return;
+    // Prism.highlight は生テキストを受け取り内部でエスケープするため、事前エスケープ不要
+    const highlighted = window.Prism.highlight(value, window.Prism.languages.markup, "markup");
+    mirrorRef.current.innerHTML = highlighted + "\\n";
+    // innerHTML 更新後・モード切り替え直後にスクロール位置を textarea に合わせる
+    if (preRef.current && taRef.current) {
+      const st = taRef.current.scrollTop;
+      const sl = taRef.current.scrollLeft;
+      preRef.current.style.transform = \`translate(\${-sl}px, \${-st}px)\`;
+    }
+  }, [value, highlightMode, prismReady]);
+
+  // ── ミラーのスクロールを transform で同期（overflow:hidden にして自スクロールを排除） ──
+  const syncMirrorScroll = useCallback(() => {
+    if (preRef.current && taRef.current) {
+      const st = taRef.current.scrollTop;
+      const sl = taRef.current.scrollLeft;
+      preRef.current.style.transform = \`translate(\${-sl}px, \${-st}px)\`;
+    }
+  }, []);
+
+  // ── textarea 幅を ResizeObserver で監視 ──
+  useEffect(() => {
+    const ta = taRef.current;
+    if (!ta) return;
+    const obs = new ResizeObserver(() => {
+      // padding 左右 14px × 2 = 28px、スクロールバー幅を引く
+      const inner = ta.clientWidth - 28 - (ta.offsetWidth - ta.clientWidth);
+      setTaInnerW(Math.max(0, inner));
+    });
+    obs.observe(ta);
+    return () => obs.disconnect();
+  }, []);
+
+  // ── 現在行ハイライト + インデントガイド線 overlay ──
+  const overlayRef = useRef(null);
+
+  // ── 行番号同期スクロール（単体） ──
+  const syncScroll = useCallback(() => {
+    if (gutterRef.current && taRef.current) {
+      gutterRef.current.scrollTop = taRef.current.scrollTop;
+    }
+  }, []);
+
+  // ── カーソル位置計算 ──
+  const updateCursor = useCallback(() => {
+    const ta = taRef.current;
+    if (!ta) return;
+    const before = ta.value.slice(0, ta.selectionStart);
+    const ls  = before.split("\\n");
+    setCursor({ line: ls.length, col: ls[ls.length - 1].length + 1 });
+  }, []);
+
+  // ── Tab キー処理 ──
+  const handleKeyDown = useCallback((e) => {
+    const ta = taRef.current;
+    if (!ta) return;
+
+    if (e.key === "Tab") {
+      e.preventDefault();
+      const start = ta.selectionStart;
+      const end   = ta.selectionEnd;
+      const indent = "  "; // 2スペース
+
+      if (e.shiftKey) {
+        // Shift+Tab: アンインデント
+        const lineStart = ta.value.lastIndexOf("\\n", start - 1) + 1;
+        const line = ta.value.slice(lineStart);
+        if (line.startsWith(indent)) {
+          const next = ta.value.slice(0, lineStart) + line.slice(indent.length);
+          onChange(next);
+          requestAnimationFrame(() => {
+            ta.selectionStart = Math.max(lineStart, start - indent.length);
+            ta.selectionEnd   = Math.max(lineStart, end   - indent.length);
+          });
+        }
+      } else {
+        // Tab: インデント挿入
+        const next = ta.value.slice(0, start) + indent + ta.value.slice(end);
+        onChange(next);
+        requestAnimationFrame(() => {
+          ta.selectionStart = ta.selectionEnd = start + indent.length;
+        });
+      }
+    }
+  }, [onChange]);
+
+  // ── 統計 ──
+  const lines     = value.split("\\n");
+  const lineCount = lines.length;
+  const charCount = value.length;
+  const selCount  = (() => {
+    const ta = taRef.current;
+    if (!ta) return 0;
+    return Math.abs(ta.selectionEnd - ta.selectionStart);
+  })();
+  const sizeKB = (new TextEncoder().encode(value).length / 1024).toFixed(1);
+
+  // ── 折り返し時の各行高さ（px）を計算 ──
+  const lineH = fontSize * LINE_HEIGHT_RATIO;
+  const wrappedCounts = wordWrap && taInnerW > 0
+    ? calcWrappedHeights(lines, fontSize, taInnerW)
+    : null;
+
+  // ── drawOverlay（lines・wrappedCounts・lineH の定義後に配置） ──
+  const drawOverlay = useCallback(() => {
+    const canvas = overlayRef.current;
+    const ta     = taRef.current;
+    if (!canvas || !ta) return;
+
+    const dpr = window.devicePixelRatio || 1;
+    const W   = ta.clientWidth;
+    const H   = ta.clientHeight;
+    canvas.width  = W * dpr;
+    canvas.height = H * dpr;
+    canvas.style.width  = W + "px";
+    canvas.style.height = H + "px";
+
+    const ctx = canvas.getContext("2d");
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    ctx.scale(dpr, dpr);
+
+    const padL    = 14;
+    const padT    = 12;
+    const scrollT = ta.scrollTop;
+    const scrollL = ta.scrollLeft;
+    const indentW = fontSize * 0.6 * 2;
+
+    // 現在行ハイライト
+    const activeLine = cursor.line - 1;
+    let activeTop;
+    if (wrappedCounts) {
+      let acc = 0;
+      for (let i = 0; i < activeLine; i++) acc += (wrappedCounts[i] || 1);
+      activeTop = padT + acc * lineH - scrollT;
+    } else {
+      activeTop = padT + activeLine * lineH - scrollT;
+    }
+    const activeH = wrappedCounts ? (wrappedCounts[activeLine] || 1) * lineH : lineH;
+    if (activeTop + activeH > 0 && activeTop < H) {
+      ctx.fillStyle = darkMode ? "rgba(203,166,247,0.07)" : "rgba(25,118,210,0.055)";
+      ctx.fillRect(0, activeTop, W, activeH);
+    }
+
+    // インデントガイド線
+    ctx.strokeStyle = darkMode ? "rgba(255,255,255,0.08)" : "rgba(0,0,0,0.07)";
+    ctx.lineWidth   = 1;
+    lines.forEach((line, i) => {
+      const match  = line.match(/^( *)/);
+      const spaces = match ? match[1].length : 0;
+      const depth  = Math.floor(spaces / 2);
+      if (depth === 0) return;
+      let lineTop;
+      if (wrappedCounts) {
+        let acc = 0;
+        for (let j = 0; j < i; j++) acc += (wrappedCounts[j] || 1);
+        lineTop = padT + acc * lineH - scrollT;
+      } else {
+        lineTop = padT + i * lineH - scrollT;
+      }
+      const rowH = wrappedCounts ? (wrappedCounts[i] || 1) * lineH : lineH;
+      if (lineTop + rowH < 0 || lineTop > H) return;
+      for (let d = 1; d <= depth; d++) {
+        const x = padL + d * indentW - scrollL + 0.5;
+        if (x < padL || x > W) continue;
+        ctx.beginPath();
+        ctx.moveTo(x, lineTop);
+        ctx.lineTo(x, lineTop + rowH);
+        ctx.stroke();
+      }
+    });
+  }, [cursor, lines, wrappedCounts, lineH, fontSize, darkMode]);
+
+  // 再描画 effect
+  useEffect(() => { drawOverlay(); }, [drawOverlay]);
+
+  // スクロール時
+  const handleScroll = useCallback(() => {
+    syncScroll();
+    syncMirrorScroll();
+    drawOverlay();
+  }, [syncScroll, syncMirrorScroll, drawOverlay]);
+
+  // ── カラー設定 ──
+  const bg       = darkMode ? "#1e1e2e" : "#fff";
+  const fg       = darkMode ? "#cdd6f4" : "#1a1a2e";
+  const gutterBg = darkMode ? "#181825" : "#f5f6f8";
+  const gutterFg = darkMode ? "#585b70" : "#aab0bc";
+  const statusBg = darkMode ? "#11111b" : "#f0f2f5";
+  const statusFg = darkMode ? "#6c7086" : "#888";
+  const borderC  = darkMode ? "#313244" : "#e0e3e8";
+
+  return (
+    <Box sx={{ flex: 1, display: "flex", flexDirection: "column", overflow: "hidden", minHeight: 0 }}>
+
+      {/* ── エディタ本体（行番号 + textarea） ── */}
+      <Box ref={wrapperRef} sx={{ flex: 1, display: "flex", overflow: "hidden", minHeight: 0, background: bg }}>
+        {/* 行番号ガター */}
+        <Box
+          ref={gutterRef}
+          aria-hidden="true"
+          sx={{
+            width: 44,
+            flexShrink: 0,
+            overflowY: "hidden",
+            overflowX: "hidden",
+            background: gutterBg,
+            borderRight: \`1px solid \${borderC}\`,
+            pt: "12px",
+            pb: "12px",
+            userSelect: "none",
+          }}
+        >
+          {lines.map((_, i) => {
+            // 折り返しモード: 折り返し行数分の高さを確保、番号は先頭行のみ表示
+            const rowSpan  = wrappedCounts ? wrappedCounts[i] : 1;
+            const rowPx    = rowSpan * lineH;
+            const isActive = i + 1 === cursor.line;
+            return (
+              <Box key={i} sx={{
+                height: \`\${rowPx}px\`,
+                display: "flex",
+                alignItems: "flex-start",
+                justifyContent: "flex-end",
+                pt: "1px",
+                pr: "8px",
+                color: isActive ? (darkMode ? "#cba6f7" : "#1976d2") : gutterFg,
+                fontFamily: EDITOR_FONT,
+                fontSize: fontSize,
+                lineHeight: \`\${lineH}px\`,
+                fontWeight: isActive ? 700 : 400,
+                background: isActive
+                  ? (darkMode ? "rgba(203,166,247,0.08)" : "rgba(25,118,210,0.06)")
+                  : "transparent",
+              }}>
+                {i + 1}
+              </Box>
+            );
+          })}
+        </Box>
+
+        {/* textarea + overlay canvas */}
+        <Box sx={{ flex: 1, position: "relative", overflow: "hidden", background: bg }}>
+
+          {/* Prism ミラー（ハイライトモード時のみ表示） */}
+          {highlightMode === "prism" && (
+            <pre
+              ref={preRef}
+              aria-hidden="true"
+              className="prism-mirror"
+              style={{
+                position: "absolute",
+                top: 0, left: 0,
+                // コンテンツ全体を収めるため min-width/height を大きく設定
+                // 親 Box が overflow:hidden でクリップする
+                minWidth: "100%",
+                minHeight: "100%",
+                margin: 0,
+                padding: "12px 14px",
+                fontFamily: EDITOR_FONT,
+                fontSize: fontSize,
+                lineHeight: LINE_HEIGHT_RATIO,
+                color: fg,
+                background: "transparent",
+                tabSize: 2,
+                // 自スクロールを完全に排除（transform で位置制御）
+                overflow: "visible",
+                whiteSpace: wordWrap ? "pre-wrap" : "pre",
+                wordBreak: wordWrap ? "break-all" : "normal",
+                pointerEvents: "none",
+                zIndex: 1,
+                boxSizing: "border-box",
+                willChange: "transform",
+              }}
+            >
+              <code ref={mirrorRef} style={{ fontFamily: "inherit", fontSize: "inherit", background: "none", display: "block" }} />
+            </pre>
+          )}
+
+          {/* overlay: 現在行ハイライト + インデントガイド線 */}
+          <canvas
+            ref={overlayRef}
+            style={{
+              position: "absolute",
+              top: 0, left: 0,
+              pointerEvents: "none",
+              zIndex: 2,
+            }}
+          />
+          <textarea
+            ref={taRef}
+            value={value}
+            onChange={e => onChange(e.target.value)}
+            onScroll={handleScroll}
+            onKeyDown={handleKeyDown}
+            onKeyUp={updateCursor}
+            onClick={updateCursor}
+            onSelect={updateCursor}
+            spellCheck={false}
+            autoCapitalize="none"
+            autoCorrect="off"
+            placeholder="ここに HTML を貼り付け"
+            style={{
+              position: "absolute",
+              top: 0, left: 0,
+              width: "100%", height: "100%",
+              border: "none",
+              outline: "none",
+              resize: "none",
+              padding: "12px 14px",
+              fontFamily: EDITOR_FONT,
+              fontSize: fontSize,
+              lineHeight: LINE_HEIGHT_RATIO,
+              // Prism モード時は文字を透明に（ミラーが背後で表示）
+              color: highlightMode === "prism" ? "transparent" : fg,
+              caretColor: fg,
+              background: highlightMode === "prism" ? "transparent" : "transparent",
+              tabSize: 2,
+              overflowY: "scroll",
+              overflowX: wordWrap ? "hidden" : "auto",
+              whiteSpace: wordWrap ? "pre-wrap" : "pre",
+              wordBreak: wordWrap ? "break-all" : "normal",
+              zIndex: 3,
+            }}
+          />
+        </Box>
+
+      </Box>
+
+      {/* ── ステータスバー ── */}
+      <Box sx={{
+        height: 22,
+        flexShrink: 0,
+        display: "flex",
+        alignItems: "center",
+        px: 1.5,
+        gap: 2,
+        background: statusBg,
+        borderTop: \`1px solid \${borderC}\`,
+        userSelect: "none",
+      }}>
+        {[
+          { icon: "format_list_numbered", label: \`\${lineCount} 行\` },
+          { icon: "text_fields",          label: \`\${charCount.toLocaleString()} 文字\` },
+          selCount > 0 && { icon: "select_all", label: \`選択: \${selCount}\` },
+          { icon: "data_usage",            label: \`\${sizeKB} KB\` },
+        ].filter(Boolean).map((item, i) => (
+          <Box key={i} sx={{ display: "flex", alignItems: "center", gap: 0.3 }}>
+            <Icon name={item.icon} size={11} style={{ color: statusFg }} />
+            <Typography variant="caption"
+              sx={{ fontSize: 10, color: statusFg, lineHeight: 1, fontFamily: EDITOR_FONT }}>
+              {item.label}
+            </Typography>
+          </Box>
+        ))}
+        <Box sx={{ flex: 1 }} />
+        <Typography variant="caption"
+          sx={{ fontSize: 10, color: statusFg, lineHeight: 1, fontFamily: EDITOR_FONT }}>
+          {cursor.line}:{cursor.col}
+        </Typography>
+        <Typography variant="caption"
+          sx={{ fontSize: 10, color: statusFg, lineHeight: 1, fontFamily: EDITOR_FONT }}>
+          UTF-8
+        </Typography>
+      </Box>
+    </Box>
+  );
+}
+
+function PaneHeader({ title, fullscreen, onToggleFullscreen, darkMode, children }) {
+  const bg     = darkMode ? "#181825" : "#f8f9fb";
+  const border = darkMode ? "#313244" : "#e0e3e8";
+  return (
+    <Stack direction="row" alignItems="center" spacing={0.5}
+      sx={{
+        px: 1.5, py: 0.75,
+        background: bg,
+        borderBottom: \`1px solid \${border}\`,
+        flexShrink: 0,
+        minHeight: 40,
+      }}>
+      <Typography variant="caption" fontWeight={700} color={darkMode ? "rgba(205,214,244,0.6)" : "text.secondary"}
+        sx={{ textTransform: "uppercase", letterSpacing: 0.8, mr: "auto" }}>
+        {title}
+      </Typography>
+      {children}
+      <Tooltip title={fullscreen ? "元のサイズに戻す" : "全画面"} arrow>
+        <IconButton size="small" onClick={onToggleFullscreen} sx={{ ml: 0.5, color: darkMode ? "rgba(205,214,244,0.6)" : "inherit" }}>
+          <Icon name={fullscreen ? "fullscreen_exit" : "fullscreen"} size={18} />
+        </IconButton>
+      </Tooltip>
+    </Stack>
+  );
+}
+
+// ─── メインアプリ ─────────────────────────────────────────────────────────────
+
+function App() {
+  // レイアウト判定: md(900px)以上 → 左右ペイン
+  const isWide     = useMediaQuery(theme.breakpoints.up("md"));
+  const isMobile   = useMediaQuery(theme.breakpoints.down("sm"));
+
+  // ── プロファイル ──
+  const [profiles, setProfiles] = useState(() => {
+    const ps = loadProfiles();
+    if (ps.length > 0) return ps;
+    const def = createProfile("デフォルト", {
+      code: (() => { try { return localStorage.getItem(STORAGE_KEY) || DEFAULT_HTML; } catch { return DEFAULT_HTML; } })(),
+    });
+    saveProfiles([def]);
+    return [def];
+  });
+  const [activeProfileId, setActiveProfileId] = useState(() => {
+    const ps   = loadProfiles();
+    const saved = loadActiveProfileId();
+    if (saved && ps.find(p => p.id === saved)) return saved;
+    return ps[0]?.id || null;
+  });
+  const [confirmSwitch, setConfirmSwitch] = useState(null); // 切り替え先 profile id
+
+  const activeProfile = profiles.find(p => p.id === activeProfileId) || profiles[0];
+  const initS = activeProfile?.data?.settings || DEFAULT_SETTINGS;
+
+  // ── 状態 ──
+  const [html, setHtml]             = useState(() => activeProfile?.data?.code ?? DEFAULT_HTML);
+  const [previewKey, setPreviewKey] = useState(0);
+  const [previewWidth, setPreviewWidth] = useState(initS.previewWidth);
+  const [fullscreen, setFullscreen] = useState("none");
+  const [darkMode, setDarkMode]         = useState(initS.darkMode);
+  const [fontSize, setFontSize]         = useState(initS.fontSize);
+  const [wordWrap, setWordWrap]         = useState(initS.wordWrap);
+  const [highlightMode, setHighlightMode] = useState(initS.highlightMode);
+  const [previewScale, setPreviewScale] = useState(initS.previewScale);
+  const [appDarkMode, setAppDarkMode]       = useState(false);
+  const [previewDarkMode, setPreviewDarkMode] = useState(false);
+  const [confirmClear, setConfirmClear] = useState(false);
+  const [snackbar, setSnackbar]         = useState({ open: false, msg: "" });
+  const [consoleLogs, setConsoleLogs]   = useState([]);
+  const [consoleOpen, setConsoleOpen]   = useState(false);
+  const [snapshots, setSnapshots]       = useState([]);
+  const [snapshotOpen, setSnapshotOpen] = useState(false);
+  const lastGoodCodeRef = useRef(null); // 最後に正常表示できたコード
+
+  // ── フローティングウィンドウ（プロファイルから復元） ──
+  const [wins, setWins] = useState(() => activeProfile?.data?.windows ?? []);
+
+  const addWin = useCallback(() => {
+    setWins(ws => [...ws, createWin()]);
+  }, []);
+
+  const closeWin = useCallback((id) => {
+    setWins(ws => ws.filter(w => w.id !== id));
+  }, []);
+
+  const updateWin = useCallback((id, patch) => {
+    setWins(ws => ws.map(w => {
+      if (w.id !== id) return w;
+      const next = typeof patch === "function" ? patch(w) : patch;
+      return { ...w, ...next };
+    }));
+  }, []);
+
+  const focusWin = useCallback((id) => {
+    setWins(ws => {
+      const maxZ = Math.max(...ws.map(w => w.zIndex), 999);
+      return ws.map(w => w.id === id ? { ...w, zIndex: maxZ + 1 } : w);
+    });
+  }, []);
+
+  // ── プロファイル操作 ──
+
+  // 現在の状態をスナップショットとして取得
+  const getCurrentData = useCallback(() => ({
+    code:     html,
+    settings: { fontSize, darkMode, wordWrap, highlightMode, previewScale, previewWidth, splitRatio: ratioRef.current },
+    windows:  wins,
+    urlHistory: activeProfile?.data?.urlHistory ?? [],
+  }), [html, fontSize, darkMode, wordWrap, highlightMode, previewScale, previewWidth, wins, activeProfile]);
+
+  // プロファイルのデータを state に適用
+  const applyProfile = useCallback((p) => {
+    const s = validateSettings(p.data?.settings);
+    setHtml(p.data?.code ?? DEFAULT_HTML);
+    setFontSize(s.fontSize);
+    setDarkMode(s.darkMode);
+    setWordWrap(s.wordWrap);
+    setHighlightMode(s.highlightMode);
+    setPreviewScale(s.previewScale);
+    setPreviewWidth(s.previewWidth);
+    setRatioRef.current(s.splitRatio);
+    setWins(p.data?.windows ?? []);
+    setActiveProfileId(p.id);
+    saveActiveProfileId(p.id);
+  }, []);
+
+  // 上書き保存
+  const handleProfileSave = useCallback(() => {
+    const data = getCurrentData();
+    setProfiles(ps => {
+      const next = ps.map(p => p.id !== activeProfileId ? p : {
+        ...p, updatedAt: new Date().toISOString(), data,
+      });
+      saveProfiles(next);
+      return next;
+    });
+    toast("プロファイルを保存しました");
+  }, [activeProfileId, getCurrentData]);
+
+  // 新規プロファイルとして保存
+  const handleProfileNew = useCallback(() => {
+    const name = window.prompt("プロファイル名を入力してください", "新しいプロファイル");
+    if (!name) return;
+    const p = createProfile(name, getCurrentData());
+    setProfiles(ps => {
+      const next = [...ps, p].slice(-MAX_PROFILES);
+      saveProfiles(next);
+      return next;
+    });
+    setActiveProfileId(p.id);
+    saveActiveProfileId(p.id);
+    toast(\`「\${name}」を作成しました\`);
+  }, [getCurrentData]);
+
+  // 切り替え（確認あり）
+  const handleProfileSwitch = useCallback((id) => {
+    if (id === activeProfileId) return;
+    setConfirmSwitch(id);
+  }, [activeProfileId]);
+
+  const doSwitch = useCallback((save) => {
+    const targetId = confirmSwitch;
+    if (save) handleProfileSave();
+    const target = profiles.find(p => p.id === targetId);
+    if (target) applyProfile(target);
+    setConfirmSwitch(null);
+    toast(\`「\${target?.name}」に切り替えました\`);
+  }, [confirmSwitch, profiles, handleProfileSave, applyProfile]);
+
+  // 名前変更
+  const handleProfileRename = useCallback((id, name) => {
+    if (!name.trim()) return;
+    setProfiles(ps => {
+      const next = ps.map(p => p.id !== id ? p : { ...p, name: name.trim(), updatedAt: new Date().toISOString() });
+      saveProfiles(next);
+      return next;
+    });
+  }, []);
+
+  // 複製
+  const handleProfileDuplicate = useCallback((id) => {
+    const src = profiles.find(p => p.id === id);
+    if (!src) return;
+    const p = createProfile(\`\${src.name} のコピー\`, src.data);
+    setProfiles(ps => {
+      const next = [...ps, p].slice(-MAX_PROFILES);
+      saveProfiles(next);
+      return next;
+    });
+    toast(\`「\${p.name}」を作成しました\`);
+  }, [profiles]);
+
+  // 削除
+  const handleProfileDelete = useCallback((id) => {
+    setProfiles(ps => {
+      const next = ps.filter(p => p.id !== id);
+      saveProfiles(next);
+      if (id === activeProfileId && next.length > 0) {
+        applyProfile(next[0]);
+      }
+      return next;
+    });
+  }, [activeProfileId, applyProfile]);
+
+  // エクスポート（単体）
+  const handleProfileExport = useCallback((id) => {
+    const p = profiles.find(pr => pr.id === id);
+    if (p) exportProfile(p);
+  }, [profiles]);
+
+  // 全エクスポート
+  const handleProfileExportAll = useCallback(() => {
+    exportAllProfiles(profiles);
+  }, [profiles]);
+
+  // インポート
+  const handleProfileImport = useCallback((file) => {
+    const reader = new FileReader();
+    reader.onload = (e) => {
+      try {
+        const json = JSON.parse(e.target.result);
+        const imported = (json.profiles || [json]).filter(p => p && p.name && p.data);
+        if (imported.length === 0) { toast("有効なプロファイルが見つかりませんでした"); return; }
+        const newProfiles = imported.map(p => createProfile(p.name, {
+          code:       p.data?.code,
+          settings:   validateSettings(p.data?.settings),
+          windows:    p.data?.windows ?? [],
+          urlHistory: p.data?.urlHistory ?? [],
+        }));
+        setProfiles(ps => {
+          const next = [...ps, ...newProfiles].slice(-MAX_PROFILES);
+          saveProfiles(next);
+          return next;
+        });
+        toast(\`\${newProfiles.length} 件のプロファイルをインポートしました\`);
+      } catch { toast("JSONの読み込みに失敗しました"); }
+    };
+    reader.readAsText(file);
+  }, []);
+
+  // 初期設定に戻す
+  const handleProfileReset = useCallback(() => {
+    if (!window.confirm("現在のプロファイルを初期設定に戻しますか？")) return;
+    const s = DEFAULT_SETTINGS;
+    setHtml(DEFAULT_HTML);
+    setFontSize(s.fontSize);
+    setDarkMode(s.darkMode);
+    setWordWrap(s.wordWrap);
+    setHighlightMode(s.highlightMode);
+    setPreviewScale(s.previewScale);
+    setPreviewWidth(s.previewWidth);
+    setRatioRef.current(s.splitRatio);
+    setWins([]);
+    toast("初期設定に戻しました");
+  }, []);
+
+  // ── スプリットペイン ──
+  const containerRef = useRef(null);
+  const { ratio, setRatio, handleProps, dragging } = useSplitPane(containerRef, isWide, initS.splitRatio);
+
+  // ratio/setRatio を ref 経由で前方参照できるようにする
+  const ratioRef    = useRef(ratio);
+  const setRatioRef = useRef(setRatio);
+  useEffect(() => { ratioRef.current = ratio; }, [ratio]);
+  useEffect(() => { setRatioRef.current = setRatio; }, [setRatio]);
+
+  // ── 派生値 ──
+  const debounced = useDebounce(html, 400);
+  const srcDoc    = useMemo(() => buildSrcDoc(debounced), [debounced]);
+
+  // ── isWide 切り替え時にレイアウト変更 → ratio リセット ──
+  useEffect(() => { setRatio(RATIO_DEFAULT); }, [isWide]);
+
+  // ── appDarkMode 変更時にエディタ・プレビューも連動 ──
+  useEffect(() => {
+    setDarkMode(appDarkMode);
+    setPreviewDarkMode(appDarkMode);
+  }, [appDarkMode]);
+
+  // ── localStorage 自動保存（プロファイルに統合） ──
+  useEffect(() => {
+    if (!activeProfileId) return;
+    const settings = { fontSize, darkMode, wordWrap, highlightMode, previewScale, previewWidth, splitRatio: ratioRef.current };
+    setProfiles(ps => {
+      const next = ps.map(p => p.id !== activeProfileId ? p : {
+        ...p,
+        updatedAt: new Date().toISOString(),
+        data: { ...p.data, code: html, settings, windows: wins },
+      });
+      saveProfiles(next);
+      return next;
+    });
+  }, [html, fontSize, darkMode, wordWrap, highlightMode, previewScale, previewWidth, wins]);
+
+  // ── スマホでは幅切り替え無効 ──
+  useEffect(() => {
+    if (isMobile) setPreviewWidth("100%");
+  }, [isMobile]);
+
+  // ── ハンドラ ──
+  const toast    = (msg) => setSnackbar({ open: true, msg });
+  const reload   = useCallback(() => { setPreviewKey(k => k + 1); setConsoleLogs([]); }, []);
+
+  // ── iframe コンソールメッセージ受信 ──
+  useEffect(() => {
+    const handler = (e) => {
+      if (e.data?.type !== "__ht_console__") return;
+      setConsoleLogs(prev => [...prev, { level: e.data.level, msg: e.data.msg, ts: e.data.ts }]);
+    };
+    window.addEventListener("message", handler);
+    return () => window.removeEventListener("message", handler);
+  }, []);
+
+  // ── スナップショット操作 ──
+  const addSnapshot = useCallback((code, label, opts = {}) => {
+    const snap = {
+      id:         \`snap-\${Date.now()}-\${Math.random().toString(36).slice(2,6)}\`,
+      label:      label || \`手動 \${new Date().toLocaleTimeString("ja-JP")}\`,
+      code,
+      ts:         Date.now(),
+      isAuto:     opts.isAuto     ?? false,
+      isLastGood: opts.isLastGood ?? false,
+    };
+    setSnapshots(prev => {
+      // isLastGood は常に 1 件だけ（既存の isLastGood を置き換え）
+      const base = opts.isLastGood
+        ? prev.filter(s => !s.isLastGood)
+        : prev;
+      return [snap, ...base].slice(0, MAX_SNAPSHOTS);
+    });
+    return snap;
+  }, []);
+
+  const takeSnapshot = useCallback(() => {
+    addSnapshot(html, \`手動 \${new Date().toLocaleTimeString("ja-JP")}\`);
+    toast("スナップショットを保存しました");
+  }, [html, addSnapshot]);
+
+  const restoreSnapshot = useCallback((code) => {
+    addSnapshot(html, \`復元前 \${new Date().toLocaleTimeString("ja-JP")}\`, { isAuto: true });
+    setHtml(code);
+    toast("コードを復元しました");
+  }, [html, addSnapshot]);
+
+  const deleteSnapshot = useCallback((id) => {
+    setSnapshots(prev => prev.filter(s => s.id !== id));
+  }, []);
+
+  const clearSnapshots = useCallback(() => {
+    setSnapshots([]);
+  }, []);
+
+  // ── 「最後の正常表示」自動記録 ──
+  // プレビューが更新されてから 1.5 秒後にエラーがなければ lastGood として記録
+  useEffect(() => {
+    const timer = setTimeout(() => {
+      if (consoleLogs.some(l => l.level === "error")) return;
+      const code = html;
+      if (code === lastGoodCodeRef.current) return;
+      lastGoodCodeRef.current = code;
+      addSnapshot(code, \`最後の正常表示 \${new Date().toLocaleTimeString("ja-JP")}\`, { isAuto: true, isLastGood: true });
+    }, 1500);
+    return () => clearTimeout(timer);
+  }, [previewKey]); // previewKey が変わる = プレビュー更新
+  const sample   = useCallback(() => { setHtml(DEFAULT_HTML); toast("サンプルを投入しました"); }, []);
+  const copy     = useCallback(async () => {
+    try { await navigator.clipboard.writeText(html); toast("コピーしました"); }
+    catch { toast("コピーに失敗しました"); }
+  }, [html]);
+  const download = useCallback(() => {
+    const blob = new Blob([html], { type: "text/html;charset=utf-8" });
+    const url  = URL.createObjectURL(blob);
+    const a    = document.createElement("a");
+    a.href = url; a.download = "output.html"; a.click();
+    URL.revokeObjectURL(url);
+    toast("ダウンロードしました");
+  }, [html]);
+  const clearConfirm    = useCallback(() => { setHtml(""); setConfirmClear(false); toast("クリアしました"); }, []);
+  const toggleFullscreen = useCallback((pane) => {
+    setFullscreen(f => f === pane ? "none" : pane);
+  }, []);
+
+  // ── キーボードショートカット ──
+  useEffect(() => {
+    const fn = (e) => {
+      if (!(e.ctrlKey || e.metaKey)) return;
+      if (e.key === "Enter") { e.preventDefault(); reload(); }
+      if (e.key === "s")     { e.preventDefault(); download(); }
+    };
+    window.addEventListener("keydown", fn);
+    return () => window.removeEventListener("keydown", fn);
+  }, [reload, download]);
+
+  // ── ペイン表示・サイズ計算 ──
+  const showEditor  = fullscreen !== "preview";
+  const showPreview = fullscreen !== "editor";
+  const showHandle  = fullscreen === "none" && showEditor && showPreview;
+
+  // ratio → CSS サイズ（%）
+  const editorSize  = fullscreen === "editor"  ? "100%" :
+                      fullscreen === "preview" ? "0%"   : \`\${ratio * 100}%\`;
+  const previewSize = fullscreen === "preview" ? "100%" :
+                      fullscreen === "editor"  ? "0%"   : \`\${(1 - ratio) * 100}%\`;
+
+  const sizeKey = isWide ? "width" : "height";
+
+  // ── レンダリング ──
+  return (
+    <ThemeProvider theme={theme}>
+      <CssBaseline />
+
+      <Box sx={{ display: "flex", flexDirection: "column", height: "100vh", overflow: "hidden" }}>
+
+        {/* ── トップバー ── */}
+        <AppBar position="static" elevation={0}
+          sx={{ background: "#1565c0", flexShrink: 0, minHeight: TOOLBAR_H }}>
+          <Toolbar variant="dense" sx={{ gap: 0.5, minHeight: TOOLBAR_H, px: { xs: 1, sm: 2 } }}>
+            <Typography variant="subtitle1" fontWeight={700} noWrap
+              sx={{ mr: 1.5, fontSize: { xs: 13, sm: 15 } }}>
+              HTML Tester
+            </Typography>
+            <Divider orientation="vertical" flexItem sx={{ borderColor: "rgba(255,255,255,0.2)", mx: 0.5 }} />
+            <Tooltip title="サンプル投入" arrow>
+              <IconButton size="small" onClick={sample} sx={{ color: "#fff" }}>
+                <Icon name="article" size={19} />
+              </IconButton>
+            </Tooltip>
+            <Tooltip title="コピー" arrow>
+              <IconButton size="small" onClick={copy} sx={{ color: "#fff" }}>
+                <Icon name="content_copy" size={19} />
+              </IconButton>
+            </Tooltip>
+            <Tooltip title={isMobile ? "ダウンロード" : "HTMLとして保存 (Ctrl+S)"} arrow>
+              <IconButton size="small" onClick={download} sx={{ color: "#fff" }}>
+                <Icon name="download" size={19} />
+              </IconButton>
+            </Tooltip>
+            <Tooltip title="プレビュー再読み込み (Ctrl+Enter)" arrow>
+              <IconButton size="small" onClick={reload} sx={{ color: "#fff" }}>
+                <Icon name="refresh" size={19} />
+              </IconButton>
+            </Tooltip>
+            <Tooltip title="クリア" arrow>
+              <IconButton size="small" onClick={() => setConfirmClear(true)} sx={{ color: "#ffb3b3" }}>
+                <Icon name="delete_outline" size={19} />
+              </IconButton>
+            </Tooltip>
+            <Divider orientation="vertical" flexItem sx={{ borderColor: "rgba(255,255,255,0.2)", mx: 0.5 }} />
+            {/* ブラウザウィンドウ追加 */}
+            <Tooltip title="ブラウザウィンドウを追加" arrow>
+              <IconButton size="small" onClick={addWin} sx={{ color: "#a5d6ff" }}>
+                <Icon name="add_circle_outline" size={19} />
+              </IconButton>
+            </Tooltip>
+            {/* ウィンドウ一覧 — 最小化中は強調表示、クリックで展開/最小化トグル */}
+            {wins.map(w => {
+              const aTab = w.tabs.find(t => t.id === w.activeTab) || w.tabs[0];
+              return (
+                <Tooltip key={w.id} title={w.minimized ? \`展開: \${aTab.title}\` : \`最小化: \${aTab.title}\`} arrow>
+                  <Box
+                    onClick={() => updateWin(w.id, { minimized: !w.minimized })}
+                    sx={{
+                      display: "flex", alignItems: "center", gap: 0.4,
+                      px: 1, py: 0.3, borderRadius: 1, cursor: "pointer",
+                      background: w.minimized ? "rgba(255,255,255,0.22)" : "rgba(255,255,255,0.08)",
+                      border: w.minimized ? "1px solid rgba(255,255,255,0.5)" : "1px solid rgba(255,255,255,0.2)",
+                      "&:hover": { background: "rgba(255,255,255,0.3)" },
+                      maxWidth: 130,
+                    }}
+                  >
+                    <Icon name="language" size={13} style={{ color: w.minimized ? "#fff" : "#a5d6ff", flexShrink: 0 }} />
+                    <Typography noWrap variant="caption"
+                      sx={{ fontSize: 11, color: "rgba(255,255,255,0.9)", lineHeight: 1,
+                        fontWeight: w.minimized ? 700 : 400 }}>
+                      {aTab.title.length > 12 ? aTab.title.slice(0, 12) + "…" : aTab.title}
+                    </Typography>
+                    {/* 最小化中はインジケーター */}
+                    {w.minimized && (
+                      <Box sx={{ width: 5, height: 5, borderRadius: "50%", background: "#ffd700", flexShrink: 0, ml: 0.3 }} />
+                    )}
+                  </Box>
+                </Tooltip>
+              );
+            })}
+            <Divider orientation="vertical" flexItem sx={{ borderColor: "rgba(255,255,255,0.2)", mx: 0.5 }} />
+            <Box sx={{ flex: 1 }} />
+            {/* プロファイルメニュー */}
+            <ProfileMenu
+              profiles={profiles}
+              activeId={activeProfileId}
+              onSwitch={handleProfileSwitch}
+              onSave={handleProfileSave}
+              onNew={handleProfileNew}
+              onRename={handleProfileRename}
+              onDuplicate={handleProfileDuplicate}
+              onDelete={handleProfileDelete}
+              onExport={handleProfileExport}
+              onExportAll={handleProfileExportAll}
+              onImport={handleProfileImport}
+              onReset={handleProfileReset}
+            />
+            {/* グローバルテーマ切り替え */}
+            <Tooltip title={appDarkMode ? "アプリ全体: ライトモード" : "アプリ全体: ダークモード"} arrow>
+              <IconButton size="small" onClick={() => setAppDarkMode(d => !d)}
+                sx={{ color: appDarkMode ? "#ffd700" : "rgba(255,255,255,0.6)" }}>
+                <Icon name={appDarkMode ? "light_mode" : "dark_mode"} size={19} />
+              </IconButton>
+            </Tooltip>
+          </Toolbar>
+        </AppBar>
+
+        {/* ── ペイン領域 ── */}
+        <Box
+          ref={containerRef}
+          sx={{
+            flex: 1,
+            display: "flex",
+            flexDirection: isWide ? "row" : "column",
+            overflow: "hidden",
+            background: "#b0b8c4",
+            position: "relative",
+            // ドラッグ中はカーソルをペイン全体に適用
+            cursor: dragging
+              ? (isWide ? "col-resize" : "row-resize")
+              : "default",
+          }}
+        >
+          {/* ドラッグ中に iframe がポインターを奪わないようにするオーバーレイ */}
+          {dragging && (
+            <Box sx={{
+              position: "absolute", inset: 0, zIndex: 100,
+              cursor: isWide ? "col-resize" : "row-resize",
+            }}
+              {...handleProps}
+            />
+          )}
+
+          {/* ── エディタペイン ── */}
+          {showEditor && (
+            <Box sx={{
+              [sizeKey]: editorSize,
+              flexShrink: 0,
+              display: "flex",
+              flexDirection: "column",
+              overflow: "hidden",
+              background: darkMode ? "#1e1e2e" : "#fff",
+              minWidth: 0, minHeight: 0,
+            }}>
+              <PaneHeader
+                title="コード"
+                fullscreen={fullscreen === "editor"}
+                onToggleFullscreen={() => toggleFullscreen("editor")}
+                darkMode={darkMode}
+              >
+                {/* ハイライトモード切り替え */}
+                <Tooltip title={highlightMode === "prism" ? "プレーンモードに切り替え" : "シンタックスハイライト (Prism.js)"} arrow>
+                  <IconButton size="small"
+                    onClick={() => setHighlightMode(m => m === "prism" ? "plain" : "prism")}
+                    sx={{ p: 0.4, color: highlightMode === "prism" ? "#f59e0b" : (darkMode ? "rgba(205,214,244,0.4)" : "#bbb") }}>
+                    <Icon name="format_color_text" size={16} />
+                  </IconButton>
+                </Tooltip>
+                {/* スナップショット */}
+                <Tooltip title="スナップショットを保存" arrow>
+                  <IconButton size="small" onClick={takeSnapshot}
+                    sx={{ p: 0.4, position: "relative", color: darkMode ? "rgba(205,214,244,0.5)" : "#888" }}>
+                    <Icon name="photo_camera" size={16} />
+                    {snapshots.length > 0 && (
+                      <Box sx={{ position: "absolute", top: 1, right: 1, width: 5, height: 5,
+                        borderRadius: "50%", background: "#1976d2" }} />
+                    )}
+                  </IconButton>
+                </Tooltip>
+                <Tooltip title={\`スナップショット一覧 (\${snapshots.length})\`} arrow>
+                  <IconButton size="small" onClick={() => setSnapshotOpen(true)}
+                    sx={{ p: 0.4, color: snapshots.some(s => s.isLastGood) ? "#43a047" : (darkMode ? "rgba(205,214,244,0.4)" : "#bbb") }}>
+                    <Icon name="history" size={16} />
+                  </IconButton>
+                </Tooltip>
+                {/* 折り返し */}
+                <Tooltip title={wordWrap ? "折り返しをオフ" : "折り返しをオン"} arrow>                  <IconButton size="small" onClick={() => setWordWrap(w => !w)}
+                    sx={{ p: 0.4, color: wordWrap ? "#1976d2" : (darkMode ? "rgba(205,214,244,0.4)" : "#bbb") }}>
+                    <Icon name="wrap_text" size={16} />
+                  </IconButton>
+                </Tooltip>
+                {/* フォントサイズ */}
+                <Tooltip title="文字を小さく" arrow>
+                  <IconButton size="small" onClick={() => setFontSize(s => Math.max(10, s - 1))}
+                    sx={{ p: 0.4, color: darkMode ? "rgba(205,214,244,0.5)" : "#888" }}>
+                    <Icon name="text_decrease" size={15} />
+                  </IconButton>
+                </Tooltip>
+                <Typography variant="caption"
+                  onClick={() => setFontSize(13)}
+                  sx={{
+                    fontSize: 10, minWidth: 18, textAlign: "center", cursor: "pointer",
+                    color: fontSize !== 13 ? "#1976d2" : (darkMode ? "rgba(205,214,244,0.5)" : "#aaa"),
+                    fontWeight: fontSize !== 13 ? 700 : 400,
+                    "&:hover": { textDecoration: "underline" },
+                  }}>
+                  {fontSize}
+                </Typography>
+                <Tooltip title="文字を大きく" arrow>
+                  <IconButton size="small" onClick={() => setFontSize(s => Math.min(24, s + 1))}
+                    sx={{ p: 0.4, color: darkMode ? "rgba(205,214,244,0.5)" : "#888" }}>
+                    <Icon name="text_increase" size={15} />
+                  </IconButton>
+                </Tooltip>
+                {/* ダークモード */}
+                <Tooltip title={darkMode ? "ライトモード" : "ダークモード"} arrow>
+                  <IconButton size="small" onClick={() => setDarkMode(d => !d)}
+                    sx={{ p: 0.4, color: darkMode ? "#ffd700" : "#aaa" }}>
+                    <Icon name={darkMode ? "light_mode" : "dark_mode"} size={16} />
+                  </IconButton>
+                </Tooltip>
+              </PaneHeader>
+              <CodeEditor
+                value={html}
+                onChange={setHtml}
+                fontSize={isMobile ? Math.min(fontSize, 13) : fontSize}
+                darkMode={darkMode}
+                wordWrap={wordWrap}
+                highlightMode={highlightMode}
+              />
+            </Box>
+          )}
+
+          {/* ── ドラッグハンドル ── */}
+          {showHandle && (
+            <SplitHandle
+              isHorizontal={isWide}
+              handleProps={handleProps}
+              dragging={dragging}
+            />
+          )}
+
+          {/* ── プレビューペイン ── */}
+          {showPreview && (
+            <Box sx={{
+              [sizeKey]: previewSize,
+              flexShrink: 0,
+              display: "flex",
+              flexDirection: "column",
+              overflow: "hidden",
+              background: previewDarkMode ? "#1e1e2e" : "#fff",
+              minWidth: 0, minHeight: 0,
+            }}>
+              <PaneHeader
+                title="プレビュー"
+                fullscreen={fullscreen === "preview"}
+                onToggleFullscreen={() => toggleFullscreen("preview")}
+              >
+                {/* プレビューダークモード */}
+                <Tooltip title={previewDarkMode ? "プレビュー: ライトモード" : "プレビュー: ダークモード"} arrow>
+                  <IconButton size="small" onClick={() => setPreviewDarkMode(d => !d)}
+                    sx={{ p: 0.4, color: previewDarkMode ? "#ffd700" : "#aaa" }}>
+                    <Icon name={previewDarkMode ? "light_mode" : "dark_mode"} size={16} />
+                  </IconButton>
+                </Tooltip>
+                {/* プレビュー幅切り替え */}
+                {!isMobile && (
+                  <WidthSelector value={previewWidth} onChange={setPreviewWidth} />
+                )}
+                {/* 表示倍率 */}
+                {!isMobile && (
+                  <Box sx={{ display: "flex", alignItems: "center", gap: 0.2 }}>
+                    <Tooltip title="縮小" arrow>
+                      <IconButton size="small"
+                        onClick={() => setPreviewScale(s => Math.max(25, s - 25))}
+                        sx={{ p: 0.4 }}>
+                        <Icon name="zoom_out" size={16} />
+                      </IconButton>
+                    </Tooltip>
+                    <Tooltip title="100%にリセット" arrow>
+                      <Typography
+                        variant="caption"
+                        onClick={() => setPreviewScale(100)}
+                        sx={{
+                          fontSize: 11, minWidth: 36, textAlign: "center",
+                          cursor: "pointer", color: previewScale !== 100 ? "#1976d2" : "text.secondary",
+                          fontWeight: previewScale !== 100 ? 700 : 400,
+                          "&:hover": { textDecoration: "underline" },
+                        }}>
+                        {previewScale}%
+                      </Typography>
+                    </Tooltip>
+                    <Tooltip title="拡大" arrow>
+                      <IconButton size="small"
+                        onClick={() => setPreviewScale(s => Math.min(200, s + 25))}
+                        sx={{ p: 0.4 }}>
+                        <Icon name="zoom_in" size={16} />
+                      </IconButton>
+                    </Tooltip>
+                  </Box>
+                )}
+                <Tooltip title="再読み込み" arrow>
+                  <IconButton size="small" onClick={reload}>
+                    <Icon name="refresh" size={17} />
+                  </IconButton>
+                </Tooltip>
+                {/* コンソール */}
+                <Tooltip title="デバッグコンソール" arrow>
+                  <IconButton size="small" onClick={() => setConsoleOpen(true)}
+                    sx={{ position: "relative" }}>
+                    <Icon name="terminal" size={17} />
+                    {consoleLogs.some(l => l.level === "error") && (
+                      <Box sx={{ position: "absolute", top: 2, right: 2, width: 6, height: 6,
+                        borderRadius: "50%", background: "#d32f2f" }} />
+                    )}
+                    {!consoleLogs.some(l => l.level === "error") && consoleLogs.some(l => l.level === "warn") && (
+                      <Box sx={{ position: "absolute", top: 2, right: 2, width: 6, height: 6,
+                        borderRadius: "50%", background: "#f57c00" }} />
+                    )}
+                    {consoleLogs.length > 0 && !consoleLogs.some(l => ["error","warn"].includes(l.level)) && (
+                      <Box sx={{ position: "absolute", top: 2, right: 2, width: 6, height: 6,
+                        borderRadius: "50%", background: "#1976d2" }} />
+                    )}
+                  </IconButton>
+                </Tooltip>
+              </PaneHeader>
+              <PreviewFrame
+                srcDoc={srcDoc}
+                previewKey={previewKey}
+                width={isMobile ? "100%" : previewWidth}
+                scale={previewScale}
+                darkMode={previewDarkMode}
+              />
+            </Box>
+          )}
+
+        </Box>
+      </Box>
+
+      <ConfirmDialog
+        open={confirmClear}
+        title="入力内容をクリア"
+        message="テキストエリアの内容をすべて削除します。この操作は元に戻せません。"
+        confirmLabel="クリアする"
+        onConfirm={clearConfirm}
+        onCancel={() => setConfirmClear(false)}
+      />
+
+      {/* デバッグコンソール */}
+      <ConsolePanel
+        open={consoleOpen}
+        onClose={() => setConsoleOpen(false)}
+        logs={consoleLogs}
+        onClear={() => setConsoleLogs([])}
+      />
+
+      {/* スナップショット */}
+      <SnapshotPanel
+        open={snapshotOpen}
+        onClose={() => setSnapshotOpen(false)}
+        snapshots={snapshots}
+        onRestore={restoreSnapshot}
+        onDelete={deleteSnapshot}
+        onClearAll={clearSnapshots}
+        darkMode={darkMode}
+      />
+
+      {/* プロファイル切り替え確認 */}
+      {confirmSwitch && (
+        <MaterialUI.Dialog open maxWidth="xs" fullWidth PaperProps={{ sx: { borderRadius: 3, mx: 2 } }}>
+          <MaterialUI.DialogTitle sx={{ fontWeight: 700, pb: 1 }}>プロファイルを切り替え</MaterialUI.DialogTitle>
+          <MaterialUI.DialogContent>
+            <MaterialUI.DialogContentText>
+              現在の変更を保存してから切り替えますか？
+            </MaterialUI.DialogContentText>
+          </MaterialUI.DialogContent>
+          <MaterialUI.DialogActions sx={{ px: 3, pb: 2.5, flexDirection: "column", gap: 1 }}>
+            <Button onClick={() => doSwitch(true)} variant="contained" fullWidth>
+              保存して切り替え
+            </Button>
+            <Button onClick={() => doSwitch(false)} variant="outlined" fullWidth>
+              保存せず切り替え
+            </Button>
+            <Button onClick={() => setConfirmSwitch(null)} variant="text" fullWidth>
+              キャンセル
+            </Button>
+          </MaterialUI.DialogActions>
+        </MaterialUI.Dialog>
+      )}
+
+      <Snackbar
+        open={snackbar.open}
+        autoHideDuration={2200}
+        onClose={() => setSnackbar(s => ({ ...s, open: false }))}
+        message={snackbar.msg}
+        anchorOrigin={{ vertical: "bottom", horizontal: "center" }}
+      />
+
+      {/* ── フローティングウィンドウ群 ── */}
+      {wins.map(w => (
+        <FloatingWindow
+          key={w.id}
+          win={w}
+          onUpdate={updateWin}
+          onClose={closeWin}
+          onFocus={focusWin}
+        />
+      ))}
+
+    </ThemeProvider>
+  );
+}
+
+const root = createRoot(document.getElementById("root"));
+root.render(<React.StrictMode><App /></React.StrictMode>);
+`;
+
+    const { code } = Babel.transform(appCode, { presets: ["react"] });
+    const runApp = new Function("React", "createRoot", "MaterialUI", code);
+    runApp(React, createRoot, MaterialUI);
+  </script>
+</body>
+</html>
