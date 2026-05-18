@@ -742,6 +742,162 @@ function ConfirmDialog({ open, title, message, confirmLabel = "実行", confirmC
   );
 }
 
+
+function parseSimpleDiffPatch(diffText) {
+  const lines = diffText.replace(/\r\n/g, "\n").split("\n");
+  const oldLines = [];
+  const newLines = [];
+
+  for (const line of lines) {
+    if (line.startsWith("---") || line.startsWith("+++") || line.startsWith("@@")) continue;
+
+    if (line.startsWith("-")) {
+      oldLines.push(line.slice(1));
+      continue;
+    }
+
+    if (line.startsWith("+")) {
+      newLines.push(line.slice(1));
+      continue;
+    }
+
+    if (line.startsWith(" ")) {
+      oldLines.push(line.slice(1));
+      newLines.push(line.slice(1));
+    }
+  }
+
+  return {
+    oldBlock: oldLines.join("\n").trim(),
+    newBlock: newLines.join("\n").trim(),
+  };
+}
+
+function applySimpleDiffPatch(source, diffText) {
+  const { oldBlock, newBlock } = parseSimpleDiffPatch(diffText);
+
+  if (!oldBlock || !newBlock) {
+    return {
+      ok: false,
+      code: source,
+      message: "差分として認識できませんでした。",
+    };
+  }
+
+  const count = source.split(oldBlock).length - 1;
+
+  if (count === 0) {
+    return {
+      ok: false,
+      code: source,
+      message: "置換対象のコードが現在の内容内に見つかりませんでした。",
+    };
+  }
+
+  if (count > 1) {
+    return {
+      ok: false,
+      code: source,
+      message: `置換対象が ${count} 件見つかりました。誤適用防止のため中止しました。`,
+    };
+  }
+
+  return {
+    ok: true,
+    code: source.replace(oldBlock, newBlock),
+    message: "差分を適用しました。",
+  };
+}
+
+function PatchDialog({ open, onClose, currentCode, onApply }) {
+  const [patchText, setPatchText] = useState("");
+  const [result, setResult] = useState("");
+
+  useEffect(() => {
+    if (open) {
+      setPatchText("");
+      setResult("");
+    }
+  }, [open]);
+
+  const handleApply = useCallback(() => {
+    const res = applySimpleDiffPatch(currentCode, patchText);
+
+    if (!res.ok) {
+      setResult(res.message);
+      return;
+    }
+
+    onApply(res.code);
+    setResult(res.message);
+    onClose();
+  }, [currentCode, patchText, onApply, onClose]);
+
+  return (
+    <Dialog
+      open={open}
+      onClose={onClose}
+      maxWidth="md"
+      fullWidth
+      PaperProps={{ sx: { borderRadius: 3, height: "70vh", display: "flex", flexDirection: "column" } }}
+    >
+      <DialogTitle sx={{ fontWeight: 700, pb: 1, display: "flex", alignItems: "center", gap: 1 }}>
+        <Icon name="difference" size={20} />
+        差分パッチを適用
+      </DialogTitle>
+
+      <DialogContent sx={{ display: "flex", flexDirection: "column", gap: 1.5, flex: 1, minHeight: 0 }}>
+        <Typography variant="body2" color="text.secondary">
+          ChatGPT などから受け取った diff を貼り付けてください。現在のコード内から削除行ブロックを探し、追加行ブロックへ置換します。
+        </Typography>
+
+        <Box
+          component="textarea"
+          value={patchText}
+          onChange={e => setPatchText(e.target.value)}
+          placeholder={`例:
+-const oldValue = 1;
++const newValue = 2;`}
+          spellCheck={false}
+          style={{
+            flex: 1,
+            width: "100%",
+            minHeight: 260,
+            resize: "none",
+            border: "1px solid #d0d0d0",
+            borderRadius: 8,
+            padding: 12,
+            fontFamily: "ui-monospace,SFMono-Regular,Menlo,Consolas,monospace",
+            fontSize: 16,
+            lineHeight: 1.6,
+            outline: "none",
+          }}
+        />
+
+        {result && (
+          <Typography variant="caption" color="error">
+            {result}
+          </Typography>
+        )}
+      </DialogContent>
+
+      <DialogActions sx={{ px: 3, pb: 2, gap: 1 }}>
+        <Button onClick={onClose} variant="outlined">
+          キャンセル
+        </Button>
+        <Button
+          onClick={handleApply}
+          variant="contained"
+          disabled={!patchText.trim()}
+          startIcon={<Icon name="check" size={16} />}
+        >
+          適用
+        </Button>
+      </DialogActions>
+    </Dialog>
+  );
+}
+
 function WidthSelector({ value, onChange }) {
   return (
     <ToggleButtonGroup value={value} exclusive size="small" onChange={(_, v) => { if (v !== null) onChange(v); }}>
@@ -1329,6 +1485,7 @@ function App() {
   const [consoleOpen, setConsoleOpen] = useState(false);
   const [snapshots, setSnapshots] = useState([]);
   const [snapshotOpen, setSnapshotOpen] = useState(false);
+  const [patchOpen, setPatchOpen] = useState(false);
   const lastGoodCodeRef = useRef(null);
   const consoleLogsRef = useRef([]);
   const [wins, setWins] = useState(() => activeProfile?.data?.windows ?? []);
@@ -1498,15 +1655,50 @@ function App() {
   useEffect(() => { setRatio(RATIO_DEFAULT); }, [isWide]);
   useEffect(() => { setDarkMode(appDarkMode); setPreviewDarkMode(appDarkMode); }, [appDarkMode]);
 
+  // Debounced autosave: avoid blocking typing with repeated JSON.stringify/localStorage writes.
   useEffect(() => {
     if (!activeProfileId) return;
-    const settings = { fontSize, darkMode, wordWrap, highlightMode, previewScale, previewWidth, splitRatio: ratioRef.current };
-    setProfiles(ps => {
-      const next = ps.map(p => p.id !== activeProfileId ? p : { ...p, updatedAt: new Date().toISOString(), data: { ...p.data, code: html, settings, windows: wins } });
-      saveProfiles(next);
-      return next;
-    });
-  }, [html, fontSize, darkMode, wordWrap, highlightMode, previewScale, previewWidth, wins]);
+
+    const timer = setTimeout(() => {
+      const settings = {
+        fontSize,
+        darkMode,
+        wordWrap,
+        highlightMode,
+        previewScale,
+        previewWidth,
+        splitRatio: ratioRef.current,
+      };
+
+      setProfiles(ps => {
+        const next = ps.map(p => p.id !== activeProfileId ? p : {
+          ...p,
+          updatedAt: new Date().toISOString(),
+          data: {
+            ...p.data,
+            code: html,
+            settings,
+            windows: wins,
+          },
+        });
+
+        saveProfiles(next);
+        return next;
+      });
+    }, 800);
+
+    return () => clearTimeout(timer);
+  }, [
+    activeProfileId,
+    html,
+    fontSize,
+    darkMode,
+    wordWrap,
+    highlightMode,
+    previewScale,
+    previewWidth,
+    wins,
+  ]);
 
   useEffect(() => { if (isMobile) setPreviewWidth("100%"); }, [isMobile]);
 
@@ -1546,6 +1738,15 @@ function App() {
     addSnapshot(html, \`復元前 \${new Date().toLocaleTimeString("ja-JP")}\`, { isAuto: true });
     setHtml(code);
     toast("コードを復元しました");
+  }, [html, addSnapshot]);
+
+  const applyPatchCode = useCallback((nextCode) => {
+    addSnapshot(html, \`パッチ適用前 \${new Date().toLocaleTimeString("ja-JP")}\`, {
+      isAuto: true,
+    });
+
+    setHtml(nextCode);
+    toast("差分パッチを適用しました");
   }, [html, addSnapshot]);
 
   const deleteSnapshot = useCallback((id) => setSnapshots(prev => prev.filter(s => s.id !== id)), []);
@@ -1613,6 +1814,7 @@ function App() {
             <Tooltip title={isMobile ? "ダウンロード" : "HTMLとして保存 (Ctrl+S)"} arrow><IconButton size="small" onClick={download} sx={{ color: "#fff" }}><Icon name="download" size={19} /></IconButton></Tooltip>
             <Tooltip title="プレビュー再読み込み (Ctrl+Enter)" arrow><IconButton size="small" onClick={reload} sx={{ color: "#fff" }}><Icon name="refresh" size={19} /></IconButton></Tooltip>
             <Tooltip title="クリア" arrow><IconButton size="small" onClick={() => setConfirmClear(true)} sx={{ color: "#ffb3b3" }}><Icon name="delete_outline" size={19} /></IconButton></Tooltip>
+            <Tooltip title="差分パッチを適用" arrow><IconButton size="small" onClick={() => setPatchOpen(true)} sx={{ color: "#fff" }}><Icon name="difference" size={19} /></IconButton></Tooltip>
             <Divider orientation="vertical" flexItem sx={{ borderColor: "rgba(255,255,255,0.2)", mx: 0.5 }} />
             <Tooltip title="ブラウザウィンドウを追加" arrow><IconButton size="small" onClick={addWin} sx={{ color: "#a5d6ff" }}><Icon name="add_circle_outline" size={19} /></IconButton></Tooltip>
             {wins.map(w => {
@@ -1708,6 +1910,8 @@ function App() {
       </Box>
 
       <ConfirmDialog open={confirmClear} title="入力内容をクリア" message="テキストエリアの内容をすべて削除します。この操作は元に戻せません。" confirmLabel="クリアする" onConfirm={clearConfirm} onCancel={() => setConfirmClear(false)} />
+
+      <PatchDialog open={patchOpen} onClose={() => setPatchOpen(false)} currentCode={html} onApply={applyPatchCode} />
 
       <ConsolePanel open={consoleOpen} onClose={() => setConsoleOpen(false)} logs={consoleLogs} onClear={() => setConsoleLogs([])} />
 
