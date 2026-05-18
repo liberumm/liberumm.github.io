@@ -1131,12 +1131,13 @@ function calcWrappedHeights(lines, fontSize, taInnerWidth) {
   });
 }
 
-function CodeEditor({ value, onChange, fontSize, darkMode, wordWrap, highlightMode }) {
+function CodeEditor({ value, onChange, fontSize, darkMode, wordWrap, highlightMode, perfMode = "normal", showIndentGuides = true }) {
   const taRef = useRef(null);
   const gutterRef = useRef(null);
   const mirrorRef = useRef(null);
   const preRef = useRef(null);
   const overlayRef = useRef(null);
+  const overlayRafRef = useRef(null);
   const [cursor, setCursor] = useState({ line: 1, col: 1 });
   const [taInnerW, setTaInnerW] = useState(0);
   const [prismReady, setPrismReady] = useState(false);
@@ -1226,7 +1227,7 @@ function CodeEditor({ value, onChange, fontSize, darkMode, wordWrap, highlightMo
   })();
   const sizeKB = (new TextEncoder().encode(value).length / 1024).toFixed(1);
   const lineH = fontSize * LINE_HEIGHT_RATIO;
-  const wrappedCounts = wordWrap && taInnerW > 0 ? calcWrappedHeights(lines, fontSize, taInnerW) : null;
+  const wrappedCounts = wordWrap && perfMode === "normal" && taInnerW > 0 ? calcWrappedHeights(lines, fontSize, taInnerW) : null;
 
   const drawOverlay = useCallback(() => {
     const canvas = overlayRef.current;
@@ -1267,41 +1268,61 @@ function CodeEditor({ value, onChange, fontSize, darkMode, wordWrap, highlightMo
       ctx.fillRect(0, activeTop, W, activeH);
     }
 
-    ctx.strokeStyle = darkMode ? "rgba(255,255,255,0.08)" : "rgba(0,0,0,0.07)";
-    ctx.lineWidth = 1;
-    lines.forEach((line, i) => {
-      const match = line.match(/^( *)/);
-      const spaces = match ? match[1].length : 0;
-      const depth = Math.floor(spaces / 2);
-      if (depth === 0) return;
-      let lineTop;
-      if (wrappedCounts) {
-        let acc = 0;
-        for (let j = 0; j < i; j++) acc += (wrappedCounts[j] || 1);
-        lineTop = padT + acc * lineH - scrollT;
-      } else {
-        lineTop = padT + i * lineH - scrollT;
-      }
-      const rowH = wrappedCounts ? (wrappedCounts[i] || 1) * lineH : lineH;
-      if (lineTop + rowH < 0 || lineTop > H) return;
-      for (let d = 1; d <= depth; d++) {
-        const x = padL + d * indentW - scrollL + 0.5;
-        if (x < padL || x > W) continue;
-        ctx.beginPath();
-        ctx.moveTo(x, lineTop);
-        ctx.lineTo(x, lineTop + rowH);
-        ctx.stroke();
-      }
-    });
-  }, [cursor, lines, wrappedCounts, lineH, fontSize, darkMode]);
+    if (showIndentGuides && perfMode === "normal") {
+      ctx.strokeStyle = darkMode ? "rgba(255,255,255,0.08)" : "rgba(0,0,0,0.07)";
+      ctx.lineWidth = 1;
 
-  useEffect(() => { drawOverlay(); }, [drawOverlay]);
+      const startLine = Math.max(0, Math.floor((scrollT - padT) / lineH) - 2);
+      const endLine = Math.min(lines.length, Math.ceil((scrollT + H - padT) / lineH) + 2);
+
+      for (let i = startLine; i < endLine; i++) {
+        const line = lines[i] || "";
+        const match = line.match(/^( *)/);
+        const spaces = match ? match[1].length : 0;
+        const depth = Math.floor(spaces / 2);
+        if (depth === 0) continue;
+
+        const lineTop = padT + i * lineH - scrollT;
+        const rowH = lineH;
+        if (lineTop + rowH < 0 || lineTop > H) continue;
+
+        for (let d = 1; d <= depth; d++) {
+          const x = padL + d * indentW - scrollL + 0.5;
+          if (x < padL || x > W) continue;
+          ctx.beginPath();
+          ctx.moveTo(x, lineTop);
+          ctx.lineTo(x, lineTop + rowH);
+          ctx.stroke();
+        }
+      }
+    }
+  }, [cursor, lines, wrappedCounts, lineH, fontSize, darkMode, perfMode, showIndentGuides]);
+
+  const scheduleDrawOverlay = useCallback(() => {
+    if (overlayRafRef.current !== null) return;
+
+    overlayRafRef.current = requestAnimationFrame(() => {
+      overlayRafRef.current = null;
+      drawOverlay();
+    });
+  }, [drawOverlay]);
+
+  useEffect(() => {
+    return () => {
+      if (overlayRafRef.current !== null) {
+        cancelAnimationFrame(overlayRafRef.current);
+        overlayRafRef.current = null;
+      }
+    };
+  }, []);
+
+  useEffect(() => { scheduleDrawOverlay(); }, [scheduleDrawOverlay]);
 
   const handleScroll = useCallback(() => {
     syncScroll();
     syncMirrorScroll();
-    drawOverlay();
-  }, [syncScroll, syncMirrorScroll, drawOverlay]);
+    scheduleDrawOverlay();
+  }, [syncScroll, syncMirrorScroll, scheduleDrawOverlay]);
 
   const bg       = darkMode ? "#1e1e2e" : "#fff";
   const fg       = darkMode ? "#cdd6f4" : "#1a1a2e";
@@ -1490,6 +1511,15 @@ function App() {
   const consoleLogsRef = useRef([]);
   const [wins, setWins] = useState(() => activeProfile?.data?.windows ?? []);
 
+  const lineCountForPerf = useMemo(() => html.split("\n").length, [html]);
+  const isLargeCode = html.length > 50000 || lineCountForPerf > 1500;
+  const isHugeCode = html.length > 200000 || lineCountForPerf > 5000;
+  const perfMode = isHugeCode ? "huge" : isLargeCode ? "large" : "normal";
+  const previewDelay = isHugeCode ? 2000 : isLargeCode ? 1200 : 400;
+  const effectiveHighlightMode = isLargeCode ? "plain" : highlightMode;
+  const effectiveWordWrap = isLargeCode ? false : wordWrap;
+  const showIndentGuides = perfMode === "normal";
+
   const containerRef = useRef(null);
   const { ratio, setRatio, handleProps, dragging } = useSplitPane(containerRef, isWide, initS.splitRatio);
   const ratioRef = useRef(ratio);
@@ -1649,8 +1679,16 @@ function App() {
     toast("初期設定に戻しました");
   }, []);
 
-  const debounced = useDebounce(html, 400);
+  const debounced = useDebounce(html, previewDelay);
   const srcDoc = useMemo(() => buildSrcDoc(debounced), [debounced]);
+
+  useEffect(() => {
+    if (perfMode === "large") {
+      toast("大きいコードのため軽量モードにしました");
+    } else if (perfMode === "huge") {
+      toast("非常に大きいコードのため超軽量モードにしました");
+    }
+  }, [perfMode]);
 
   useEffect(() => { setRatio(RATIO_DEFAULT); }, [isWide]);
   useEffect(() => { setDarkMode(appDarkMode); setPreviewDarkMode(appDarkMode); }, [appDarkMode]);
@@ -1722,9 +1760,12 @@ function App() {
       isAuto: opts.isAuto ?? false,
       isLastGood: opts.isLastGood ?? false,
     };
+
+    const maxSnapshots = code.length > 200000 ? 5 : code.length > 50000 ? 15 : MAX_SNAPSHOTS;
+
     setSnapshots(prev => {
       const base = opts.isLastGood ? prev.filter(s => !s.isLastGood) : prev;
-      return [snap, ...base].slice(0, MAX_SNAPSHOTS);
+      return [snap, ...base].slice(0, maxSnapshots);
     });
     return snap;
   }, []);
@@ -1867,14 +1908,23 @@ function App() {
                 <Typography variant="caption" onClick={() => setFontSize(13)} sx={{ fontSize: 10, minWidth: 18, textAlign: "center", cursor: "pointer", color: fontSize !== 13 ? "#1976d2" : (darkMode ? "rgba(205,214,244,0.5)" : "#aaa"), fontWeight: fontSize !== 13 ? 700 : 400 }}>{fontSize}</Typography>
                 <Tooltip title="文字を大きく" arrow><IconButton size="small" onClick={() => setFontSize(s => Math.min(24, s + 1))} sx={{ p: 0.4, color: darkMode ? "rgba(205,214,244,0.5)" : "#888" }}><Icon name="text_increase" size={15} /></IconButton></Tooltip>
                 <Tooltip title={darkMode ? "ライトモード" : "ダークモード"} arrow><IconButton size="small" onClick={() => setDarkMode(d => !d)} sx={{ p: 0.4, color: darkMode ? "#ffd700" : "#aaa" }}><Icon name={darkMode ? "light_mode" : "dark_mode"} size={16} /></IconButton></Tooltip>
+                {perfMode !== "normal" && (
+                  <Tooltip title={`性能モード: ${perfMode} / ${lineCountForPerf.toLocaleString()} 行`} arrow>
+                    <Typography variant="caption" sx={{ px: 0.7, py: 0.25, borderRadius: 1, fontSize: 10, fontWeight: 700, color: "#fff", background: perfMode === "huge" ? "#d32f2f" : "#f57c00" }}>
+                      {perfMode.toUpperCase()}
+                    </Typography>
+                  </Tooltip>
+                )}
               </PaneHeader>
               <CodeEditor
                 value={html}
                 onChange={setHtml}
                 fontSize={isMobile ? Math.max(16, fontSize) : fontSize}
                 darkMode={darkMode}
-                wordWrap={wordWrap}
-                highlightMode={highlightMode}
+                wordWrap={effectiveWordWrap}
+                highlightMode={effectiveHighlightMode}
+                perfMode={perfMode}
+                showIndentGuides={showIndentGuides}
               />
             </Box>
           )}
@@ -1911,11 +1961,11 @@ function App() {
 
       <ConfirmDialog open={confirmClear} title="入力内容をクリア" message="テキストエリアの内容をすべて削除します。この操作は元に戻せません。" confirmLabel="クリアする" onConfirm={clearConfirm} onCancel={() => setConfirmClear(false)} />
 
-      <PatchDialog open={patchOpen} onClose={() => setPatchOpen(false)} currentCode={html} onApply={applyPatchCode} />
+      {patchOpen && <PatchDialog open={patchOpen} onClose={() => setPatchOpen(false)} currentCode={html} onApply={applyPatchCode} />}
 
-      <ConsolePanel open={consoleOpen} onClose={() => setConsoleOpen(false)} logs={consoleLogs} onClear={() => setConsoleLogs([])} />
+      {consoleOpen && <ConsolePanel open={consoleOpen} onClose={() => setConsoleOpen(false)} logs={consoleLogs} onClear={() => setConsoleLogs([])} />}
 
-      <SnapshotPanel open={snapshotOpen} onClose={() => setSnapshotOpen(false)} snapshots={snapshots} onRestore={restoreSnapshot} onDelete={deleteSnapshot} onClearAll={clearSnapshots} darkMode={darkMode} />
+      {snapshotOpen && <SnapshotPanel open={snapshotOpen} onClose={() => setSnapshotOpen(false)} snapshots={snapshots} onRestore={restoreSnapshot} onDelete={deleteSnapshot} onClearAll={clearSnapshots} darkMode={darkMode} />}
 
       {confirmSwitch && (
         <MaterialUI.Dialog open maxWidth="xs" fullWidth PaperProps={{ sx: { borderRadius: 3, mx: 2 } }}>
