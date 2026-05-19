@@ -2582,6 +2582,15 @@ function supportAIExtractPipelineText(output) {
     return output.map(item => supportAIExtractPipelineText(item)).filter(Boolean).join("\n");
   }
   if (output && typeof output === "object") {
+    if (Array.isArray(output.generated_text)) {
+      const messages = output.generated_text;
+      const assistant = [...messages].reverse().find(m => m && typeof m === "object" && m.role === "assistant" && typeof m.content === "string");
+      const last = assistant || [...messages].reverse().find(m => m && typeof m === "object" && typeof m.content === "string");
+      return String(last?.content || "");
+    }
+    if (output.generated_text && typeof output.generated_text === "object") {
+      return String(output.generated_text.content ?? output.generated_text.text ?? "");
+    }
     return String(
       output.generated_text ??
       output.summary_text ??
@@ -2596,6 +2605,171 @@ function supportAIExtractPipelineText(output) {
   return "";
 }
 
+function supportAIBuildChatSystemContent(config = DEFAULT_SUPPORT_AI_CONFIG) {
+  const language = normalizeSupportAIConfig(config).language || "ja";
+  const answerLanguage = language === "ja" ? "日本語" : language;
+  return [
+    "あなたはSupportAIです。",
+    `${answerLanguage}で、ユーザーの最後の発言に直接答えます。`,
+    "短く自然な文章で答えます。",
+    "コードを求められた時だけコードを出します。",
+  ].join("\n");
+}
+
+function supportAIBuildChatMessages(prompt, config = DEFAULT_SUPPORT_AI_CONFIG) {
+  return [
+    { role: "system", content: supportAIBuildChatSystemContent(config) },
+    { role: "user", content: String(prompt || "").trim() },
+  ];
+}
+
+function supportAICleanGeneratedText(text) {
+  let output = String(text || "").replace(/\r\n/g, "\n").trim();
+  output = output.replace(/^(assistant|supportai|回答)\s*[:：]\s*/i, "").trim();
+  output = output.replace(/\n(?:user|ユーザー|質問)\s*[:：][\s\S]*$/i, "").trim();
+  output = output.replace(/<\|endoftext\|>|<\|im_end\|>|<\/s>/g, "").trim();
+  output = output
+    .replace(/(^|\n)\s*(役割名の除外|JSONの不要|英語の見出しの除外|プロンプトの復唱)[\s\S]*?(?=\n\s*(役割名の除外|JSONの不要|英語の見出しの除外|プロンプトの復唱)|$)/g, "")
+    .replace(/事実と推測を分け、知らないことは知らないと\s*/g, "")
+    .trim();
+  return output;
+}
+
+function supportAIEmitTokenChars(onToken, chunk) {
+  if (typeof onToken !== "function") return;
+  for (const char of Array.from(String(chunk || ""))) {
+    try { onToken(char); } catch {}
+  }
+}
+
+function supportAIShouldAttachDocumentContext(message) {
+  const text = String(message || "").toLowerCase();
+  const explicitLocalReference = /現在|いま|この|その|上の|下の|貼った|表示中|開いている|エディタ|ページ|ファイル|選択|文書|本文/.test(text);
+  if (explicitLocalReference) return true;
+  const codeTarget = /コード|html|markdown|md|css|javascript|js/.test(text);
+  const editIntent = /修正|校正|要約|解析|レビュー|差分|エラー|バグ|実装|リファクタ|直して|見て|チェック|改善|整形|補完|変換/.test(text);
+  return codeTarget && editIntent;
+}
+
+function supportAITextChunks(text, chunkSize = 4200) {
+  const value = String(text || "");
+  const chunks = [];
+  for (let start = 0; start < value.length; start += chunkSize) {
+    chunks.push({ index: chunks.length + 1, start, end: Math.min(value.length, start + chunkSize), text: value.slice(start, start + chunkSize) });
+  }
+  return chunks;
+}
+
+function supportAIReferenceKeywords(query) {
+  return Array.from(new Set(String(query || "").toLowerCase().match(/[a-z0-9_\-]{2,}|[\u3040-\u30ff\u3400-\u9fff]{2,}/g) || []));
+}
+
+function supportAIScoreReferenceChunk(query, chunk) {
+  const keywords = supportAIReferenceKeywords(query);
+  if (!keywords.length) return 0;
+  const body = String(chunk?.text || "").toLowerCase();
+  return keywords.reduce((score, keyword) => score + (body.includes(keyword) ? 1 : 0), 0);
+}
+
+function supportAIExtractReferenceSignals(text, limit = 24) {
+  const lines = String(text || "").split(/\r?\n/);
+  const patterns = [
+    /^\s{0,4}#{1,6}\s+.+/,
+    /^\s*<(title|h[1-6]|script|style|section|article|main|header|footer|dialog|form|button|input|textarea|select)\b[^>]*>/i,
+    /^\s*(function|const|let|var|class)\s+[A-Za-z0-9_$-]+/,
+    /^\s*[A-Za-z0-9_$-]+\s*[:=]\s*(function|\(|async|\{)/,
+  ];
+  return lines
+    .map((line, i) => ({ line: i + 1, text: line.trim() }))
+    .filter(item => item.text && patterns.some(pattern => pattern.test(item.text)))
+    .slice(0, limit);
+}
+
+function supportAISummarizeReferenceChunk(chunk, query) {
+  const lines = String(chunk.text || "").split(/\r?\n/);
+  const nonEmpty = lines.map(line => line.trim()).filter(Boolean);
+  const signals = supportAIExtractReferenceSignals(chunk.text, 6);
+  const preview = [
+    ...nonEmpty.slice(0, 2),
+    ...(nonEmpty.length > 4 ? ["..."] : []),
+    ...nonEmpty.slice(-2),
+  ].filter(Boolean).join(" / ");
+  return {
+    index: chunk.index,
+    start: chunk.start,
+    end: chunk.end,
+    score: supportAIScoreReferenceChunk(query, chunk),
+    signals,
+    preview: preview.slice(0, 420),
+  };
+}
+
+function supportAIBuildReferenceText(text, query, options = {}) {
+  const value = String(text || "");
+  const maxFullChars = options.maxFullChars || 16000;
+  const chunkSize = options.chunkSize || 4200;
+  const maxRelevantChunks = options.maxRelevantChunks || 4;
+  if (value.length <= maxFullChars) return value;
+
+  const chunks = supportAITextChunks(value, chunkSize);
+  const chunkSummaries = chunks.map(chunk => supportAISummarizeReferenceChunk(chunk, query));
+  const ranked = [...chunkSummaries].sort((a, b) => b.score - a.score || a.index - b.index);
+  const picked = new Set([
+    1,
+    chunks.length,
+    ...ranked.filter(item => item.score > 0).slice(0, maxRelevantChunks).map(item => item.index),
+  ]);
+  if (picked.size < Math.min(maxRelevantChunks, chunks.length)) {
+    const stride = Math.max(1, Math.floor(chunks.length / Math.min(maxRelevantChunks, chunks.length)));
+    for (let i = 1; i <= chunks.length && picked.size < Math.min(maxRelevantChunks + 2, chunks.length); i += stride) picked.add(i);
+  }
+
+  const globalSignals = supportAIExtractReferenceSignals(value, 40);
+  const mapText = chunkSummaries.map(item => {
+    const signals = item.signals.map(signal => `L${signal.line}:${signal.text}`).join(" | ");
+    return `- chunk ${item.index}/${chunks.length} chars ${item.start}-${item.end} score=${item.score}: ${signals || item.preview}`;
+  }).join("\n");
+  const excerpts = [...picked].sort((a, b) => a - b).map(index => {
+    const chunk = chunks[index - 1];
+    return `--- chunk ${index}/${chunks.length} chars ${chunk.start}-${chunk.end} ---\n${chunk.text}`;
+  }).join("\n\n");
+
+  return [
+    "[全文圧縮参照]",
+    `総文字数: ${value.length}`,
+    `総行数: ${value.split(/\r?\n/).length}`,
+    `チャンク数: ${chunks.length} / チャンクサイズ: ${chunkSize}`,
+    "",
+    "[全体シグナル]",
+    globalSignals.map(signal => `L${signal.line}: ${signal.text}`).join("\n") || "検出なし",
+    "",
+    "[全文チャンクマップ]",
+    mapText,
+    "",
+    "[関連/境界チャンク本文]",
+    excerpts,
+  ].join("\n");
+}
+
+function supportAIChatReferenceForMessage(message, target) {
+  if (!target || !String(target.text || "").trim()) return { scope: "none", text: "", range: null, label: "" };
+  if (target.scope === "selection") {
+    return {
+      scope: "selection",
+      text: supportAIBuildReferenceText(target.text, message),
+      range: target.range || null,
+      label: "選択範囲",
+    };
+  }
+  if (!supportAIShouldAttachDocumentContext(message)) return { scope: "none", text: "", range: null, label: "" };
+  return {
+    scope: "document",
+    text: supportAIBuildReferenceText(target.text, message),
+    range: null,
+    label: "現在の文書",
+  };
+}
+
 async function supportAIBrowserGenerateText(prompt, options = {}, rawConfig = DEFAULT_SUPPORT_AI_CONFIG) {
   const config = normalizeSupportAIConfig({ ...rawConfig, ...options });
   if (!supportAIFeatureEnabled(config, "text")) return supportAIDisabledResult("text", "Text LLM");
@@ -2603,6 +2777,7 @@ async function supportAIBrowserGenerateText(prompt, options = {}, rawConfig = DE
   const model = options.model || config.browserTextModel;
   const task = options.task || config.browserTextTask || "text-generation";
   const dtype = options.dtype || config.browserTextDtype || "q4";
+  const useChatInput = Boolean(options.chat);
   try {
     const pipe = await supportAIGetBrowserPipeline(task, model, { device, dtype }, config);
     SUPPORT_AI_BROWSER_LOCAL.prepared.text = true;
@@ -2611,25 +2786,31 @@ async function supportAIBrowserGenerateText(prompt, options = {}, rawConfig = DE
     const maxNewTokens = Math.min(config.maxTokens || 512, config.browserMaxNewTokens || 512);
     const generationOptions = {
       max_new_tokens: maxNewTokens,
-      temperature: config.temperature,
-      do_sample: config.temperature > 0,
-      return_full_text: false,
+      do_sample: useChatInput ? false : config.temperature > 0,
     };
+    if (!useChatInput) {
+      generationOptions.temperature = config.temperature;
+      generationOptions.return_full_text = false;
+    }
     if (typeof options.onToken === "function") {
       try {
         const tf = await importSupportAITransformers(config);
         if (tf.TextStreamer && pipe.tokenizer) {
           generationOptions.streamer = new tf.TextStreamer(pipe.tokenizer, {
             skip_prompt: true,
+            skip_special_tokens: true,
             callback_function: (chunk) => {
-              try { options.onToken(String(chunk || "")); } catch {}
+              supportAIEmitTokenChars(options.onToken, chunk);
             },
           });
         }
       } catch {}
     }
-    const output = await pipe(String(prompt || ""), generationOptions);
-    const text = supportAIExtractPipelineText(output);
+    const effectiveInput = useChatInput
+      ? (Array.isArray(prompt) ? prompt : supportAIBuildChatMessages(prompt, config))
+      : String(prompt || "");
+    const output = await pipe(effectiveInput, generationOptions);
+    const text = supportAICleanGeneratedText(supportAIExtractPipelineText(output));
     return { ok: Boolean(text), text, provider: "browser-local", model, device, raw: output, usage: null, error: text ? null : "ブラウザ内Text推論は完了しましたが、空の結果でした。" };
   } catch (error) {
     SUPPORT_AI_BROWSER_LOCAL.lastError = supportAIErrorMessage(error);
@@ -3226,7 +3407,9 @@ function createOOSGhostRuntime({ providers, config }) {
 
   const LLM = {
     async generate(input = {}) {
-      const prompt = input.prompt || oosGhostMessagesToPrompt(input.messages);
+      const prompt = input.chat && Array.isArray(input.messages)
+        ? input.messages
+        : (input.prompt || oosGhostMessagesToPrompt(input.messages));
       const result = await providers.text.ask(prompt, input);
       return { ok: result.ok, modality: "text", text: result.text || "", model: input.model || runtimeConfig.textModel, raw: result.raw || null, usage: result.usage || null, error: result.error || null };
     },
@@ -3336,7 +3519,18 @@ function createOOSGhostRuntime({ providers, config }) {
         "User Task:",
         basePrompt,
       ].filter(Boolean).join("\n\n");
-      const response = await LLM.generate({ ...input, prompt });
+      let llmInput = { ...input, prompt };
+      if (input.chat && Array.isArray(input.messages)) {
+        const contextBlock = [
+          contextText ? "RAG Context:\n" + contextText : "",
+          knowledgeText ? "Knowledge Facts:\n" + knowledgeText : "",
+        ].filter(Boolean).join("\n\n");
+        const messages = contextBlock
+          ? [...input.messages, { role: "user", content: `参照情報:\n${contextBlock}` }]
+          : input.messages;
+        llmInput = { ...input, prompt: "", messages };
+      }
+      const response = await LLM.generate(llmInput);
       return { ...response, contextText, ragSources: ragResult?.hits || [], knowledgeSources: knowledgeResult?.hits || [] };
     },
   };
@@ -3478,6 +3672,88 @@ function collectSupportAISources(response) {
   return sources;
 }
 
+async function supportAICopyText(text) {
+  const value = String(text || "");
+  if (!value) throw new Error("copy text is empty");
+  try {
+    if (navigator.clipboard?.writeText) {
+      await navigator.clipboard.writeText(value);
+      return true;
+    }
+  } catch {}
+  const textarea = document.createElement("textarea");
+  textarea.value = value;
+  textarea.setAttribute("readonly", "readonly");
+  textarea.style.position = "fixed";
+  textarea.style.left = "-9999px";
+  textarea.style.top = "0";
+  document.body.appendChild(textarea);
+  textarea.focus();
+  textarea.select();
+  try {
+    const ok = document.execCommand("copy");
+    if (!ok) throw new Error("execCommand copy failed");
+    return true;
+  } finally {
+    document.body.removeChild(textarea);
+  }
+}
+
+function supportAIIsModelConversationMessage(msg) {
+  if (!msg || msg.id === "welcome" || msg.pending) return false;
+  if (!(msg.role === "user" || msg.role === "assistant")) return false;
+  const text = String(msg.text || "").trim();
+  if (!text) return false;
+  if (msg.role === "assistant" && /^(停止しました|AI停止中|緊急停止しました|受付しました|推論準備中です|生成中です)/.test(text)) return false;
+  if (msg.role === "assistant" && /(役割名の除外|JSONの不要|英語の見出しの除外|プロンプトの復唱|事実と推測を分け、知らないことは知らないと)/.test(text)) return false;
+  return true;
+}
+
+function formatSupportAIConversation(messages = []) {
+  const lines = (Array.isArray(messages) ? messages : [])
+    .filter(msg => msg && (msg.role === "user" || msg.role === "assistant") && String(msg.text || "").trim())
+    .filter(msg => msg.id !== "welcome")
+    .map(msg => {
+      const role = msg.role === "user" ? "User" : "SupportAI";
+      const time = msg.ts ? new Date(msg.ts).toLocaleString("ja-JP") : "";
+      const metrics = msg.metrics ? ` / ${formatSupportAIDuration(msg.metrics.durationMs)} / ${msg.metrics.tokens} tok / ${msg.metrics.tokensPerSec} tok/s` : "";
+      return `[${role}${time ? ` ${time}` : ""}${metrics}]\n${String(msg.text || "").trim()}`;
+    })
+    .join("\n\n---\n\n");
+  return lines ? `SupportAI 会話ログ\n作成日時: ${new Date().toLocaleString("ja-JP")}\n\n${lines}` : "";
+}
+
+function buildSupportAIConversationContext(messages = [], limit = 10) {
+  const usable = (Array.isArray(messages) ? messages : [])
+    .filter(supportAIIsModelConversationMessage)
+    .slice(-limit);
+  if (!usable.length) return "";
+  return usable.map(msg => `${msg.role === "user" ? "ユーザー" : "SupportAI"}: ${String(msg.text || "").trim()}`).join("\n\n");
+}
+
+function supportAIShouldUseConversationHistory(message) {
+  const text = String(message || "").trim().toLowerCase();
+  if (!text) return false;
+  if (/^(続き|つづき|それ|その|これ|この|さっき|前|直前|今の|同じ|もう一度|もっと|詳しく|具体的|例を|なぜ|どうして|じゃあ|では|なら|つまり|要するに)/.test(text)) return true;
+  if (/(についてもう|について詳しく|を詳しく|を続けて|の続き|前の|上の|先ほど|さっきの|直前の|今の回答|同じテーマ)/.test(text)) return true;
+  return false;
+}
+
+function buildSupportAIChatMessages(messages = [], currentUserText = "", reference = null, config = DEFAULT_SUPPORT_AI_CONFIG, limit = 10) {
+  const history = supportAIShouldUseConversationHistory(currentUserText)
+    ? (Array.isArray(messages) ? messages : [])
+      .filter(supportAIIsModelConversationMessage)
+      .slice(-limit)
+      .map(msg => ({ role: msg.role, content: String(msg.text || "").trim() }))
+    : [];
+  const referenceText = reference?.text ? `\n\n参照対象（${reference.label}）:\n${reference.text}` : "";
+  return [
+    { role: "system", content: supportAIBuildChatSystemContent(config) },
+    ...history,
+    { role: "user", content: `${String(currentUserText || "").trim()}${referenceText}` },
+  ];
+}
+
 function SupportAIDialog({ open, onClose, appDarkMode, activeMode, editorApiRef, fallbackText, onFallbackSetText, onToast, onForceMarkdown, onForceHtml }) {
   const [tab, setTab] = useState("chat");
   const [instruction, setInstruction] = useState("自然で読みやすくしてください");
@@ -3522,7 +3798,12 @@ function SupportAIDialog({ open, onClose, appDarkMode, activeMode, editorApiRef,
   useEffect(() => {
     if (tab !== "chat") return;
     chatMessagesEndRef.current?.scrollIntoView?.({ block: "end", behavior: "smooth" });
-  }, [tab, chatMessages.length, busy]);
+  }, [tab, chatMessages, busy]);
+  const copyChatConversation = useCallback(() => {
+    const text = formatSupportAIConversation(chatMessages);
+    if (!text) return onToast?.("コピーする会話がありません");
+    supportAICopyText(text).then(() => onToast?.("会話全体をコピーしました")).catch(() => onToast?.("コピーに失敗しました"));
+  }, [chatMessages, onToast]);
   const updateAIConfig = useCallback((patch) => {
     setAIConfig(prev => {
       const next = normalizeSupportAIConfig({ ...prev, ...patch });
@@ -3823,13 +4104,14 @@ function SupportAIDialog({ open, onClose, appDarkMode, activeMode, editorApiRef,
       return;
     }
     const target = getTarget();
+    const chatReference = supportAIChatReferenceForMessage(message, target);
     const ts = Date.now();
     const userMessage = {
       id: `user-${ts}-${Math.random().toString(36).slice(2)}`,
       role: "user",
       text: message,
       ts,
-      scope: target.scope,
+      scope: chatReference.scope,
     };
     const assistantId = `assistant-${ts}-${Math.random().toString(36).slice(2)}`;
     const assistantMessage = {
@@ -3849,22 +4131,23 @@ function SupportAIDialog({ open, onClose, appDarkMode, activeMode, editorApiRef,
     run("ai-chat", async ({ signal }) => {
       const startedAt = performance.now();
       updateChatMessage(assistantId, { text: "推論準備中です。初回はRuntime/モデルの読み込みに時間がかかります...", pending: true });
+      const useConversationHistory = supportAIShouldUseConversationHistory(message);
+      const conversationContext = useConversationHistory ? buildSupportAIConversationContext(chatMessages, 10) : "";
       const prompt = [
-        message,
-        target.text ? `参照対象（${target.scope === "selection" ? "選択範囲" : "現在の文書"}）:\n${target.text}` : "",
+        conversationContext ? `これまでの会話:\n${conversationContext}` : "",
+        `今回のユーザー発言:\n${message}`,
+        chatReference.text ? `参照対象（${chatReference.label}）:\n${chatReference.text}` : "",
       ].filter(Boolean).join("\n\n");
+      const messages = buildSupportAIChatMessages(chatMessages, message, chatReference, aiConfig, 10);
       if (!signal?.aborted) {
-        updateChatMessage(assistantId, { text: "生成中です。完了した回答をこのカードに表示します...", pending: true });
+        updateChatMessage(assistantId, { text: "生成中です。受信した文字からこのカードに表示します...", pending: true });
       }
       let response;
       let partialText = "";
-      let lastPartialAt = 0;
       const pushPartial = (chunk) => {
         if (signal?.aborted) return;
         partialText += String(chunk || "");
         const now = performance.now();
-        if (now - lastPartialAt < 120 && partialText.length > 24) return;
-        lastPartialAt = now;
         updateChatMessage(assistantId, {
           text: partialText || "生成中です...",
           pending: true,
@@ -3874,8 +4157,10 @@ function SupportAIDialog({ open, onClose, appDarkMode, activeMode, editorApiRef,
       try {
         response = await ghostRuntime.AI.generate({
           prompt,
+          messages,
           rag: { enabled: Boolean(aiConfig.enableRag) },
           knowledge: { enabled: Boolean(aiConfig.enableKnowledge) },
+          chat: true,
           onToken: pushPartial,
         });
       } catch (error) {
@@ -3885,7 +4170,7 @@ function SupportAIDialog({ open, onClose, appDarkMode, activeMode, editorApiRef,
           updateChatMessage(assistantId, { text: message, pending: false, ok: false, metrics, sources: [] });
         }
         activeChatAssistantIdRef.current = null;
-        return { ok: false, type: "text", command: "ai-chat", scope: target.scope, range: target.range, original: target.text, suggestion: "", text: "", error: message };
+        return { ok: false, type: "text", command: "ai-chat", scope: chatReference.scope, range: chatReference.range, original: chatReference.text, suggestion: "", text: "", error: message };
       }
       const assistantText = response.text || partialText || response.error || "";
       const metrics = buildSupportAIMetrics(startedAt, performance.now(), assistantText);
@@ -3900,9 +4185,9 @@ function SupportAIDialog({ open, onClose, appDarkMode, activeMode, editorApiRef,
         });
       }
       activeChatAssistantIdRef.current = null;
-      return { ok: response.ok, type: "text", command: "ai-chat", scope: target.scope, range: target.range, original: target.text, suggestion: assistantText, text: assistantText, contextText: response.contextText, knowledgeSources: response.knowledgeSources, error: response.error || null };
+      return { ok: response.ok, type: "text", command: "ai-chat", scope: chatReference.scope, range: chatReference.range, original: chatReference.text, suggestion: assistantText, text: assistantText, contextText: response.contextText, knowledgeSources: response.knowledgeSources, error: response.error || null };
     });
-  }, [aiConfig.enableKnowledge, aiConfig.enableRag, aiConfig.localAIEnabled, chatInput, getTarget, ghostRuntime, instruction, onToast, run, runtimeReady, textReady, textRunnable, updateChatMessage]);
+  }, [aiConfig.enableKnowledge, aiConfig.enableRag, aiConfig.localAIEnabled, chatInput, chatMessages, getTarget, ghostRuntime, instruction, onToast, run, runtimeReady, textReady, textRunnable, updateChatMessage]);
 
   const clearChatMessages = useCallback(() => {
     setChatMessages([{ id: `welcome-${Date.now()}`, role: "assistant", text: "会話をクリアしました。新しい相談を入力してください。", ts: Date.now() }]);
@@ -4078,7 +4363,7 @@ function SupportAIDialog({ open, onClose, appDarkMode, activeMode, editorApiRef,
           </Tabs>
         </Box>
 
-        <Grid container spacing={{ xs: 0.8, sm: 1.5 }} sx={{ p: { xs: 0.8, sm: 1.5 }, minHeight: 0, flex: 1, overflow: { xs: "auto", md: "hidden" }, alignItems: "stretch", WebkitOverflowScrolling: "touch" }}>
+        <Grid container spacing={{ xs: 0.8, sm: 1.5 }} sx={{ p: { xs: 0.8, sm: 1.5 }, minHeight: 0, height: "100%", flex: 1, overflow: { xs: "auto", md: "hidden" }, alignItems: "stretch", WebkitOverflowScrolling: "touch" }}>
           <Grid size={{ xs: 12, md: 4 }} sx={{ order: chatLayoutOrder, display: "flex", flexDirection: "column", gap: 1, minHeight: 0, maxHeight: { xs: "none", md: "100%" }, overflow: { xs: "visible", md: "auto" } }}>
             {tab === "work" && <>
               <MaterialUI.TextField label="AIへの指示" value={instruction} onChange={e => setInstruction(e.target.value)} size="small" multiline minRows={2} placeholder="例：選択範囲を自然で読みやすく直して" />
@@ -4212,16 +4497,17 @@ function SupportAIDialog({ open, onClose, appDarkMode, activeMode, editorApiRef,
             <input ref={imageInputRef} type="file" accept="image/*" style={{ display: "none" }} onChange={e => { handleImageFile(e.target.files?.[0]); e.target.value = ""; }} />
           </Grid>
 
-          <Grid size={{ xs: 12, md: 8 }} sx={{ order: resultLayoutOrder, minHeight: 0, minWidth: 0, display: "flex" }}>
+          <Grid size={{ xs: 12, md: 8 }} sx={{ order: resultLayoutOrder, minHeight: 0, minWidth: 0, height: { xs: "auto", md: "100%" }, display: "flex" }}>
           {tab === "chat" ? (
-            <Box sx={{ display: "flex", flexDirection: "column", width: "100%", minHeight: { xs: 320, md: 0 }, height: { xs: "min(68dvh, calc(100dvh - 230px))", md: "auto" }, border: `1px solid ${border}`, borderRadius: 2, overflow: "hidden", background: dark ? "#020617" : "#fbfdff", minWidth: 0 }}>
+            <Box sx={{ display: "flex", flexDirection: "column", width: "100%", minHeight: { xs: 320, md: 0 }, height: { xs: "min(68dvh, calc(100dvh - 230px))", md: "100%" }, border: `1px solid ${border}`, borderRadius: 2, overflow: "hidden", background: dark ? "#020617" : "#fbfdff", minWidth: 0 }}>
               <Box sx={{ px: 1.2, py: 0.8, display: "flex", alignItems: "center", gap: 1, borderBottom: `1px solid ${border}` }}>
                 <Typography variant="caption" fontWeight={900} sx={{ flex: 1 }}>会話</Typography>
                 {busy && <MaterialUI.Chip size="small" color="primary" label="AI応答中" />}
                 <MaterialUI.Chip size="small" label={`${chatMessages.length} 件`} />
+                <Button size="small" variant="text" onClick={copyChatConversation} disabled={!chatMessages.some(msg => msg.id !== "welcome" && (msg.role === "user" || msg.role === "assistant"))} sx={{ minHeight: 22, px: 0.7, fontSize: 11 }}>会話コピー</Button>
               </Box>
               {busy && <MaterialUI.LinearProgress />}
-              <Box sx={{ flex: 1, minHeight: 0, overflow: "auto", p: { xs: 1, sm: 1.25 }, display: "flex", flexDirection: "column", gap: 1, WebkitOverflowScrolling: "touch" }}>
+              <Box sx={{ flex: "1 1 0", minHeight: 0, overflowY: "auto", overflowX: "hidden", p: { xs: 1, sm: 1.25 }, display: "flex", flexDirection: "column", gap: 1, WebkitOverflowScrolling: "touch", overscrollBehavior: "contain" }}>
                 {chatMessages.map(msg => {
                   const isUser = msg.role === "user";
                   return (
@@ -4244,7 +4530,7 @@ function SupportAIDialog({ open, onClose, appDarkMode, activeMode, editorApiRef,
                               size="small"
                               variant="text"
                               disabled={!msg.text}
-                              onClick={() => navigator.clipboard.writeText(msg.text || "").then(() => onToast?.("回答をコピーしました")).catch(() => onToast?.("コピーに失敗しました"))}
+                              onClick={() => supportAICopyText(msg.text || "").then(() => onToast?.("回答をコピーしました")).catch(() => onToast?.("コピーに失敗しました"))}
                               sx={{ minHeight: 22, px: 0.7, fontSize: 11 }}
                             >
                               コピー
@@ -4261,7 +4547,7 @@ function SupportAIDialog({ open, onClose, appDarkMode, activeMode, editorApiRef,
                                 <Box key={`${src.type}-${i}`} sx={{ p: 0.8, borderRadius: 1.5, background: dark ? "rgba(255,255,255,0.05)" : "#f8fafc", border: `1px solid ${border}` }}>
                                   <Box sx={{ display: "flex", alignItems: "center", gap: 0.5 }}>
                                     <Typography variant="caption" sx={{ flex: 1, minWidth: 0, fontWeight: 900 }}>{src.type} · {src.title}</Typography>
-                                    <Button size="small" variant="text" onClick={() => navigator.clipboard.writeText(src.text || "").then(() => onToast?.("ソースをコピーしました")).catch(() => onToast?.("コピーに失敗しました"))} sx={{ minHeight: 20, px: 0.6, fontSize: 10 }}>コピー</Button>
+                                    <Button size="small" variant="text" onClick={() => supportAICopyText(src.text || "").then(() => onToast?.("ソースをコピーしました")).catch(() => onToast?.("コピーに失敗しました"))} sx={{ minHeight: 20, px: 0.6, fontSize: 10 }}>コピー</Button>
                                   </Box>
                                   <Typography component="pre" sx={{ m: 0, mt: 0.35, whiteSpace: "pre-wrap", wordBreak: "break-word", fontFamily: "inherit", fontSize: 12, lineHeight: 1.55, color: muted }}>{String(src.text || "").slice(0, 1200)}</Typography>
                                 </Box>
@@ -4323,7 +4609,7 @@ function SupportAIDialog({ open, onClose, appDarkMode, activeMode, editorApiRef,
 
       <DialogActions sx={{ px: { xs: 1, sm: 2 }, py: 1, borderTop: `1px solid ${border}`, flexShrink: 0 }}>
         <Stack direction={{ xs: "column", sm: "row" }} spacing={1} sx={{ width: { xs: "100%", sm: "auto" }, ml: { sm: "auto" }, "& .MuiButton-root": { ...responsiveButtonSx, width: { xs: "100%", sm: "auto" } } }}>
-          <Button onClick={() => navigator.clipboard.writeText(resultText || "").then(() => onToast?.("AI結果をコピーしました")).catch(() => onToast?.("コピーに失敗しました"))} disabled={!resultText}>結果コピー</Button>
+          <Button onClick={tab === "chat" ? copyChatConversation : () => supportAICopyText(resultText || "").then(() => onToast?.("AI結果をコピーしました")).catch(() => onToast?.("コピーに失敗しました"))} disabled={tab === "chat" ? !chatMessages.some(msg => msg.id !== "welcome" && (msg.role === "user" || msg.role === "assistant")) : !resultText}>{tab === "chat" ? "会話コピー" : "結果コピー"}</Button>
           <Button onClick={() => applySuggestion(result, true)} disabled={!resultText || busy} variant="outlined">カーソルへ挿入</Button>
           <Button onClick={() => applySuggestion(result, false)} disabled={!resultText || busy} variant="contained">結果を反映</Button>
         </Stack>
