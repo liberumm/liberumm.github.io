@@ -115,7 +115,7 @@ const {
   ThemeProvider, createTheme, CssBaseline, useMediaQuery,
   Box, Button, Dialog, DialogActions, DialogContent,
   DialogContentText, DialogTitle, Divider, IconButton,
-  Stack, Tooltip, Typography,
+  Grid, Stack, Tooltip, Typography,
   ToggleButton, ToggleButtonGroup, Snackbar, AppBar, Toolbar,
 } = MaterialUI;
 
@@ -2609,12 +2609,26 @@ async function supportAIBrowserGenerateText(prompt, options = {}, rawConfig = DE
     SUPPORT_AI_BROWSER_LOCAL.preparedAt.text = Date.now();
     if (!SUPPORT_AI_BROWSER_LOCAL.activeDevice) SUPPORT_AI_BROWSER_LOCAL.activeDevice = device;
     const maxNewTokens = Math.min(config.maxTokens || 512, config.browserMaxNewTokens || 512);
-    const output = await pipe(String(prompt || ""), {
+    const generationOptions = {
       max_new_tokens: maxNewTokens,
       temperature: config.temperature,
       do_sample: config.temperature > 0,
       return_full_text: false,
-    });
+    };
+    if (typeof options.onToken === "function") {
+      try {
+        const tf = await importSupportAITransformers(config);
+        if (tf.TextStreamer && pipe.tokenizer) {
+          generationOptions.streamer = new tf.TextStreamer(pipe.tokenizer, {
+            skip_prompt: true,
+            callback_function: (chunk) => {
+              try { options.onToken(String(chunk || "")); } catch {}
+            },
+          });
+        }
+      } catch {}
+    }
+    const output = await pipe(String(prompt || ""), generationOptions);
     const text = supportAIExtractPipelineText(output);
     return { ok: Boolean(text), text, provider: "browser-local", model, device, raw: output, usage: null, error: text ? null : "ブラウザ内Text推論は完了しましたが、空の結果でした。" };
   } catch (error) {
@@ -3417,6 +3431,53 @@ function buildMarkdownDevPrompt({ theme, currentMarkdown = "", errors = [], mode
   ].filter(Boolean).join("\n");
 }
 
+function estimateSupportAITokens(text) {
+  const body = String(text || "");
+  if (!body) return 0;
+  const asciiWords = body.match(/[A-Za-z0-9_]+/g) || [];
+  const cjkChars = body.match(/[\u3040-\u30ff\u3400-\u9fff]/g) || [];
+  const symbols = body.replace(/[A-Za-z0-9_\s\u3040-\u30ff\u3400-\u9fff]/g, "").length;
+  return Math.max(1, Math.round(asciiWords.length * 1.25 + cjkChars.length * 0.75 + symbols * 0.5));
+}
+
+function buildSupportAIMetrics(startedAt, endedAt, text) {
+  const durationMs = Math.max(0, Math.round((endedAt || performance.now()) - (startedAt || performance.now())));
+  const tokens = estimateSupportAITokens(text);
+  const seconds = Math.max(0.001, durationMs / 1000);
+  return {
+    durationMs,
+    chars: String(text || "").length,
+    tokens,
+    tokensPerSec: Math.round((tokens / seconds) * 10) / 10,
+  };
+}
+
+function formatSupportAIDuration(ms) {
+  const n = Number(ms) || 0;
+  return n >= 1000 ? `${(n / 1000).toFixed(1)}s` : `${Math.round(n)}ms`;
+}
+
+function collectSupportAISources(response) {
+  const sources = [];
+  (response?.ragSources || []).forEach((src, i) => {
+    sources.push({
+      type: "RAG",
+      title: src.title || `RAG Source ${i + 1}`,
+      text: src.text || src.contextText || "",
+      score: src.score,
+    });
+  });
+  (response?.knowledgeSources || []).forEach((src, i) => {
+    sources.push({
+      type: "Knowledge",
+      title: [src.subject, src.predicate, src.object].filter(Boolean).join(" ") || `Knowledge ${i + 1}`,
+      text: [src.subject, src.predicate, src.object].filter(Boolean).join(" "),
+      score: src.score,
+    });
+  });
+  return sources;
+}
+
 function SupportAIDialog({ open, onClose, appDarkMode, activeMode, editorApiRef, fallbackText, onFallbackSetText, onToast, onForceMarkdown, onForceHtml }) {
   const [tab, setTab] = useState("chat");
   const [instruction, setInstruction] = useState("自然で読みやすくしてください");
@@ -3438,11 +3499,20 @@ function SupportAIDialog({ open, onClose, appDarkMode, activeMode, editorApiRef,
     ts: Date.now(),
   }]);
   const chatMessagesEndRef = useRef(null);
+  const activeChatAssistantIdRef = useRef(null);
   const audioInputRef = useRef(null);
   const imageInputRef = useRef(null);
   const { Tabs, Tab } = MaterialUI;
   const providers = useMemo(() => createSupportAIProviders(aiConfig), [aiConfig]);
-  const providerStatus = useMemo(() => providers.status(), [providers]);
+  const providerStatus = providers.status();
+  const runtimeReady = Boolean(providerStatus.preparedStatus?.prepared?.runtime);
+  const enabledTextNeedsModel = Boolean(aiConfig.localAIEnabled && aiConfig.enableText);
+  const textReady = Boolean(providerStatus.preparedStatus?.prepared?.text);
+  const textRunnable = Boolean(aiConfig.localAIEnabled && aiConfig.enableText && runtimeReady && textReady);
+  const aiReadyToAnswer = Boolean(aiConfig.localAIEnabled && runtimeReady && (!aiConfig.enableText || textReady));
+  const visionRunnable = Boolean(aiConfig.localAIEnabled && aiConfig.enableVision && providerStatus.preparedStatus?.prepared?.vision);
+  const whisperRunnable = Boolean(aiConfig.localAIEnabled && aiConfig.enableWhisper && providerStatus.preparedStatus?.prepared?.whisper);
+  const ttsRunnable = Boolean(aiConfig.localAIEnabled && aiConfig.enableTts && providerStatus.preparedStatus?.prepared?.tts);
   const ghostRuntime = useMemo(() => createOOSGhostRuntime({ providers, config: aiConfig }), [providers, aiConfig]);
   const [runtimeInfo, setRuntimeInfo] = useState(null);
   const [knowledgeSubject, setKnowledgeSubject] = useState("OOS");
@@ -3468,6 +3538,11 @@ function SupportAIDialog({ open, onClose, appDarkMode, activeMode, editorApiRef,
   }, [onToast]);
   const pushAIInitLog = useCallback((entry) => {
     setAIInitLogs(prev => [...prev, entry].slice(-160));
+  }, []);
+  const updateChatMessage = useCallback((id, patch) => {
+    setChatMessages(prev => prev.map(msg => msg.id === id
+      ? { ...msg, ...(typeof patch === "function" ? patch(msg) : patch) }
+      : msg));
   }, []);
   const clearAIInitLogView = useCallback(() => {
     providers.browserLocal.clearLogs?.();
@@ -3532,18 +3607,30 @@ function SupportAIDialog({ open, onClose, appDarkMode, activeMode, editorApiRef,
     try { aiAbortRef.current?.abort(); } catch {}
     activeRunIdRef.current = null;
     aiAbortRef.current = null;
+    if (activeChatAssistantIdRef.current) {
+      updateChatMessage(activeChatAssistantIdRef.current, { text: message, pending: false, ok: false });
+      activeChatAssistantIdRef.current = null;
+    }
     setBusy(false);
     setAIPhase("stopped");
     setAITaskLabel(message);
     try { window.speechSynthesis?.cancel?.(); } catch {}
     setResult(prev => prev || { ok: false, label: "stopped", type: "runtime", text: message, suggestion: "", error: null });
     onToast?.(message);
-  }, [onToast]);
+  }, [onToast, updateChatMessage]);
 
   const emergencyStopAI = useCallback(() => {
     try { aiAbortRef.current?.abort(); } catch {}
     activeRunIdRef.current = null;
     aiAbortRef.current = null;
+    if (activeChatAssistantIdRef.current) {
+      updateChatMessage(activeChatAssistantIdRef.current, {
+        text: "緊急停止しました。実行中のAI結果は破棄され、ローカルAIはOFFになりました。",
+        pending: false,
+        ok: false,
+      });
+      activeChatAssistantIdRef.current = null;
+    }
     setBusy(false);
     setAIPhase("disabled");
     setAITaskLabel("緊急停止");
@@ -3552,7 +3639,7 @@ function SupportAIDialog({ open, onClose, appDarkMode, activeMode, editorApiRef,
     updateAIConfig({ localAIEnabled: false });
     setResult({ ok: false, label: "emergency-stop", type: "runtime", text: "緊急停止しました。実行中のAI結果は破棄され、ローカルAIはOFFになりました。必要ならAI ONで再開してください。", suggestion: "", error: null });
     onToast?.("緊急停止しました");
-  }, [onToast, providers, updateAIConfig]);
+  }, [onToast, providers, updateAIConfig, updateChatMessage]);
 
   const testAIConnection = useCallback(() => run("local-inference-test", async () => {
     if (!aiConfig.enableText) return { ok: false, type: "text", command: "local-inference-test", text: "", suggestion: "", error: "Text LLMが無効です。AI設定でTextを有効化してください。" };
@@ -3724,47 +3811,105 @@ function SupportAIDialog({ open, onClose, appDarkMode, activeMode, editorApiRef,
   const chatSend = useCallback(() => {
     const message = (chatInput || instruction || "現在の内容について、必要な支援をしてください。").trim();
     if (!message) return onToast?.("送信する内容を入力してください");
+    if (!textRunnable) {
+      const reason = !aiConfig.localAIEnabled
+        ? "AIがOFFです。AI ONで初期化してください。"
+        : !runtimeReady
+          ? "Runtimeが未初期化です。AI ONで初期化してください。"
+          : !textReady
+            ? "Textモデルが未準備です。AI ONまたは有効モデルを準備で初期化してください。"
+            : "Text LLMが無効です。AI設定でText LLMを有効化してください。";
+      onToast?.(reason);
+      return;
+    }
     const target = getTarget();
+    const ts = Date.now();
     const userMessage = {
-      id: `user-${Date.now()}-${Math.random().toString(36).slice(2)}`,
+      id: `user-${ts}-${Math.random().toString(36).slice(2)}`,
       role: "user",
       text: message,
-      ts: Date.now(),
+      ts,
       scope: target.scope,
     };
-    setChatMessages(prev => [...prev, userMessage]);
+    const assistantId = `assistant-${ts}-${Math.random().toString(36).slice(2)}`;
+    const assistantMessage = {
+      id: assistantId,
+      role: "assistant",
+      text: "受付しました。Runtimeとモデル状態を確認しています...",
+      ts: Date.now(),
+      pending: true,
+      ok: null,
+      metrics: null,
+      sources: [],
+    };
+    setChatMessages(prev => [...prev, userMessage, assistantMessage]);
+    activeChatAssistantIdRef.current = assistantId;
     setChatInput("");
 
     run("ai-chat", async ({ signal }) => {
+      const startedAt = performance.now();
+      updateChatMessage(assistantId, { text: "推論準備中です。初回はRuntime/モデルの読み込みに時間がかかります...", pending: true });
       const prompt = [
         message,
         target.text ? `参照対象（${target.scope === "selection" ? "選択範囲" : "現在の文書"}）:\n${target.text}` : "",
       ].filter(Boolean).join("\n\n");
-      const response = await ghostRuntime.AI.generate({
-        prompt,
-        rag: { enabled: Boolean(aiConfig.enableRag) },
-        knowledge: { enabled: Boolean(aiConfig.enableKnowledge) },
-      });
-      const assistantText = response.text || response.error || "";
       if (!signal?.aborted) {
-        setChatMessages(prev => [...prev, {
-          id: `assistant-${Date.now()}-${Math.random().toString(36).slice(2)}`,
-          role: "assistant",
-          text: assistantText || "応答が空でした。",
-          ts: Date.now(),
-          ok: response.ok,
-        }]);
+        updateChatMessage(assistantId, { text: "生成中です。完了した回答をこのカードに表示します...", pending: true });
       }
-      return { ok: response.ok, type: "text", command: "ai-chat", scope: target.scope, range: target.range, original: target.text, suggestion: response.text || "", text: response.text || "", contextText: response.contextText, knowledgeSources: response.knowledgeSources, error: response.error || null };
+      let response;
+      let partialText = "";
+      let lastPartialAt = 0;
+      const pushPartial = (chunk) => {
+        if (signal?.aborted) return;
+        partialText += String(chunk || "");
+        const now = performance.now();
+        if (now - lastPartialAt < 120 && partialText.length > 24) return;
+        lastPartialAt = now;
+        updateChatMessage(assistantId, {
+          text: partialText || "生成中です...",
+          pending: true,
+          metrics: buildSupportAIMetrics(startedAt, now, partialText),
+        });
+      };
+      try {
+        response = await ghostRuntime.AI.generate({
+          prompt,
+          rag: { enabled: Boolean(aiConfig.enableRag) },
+          knowledge: { enabled: Boolean(aiConfig.enableKnowledge) },
+          onToken: pushPartial,
+        });
+      } catch (error) {
+        const message = supportAIErrorMessage(error);
+        const metrics = buildSupportAIMetrics(startedAt, performance.now(), message);
+        if (!signal?.aborted) {
+          updateChatMessage(assistantId, { text: message, pending: false, ok: false, metrics, sources: [] });
+        }
+        activeChatAssistantIdRef.current = null;
+        return { ok: false, type: "text", command: "ai-chat", scope: target.scope, range: target.range, original: target.text, suggestion: "", text: "", error: message };
+      }
+      const assistantText = response.text || partialText || response.error || "";
+      const metrics = buildSupportAIMetrics(startedAt, performance.now(), assistantText);
+      const sources = collectSupportAISources(response);
+      if (!signal?.aborted) {
+        updateChatMessage(assistantId, {
+          text: assistantText || "応答が空でした。",
+          pending: false,
+          ok: response.ok,
+          metrics,
+          sources,
+        });
+      }
+      activeChatAssistantIdRef.current = null;
+      return { ok: response.ok, type: "text", command: "ai-chat", scope: target.scope, range: target.range, original: target.text, suggestion: assistantText, text: assistantText, contextText: response.contextText, knowledgeSources: response.knowledgeSources, error: response.error || null };
     });
-  }, [aiConfig.enableKnowledge, aiConfig.enableRag, chatInput, getTarget, ghostRuntime, instruction, onToast, run]);
+  }, [aiConfig.enableKnowledge, aiConfig.enableRag, aiConfig.localAIEnabled, chatInput, getTarget, ghostRuntime, instruction, onToast, run, runtimeReady, textReady, textRunnable, updateChatMessage]);
 
   const clearChatMessages = useCallback(() => {
     setChatMessages([{ id: `welcome-${Date.now()}`, role: "assistant", text: "会話をクリアしました。新しい相談を入力してください。", ts: Date.now() }]);
   }, []);
 
   const toggleAIEnabled = useCallback(async () => {
-    if (aiConfig.localAIEnabled) {
+    if (aiReadyToAnswer) {
       stopAI("AI停止中");
       updateAIConfig({ localAIEnabled: false });
       setAIPhase("disabled");
@@ -3775,19 +3920,26 @@ function SupportAIDialog({ open, onClose, appDarkMode, activeMode, editorApiRef,
     const nextConfig = normalizeSupportAIConfig({ ...aiConfig, localAIEnabled: true });
     saveSupportAIConfig(nextConfig);
     setAIConfig(nextConfig);
-    setAIPhase("loading-runtime");
-    setAITaskLabel("Runtime読込中");
+    const features = [];
+    if (nextConfig.enableText) features.push("text");
+    if (nextConfig.enableVision) features.push("vision");
+    if (nextConfig.enableWhisper) features.push("whisper");
+    if (nextConfig.enableTts) features.push("tts");
+    setAIPhase(features.length ? "preparing-model" : "loading-runtime");
+    setAITaskLabel(features.length ? "有効モデル準備中" : "Runtime読込中");
     setAIInitLogs([]);
 
     try {
       const activationProviders = createSupportAIProviders(nextConfig);
-      const response = await activationProviders.browserLocal.prepare([], { clearLogs: true, onLog: pushAIInitLog });
+      const response = await activationProviders.browserLocal.prepare(features, { clearLogs: true, onLog: pushAIInitLog });
       const logs = response.logs || activationProviders.browserLocal.readLogs?.() || [];
       setAIInitLogs(logs);
       if (response.ok) {
-        setAIPhase("idle");
-        setAITaskLabel("AI待機中");
-        onToast?.("ローカルAIを有効化しました");
+        const preparedStatus = response.status || activationProviders.browserLocal.status?.() || {};
+        const textPrepared = !nextConfig.enableText || Boolean(preparedStatus.prepared?.text);
+        setAIPhase(textPrepared ? "idle" : "error");
+        setAITaskLabel(textPrepared ? "初期化完了 / 待機中" : "Textモデル準備未完了");
+        onToast?.(textPrepared ? "ローカルAIの初期化が完了しました" : "Runtimeは読込済みですがTextモデルが未準備です");
       } else {
         setAIPhase("error");
         setAITaskLabel("Runtime読込失敗");
@@ -3801,7 +3953,7 @@ function SupportAIDialog({ open, onClose, appDarkMode, activeMode, editorApiRef,
       setResult({ ok: false, label: "ai-enable", type: "runtime", text: "", suggestion: "", error: message });
       onToast?.(`AI有効化に失敗: ${message}`);
     }
-  }, [aiConfig, onToast, pushAIInitLog, stopAI, updateAIConfig]);
+  }, [aiConfig, aiReadyToAnswer, onToast, pushAIInitLog, stopAI, updateAIConfig]);
 
   const aiStatusText = !aiConfig.localAIEnabled
     ? "未有効"
@@ -3815,11 +3967,19 @@ function SupportAIDialog({ open, onClose, appDarkMode, activeMode, editorApiRef,
             ? "エラー"
             : aiPhase === "stopped"
               ? "停止済み"
-              : "待機中";
-  const aiStatusColor = !aiConfig.localAIEnabled ? "default" : (busy || aiPhase === "loading-runtime" || aiPhase === "preparing-model") ? "primary" : aiPhase === "error" ? "error" : aiPhase === "stopped" ? "warning" : "success";
+              : !runtimeReady
+                ? "未初期化"
+                : enabledTextNeedsModel && !textReady
+                  ? "Text未準備"
+                  : "待機中";
+  const aiStatusColor = !aiConfig.localAIEnabled ? "default" : (busy || aiPhase === "loading-runtime" || aiPhase === "preparing-model") ? "primary" : aiPhase === "error" ? "error" : aiPhase === "stopped" ? "warning" : (!runtimeReady || (enabledTextNeedsModel && !textReady)) ? "warning" : "success";
   const latestAIInitLog = aiInitLogs.length ? aiInitLogs[aiInitLogs.length - 1] : null;
   const aiHeaderBusy = busy || aiPhase === "loading-runtime" || aiPhase === "preparing-model";
-  const aiHeaderDetail = latestAIInitLog?.message || aiTaskLabel || (providerStatus.preparedStatus?.prepared?.runtime ? "Runtime読込済み" : "Runtime未読込");
+  const readinessDetail = !runtimeReady
+    ? "Runtime未読込。有効モデルを準備、または初回送信時に読み込みます。"
+    : (enabledTextNeedsModel && !textReady ? "Runtime読込済み。Textモデルは未準備です。" : "Runtime/有効モデル準備済み");
+  const effectiveAITaskLabel = aiTaskLabel === "AI待機中" && (!runtimeReady || (enabledTextNeedsModel && !textReady)) ? "" : aiTaskLabel;
+  const aiHeaderDetail = latestAIInitLog?.message || effectiveAITaskLabel || readinessDetail;
   const resultText = result?.text || result?.suggestion || "";
 
   const StatusItem = ({ name, value, color = "default" }) => (
@@ -3832,18 +3992,30 @@ function SupportAIDialog({ open, onClose, appDarkMode, activeMode, editorApiRef,
   const FeatureSwitch = ({ label, checked, onChange, disabled = false }) => (
     <MaterialUI.FormControlLabel
       control={<MaterialUI.Checkbox size="small" checked={checked} disabled={disabled} onChange={e => onChange(e.target.checked)} />}
-      label={<Typography variant="caption">{label}</Typography>}
-      sx={{ m: 0 }}
+      label={<Typography variant="caption" sx={{ lineHeight: 1.25, overflowWrap: "anywhere" }}>{label}</Typography>}
+      sx={{ m: 0, minWidth: 0, alignItems: "flex-start" }}
     />
   );
 
+  const responsiveButtonSx = {
+    width: "100%",
+    minWidth: 0,
+    minHeight: 36,
+    lineHeight: 1.2,
+    whiteSpace: "normal",
+    overflowWrap: "anywhere",
+    px: 1,
+  };
+
   const ActionButton = ({ children, onClick, disabled = false, variant = "outlined", color = "primary" }) => (
-    <Button size="small" variant={variant} color={color} disabled={busy || disabled || !aiConfig.localAIEnabled} onClick={onClick} sx={{ minHeight: 34, lineHeight: 1.2 }}>
+    <Button size="small" variant={variant} color={color} disabled={busy || disabled || !aiConfig.localAIEnabled} onClick={onClick} sx={responsiveButtonSx}>
       {children}
     </Button>
   );
 
   const settingDisabled = busy;
+  const chatLayoutOrder = tab === "chat" ? { xs: 2, md: 1 } : { xs: 1, md: 1 };
+  const resultLayoutOrder = tab === "chat" ? { xs: 1, md: 2 } : { xs: 2, md: 2 };
 
   return (
     <Dialog
@@ -3865,16 +4037,16 @@ function SupportAIDialog({ open, onClose, appDarkMode, activeMode, editorApiRef,
         },
       }}
     >
-      <DialogTitle sx={{ display: "flex", alignItems: "center", gap: 1, py: { xs: 0.9, sm: 1.2 }, px: { xs: 1, sm: 2 }, borderBottom: `1px solid ${border}`, flexShrink: 0 }}>
+      <DialogTitle sx={{ display: "flex", alignItems: "center", gap: 0.75, flexWrap: "wrap", py: { xs: 0.75, sm: 1.2 }, px: { xs: 0.8, sm: 2 }, borderBottom: `1px solid ${border}`, flexShrink: 0 }}>
         <Icon name="auto_awesome" size={21} />
-        <Box sx={{ minWidth: 0, flex: 1 }}>
+        <Box sx={{ minWidth: 0, flex: { xs: "1 1 calc(100% - 36px)", sm: 1 } }}>
           <Typography variant="subtitle1" fontWeight={900}>SupportAI</Typography>
           <Box sx={{ display: "flex", alignItems: "center", gap: 0.75, minWidth: 0, flexWrap: "wrap" }}>
             <MaterialUI.Chip size="small" color={aiStatusColor} label={aiStatusText} sx={{ height: 20, fontSize: 10 }} />
-            <Typography noWrap variant="caption" sx={{ color: muted, maxWidth: { xs: "46vw", sm: "56vw" } }}>{providerStatus.label} · {providerStatus.textModel}</Typography>
+            <Typography noWrap variant="caption" sx={{ color: muted, minWidth: 0, flex: "1 1 180px", maxWidth: { xs: "100%", sm: "56vw" } }}>{providerStatus.label} · {providerStatus.textModel}</Typography>
           </Box>
         </Box>
-        <Button size="small" variant={aiConfig.localAIEnabled ? "contained" : "outlined"} color={aiConfig.localAIEnabled ? "success" : "primary"} onClick={toggleAIEnabled} disabled={busy} sx={{ flexShrink: 0, minWidth: { xs: 52, sm: 76 }, px: { xs: 0.8, sm: 1.2 } }}>{aiConfig.localAIEnabled ? "AI ON" : "AI OFF"}</Button>
+        <Button size="small" variant={aiReadyToAnswer ? "outlined" : "contained"} color={aiReadyToAnswer ? "warning" : "primary"} onClick={toggleAIEnabled} disabled={busy} sx={{ flexShrink: 0, minWidth: { xs: 64, sm: 76 }, px: { xs: 0.8, sm: 1.2 } }}>{aiReadyToAnswer ? "AI OFF" : "AI ON"}</Button>
         <Button size="small" variant="outlined" color="warning" onClick={() => stopAI()} disabled={!busy} sx={{ flexShrink: 0, minWidth: { xs: 44, sm: 68 }, px: { xs: 0.8, sm: 1.2 } }}>停止</Button>
         <Button size="small" variant="contained" color="error" onClick={emergencyStopAI} sx={{ flexShrink: 0, minWidth: { xs: 44, sm: 92 }, px: { xs: 0.8, sm: 1.2 } }}><Box component="span" sx={{ display: { xs: "none", sm: "inline" } }}>緊急停止</Box><Box component="span" sx={{ display: { xs: "inline", sm: "none" } }}>緊急</Box></Button>
         <IconButton onClick={onClose} disabled={busy}><Icon name="close" size={20} /></IconButton>
@@ -3893,10 +4065,11 @@ function SupportAIDialog({ open, onClose, appDarkMode, activeMode, editorApiRef,
           <Tabs
             value={tab}
             onChange={(_, v) => setTab(v)}
-            variant="fullWidth"
+            variant={supportAIFullScreen ? "scrollable" : "fullWidth"}
+            scrollButtons={supportAIFullScreen ? "auto" : false}
             sx={{
               minHeight: 42,
-              "& .MuiTab-root": { minHeight: 42, px: { xs: 0.5, sm: 1.2 }, fontSize: { xs: 12, sm: 13 }, fontWeight: 900, whiteSpace: "nowrap" },
+              "& .MuiTab-root": { minHeight: 42, minWidth: { xs: 108, sm: 0 }, px: { xs: 0.8, sm: 1.2 }, fontSize: { xs: 12, sm: 13 }, fontWeight: 900, whiteSpace: "nowrap" },
             }}
           >
             <Tab value="chat" label="AIチャット" />
@@ -3905,8 +4078,8 @@ function SupportAIDialog({ open, onClose, appDarkMode, activeMode, editorApiRef,
           </Tabs>
         </Box>
 
-        <Box sx={{ p: { xs: 1, sm: 1.5 }, display: "grid", gridTemplateColumns: { xs: "1fr", md: "340px minmax(0, 1fr)" }, gridTemplateRows: { xs: "auto minmax(320px, 1fr)", md: "minmax(0, 1fr)" }, gap: { xs: 1, sm: 1.5 }, minHeight: 0, flex: 1, overflow: { xs: "auto", md: "hidden" }, alignItems: "stretch", WebkitOverflowScrolling: "touch" }}>
-          <Box sx={{ display: "flex", flexDirection: "column", gap: 1, minHeight: 0, maxHeight: { xs: "none", md: "100%" }, overflow: { xs: "visible", md: "auto" } }}>
+        <Grid container spacing={{ xs: 0.8, sm: 1.5 }} sx={{ p: { xs: 0.8, sm: 1.5 }, minHeight: 0, flex: 1, overflow: { xs: "auto", md: "hidden" }, alignItems: "stretch", WebkitOverflowScrolling: "touch" }}>
+          <Grid size={{ xs: 12, md: 4 }} sx={{ order: chatLayoutOrder, display: "flex", flexDirection: "column", gap: 1, minHeight: 0, maxHeight: { xs: "none", md: "100%" }, overflow: { xs: "visible", md: "auto" } }}>
             {tab === "work" && <>
               <MaterialUI.TextField label="AIへの指示" value={instruction} onChange={e => setInstruction(e.target.value)} size="small" multiline minRows={2} placeholder="例：選択範囲を自然で読みやすく直して" />
               <MaterialUI.TextField label="生成テーマ / Dev指示" value={themeText} onChange={e => setThemeText(e.target.value)} size="small" multiline minRows={2} placeholder="例：美しいTODOアプリを単一HTMLで作って" />
@@ -3917,20 +4090,20 @@ function SupportAIDialog({ open, onClose, appDarkMode, activeMode, editorApiRef,
                 <Typography variant="caption" fontWeight={900}>会話モード</Typography>
                 <Typography variant="caption" sx={{ display: "block", color: muted, lineHeight: 1.6, mt: 0.5 }}>下のチャット欄に入力すると、現在の選択範囲または文書を必要に応じて参照しながら応答します。画像・音声・RAG・Knowledge・Agentもここから使えます。</Typography>
               </Box>
-              <Box sx={{ display: "grid", gridTemplateColumns: { xs: "1fr 1fr", sm: "1fr 1fr" }, gap: 0.75 }}>
-                <ActionButton variant="contained" onClick={chatSend} disabled={!aiConfig.enableText}>送信</ActionButton>
-                <Button size="small" variant="outlined" onClick={clearChatMessages} disabled={busy}>会話クリア</Button>
-                <ActionButton onClick={ghostGenerateWithKnowledge} disabled={!aiConfig.enableText || (!aiConfig.enableRag && !aiConfig.enableKnowledge)}>RAG+Knowledge</ActionButton>
-                <ActionButton onClick={ghostRunAgent} disabled={!aiConfig.enableText || !aiConfig.enableAgents}>Agentで検討</ActionButton>
-                <ActionButton onClick={() => imageInputRef.current?.click()} disabled={!aiConfig.enableVision}>画像を読む</ActionButton>
-                <ActionButton onClick={() => audioInputRef.current?.click()} disabled={!aiConfig.enableWhisper}>音声→文字</ActionButton>
-                <ActionButton onClick={runLocalTTS} disabled={!aiConfig.enableTts}>本文→音声</ActionButton>
-              </Box>
-              <Box sx={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 0.6 }}>
-                <MaterialUI.Chip size="small" label={aiConfig.enableRag ? "RAG ON" : "RAG OFF"} color={aiConfig.enableRag ? "success" : "default"} />
-                <MaterialUI.Chip size="small" label={aiConfig.enableKnowledge ? "Knowledge ON" : "Knowledge OFF"} color={aiConfig.enableKnowledge ? "success" : "default"} />
-                <MaterialUI.Chip size="small" label={aiConfig.enableAgents ? "Agent ON" : "Agent OFF"} color={aiConfig.enableAgents ? "success" : "default"} />
-              </Box>
+              <Grid container spacing={0.75} sx={{ minWidth: 0 }}>
+                <Grid size={{ xs: 12, sm: 6 }}><ActionButton variant="contained" onClick={chatSend} disabled={!textRunnable}>送信</ActionButton></Grid>
+                <Grid size={{ xs: 12, sm: 6 }}><Button size="small" variant="outlined" onClick={clearChatMessages} disabled={busy} sx={responsiveButtonSx}>会話クリア</Button></Grid>
+                <Grid size={{ xs: 12, sm: 6 }}><ActionButton onClick={ghostGenerateWithKnowledge} disabled={!textRunnable || (!aiConfig.enableRag && !aiConfig.enableKnowledge)}>RAG+Knowledge</ActionButton></Grid>
+                <Grid size={{ xs: 12, sm: 6 }}><ActionButton onClick={ghostRunAgent} disabled={!textRunnable || !aiConfig.enableAgents}>Agentで検討</ActionButton></Grid>
+                <Grid size={{ xs: 12, sm: 6 }}><ActionButton onClick={() => imageInputRef.current?.click()} disabled={!visionRunnable}>画像を読む</ActionButton></Grid>
+                <Grid size={{ xs: 12, sm: 6 }}><ActionButton onClick={() => audioInputRef.current?.click()} disabled={!whisperRunnable}>音声→文字</ActionButton></Grid>
+                <Grid size={{ xs: 12, sm: 6 }}><ActionButton onClick={runLocalTTS} disabled={!ttsRunnable}>本文→音声</ActionButton></Grid>
+              </Grid>
+              <Stack direction={{ xs: "column", sm: "row" }} spacing={0.6} sx={{ minWidth: 0 }}>
+                <MaterialUI.Chip size="small" label={aiConfig.enableRag ? "RAG ON" : "RAG OFF"} color={aiConfig.enableRag ? "success" : "default"} sx={{ minWidth: 0 }} />
+                <MaterialUI.Chip size="small" label={aiConfig.enableKnowledge ? "Knowledge ON" : "Knowledge OFF"} color={aiConfig.enableKnowledge ? "success" : "default"} sx={{ minWidth: 0 }} />
+                <MaterialUI.Chip size="small" label={aiConfig.enableAgents ? "Agent ON" : "Agent OFF"} color={aiConfig.enableAgents ? "success" : "default"} sx={{ minWidth: 0 }} />
+              </Stack>
             </Box>}
 
             {tab === "work" && <Box sx={{ display: "flex", flexDirection: "column", gap: 1 }}>
@@ -3938,27 +4111,27 @@ function SupportAIDialog({ open, onClose, appDarkMode, activeMode, editorApiRef,
                 <Typography variant="caption" fontWeight={900}>エディタを直接よくする</Typography>
                 <Typography variant="caption" sx={{ display: "block", color: muted, lineHeight: 1.6, mt: 0.5 }}>要約・校正・リライト・生成・検証・Undoをまとめました。反映前にSnapshotを取るので戻せます。</Typography>
               </Box>
-              <Box sx={{ display: "grid", gridTemplateColumns: { xs: "1fr 1fr", sm: "1fr 1fr" }, gap: 0.75 }}>
-                <ActionButton onClick={() => runTextCommand("summarize")} disabled={!aiConfig.enableText}>要約</ActionButton>
-                <ActionButton variant="contained" onClick={() => runTextCommand("fix")} disabled={!aiConfig.enableText}>校正</ActionButton>
-                <ActionButton onClick={() => runTextCommand("rewrite")} disabled={!aiConfig.enableText}>リライト</ActionButton>
-                <ActionButton onClick={() => runTextCommand("explain")} disabled={!aiConfig.enableText}>説明</ActionButton>
-                <ActionButton onClick={() => runTextCommand("shorten")} disabled={!aiConfig.enableText}>短く</ActionButton>
-                <ActionButton onClick={() => runTextCommand("expand")} disabled={!aiConfig.enableText}>詳しく</ActionButton>
-                <ActionButton variant="contained" onClick={directFix} disabled={!aiConfig.enableText}>選択/全文を校正</ActionButton>
-                <Button size="small" variant="outlined" onClick={undoLast} disabled={!lastSnapshot || busy}>AI Undo</Button>
-                <ActionButton variant="contained" onClick={htmlAutoComplete} disabled={!aiConfig.enableText}>HTML生成/修正</ActionButton>
-                <ActionButton onClick={markdownAutoComplete} disabled={!aiConfig.enableText}>Markdown生成/整形</ActionButton>
-                <Button size="small" variant="outlined" onClick={checkMarkdown} disabled={busy}>Markdown検証</Button>
-                <Button size="small" variant="outlined" onClick={onForceMarkdown} disabled={busy}>MD固定</Button>
-                <Button size="small" variant="outlined" onClick={onForceHtml} disabled={busy}>HTML固定</Button>
-              </Box>
+              <Grid container spacing={0.75} sx={{ minWidth: 0 }}>
+                <Grid size={{ xs: 12, sm: 6 }}><ActionButton onClick={() => runTextCommand("summarize")} disabled={!textRunnable}>要約</ActionButton></Grid>
+                <Grid size={{ xs: 12, sm: 6 }}><ActionButton variant="contained" onClick={() => runTextCommand("fix")} disabled={!textRunnable}>校正</ActionButton></Grid>
+                <Grid size={{ xs: 12, sm: 6 }}><ActionButton onClick={() => runTextCommand("rewrite")} disabled={!textRunnable}>リライト</ActionButton></Grid>
+                <Grid size={{ xs: 12, sm: 6 }}><ActionButton onClick={() => runTextCommand("explain")} disabled={!textRunnable}>説明</ActionButton></Grid>
+                <Grid size={{ xs: 12, sm: 6 }}><ActionButton onClick={() => runTextCommand("shorten")} disabled={!textRunnable}>短く</ActionButton></Grid>
+                <Grid size={{ xs: 12, sm: 6 }}><ActionButton onClick={() => runTextCommand("expand")} disabled={!textRunnable}>詳しく</ActionButton></Grid>
+                <Grid size={{ xs: 12, sm: 6 }}><ActionButton variant="contained" onClick={directFix} disabled={!textRunnable}>選択/全文を校正</ActionButton></Grid>
+                <Grid size={{ xs: 12, sm: 6 }}><Button size="small" variant="outlined" onClick={undoLast} disabled={!lastSnapshot || busy} sx={responsiveButtonSx}>AI Undo</Button></Grid>
+                <Grid size={{ xs: 12, sm: 6 }}><ActionButton variant="contained" onClick={htmlAutoComplete} disabled={!textRunnable}>HTML生成/修正</ActionButton></Grid>
+                <Grid size={{ xs: 12, sm: 6 }}><ActionButton onClick={markdownAutoComplete} disabled={!textRunnable}>Markdown生成/整形</ActionButton></Grid>
+                <Grid size={{ xs: 12, sm: 6 }}><Button size="small" variant="outlined" onClick={checkMarkdown} disabled={busy} sx={responsiveButtonSx}>Markdown検証</Button></Grid>
+                <Grid size={{ xs: 12, sm: 6 }}><Button size="small" variant="outlined" onClick={onForceMarkdown} disabled={busy} sx={responsiveButtonSx}>MD固定</Button></Grid>
+                <Grid size={{ xs: 12, sm: 6 }}><Button size="small" variant="outlined" onClick={onForceHtml} disabled={busy} sx={responsiveButtonSx}>HTML固定</Button></Grid>
+              </Grid>
             </Box>}
 
             {tab === "settings" && <Box sx={{ display: "flex", flexDirection: "column", gap: 1 }}>
               <Box sx={{ p: 1, border: `1px solid ${border}`, borderRadius: 2, background: dark ? "rgba(255,255,255,0.035)" : "#f8fafc" }}>
                 <Typography variant="caption" fontWeight={900}>AI状態</Typography>
-                <Box sx={{ display: "grid", gridTemplateColumns: "1fr", gap: 0.45, mt: 0.8 }}>
+                <Stack spacing={0.45} sx={{ mt: 0.8 }}>
                   <StatusItem name="ローカルAI" value={aiConfig.localAIEnabled ? "有効" : "未有効"} color={aiConfig.localAIEnabled ? "success" : "default"} />
                   <StatusItem name="Runtime" value={providerStatus.preparedStatus?.prepared?.runtime ? "読込済み" : "未読込"} color={providerStatus.preparedStatus?.prepared?.runtime ? "success" : "default"} />
                   <StatusItem name="Text" value={providerStatus.preparedStatus?.prepared?.text ? "準備済み" : (aiConfig.enableText ? "未準備" : "無効")} color={providerStatus.preparedStatus?.prepared?.text ? "success" : "default"} />
@@ -3967,80 +4140,81 @@ function SupportAIDialog({ open, onClose, appDarkMode, activeMode, editorApiRef,
                   <StatusItem name="TTS" value={providerStatus.preparedStatus?.prepared?.tts ? "準備済み" : (aiConfig.enableTts ? "未準備" : "無効")} color={providerStatus.preparedStatus?.prepared?.tts ? "success" : "default"} />
                   <StatusItem name="Device" value={providerStatus.browserDevice === "webgpu" ? "WebGPU使用中" : "WASM使用中"} color={providerStatus.browserDevice === "webgpu" ? "primary" : "default"} />
                   <StatusItem name="Model Cache" value={providerStatus.preparedStatus?.cache?.useBrowserCache ? "利用中" : (providerStatus.preparedStatus?.cache?.blocked ? "sandboxで無効" : "無効")} color={providerStatus.preparedStatus?.cache?.useBrowserCache ? "success" : "default"} />
-                </Box>
+                </Stack>
               </Box>
 
               <Box sx={{ p: 1, border: `1px solid ${border}`, borderRadius: 2 }}>
                 <Typography variant="caption" fontWeight={900}>有効化する範囲</Typography>
-                <Box sx={{ display: "grid", gridTemplateColumns: { xs: "1fr", sm: "1fr 1fr" }, gap: 0.2, mt: 0.5 }}>
-                  <FeatureSwitch label="ローカルAI全体" checked={aiConfig.localAIEnabled} disabled={settingDisabled} onChange={v => updateAIConfig({ localAIEnabled: v })} />
-                  <FeatureSwitch label="Text LLM" checked={aiConfig.enableText} disabled={settingDisabled} onChange={v => updateAIConfig({ enableText: v })} />
-                  <FeatureSwitch label="Vision画像理解" checked={aiConfig.enableVision} disabled={settingDisabled} onChange={v => updateAIConfig({ enableVision: v })} />
-                  <FeatureSwitch label="Whisper ASR" checked={aiConfig.enableWhisper} disabled={settingDisabled} onChange={v => updateAIConfig({ enableWhisper: v })} />
-                  <FeatureSwitch label="TTS / Interleaved" checked={aiConfig.enableTts} disabled={settingDisabled} onChange={v => updateAIConfig({ enableTts: v })} />
-                  <FeatureSwitch label="Agent / Team" checked={aiConfig.enableAgents} disabled={settingDisabled} onChange={v => updateAIConfig({ enableAgents: v })} />
-                  <FeatureSwitch label="RAG" checked={aiConfig.enableRag} disabled={settingDisabled} onChange={v => updateAIConfig({ enableRag: v })} />
-                  <FeatureSwitch label="Knowledge" checked={aiConfig.enableKnowledge} disabled={settingDisabled} onChange={v => updateAIConfig({ enableKnowledge: v })} />
-                </Box>
+                <Grid container spacing={0.35} sx={{ mt: 0.5, minWidth: 0 }}>
+                  <Grid size={{ xs: 12, sm: 6 }}><FeatureSwitch label="ローカルAI全体" checked={aiConfig.localAIEnabled} disabled={settingDisabled} onChange={v => updateAIConfig({ localAIEnabled: v })} /></Grid>
+                  <Grid size={{ xs: 12, sm: 6 }}><FeatureSwitch label="Text LLM" checked={aiConfig.enableText} disabled={settingDisabled} onChange={v => updateAIConfig({ enableText: v })} /></Grid>
+                  <Grid size={{ xs: 12, sm: 6 }}><FeatureSwitch label="Vision画像理解" checked={aiConfig.enableVision} disabled={settingDisabled} onChange={v => updateAIConfig({ enableVision: v })} /></Grid>
+                  <Grid size={{ xs: 12, sm: 6 }}><FeatureSwitch label="Whisper ASR" checked={aiConfig.enableWhisper} disabled={settingDisabled} onChange={v => updateAIConfig({ enableWhisper: v })} /></Grid>
+                  <Grid size={{ xs: 12, sm: 6 }}><FeatureSwitch label="TTS / Interleaved" checked={aiConfig.enableTts} disabled={settingDisabled} onChange={v => updateAIConfig({ enableTts: v })} /></Grid>
+                  <Grid size={{ xs: 12, sm: 6 }}><FeatureSwitch label="Agent / Team" checked={aiConfig.enableAgents} disabled={settingDisabled} onChange={v => updateAIConfig({ enableAgents: v })} /></Grid>
+                  <Grid size={{ xs: 12, sm: 6 }}><FeatureSwitch label="RAG" checked={aiConfig.enableRag} disabled={settingDisabled} onChange={v => updateAIConfig({ enableRag: v })} /></Grid>
+                  <Grid size={{ xs: 12, sm: 6 }}><FeatureSwitch label="Knowledge" checked={aiConfig.enableKnowledge} disabled={settingDisabled} onChange={v => updateAIConfig({ enableKnowledge: v })} /></Grid>
+                </Grid>
               </Box>
 
-              <Box sx={{ display: "grid", gridTemplateColumns: { xs: "1fr", sm: "1fr 1fr" }, gap: 0.75 }}>
-                <MaterialUI.TextField select SelectProps={{ native: true }} label="初回モデルDL" value={aiConfig.allowRemoteModels ? "true" : "false"} onChange={e => updateAIConfig({ allowRemoteModels: e.target.value === "true" })} size="small">
+              <Grid container spacing={0.75} sx={{ minWidth: 0, "& .MuiFormControl-root": { minWidth: 0 }, "& .MuiInputBase-root": { minWidth: 0 } }}>
+                <Grid size={{ xs: 12, sm: 6 }}><MaterialUI.TextField fullWidth select SelectProps={{ native: true }} label="初回モデルDL" value={aiConfig.allowRemoteModels ? "true" : "false"} onChange={e => updateAIConfig({ allowRemoteModels: e.target.value === "true" })} size="small">
                   <option value="true">許可：初回のみ取得、以後Cache利用</option>
                   <option value="false">禁止：完全オフライン ./models のみ</option>
-                </MaterialUI.TextField>
-                <MaterialUI.TextField select SelectProps={{ native: true }} label="Browser Device" value={aiConfig.browserDevice} onChange={e => updateAIConfig({ browserDevice: e.target.value })} size="small">
+                </MaterialUI.TextField></Grid>
+                <Grid size={{ xs: 12, sm: 6 }}><MaterialUI.TextField fullWidth select SelectProps={{ native: true }} label="Browser Device" value={aiConfig.browserDevice} onChange={e => updateAIConfig({ browserDevice: e.target.value })} size="small">
                   <option value="auto">auto WebGPU→WASM</option>
                   <option value="webgpu">webgpu</option>
                   <option value="wasm">wasm</option>
-                </MaterialUI.TextField>
-                <MaterialUI.TextField select SelectProps={{ native: true }} label="モデルCache" value={aiConfig.browserCacheMode || "auto"} onChange={e => updateAIConfig({ browserCacheMode: e.target.value })} size="small">
+                </MaterialUI.TextField></Grid>
+                <Grid size={{ xs: 12, sm: 6 }}><MaterialUI.TextField fullWidth select SelectProps={{ native: true }} label="モデルCache" value={aiConfig.browserCacheMode || "auto"} onChange={e => updateAIConfig({ browserCacheMode: e.target.value })} size="small">
                   <option value="auto">自動：使える時だけCache利用</option>
                   <option value="on">要求：Cache利用を試みる</option>
                   <option value="off">無効：Cache APIに触れない</option>
-                </MaterialUI.TextField>
-                <MaterialUI.TextField label="Local model path" value={aiConfig.localModelPath} onChange={e => updateAIConfig({ localModelPath: e.target.value })} size="small" />
-                <MaterialUI.TextField label="Text Model" value={aiConfig.browserTextModel} onChange={e => updateAIConfig({ browserTextModel: e.target.value })} size="small" />
-                <MaterialUI.TextField label="Vision Model" value={aiConfig.browserVisionModel} onChange={e => updateAIConfig({ browserVisionModel: e.target.value })} size="small" />
-                <MaterialUI.TextField label="Whisper Model" value={aiConfig.browserWhisperModel} onChange={e => updateAIConfig({ browserWhisperModel: e.target.value })} size="small" />
-                <MaterialUI.TextField label="TTS Model" value={aiConfig.browserTtsModel} onChange={e => updateAIConfig({ browserTtsModel: e.target.value })} size="small" />
-                <MaterialUI.TextField label="Max new tokens" type="number" value={aiConfig.browserMaxNewTokens} onChange={e => updateAIConfig({ browserMaxNewTokens: e.target.value })} size="small" inputProps={{ step: 64, min: 16, max: 4096 }} />
-                <MaterialUI.TextField label="Timeout ms" type="number" value={aiConfig.timeoutMs} onChange={e => updateAIConfig({ timeoutMs: e.target.value })} size="small" inputProps={{ step: 1000, min: 5000 }} />
-              </Box>
+                </MaterialUI.TextField></Grid>
+                <Grid size={{ xs: 12, sm: 6 }}><MaterialUI.TextField fullWidth label="Local model path" value={aiConfig.localModelPath} onChange={e => updateAIConfig({ localModelPath: e.target.value })} size="small" /></Grid>
+                <Grid size={{ xs: 12, sm: 6 }}><MaterialUI.TextField fullWidth label="Text Model" value={aiConfig.browserTextModel} onChange={e => updateAIConfig({ browserTextModel: e.target.value })} size="small" /></Grid>
+                <Grid size={{ xs: 12, sm: 6 }}><MaterialUI.TextField fullWidth label="Vision Model" value={aiConfig.browserVisionModel} onChange={e => updateAIConfig({ browserVisionModel: e.target.value })} size="small" /></Grid>
+                <Grid size={{ xs: 12, sm: 6 }}><MaterialUI.TextField fullWidth label="Whisper Model" value={aiConfig.browserWhisperModel} onChange={e => updateAIConfig({ browserWhisperModel: e.target.value })} size="small" /></Grid>
+                <Grid size={{ xs: 12, sm: 6 }}><MaterialUI.TextField fullWidth label="TTS Model" value={aiConfig.browserTtsModel} onChange={e => updateAIConfig({ browserTtsModel: e.target.value })} size="small" /></Grid>
+                <Grid size={{ xs: 12, sm: 6 }}><MaterialUI.TextField fullWidth label="Max new tokens" type="number" value={aiConfig.browserMaxNewTokens} onChange={e => updateAIConfig({ browserMaxNewTokens: e.target.value })} size="small" inputProps={{ step: 64, min: 16, max: 4096 }} /></Grid>
+                <Grid size={{ xs: 12, sm: 6 }}><MaterialUI.TextField fullWidth label="Timeout ms" type="number" value={aiConfig.timeoutMs} onChange={e => updateAIConfig({ timeoutMs: e.target.value })} size="small" inputProps={{ step: 1000, min: 5000 }} /></Grid>
+              </Grid>
 
               <Box sx={{ p: 1, border: `1px solid ${border}`, borderRadius: 2, background: dark ? "#020617" : "#f8fafc" }}>
                 <Box sx={{ display: "flex", alignItems: "center", gap: 1, mb: 0.6 }}>
                   <Typography variant="caption" fontWeight={900} sx={{ flex: 1 }}>初期化ログ</Typography>
-                  <Button size="small" variant="text" onClick={clearAIInitLogView}>クリア</Button>
+                  <Button size="small" variant="text" onClick={clearAIInitLogView} sx={{ flexShrink: 0, minWidth: 0, px: 0.8 }}>クリア</Button>
                 </Box>
                 <Box component="pre" sx={{ m: 0, maxHeight: 180, overflow: "auto", whiteSpace: "pre-wrap", wordBreak: "break-word", fontFamily: EDITOR_FONT, fontSize: 11.5, lineHeight: 1.55, color: dark ? "#dbeafe" : "#1f2937" }}>
                   {aiInitLogs.length ? aiInitLogs.map(formatAIInitLogLine).join("\n") : "まだログはありません。[有効モデルを準備] を押すと、Runtime読込・Cache判定・Device選択・モデルDL/ロード・WebGPU→WASM fallbackを時系列で表示します。"}
                 </Box>
               </Box>
 
-              <Box sx={{ display: "grid", gridTemplateColumns: { xs: "1fr", sm: "1fr 1fr" }, gap: 0.75 }}>
-                <Button size="small" variant="contained" disabled={busy || !aiConfig.localAIEnabled || !enabledModelFeatures().length} onClick={prepareSelectedModels}>有効モデルを準備</Button>
-                <Button size="small" variant="outlined" disabled={busy || !aiConfig.localAIEnabled || !aiConfig.enableText} onClick={testAIConnection}>Text推論テスト</Button>
-                <Button size="small" variant="outlined" disabled={busy} onClick={showGhostStatus}>Ghost Status</Button>
-                <Button size="small" variant="outlined" disabled={busy} onClick={addCurrentToRAG}>文書をRAG登録</Button>
-                <Button size="small" variant="outlined" disabled={busy} onClick={addKnowledgeFact}>Fact登録</Button>
-                <Button size="small" variant="outlined" color="warning" disabled={busy} onClick={clearModelCache}>モデルCache削除</Button>
-                <Button size="small" variant="outlined" color="warning" disabled={busy} onClick={resetAIConfig}>AI設定初期化</Button>
-              </Box>
-              <Box sx={{ display: "grid", gridTemplateColumns: { xs: "1fr", sm: "1fr 1fr 1fr" }, gap: 0.75 }}>
-                <MaterialUI.TextField label="Fact subject" value={knowledgeSubject} onChange={e => setKnowledgeSubject(e.target.value)} size="small" />
-                <MaterialUI.TextField label="Fact predicate" value={knowledgePredicate} onChange={e => setKnowledgePredicate(e.target.value)} size="small" />
-                <MaterialUI.TextField label="Fact object" value={knowledgeObject} onChange={e => setKnowledgeObject(e.target.value)} size="small" />
-              </Box>
+              <Grid container spacing={0.75} sx={{ minWidth: 0 }}>
+                <Grid size={{ xs: 12, sm: 6 }}><Button size="small" variant="contained" disabled={busy || !aiConfig.localAIEnabled || !enabledModelFeatures().length} onClick={prepareSelectedModels} sx={responsiveButtonSx}>有効モデルを準備</Button></Grid>
+                <Grid size={{ xs: 12, sm: 6 }}><Button size="small" variant="outlined" disabled={busy || !textRunnable} onClick={testAIConnection} sx={responsiveButtonSx}>Text推論テスト</Button></Grid>
+                <Grid size={{ xs: 12, sm: 6 }}><Button size="small" variant="outlined" disabled={busy} onClick={showGhostStatus} sx={responsiveButtonSx}>Ghost Status</Button></Grid>
+                <Grid size={{ xs: 12, sm: 6 }}><Button size="small" variant="outlined" disabled={busy} onClick={addCurrentToRAG} sx={responsiveButtonSx}>文書をRAG登録</Button></Grid>
+                <Grid size={{ xs: 12, sm: 6 }}><Button size="small" variant="outlined" disabled={busy} onClick={addKnowledgeFact} sx={responsiveButtonSx}>Fact登録</Button></Grid>
+                <Grid size={{ xs: 12, sm: 6 }}><Button size="small" variant="outlined" color="warning" disabled={busy} onClick={clearModelCache} sx={responsiveButtonSx}>モデルCache削除</Button></Grid>
+                <Grid size={{ xs: 12, sm: 6 }}><Button size="small" variant="outlined" color="warning" disabled={busy} onClick={resetAIConfig} sx={responsiveButtonSx}>AI設定初期化</Button></Grid>
+              </Grid>
+              <Grid container spacing={0.75} sx={{ minWidth: 0, "& .MuiFormControl-root": { minWidth: 0 } }}>
+                <Grid size={{ xs: 12, sm: 4 }}><MaterialUI.TextField fullWidth label="Fact subject" value={knowledgeSubject} onChange={e => setKnowledgeSubject(e.target.value)} size="small" /></Grid>
+                <Grid size={{ xs: 12, sm: 4 }}><MaterialUI.TextField fullWidth label="Fact predicate" value={knowledgePredicate} onChange={e => setKnowledgePredicate(e.target.value)} size="small" /></Grid>
+                <Grid size={{ xs: 12, sm: 4 }}><MaterialUI.TextField fullWidth label="Fact object" value={knowledgeObject} onChange={e => setKnowledgeObject(e.target.value)} size="small" /></Grid>
+              </Grid>
               <Typography variant="caption" sx={{ color: muted, lineHeight: 1.6 }}>基本方針は完全ローカル推論です。本文・画像・音声は外部LLMサービスへ送信されません。必要なモデルだけを有効化し、必要時に遅延ロードします。</Typography>
             </Box>}
 
             <input ref={audioInputRef} type="file" accept="audio/*" style={{ display: "none" }} onChange={e => { handleAudioFile(e.target.files?.[0]); e.target.value = ""; }} />
             <input ref={imageInputRef} type="file" accept="image/*" style={{ display: "none" }} onChange={e => { handleImageFile(e.target.files?.[0]); e.target.value = ""; }} />
-          </Box>
+          </Grid>
 
+          <Grid size={{ xs: 12, md: 8 }} sx={{ order: resultLayoutOrder, minHeight: 0, minWidth: 0, display: "flex" }}>
           {tab === "chat" ? (
-            <Box sx={{ display: "flex", flexDirection: "column", minHeight: { xs: 420, md: 0 }, height: { xs: "min(62dvh, 620px)", md: "auto" }, border: `1px solid ${border}`, borderRadius: 2, overflow: "hidden", background: dark ? "#020617" : "#fbfdff" }}>
+            <Box sx={{ display: "flex", flexDirection: "column", width: "100%", minHeight: { xs: 320, md: 0 }, height: { xs: "min(68dvh, calc(100dvh - 230px))", md: "auto" }, border: `1px solid ${border}`, borderRadius: 2, overflow: "hidden", background: dark ? "#020617" : "#fbfdff", minWidth: 0 }}>
               <Box sx={{ px: 1.2, py: 0.8, display: "flex", alignItems: "center", gap: 1, borderBottom: `1px solid ${border}` }}>
                 <Typography variant="caption" fontWeight={900} sx={{ flex: 1 }}>会話</Typography>
                 {busy && <MaterialUI.Chip size="small" color="primary" label="AI応答中" />}
@@ -4052,40 +4226,87 @@ function SupportAIDialog({ open, onClose, appDarkMode, activeMode, editorApiRef,
                   const isUser = msg.role === "user";
                   return (
                     <Box key={msg.id} sx={{ display: "flex", justifyContent: isUser ? "flex-end" : "flex-start" }}>
-                      <Box sx={{ maxWidth: "86%", px: 1.2, py: 0.9, borderRadius: 2.2, border: `1px solid ${isUser ? "transparent" : border}`, background: isUser ? "#1976d2" : (dark ? "rgba(255,255,255,0.06)" : "#ffffff"), color: isUser ? "#fff" : (dark ? "#e5e7eb" : "#111827"), boxShadow: isUser ? "none" : "0 2px 8px rgba(15,23,42,0.05)" }}>
-                        <Typography variant="caption" sx={{ display: "block", opacity: 0.72, fontWeight: 900, mb: 0.35 }}>{isUser ? "You" : "SupportAI"} · {new Date(msg.ts || Date.now()).toLocaleTimeString("ja-JP", { hour: "2-digit", minute: "2-digit", second: "2-digit" })}</Typography>
+                      <Box sx={{ maxWidth: { xs: "96%", sm: "86%" }, minWidth: 0, px: 1.2, py: 0.9, borderRadius: 2.2, border: `1px solid ${isUser ? "transparent" : border}`, background: isUser ? "#1976d2" : (dark ? "rgba(255,255,255,0.06)" : "#ffffff"), color: isUser ? "#fff" : (dark ? "#e5e7eb" : "#111827"), boxShadow: isUser ? "none" : "0 2px 8px rgba(15,23,42,0.05)" }}>
+                        <Typography variant="caption" sx={{ display: "block", opacity: 0.72, fontWeight: 900, mb: 0.35 }}>{isUser ? "You" : "SupportAI"} · {new Date(msg.ts || Date.now()).toLocaleTimeString("ja-JP", { hour: "2-digit", minute: "2-digit", second: "2-digit" })}{msg.pending ? " · 生成中" : ""}</Typography>
                         <Typography component="pre" sx={{ m: 0, whiteSpace: "pre-wrap", wordBreak: "break-word", fontFamily: "inherit", fontSize: 13.5, lineHeight: 1.65 }}>{msg.text}</Typography>
+                        {!isUser && (
+                          <Box sx={{ mt: 0.8, display: "flex", alignItems: "center", gap: 0.5, flexWrap: "wrap" }}>
+                            {msg.pending && <MaterialUI.Chip size="small" color="primary" label="生成中" sx={{ height: 20, fontSize: 10 }} />}
+                            {msg.ok === false && <MaterialUI.Chip size="small" color="error" label="ERROR" sx={{ height: 20, fontSize: 10 }} />}
+                            {msg.ok === true && <MaterialUI.Chip size="small" color="success" label="OK" sx={{ height: 20, fontSize: 10 }} />}
+                            {msg.metrics && <>
+                              <MaterialUI.Chip size="small" label={`時間 ${formatSupportAIDuration(msg.metrics.durationMs)}`} sx={{ height: 20, fontSize: 10 }} />
+                              <MaterialUI.Chip size="small" label={`推定 ${msg.metrics.tokens} tok`} sx={{ height: 20, fontSize: 10 }} />
+                              <MaterialUI.Chip size="small" label={`${msg.metrics.tokensPerSec} tok/s`} sx={{ height: 20, fontSize: 10 }} />
+                              <MaterialUI.Chip size="small" label={`${msg.metrics.chars} 文字`} sx={{ height: 20, fontSize: 10 }} />
+                            </>}
+                            <Button
+                              size="small"
+                              variant="text"
+                              disabled={!msg.text}
+                              onClick={() => navigator.clipboard.writeText(msg.text || "").then(() => onToast?.("回答をコピーしました")).catch(() => onToast?.("コピーに失敗しました"))}
+                              sx={{ minHeight: 22, px: 0.7, fontSize: 11 }}
+                            >
+                              コピー
+                            </Button>
+                          </Box>
+                        )}
+                        {!isUser && Array.isArray(msg.sources) && msg.sources.length > 0 && (
+                          <Box component="details" sx={{ mt: 0.8, borderTop: `1px solid ${border}`, pt: 0.7 }}>
+                            <Box component="summary" sx={{ cursor: "pointer", color: isUser ? "rgba(255,255,255,0.8)" : muted, fontSize: 12, fontWeight: 900 }}>
+                              ソース {msg.sources.length} 件
+                            </Box>
+                            <Box sx={{ mt: 0.7, display: "flex", flexDirection: "column", gap: 0.6 }}>
+                              {msg.sources.map((src, i) => (
+                                <Box key={`${src.type}-${i}`} sx={{ p: 0.8, borderRadius: 1.5, background: dark ? "rgba(255,255,255,0.05)" : "#f8fafc", border: `1px solid ${border}` }}>
+                                  <Box sx={{ display: "flex", alignItems: "center", gap: 0.5 }}>
+                                    <Typography variant="caption" sx={{ flex: 1, minWidth: 0, fontWeight: 900 }}>{src.type} · {src.title}</Typography>
+                                    <Button size="small" variant="text" onClick={() => navigator.clipboard.writeText(src.text || "").then(() => onToast?.("ソースをコピーしました")).catch(() => onToast?.("コピーに失敗しました"))} sx={{ minHeight: 20, px: 0.6, fontSize: 10 }}>コピー</Button>
+                                  </Box>
+                                  <Typography component="pre" sx={{ m: 0, mt: 0.35, whiteSpace: "pre-wrap", wordBreak: "break-word", fontFamily: "inherit", fontSize: 12, lineHeight: 1.55, color: muted }}>{String(src.text || "").slice(0, 1200)}</Typography>
+                                </Box>
+                              ))}
+                            </Box>
+                          </Box>
+                        )}
                       </Box>
                     </Box>
                   );
                 })}
                 <Box ref={chatMessagesEndRef} />
               </Box>
-              <Box sx={{ p: 1, borderTop: `1px solid ${border}`, display: "grid", gridTemplateColumns: { xs: "1fr", sm: "1fr auto" }, gap: 0.75, background: dark ? "#0f172a" : "#f8fafc" }}>
-                <MaterialUI.TextField
-                  value={chatInput}
-                  onChange={e => setChatInput(e.target.value)}
-                  placeholder="SupportAIに相談する。Shift+Enterで改行 / Enterで送信"
-                  multiline
-                  minRows={2}
-                  maxRows={5}
-                  size="small"
-                  onKeyDown={e => {
-                    if (e.key === "Enter" && !e.shiftKey) {
-                      e.preventDefault();
-                      if (!busy) chatSend();
-                    }
-                  }}
-                />
-                <Box sx={{ display: "grid", gridTemplateColumns: { xs: "1fr 1fr 1fr", sm: "1fr" }, gap: 0.5, alignContent: "end" }}>
-                  <Button size="small" variant="contained" onClick={chatSend} disabled={busy || !aiConfig.enableText}>送信</Button>
-                  <Button size="small" variant="outlined" onClick={() => imageInputRef.current?.click()} disabled={busy || !aiConfig.enableVision}>画像</Button>
-                  <Button size="small" variant="outlined" onClick={() => audioInputRef.current?.click()} disabled={busy || !aiConfig.enableWhisper}>音声</Button>
-                </Box>
+              <Box sx={{ p: 1, borderTop: `1px solid ${border}`, background: dark ? "#0f172a" : "#f8fafc" }}>
+                <Grid container spacing={0.75} alignItems="flex-end" sx={{ minWidth: 0 }}>
+                  <Grid size={{ xs: 12, sm: "grow" }} sx={{ minWidth: 0 }}>
+                    <MaterialUI.TextField
+                      fullWidth
+                      value={chatInput}
+                      onChange={e => setChatInput(e.target.value)}
+                      placeholder="SupportAIに相談する。Shift+Enterで改行 / Enterで送信"
+                      multiline
+                      minRows={2}
+                      maxRows={5}
+                      size="small"
+                      onKeyDown={e => {
+                        if (e.key === "Enter" && !e.shiftKey) {
+                          e.preventDefault();
+                          if (!busy) chatSend();
+                        }
+                      }}
+                    />
+                  </Grid>
+                  <Grid size={{ xs: 12, sm: "auto" }}>
+                    <Stack direction={{ xs: "row", sm: "column" }} spacing={0.5} sx={{ "& .MuiButton-root": { flex: 1 } }}>
+                      <Button size="small" variant="contained" onClick={chatSend} disabled={busy || !textRunnable} sx={responsiveButtonSx}>送信</Button>
+                      <Button size="small" variant="outlined" onClick={() => imageInputRef.current?.click()} disabled={busy || !visionRunnable} sx={responsiveButtonSx}>画像</Button>
+                      <Button size="small" variant="outlined" onClick={() => audioInputRef.current?.click()} disabled={busy || !whisperRunnable} sx={responsiveButtonSx}>音声</Button>
+                    </Stack>
+                  </Grid>
+                </Grid>
               </Box>
             </Box>
           ) : (
-          <Box sx={{ display: "flex", flexDirection: "column", minHeight: { xs: 360, md: 0 }, height: { xs: "min(52dvh, 520px)", md: "auto" }, border: `1px solid ${border}`, borderRadius: 2, overflow: "hidden" }}>
+          <Box sx={{ display: "flex", flexDirection: "column", width: "100%", minHeight: { xs: tab === "settings" ? 260 : 320, md: 0 }, height: { xs: tab === "settings" ? "min(42dvh, 420px)" : "min(56dvh, 520px)", md: "auto" }, border: `1px solid ${border}`, borderRadius: 2, overflow: "hidden", minWidth: 0 }}>
             <Box sx={{ px: 1.2, py: 0.8, display: "flex", alignItems: "center", gap: 1, borderBottom: `1px solid ${border}` }}>
               <Typography variant="caption" fontWeight={800} sx={{ flex: 1 }}>{result?.label || "結果"}</Typography>
               {busy && <Typography variant="caption" color="primary">実行中...</Typography>}
@@ -4096,13 +4317,16 @@ function SupportAIDialog({ open, onClose, appDarkMode, activeMode, editorApiRef,
             {result?.history && <Box sx={{ px: 1.2, py: 0.7, borderTop: `1px solid ${border}`, maxHeight: 80, overflow: "auto" }}>{result.history.map((h, i) => <Typography key={i} variant="caption" sx={{ display: "block", color: muted }}>{i + 1}. {h.role}: {h.ok ? "OK" : h.error}</Typography>)}</Box>}
           </Box>
           )}
-        </Box>
+          </Grid>
+        </Grid>
       </DialogContent>
 
-      <DialogActions sx={{ px: { xs: 1, sm: 2 }, py: 1, borderTop: `1px solid ${border}`, gap: 1, flexShrink: 0, display: "grid", gridTemplateColumns: { xs: "1fr 1fr", sm: "auto auto auto" }, justifyContent: { xs: "stretch", sm: "flex-end" }, "& .MuiButton-root": { m: 0 } }}>
-        <Button onClick={() => navigator.clipboard.writeText(resultText || "").then(() => onToast?.("AI結果をコピーしました")).catch(() => onToast?.("コピーに失敗しました"))} disabled={!resultText}>結果コピー</Button>
-        <Button onClick={() => applySuggestion(result, true)} disabled={!resultText || busy} variant="outlined">カーソルへ挿入</Button>
-        <Button onClick={() => applySuggestion(result, false)} disabled={!resultText || busy} variant="contained" sx={{ gridColumn: { xs: "1 / -1", sm: "auto" } }}>結果を反映</Button>
+      <DialogActions sx={{ px: { xs: 1, sm: 2 }, py: 1, borderTop: `1px solid ${border}`, flexShrink: 0 }}>
+        <Stack direction={{ xs: "column", sm: "row" }} spacing={1} sx={{ width: { xs: "100%", sm: "auto" }, ml: { sm: "auto" }, "& .MuiButton-root": { ...responsiveButtonSx, width: { xs: "100%", sm: "auto" } } }}>
+          <Button onClick={() => navigator.clipboard.writeText(resultText || "").then(() => onToast?.("AI結果をコピーしました")).catch(() => onToast?.("コピーに失敗しました"))} disabled={!resultText}>結果コピー</Button>
+          <Button onClick={() => applySuggestion(result, true)} disabled={!resultText || busy} variant="outlined">カーソルへ挿入</Button>
+          <Button onClick={() => applySuggestion(result, false)} disabled={!resultText || busy} variant="contained">結果を反映</Button>
+        </Stack>
       </DialogActions>
     </Dialog>
   );
