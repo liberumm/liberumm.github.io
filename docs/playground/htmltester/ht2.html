@@ -2,8 +2,8 @@
 <html lang="ja">
 <head>
   <meta charset="UTF-8" />
-  <title>HTML Modal Tester Core Lean Secure v1.0</title>
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>HTML Modal Tester Core Lean Secure v1.2 Mobile Toggle Fixed</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, viewport-fit=cover, user-scalable=no" />
   <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Roboto:wght@300;400;600;700&display=swap" />
   <link rel="stylesheet" href="https://fonts.googleapis.com/icon?family=Material+Icons" />
   <style>
@@ -15,6 +15,11 @@
       background: #f0f2f5;
     }
     * { box-sizing: border-box; }
+    html { -webkit-text-size-adjust: 100%; }
+    body { touch-action: manipulation; }
+    input, textarea, select, button { font: inherit; }
+    input, textarea, select, .MuiInputBase-input { font-size: 16px !important; }
+    .material-icons { vertical-align: middle; }
   </style>
 </head>
 <body>
@@ -134,7 +139,7 @@ const STORAGE_SCHEMA_VERSION = 2;
 const MAX_PROFILES         = 20;
 const MAX_SNAPSHOTS        = 50;
 const MAX_CODE_HISTORY      = 80;
-const APP_BUILD_LABEL       = "Core Lean Secure v1.0";
+const APP_BUILD_LABEL       = "Core Lean Secure v1.0 Fixed";
 
 // These runtime-readable contracts make the single-file rules visible in
 // diagnostics and future maintenance. They intentionally do not change behavior.
@@ -164,6 +169,12 @@ const UI_LIMITS = Object.freeze({
   PREVIEW_SCALE_MAX: 200,
   PREVIEW_SCALE_STEP: 25,
 });
+
+function clampValue(value, min, max, fallback = min) {
+  const n = Number(value);
+  const base = Number.isFinite(n) ? n : fallback;
+  return Math.min(max, Math.max(min, base));
+}
 
 const DEFAULT_SETTINGS = {
   fontSize: 13,
@@ -237,7 +248,10 @@ function saveProfiles(profiles) {
       updatedAt: new Date().toISOString(),
       profiles: Array.isArray(profiles) ? profiles : [],
     }));
-  } catch {}
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 function loadActiveProfileId() {
@@ -382,39 +396,44 @@ const EMPTY_HTML = `<!DOCTYPE html>
 </html>`;
 
 const MAX_EDITOR_TABS = 30;
-const EDITOR_MODES = { HTML: "html", MARKDOWN: "markdown" };
+const EDITOR_MODES = { AUTO: "auto", HTML: "html", MARKDOWN: "markdown" };
 let editorTabIdCounter = 0;
 
 function normalizeEditorMode(mode) {
   return mode === EDITOR_MODES.MARKDOWN ? EDITOR_MODES.MARKDOWN : EDITOR_MODES.HTML;
 }
 
-function inferEditorMode(name, code, explicitMode) {
-  const n = String(name || "").toLowerCase();
+function normalizeModePreference(mode) {
+  if (mode === EDITOR_MODES.HTML) return EDITOR_MODES.HTML;
+  if (mode === EDITOR_MODES.MARKDOWN) return EDITOR_MODES.MARKDOWN;
+  return EDITOR_MODES.AUTO;
+}
+
+function normalizeFenceLanguage(lang) {
+  return String(lang || "").trim().split(/\s+/)[0].toLowerCase();
+}
+
+function isMermaidFenceLanguage(lang) {
+  const normalized = normalizeFenceLanguage(lang);
+  return ["mermaid", "mmd", "marmaid"].includes(normalized);
+}
+
+function inferEditorMode(name, code, modePreference) {
+  const preference = normalizeModePreference(modePreference);
+  if (preference === EDITOR_MODES.HTML || preference === EDITOR_MODES.MARKDOWN) return preference;
+
   const raw = String(code || "");
   const c = raw.trimStart();
   const lower = c.toLowerCase();
 
-  if (/\.(html?|xhtml)$/i.test(n)) return EDITOR_MODES.HTML;
-  if (/\.(md|markdown|mmd)$/i.test(n)) return EDITOR_MODES.MARKDOWN;
-
-  if (
-    lower.startsWith("<!doctype html") ||
-    lower.startsWith("<html") ||
-    lower.startsWith("<head") ||
-    lower.startsWith("<body") ||
-    lower.startsWith("<script") ||
-    lower.startsWith("<style") ||
-    /^<(div|section|main|article|header|footer|nav|p|h[1-6]|span|button|input|form|canvas|svg|table|ul|ol|li)\b/i.test(c)
-  ) {
+  // 拡張子では判定しない。
+  // Autoでは「完全なHTML文書」と分かる場合だけHTMLにする。
+  // それ以外はMarkdownをデフォルトにして、HTML断片や通常メモの誤判定を避ける。
+  if (lower.startsWith("<!doctype html") || lower.startsWith("<html")) {
     return EDITOR_MODES.HTML;
   }
 
-  if (/^#\s+/.test(c) || /```mermaid/i.test(c) || /^[-*+]\s+/m.test(c) || /^>\s+/m.test(c)) {
-    return EDITOR_MODES.MARKDOWN;
-  }
-
-  return explicitMode ? normalizeEditorMode(explicitMode) : EDITOR_MODES.MARKDOWN;
+  return EDITOR_MODES.MARKDOWN;
 }
 
 function extensionForMode(mode) {
@@ -432,14 +451,19 @@ function newEditorTabId() {
   return `editor-tab-${Date.now()}-${++editorTabIdCounter}`;
 }
 
-function createEditorTab(name, code, mode) {
+function createEditorTab(name, code, modePreference = EDITOR_MODES.AUTO) {
   const now = new Date().toISOString();
-  const resolvedMode = normalizeEditorMode(mode || inferEditorMode(name, code));
+  const resolvedPreference = normalizeModePreference(modePreference);
+  const initialCode = typeof code === "string" ? code : (resolvedPreference === EDITOR_MODES.HTML ? DEFAULT_HTML : DEFAULT_MARKDOWN);
+  const actualMode = inferEditorMode(name, initialCode, resolvedPreference);
   return {
     id: newEditorTabId(),
-    name: name || (resolvedMode === EDITOR_MODES.MARKDOWN ? "notes.md" : "index.html"),
-    code: typeof code === "string" ? code : (resolvedMode === EDITOR_MODES.MARKDOWN ? DEFAULT_MARKDOWN : DEFAULT_HTML),
-    mode: resolvedMode,
+    name: name || (actualMode === EDITOR_MODES.MARKDOWN ? "notes.md" : "index.html"),
+    code: initialCode,
+    // modePreference はユーザーの明示指定。auto なら内容でHTML/Markdownを自動解決する。
+    // mode は旧データ互換用に同じ値を保持する。実際の描画モードは inferEditorMode で毎回解決する。
+    modePreference: resolvedPreference,
+    mode: resolvedPreference,
     createdAt: now,
     updatedAt: now,
   };
@@ -451,14 +475,23 @@ function normalizeEditorTabs(data) {
     ? data.editorTabs
     : [{ id: null, name: "index.html", code: data?.code ?? DEFAULT_HTML }];
 
-  return rawTabs.slice(0, MAX_EDITOR_TABS).map((tab, index) => ({
-    id: typeof tab.id === "string" && tab.id ? tab.id : newEditorTabId(),
-    name: typeof tab.name === "string" && tab.name.trim() ? tab.name.trim() : (index === 0 ? "index.html" : `tab-${index + 1}.html`),
-    code: typeof tab.code === "string" ? tab.code : DEFAULT_HTML,
-    mode: normalizeEditorMode(tab.mode || inferEditorMode(tab.name, tab.code)),
-    createdAt: tab.createdAt || now,
-    updatedAt: tab.updatedAt || tab.createdAt || now,
-  }));
+  return rawTabs.slice(0, MAX_EDITOR_TABS).map((tab, index) => {
+    const code = typeof tab.code === "string" ? tab.code : DEFAULT_HTML;
+    const name = typeof tab.name === "string" && tab.name.trim() ? tab.name.trim() : (index === 0 ? "index.html" : `tab-${index + 1}.html`);
+    // v2以前の保存データには modePreference が無い。
+    // その場合は旧 mode を強制指定として扱わず auto に戻し、
+    // 「HTMLタブにMarkdownを貼ってもHTML扱いのまま」という不具合を断つ。
+    const preference = typeof tab.modePreference === "string" ? normalizeModePreference(tab.modePreference) : EDITOR_MODES.AUTO;
+    return {
+      id: typeof tab.id === "string" && tab.id ? tab.id : newEditorTabId(),
+      name,
+      code,
+      modePreference: preference,
+      mode: preference,
+      createdAt: tab.createdAt || now,
+      updatedAt: tab.updatedAt || tab.createdAt || now,
+    };
+  });
 }
 
 function getInitialEditorTabId(data, tabs) {
@@ -501,16 +534,17 @@ const EditorDomain = Object.freeze({
     return { ok: true, tabs: synced, activeEditorTabId: target.id, code: target.code };
   },
 
-  addTab(tabs, activeEditorTabId, currentCode, mode = EDITOR_MODES.HTML) {
+  addTab(tabs, activeEditorTabId, currentCode, modePreference = EDITOR_MODES.AUTO) {
     const synced = this.syncCurrentTab(tabs, activeEditorTabId, currentCode);
     if (synced.length >= MAX_EDITOR_TABS) {
       return { ok: false, tabs: synced, activeEditorTabId, code: currentCode, reason: `コードタブは最大 ${MAX_EDITOR_TABS} 件です` };
     }
-    const resolvedMode = normalizeEditorMode(mode);
-    const baseName = resolvedMode === EDITOR_MODES.MARKDOWN ? "notes.md" : "index.html";
+    const preference = normalizeModePreference(modePreference);
+    const initialMode = preference === EDITOR_MODES.HTML ? EDITOR_MODES.HTML : EDITOR_MODES.MARKDOWN;
+    const baseName = initialMode === EDITOR_MODES.MARKDOWN ? "notes.md" : "index.html";
     const name = getUniqueTabName(synced, baseName);
-    const code = resolvedMode === EDITOR_MODES.MARKDOWN ? DEFAULT_MARKDOWN : DEFAULT_HTML;
-    const tab = createEditorTab(name, code, resolvedMode);
+    const code = initialMode === EDITOR_MODES.MARKDOWN ? DEFAULT_MARKDOWN : DEFAULT_HTML;
+    const tab = createEditorTab(name, code, preference);
     return { ok: true, tabs: [...synced, tab], activeEditorTabId: tab.id, code: tab.code, tab };
   },
 
@@ -528,7 +562,7 @@ const EditorDomain = Object.freeze({
     const cleaned = String(name || "").trim();
     if (!cleaned) return tabs;
     const now = new Date().toISOString();
-    return (Array.isArray(tabs) ? tabs : []).map(tab => tab.id === tabId ? { ...tab, name: cleaned, mode: inferEditorMode(cleaned, tab.code, tab.mode), updatedAt: now } : tab);
+    return (Array.isArray(tabs) ? tabs : []).map(tab => tab.id === tabId ? { ...tab, name: cleaned, updatedAt: now } : tab);
   },
 
   duplicateTab(tabs, activeEditorTabId, currentCode) {
@@ -538,14 +572,20 @@ const EditorDomain = Object.freeze({
     }
     const src = synced.find(t => t.id === activeEditorTabId) || synced[0];
     if (!src) return { ok: false, tabs: synced, activeEditorTabId, code: currentCode, reason: "複製元タブが見つかりません" };
-    const tab = createEditorTab(getUniqueTabName(synced, src.name), src.code, src.mode);
+    const tab = createEditorTab(getUniqueTabName(synced, src.name), src.code, src.modePreference ?? src.mode ?? EDITOR_MODES.AUTO);
     return { ok: true, tabs: [...synced, tab], activeEditorTabId: tab.id, code: tab.code, tab };
   },
 
-  changeMode(tabs, activeEditorTabId, mode) {
-    const resolvedMode = normalizeEditorMode(mode);
+  changeMode(tabs, activeEditorTabId, modePreference) {
+    const resolvedPreference = normalizeModePreference(modePreference);
     const now = new Date().toISOString();
-    return (Array.isArray(tabs) ? tabs : []).map(tab => tab.id === activeEditorTabId ? { ...tab, mode: resolvedMode, name: renameForMode(tab.name, resolvedMode), updatedAt: now } : tab);
+    // モード変更時もファイル名・拡張子は変えない。
+    // auto に戻せば内容から再判定し、HTML/MD は明示指定として保持する。
+    return (Array.isArray(tabs) ? tabs : []).map(tab =>
+      tab.id === activeEditorTabId
+        ? { ...tab, modePreference: resolvedPreference, mode: resolvedPreference, updatedAt: now }
+        : tab
+    );
   },
 });
 
@@ -612,11 +652,40 @@ const theme = createTheme({
 });
 
 function buildHtmlSrcDoc(html) {
-  const content = (html || "").trim();
+  const content = String(html || "").trim();
   if (!content) return EMPTY_HTML;
-  if (content.includes("<head>")) return content.replace("<head>", "<head>" + CONSOLE_INTERCEPT);
-  if (content.includes("<head ")) return content.replace(/<head([^>]*)>/i, function(m){ return m + CONSOLE_INTERCEPT; });
-  return CONSOLE_INTERCEPT + content;
+
+  if (/<head\b[^>]*>/i.test(content)) {
+    return content.replace(/<head\b([^>]*)>/i, `<head$1>${CONSOLE_INTERCEPT}`);
+  }
+
+  if (/<html\b[^>]*>/i.test(content)) {
+    return content.replace(/<html\b([^>]*)>/i, `<html$1><head>${CONSOLE_INTERCEPT}</head>`);
+  }
+
+  if (/<!doctype html/i.test(content) || /<body\b[^>]*>/i.test(content)) {
+    return `<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8" />
+${CONSOLE_INTERCEPT}
+</head>
+<body>
+${content}
+</body>
+</html>`;
+  }
+
+  return `<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8" />
+${CONSOLE_INTERCEPT}
+</head>
+<body>
+${content}
+</body>
+</html>`;
 }
 
 function escapeHtml(value) {
@@ -636,10 +705,10 @@ function createMarkdownRenderer() {
   renderer.code = function(codeOrToken, infostring) {
     const isToken = codeOrToken && typeof codeOrToken === "object";
     const text = isToken ? codeOrToken.text : codeOrToken;
-    const lang = String((isToken ? codeOrToken.lang : infostring) || "").trim().split(/\s+/)[0].toLowerCase();
+    const lang = normalizeFenceLanguage(isToken ? codeOrToken.lang : infostring);
 
-    if (lang === "mermaid") {
-      return `<div class="mermaid">${escapeHtml(text)}</div>`;
+    if (isMermaidFenceLanguage(lang)) {
+      return `<div class="mermaid" data-original-lang="${escapeHtml(lang)}">${escapeHtml(text)}</div>`;
     }
 
     const cls = lang ? ` class="language-${escapeHtml(lang)}"` : "";
@@ -683,12 +752,16 @@ function buildMarkdownSrcDoc(markdown, options = {}) {
   });
 
   const mermaidTheme = dark ? "dark" : "default";
-  const mermaidUrl = window.__HT_MD__?.mermaidUrl || "https://esm.sh/mermaid@11.15.0";
+  const mermaidUrl = window.__HT_MD__?.mermaidUrl || "https://esm.sh/mermaid@11.15.0?bundle";
   const mermaidRunner = `<script type="module">
 import mermaid from ${JSON.stringify(mermaidUrl)};
 try {
-  mermaid.initialize({ startOnLoad: false, securityLevel: "strict", theme: ${JSON.stringify(mermaidTheme)} });
-  await mermaid.run({ querySelector: ".mermaid" });
+  const nodes = Array.from(document.querySelectorAll(".mermaid"));
+  if (nodes.length > 0) {
+    await (document.fonts && document.fonts.ready ? document.fonts.ready : Promise.resolve());
+    mermaid.initialize({ startOnLoad: false, securityLevel: "strict", theme: ${JSON.stringify(mermaidTheme)} });
+    await mermaid.run({ nodes });
+  }
 } catch (e) {
   console.error("Mermaid render error:", e && e.message ? e.message : e);
 }
@@ -698,7 +771,7 @@ try {
 <html lang="ja">
 <head>
   <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, viewport-fit=cover" />
   ${markdownPreviewStyle(dark)}
 </head>
 <body>
@@ -1008,12 +1081,38 @@ function PatchDialog({ open, onClose, currentCode, onApply }) {
   );
 }
 
-function WidthSelector({ value, onChange }) {
+function WidthSelector({ value, onChange, darkMode = false, compact = false }) {
+  const border = darkMode ? "rgba(205,214,244,0.22)" : "rgba(96,112,128,0.25)";
+  const fg = darkMode ? "rgba(205,214,244,0.86)" : "#45515f";
+  const selectedBg = darkMode ? "rgba(144,202,249,0.22)" : "rgba(25,118,210,0.12)";
+  const selectedFg = darkMode ? "#90caf9" : "#1976d2";
+
   return (
-    <ToggleButtonGroup value={value} exclusive size="small" onChange={(_, v) => { if (v !== null) onChange(v); }}>
+    <ToggleButtonGroup
+      value={value}
+      exclusive
+      size="small"
+      onChange={(_, v) => { if (v !== null) onChange(v); }}
+      sx={{
+        flexShrink: 0,
+        "& .MuiToggleButton-root": {
+          minWidth: compact ? 34 : 38,
+          px: compact ? 0.65 : 1.05,
+          py: 0.45,
+          color: fg,
+          borderColor: border,
+          background: darkMode ? "rgba(255,255,255,0.03)" : "rgba(255,255,255,0.65)",
+          "&.Mui-selected": {
+            color: selectedFg,
+            backgroundColor: selectedBg,
+            "&:hover": { backgroundColor: selectedBg },
+          },
+        },
+      }}
+    >
       {WIDTH_PRESETS.map(p => (
         <Tooltip key={p.value} title={p.label} arrow disableFocusListener disableTouchListener>
-          <span><ToggleButton value={p.value} sx={{ px: 1.2, py: 0.5 }}><Icon name={p.icon} size={17} /></ToggleButton></span>
+          <span><ToggleButton value={p.value}><Icon name={p.icon} size={compact ? 16 : 17} /></ToggleButton></span>
         </Tooltip>
       ))}
     </ToggleButtonGroup>
@@ -1161,19 +1260,115 @@ function ConsolePanel({ open, onClose, logs, onClear }) {
   );
 }
 
-function PreviewFrame({ srcDoc, previewKey, width, scale, darkMode }) {
+function parseCssPx(value) {
+  const m = String(value || "").trim().match(/^(\d+(?:\.\d+)?)px$/i);
+  return m ? Number(m[1]) : null;
+}
+
+function PreviewFrame({ srcDoc, previewKey, width, scale, darkMode, onFrameWindowChange, fitToContainer = false }) {
+  const outerRef = useRef(null);
+  const iframeRef = useRef(null);
+  const [outerWidth, setOuterWidth] = useState(0);
+
+  const targetPx = parseCssPx(width);
   const constrained = width !== "100%";
-  const s = (scale || 100) / 100;
-  const iframeW = s !== 1 ? `${100 / s}%` : "100%";
-  const iframeH = s !== 1 ? `${100 / s}%` : "100%";
-  const outerBg = darkMode ? (constrained ? "#2a2a3e" : "#1e1e2e") : (constrained ? "#dde1e8" : (s < 1 ? "#e8eaf0" : "#fff"));
+  const userScale = clampValue((scale || 100) / 100, 0.25, 2, 1);
+  const availableWidth = Math.max(0, outerWidth - (constrained ? 16 : 0));
+  const fitScale = fitToContainer && targetPx && availableWidth
+    ? Math.min(1, Math.max(0.25, availableWidth / targetPx))
+    : 1;
+
+  const deviceWidth = targetPx ? `${targetPx}px` : "100%";
+  const visualWidth = targetPx && fitScale < 1 ? `${Math.floor(targetPx * fitScale)}px` : deviceWidth;
+  const visualHeight = fitScale < 1 ? `${100 / fitScale}%` : "100%";
+  const iframeW = userScale !== 1 ? `${100 / userScale}%` : "100%";
+  const iframeH = userScale !== 1 ? `${100 / userScale}%` : "100%";
+  const outerBg = darkMode ? (constrained ? "#2a2a3e" : "#1e1e2e") : (constrained ? "#dde1e8" : (userScale < 1 ? "#e8eaf0" : "#fff"));
   const innerBg = darkMode ? "#1e1e2e" : "#fff";
 
+  useEffect(() => {
+    const el = outerRef.current;
+    if (!el) return;
+
+    const update = () => setOuterWidth(el.clientWidth || 0);
+    update();
+
+    if (typeof ResizeObserver === "undefined") {
+      window.addEventListener("resize", update);
+      return () => window.removeEventListener("resize", update);
+    }
+
+    const ro = new ResizeObserver(update);
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, []);
+
+  useEffect(() => {
+    const win = iframeRef.current?.contentWindow || null;
+    onFrameWindowChange?.(win);
+    return () => onFrameWindowChange?.(null);
+  }, [previewKey, srcDoc, onFrameWindowChange]);
+
   return (
-    <Box sx={{ flex: 1, overflow: "auto", background: outerBg, display: "flex", flexDirection: "column", p: constrained ? 1 : 0 }}>
-      <Box sx={{ width, mx: "auto", flex: 1, border: constrained ? `1px solid ${darkMode ? "#444" : "#c8cdd6"}` : "none", borderRadius: constrained ? 1 : 0, overflow: "hidden", background: innerBg, transition: "width 0.25s ease", minHeight: 0, position: "relative" }}>
-        <Box sx={{ width: iframeW, height: iframeH, transformOrigin: "top left", transform: s !== 1 ? `scale(${s})` : "none", position: "absolute", top: 0, left: 0 }}>
-          <iframe key={previewKey} title="preview" srcDoc={srcDoc} sandbox="allow-scripts allow-forms allow-popups" style={{ width: "100%", height: "100%", minHeight: 200, border: "none", display: "block" }} />
+    <Box
+      ref={outerRef}
+      sx={{
+        flex: 1,
+        minHeight: 0,
+        overflow: fitScale < 1 ? "hidden" : "auto",
+        background: outerBg,
+        display: "flex",
+        justifyContent: "center",
+        alignItems: "stretch",
+        p: constrained ? 1 : 0,
+        WebkitOverflowScrolling: "touch",
+      }}
+    >
+      <Box
+        sx={{
+          width: visualWidth,
+          height: "100%",
+          minHeight: 0,
+          flexShrink: 0,
+          border: constrained ? `1px solid ${darkMode ? "#444" : "#c8cdd6"}` : "none",
+          borderRadius: constrained ? 1 : 0,
+          overflow: "hidden",
+          background: innerBg,
+          position: "relative",
+          transition: "width 0.2s ease",
+        }}
+      >
+        <Box
+          sx={{
+            width: deviceWidth,
+            height: visualHeight,
+            transformOrigin: "top left",
+            transform: fitScale !== 1 ? `scale(${fitScale})` : "none",
+            position: "absolute",
+            top: 0,
+            left: 0,
+          }}
+        >
+          <Box
+            sx={{
+              width: iframeW,
+              height: iframeH,
+              transformOrigin: "top left",
+              transform: userScale !== 1 ? `scale(${userScale})` : "none",
+              position: "absolute",
+              top: 0,
+              left: 0,
+            }}
+          >
+            <iframe
+              ref={iframeRef}
+              key={previewKey}
+              title="preview"
+              srcDoc={srcDoc}
+              sandbox="allow-scripts allow-forms"
+              style={{ width: "100%", height: "100%", minHeight: 200, border: "none", display: "block" }}
+            />
+          </Box>
         </Box>
       </Box>
     </Box>
@@ -1336,7 +1531,7 @@ function CodeEditor({ value, onChange, fontSize, darkMode, wordWrap, highlightMo
   );
 }
 
-function EditorTabBar({ tabs, activeId, onSwitch, onNew, onClose, onRename, onDuplicate, onModeChange, activeMode, darkMode }) {
+function EditorTabBar({ tabs, activeId, onSwitch, onNew, onClose, onRename, onDuplicate, onModeChange, activeMode, activeModePreference, darkMode }) {
   const bg = darkMode ? "#181825" : "#eef1f6";
   const border = darkMode ? "#313244" : "#d7dce5";
   const activeBg = darkMode ? "#1e1e2e" : "#fff";
@@ -1373,7 +1568,7 @@ function EditorTabBar({ tabs, activeId, onSwitch, onNew, onClose, onRename, onDu
                 "&:hover": { background: active ? activeBg : (darkMode ? "rgba(255,255,255,0.07)" : "rgba(255,255,255,0.8)") },
               }}
             >
-              <Icon name={normalizeEditorMode(tab.mode) === EDITOR_MODES.MARKDOWN ? "article" : "code"} size={13} style={{ color: active ? "#1976d2" : "currentColor", flexShrink: 0 }} />
+              <Icon name={inferEditorMode(tab.name, tab.code, tab.modePreference ?? tab.mode) === EDITOR_MODES.MARKDOWN ? "article" : "code"} size={13} style={{ color: active ? "#1976d2" : "currentColor", flexShrink: 0 }} />
               <Typography noWrap variant="caption" sx={{ flex: 1, fontSize: 11, lineHeight: 1, fontWeight: active ? 700 : 500, color: "inherit" }}>
                 {tab.name}
               </Typography>
@@ -1395,7 +1590,7 @@ function EditorTabBar({ tabs, activeId, onSwitch, onNew, onClose, onRename, onDu
       </Box>
 
       <ToggleButtonGroup
-        value={normalizeEditorMode(activeMode)}
+        value={normalizeModePreference(activeModePreference)}
         exclusive
         size="small"
         onChange={(_, v) => { if (v) onModeChange(v); }}
@@ -1412,6 +1607,7 @@ function EditorTabBar({ tabs, activeId, onSwitch, onNew, onClose, onRename, onDu
           },
         }}
       >
+        <ToggleButton value={EDITOR_MODES.AUTO}>AUTO</ToggleButton>
         <ToggleButton value={EDITOR_MODES.HTML}>HTML</ToggleButton>
         <ToggleButton value={EDITOR_MODES.MARKDOWN}>MD</ToggleButton>
       </ToggleButtonGroup>
@@ -1430,18 +1626,43 @@ function EditorTabBar({ tabs, activeId, onSwitch, onNew, onClose, onRename, onDu
   );
 }
 
-function PaneHeader({ title, fullscreen, onToggleFullscreen, darkMode, children }) {
+function PaneHeader({ title, fullscreen, onToggleFullscreen, darkMode = false, showFullscreen = true, children }) {
   const bg = darkMode ? "#181825" : "#f8f9fb";
   const border = darkMode ? "#313244" : "#e0e3e8";
+  const fg = darkMode ? "rgba(205,214,244,0.88)" : "#45515f";
+  const muted = darkMode ? "rgba(205,214,244,0.62)" : "text.secondary";
+  const disabled = darkMode ? "rgba(205,214,244,0.28)" : "rgba(0,0,0,0.26)";
+
   return (
-    <Stack direction="row" alignItems="center" spacing={0.5} sx={{ px: 1.5, py: 0.75, background: bg, borderBottom: `1px solid ${border}`, flexShrink: 0, minHeight: 40 }}>
-      <Typography variant="caption" fontWeight={700} color={darkMode ? "rgba(205,214,244,0.6)" : "text.secondary"} sx={{ textTransform: "uppercase", letterSpacing: 0.8, mr: "auto" }}>{title}</Typography>
+    <Stack
+      direction="row"
+      alignItems="center"
+      spacing={0.5}
+      sx={{
+        px: { xs: 0.8, sm: 1.5 },
+        py: 0.75,
+        background: bg,
+        borderBottom: `1px solid ${border}`,
+        flexShrink: 0,
+        minHeight: 40,
+        overflowX: "auto",
+        overflowY: "hidden",
+        WebkitOverflowScrolling: "touch",
+        color: fg,
+        "& .MuiIconButton-root": { color: fg, flexShrink: 0 },
+        "& .MuiIconButton-root.Mui-disabled": { color: disabled },
+        "& .MuiTypography-root": { flexShrink: 0 },
+      }}
+    >
+      <Typography variant="caption" fontWeight={700} color={muted} sx={{ textTransform: "uppercase", letterSpacing: 0.8, mr: "auto" }}>{title}</Typography>
       {children}
-      <Tooltip title={fullscreen ? "元のサイズに戻す" : "全画面"} arrow>
-        <IconButton size="small" onClick={onToggleFullscreen} sx={{ ml: 0.5, color: darkMode ? "rgba(205,214,244,0.6)" : "inherit" }}>
-          <Icon name={fullscreen ? "fullscreen_exit" : "fullscreen"} size={18} />
-        </IconButton>
-      </Tooltip>
+      {showFullscreen && (
+        <Tooltip title={fullscreen ? "元のサイズに戻す" : "全画面"} arrow>
+          <IconButton size="small" onClick={onToggleFullscreen} sx={{ ml: 0.5 }}>
+            <Icon name={fullscreen ? "fullscreen_exit" : "fullscreen"} size={18} />
+          </IconButton>
+        </Tooltip>
+      )}
     </Stack>
   );
 }
@@ -1619,6 +1840,154 @@ function SecurityStorageDialog({ open, onClose, onExportAll, onFullReset, onToas
   );
 }
 
+
+function CommandDrawer({
+  open, onClose, appDarkMode, activeProfileName, activeTab, activeMode, activeModePreference,
+  editorTabs, activeEditorTabId, onSwitchTab, onNewHtml, onNewMarkdown,
+  onRenameTab, onCloseTab, onDuplicateTab,
+  codeHistory, codeHistoryIndex, onRestoreHistory, onUndo, onRedo, canUndo, canRedo,
+  snapshotsCount, consoleLogsCount, onSave, onCopy, onDownload, onClear,
+  onPatch, onConsole, onStorage, onSnapshots, onTakeSnapshot, onToggleTheme,
+}) {
+  const { Drawer, List, ListItemButton, ListItemIcon, ListItemText, Chip } = MaterialUI;
+  const dark = Boolean(appDarkMode);
+  const panelBg = dark ? '#0f172a' : '#ffffff';
+  const cardBg = dark ? 'rgba(255,255,255,0.045)' : '#f7f9fc';
+  const border = dark ? 'rgba(255,255,255,0.09)' : '#e5e9f2';
+  const fg = dark ? '#e5e7eb' : '#111827';
+  const muted = dark ? 'rgba(229,231,235,0.64)' : '#667085';
+  const accent = '#1976d2';
+  const recentHistory = Array.isArray(codeHistory)
+    ? codeHistory.map((entry, index) => ({ entry, index })).slice(-10).reverse()
+    : [];
+
+  const SectionTitle = ({ children, right }) => (
+    <Box sx={{ display: 'flex', alignItems: 'center', gap: 1, px: 1, pt: 1.25, pb: 0.6 }}>
+      <Typography variant="caption" sx={{ color: muted, fontWeight: 800, letterSpacing: 0.7, textTransform: 'uppercase', flex: 1 }}>{children}</Typography>
+      {right}
+    </Box>
+  );
+
+  const Action = ({ icon, label, secondary, onClick, disabled, selected }) => (
+    <ListItemButton
+      disabled={disabled}
+      selected={selected}
+      onClick={onClick}
+      sx={{
+        borderRadius: 1.5,
+        mx: 0.6,
+        my: 0.15,
+        color: fg,
+        '&.Mui-selected': { background: dark ? 'rgba(25,118,210,0.22)' : 'rgba(25,118,210,0.10)' },
+        '&.Mui-selected:hover': { background: dark ? 'rgba(25,118,210,0.30)' : 'rgba(25,118,210,0.16)' },
+      }}
+    >
+      <ListItemIcon sx={{ minWidth: 34, color: selected ? accent : muted }}><Icon name={icon} size={20} /></ListItemIcon>
+      <ListItemText
+        primary={label}
+        secondary={secondary}
+        primaryTypographyProps={{ fontSize: 13, fontWeight: selected ? 800 : 600, noWrap: true }}
+        secondaryTypographyProps={{ fontSize: 11, color: muted, noWrap: true }}
+      />
+    </ListItemButton>
+  );
+
+  return (
+    <Drawer
+      anchor="right"
+      open={open}
+      onClose={onClose}
+      PaperProps={{
+        sx: {
+          width: { xs: '86vw', sm: 360 },
+          maxWidth: 390,
+          background: panelBg,
+          color: fg,
+          borderLeft: `1px solid ${border}`,
+          overflow: 'hidden',
+        },
+      }}
+    >
+      <Box sx={{ height: '100%', display: 'flex', flexDirection: 'column', minHeight: 0 }}>
+        <Box sx={{ px: 1.4, py: 1.25, display: 'flex', alignItems: 'center', gap: 1, borderBottom: `1px solid ${border}` }}>
+          <Box sx={{ width: 34, height: 34, borderRadius: 2, display: 'grid', placeItems: 'center', background: dark ? 'rgba(25,118,210,0.22)' : 'rgba(25,118,210,0.10)', color: accent }}>
+            <Icon name="auto_awesome" size={20} />
+          </Box>
+          <Box sx={{ minWidth: 0, flex: 1 }}>
+            <Typography noWrap variant="subtitle2" sx={{ fontWeight: 900, lineHeight: 1.2 }}>Core Lean Secure</Typography>
+            <Typography noWrap variant="caption" sx={{ color: muted }}>{activeProfileName || 'プロファイル未選択'} · {activeTab?.name || 'タブ未選択'}</Typography>
+          </Box>
+          <IconButton onClick={onClose} size="small" sx={{ color: muted }}><Icon name="close" size={20} /></IconButton>
+        </Box>
+
+        <Box sx={{ flex: 1, minHeight: 0, overflowY: 'auto', WebkitOverflowScrolling: 'touch', p: 0.8 }}>
+          <SectionTitle right={<Chip size="small" label={`${normalizeModePreference(activeModePreference) === EDITOR_MODES.AUTO ? 'AUTO / ' : ''}${activeMode === EDITOR_MODES.MARKDOWN ? 'MD' : 'HTML'}`} sx={{ height: 20, fontSize: 10 }} />}>操作</SectionTitle>
+          <Box sx={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 0.6, px: 0.6 }}>
+            <Button onClick={onSave} variant="contained" size="small" startIcon={<Icon name="save" size={16} />} sx={{ justifyContent: 'flex-start' }}>保存</Button>
+            <Button onClick={onCopy} variant="outlined" size="small" startIcon={<Icon name="content_copy" size={16} />} sx={{ justifyContent: 'flex-start' }}>コピー</Button>
+            <Button onClick={onDownload} variant="outlined" size="small" startIcon={<Icon name="download" size={16} />} sx={{ justifyContent: 'flex-start' }}>出力</Button>
+            <Button onClick={onPatch} variant="outlined" size="small" startIcon={<Icon name="difference" size={16} />} sx={{ justifyContent: 'flex-start' }}>差分</Button>
+          </Box>
+          <List dense disablePadding sx={{ mt: 0.6, borderRadius: 2, background: cardBg, border: `1px solid ${border}`, py: 0.4 }}>
+            <Action icon="terminal" label="Console" secondary={`${consoleLogsCount || 0} 件のログ`} onClick={onConsole} />
+            <Action icon="photo_camera" label="スナップショット保存" secondary={`${snapshotsCount || 0} 件保存中`} onClick={onTakeSnapshot} />
+            <Action icon="history" label="スナップショット一覧" secondary="復元・削除" onClick={onSnapshots} />
+            <Action icon="security" label="Security & Storage" secondary="容量確認・完全初期化" onClick={onStorage} />
+            <Action icon={appDarkMode ? 'light_mode' : 'dark_mode'} label={appDarkMode ? 'ライトテーマ' : 'ダークテーマ'} secondary="アプリ全体の見た目" onClick={onToggleTheme} />
+            <Action icon="delete_outline" label="現在タブをクリア" secondary="確認ダイアログあり" onClick={onClear} />
+          </List>
+
+          <SectionTitle right={<Chip size="small" label={`${editorTabs.length} / ${MAX_EDITOR_TABS}`} sx={{ height: 20, fontSize: 10 }} />}>タブ一覧</SectionTitle>
+          <Box sx={{ display: 'flex', gap: 0.6, px: 0.6, pb: 0.6 }}>
+            <Button fullWidth size="small" variant="outlined" onClick={onNewHtml} startIcon={<Icon name="add" size={15} />}>HTML</Button>
+            <Button fullWidth size="small" variant="outlined" onClick={onNewMarkdown} startIcon={<Icon name="article" size={15} />}>MD</Button>
+            <Button size="small" variant="outlined" onClick={onDuplicateTab} sx={{ minWidth: 42 }}><Icon name="content_copy" size={15} /></Button>
+          </Box>
+          <List dense disablePadding sx={{ borderRadius: 2, background: cardBg, border: `1px solid ${border}`, py: 0.4 }}>
+            {editorTabs.map(tab => {
+              const active = tab.id === activeEditorTabId;
+              return (
+                <ListItemButton key={tab.id} selected={active} onClick={() => onSwitchTab(tab.id)} sx={{ borderRadius: 1.5, mx: 0.6, my: 0.15 }}>
+                  <ListItemIcon sx={{ minWidth: 34, color: active ? accent : muted }}><Icon name={inferEditorMode(tab.name, tab.code, tab.modePreference ?? tab.mode) === EDITOR_MODES.MARKDOWN ? 'article' : 'code'} size={19} /></ListItemIcon>
+                  <ListItemText
+                    primary={tab.name}
+                    secondary={`${normalizeModePreference(tab.modePreference ?? tab.mode) === EDITOR_MODES.AUTO ? 'Auto / ' : ''}${inferEditorMode(tab.name, tab.code, tab.modePreference ?? tab.mode) === EDITOR_MODES.MARKDOWN ? 'Markdown' : 'HTML'} · ${String(tab.code || '').length.toLocaleString()} 文字`}
+                    primaryTypographyProps={{ fontSize: 13, fontWeight: active ? 800 : 600, noWrap: true }}
+                    secondaryTypographyProps={{ fontSize: 11, color: muted, noWrap: true }}
+                  />
+                  <IconButton size="small" onClick={(e) => { e.stopPropagation(); onRenameTab(tab.id); }} sx={{ color: muted }}><Icon name="edit" size={15} /></IconButton>
+                  {editorTabs.length > 1 && <IconButton size="small" onClick={(e) => { e.stopPropagation(); onCloseTab(tab.id); }} sx={{ color: muted }}><Icon name="close" size={15} /></IconButton>}
+                </ListItemButton>
+              );
+            })}
+          </List>
+
+          <SectionTitle right={<Chip size="small" label={`${Math.max(0, codeHistoryIndex + 1)} / ${codeHistory.length || 0}`} sx={{ height: 20, fontSize: 10 }} />}>ヒストリー</SectionTitle>
+          <Box sx={{ display: 'flex', gap: 0.6, px: 0.6, pb: 0.6 }}>
+            <Button fullWidth size="small" variant="outlined" disabled={!canUndo} onClick={onUndo} startIcon={<Icon name="undo" size={15} />}>Undo</Button>
+            <Button fullWidth size="small" variant="outlined" disabled={!canRedo} onClick={onRedo} startIcon={<Icon name="redo" size={15} />}>Redo</Button>
+          </Box>
+          <List dense disablePadding sx={{ borderRadius: 2, background: cardBg, border: `1px solid ${border}`, py: 0.4 }}>
+            {recentHistory.length === 0 ? (
+              <Box sx={{ px: 1.4, py: 1.4, color: muted, fontSize: 12 }}>履歴はまだありません</Box>
+            ) : recentHistory.map(({ entry, index }) => (
+              <ListItemButton key={entry.id || index} selected={index === codeHistoryIndex} onClick={() => onRestoreHistory(index)} sx={{ borderRadius: 1.5, mx: 0.6, my: 0.15 }}>
+                <ListItemIcon sx={{ minWidth: 34, color: index === codeHistoryIndex ? accent : muted }}><Icon name={index === codeHistoryIndex ? 'radio_button_checked' : 'restore'} size={18} /></ListItemIcon>
+                <ListItemText
+                  primary={entry.label || '編集'}
+                  secondary={`${new Date(entry.ts || Date.now()).toLocaleTimeString('ja-JP', { hour: '2-digit', minute: '2-digit', second: '2-digit' })} · ${String(entry.code || '').length.toLocaleString()} 文字`}
+                  primaryTypographyProps={{ fontSize: 13, fontWeight: index === codeHistoryIndex ? 800 : 600, noWrap: true }}
+                  secondaryTypographyProps={{ fontSize: 11, color: muted, noWrap: true }}
+                />
+              </ListItemButton>
+            ))}
+          </List>
+        </Box>
+      </Box>
+    </Drawer>
+  );
+}
+
 function App() {
   const isWide = useMediaQuery(theme.breakpoints.up("md"));
   const isMobile = useMediaQuery(theme.breakpoints.down("sm"));
@@ -1638,7 +2007,8 @@ function App() {
   const [activeEditorTabId, setActiveEditorTabId] = useState(initialEditorTabId);
   const [html, setHtmlState] = useState(() => (initialEditorTabs.find(t => t.id === initialEditorTabId) || initialEditorTabs[0])?.code ?? activeProfile?.data?.code ?? DEFAULT_HTML);
   const activeEditorTab = useMemo(() => AppStateSelectors.activeEditorTab(editorTabs, activeEditorTabId), [editorTabs, activeEditorTabId]);
-  const activeEditorMode = inferEditorMode(activeEditorTab?.name, html, activeEditorTab?.mode);
+  const activeEditorModePreference = normalizeModePreference(activeEditorTab?.modePreference ?? activeEditorTab?.mode);
+  const activeEditorMode = inferEditorMode(activeEditorTab?.name, html, activeEditorModePreference);
   const [previewKey, setPreviewKey] = useState(0);
   const [previewWidth, setPreviewWidth] = useState(initS.previewWidth);
   const [fullscreen, setFullscreen] = useState("none");
@@ -1648,8 +2018,23 @@ function App() {
   const [highlightMode, setHighlightMode] = useState(initS.highlightMode);
   const [previewScale, setPreviewScale] = useState(initS.previewScale);
   const [appDarkMode, setAppDarkMode] = useState(false);
+  const appTheme = useMemo(() => createTheme({
+    palette: { mode: appDarkMode ? "dark" : "light", primary: { main: "#1976d2" } },
+    typography: { fontFamily: '"Roboto","Helvetica","Arial",sans-serif' },
+    shape: { borderRadius: 8 },
+    components: {
+      MuiCssBaseline: {
+        styleOverrides: {
+          html: { WebkitTextSizeAdjust: "100%" },
+          input: { fontSize: "16px" },
+          textarea: { fontSize: "16px" },
+          select: { fontSize: "16px" },
+          ".MuiInputBase-input": { fontSize: "16px" },
+        },
+      },
+    },
+  }), [appDarkMode]);
   const [previewDarkMode, setPreviewDarkMode] = useState(false);
-  const [mobileView, setMobileView] = useState("editor");
   const [consoleLogs, setConsoleLogs] = useState([]);
   const [consoleOpen, setConsoleOpen] = useState(false);
   const [snapshots, setSnapshots] = useState([]);
@@ -1664,8 +2049,11 @@ function App() {
   const [profileNewName, setProfileNewName] = useState("新しいプロファイル");
   const [previewDialog, setPreviewDialog] = useState(null);
   const [snackbar, setSnackbar] = useState({ open: false, msg: "" });
+  const [drawerOpen, setDrawerOpen] = useState(false);
   const historyMuteRef = useRef(false);
   const consoleLogsRef = useRef([]);
+  const previewWindowRef = useRef(null);
+  const previewHasErrorRef = useRef(false);
   const lastGoodCodeRef = useRef(null);
   const [codeHistory, setCodeHistory] = useState(() => HistoryDomain.reset(html, activeEditorTabId, "初期状態").history);
   const [codeHistoryIndex, setCodeHistoryIndex] = useState(0);
@@ -1676,6 +2064,10 @@ function App() {
   const previewDelay = isHugeCode ? PERF_LIMITS.PREVIEW_DELAY_HUGE : isLargeCode ? PERF_LIMITS.PREVIEW_DELAY_LARGE : PERF_LIMITS.PREVIEW_DELAY_NORMAL;
   const effectiveHighlightMode = isLargeCode ? "plain" : highlightMode;
   const effectiveWordWrap = isLargeCode ? false : wordWrap;
+  const effectiveEditorFontSize = isMobile ? Math.max(fontSize, 16) : fontSize;
+  const effectivePreviewScale = isMobile ? 100 : previewScale;
+  const editorHeaderDark = appDarkMode || darkMode;
+  const previewHeaderDark = appDarkMode || previewDarkMode;
   const containerRef = useRef(null);
   const { ratio, setRatio, handleProps, dragging } = useSplitPane(containerRef, isWide, initS.splitRatio);
   const ratioRef = useRef(ratio);
@@ -1685,20 +2077,70 @@ function App() {
   const getSyncedEditorTabs = useCallback(() => EditorDomain.syncCurrentTab(editorTabs, activeEditorTabId, html), [editorTabs, activeEditorTabId, html]);
   const currentSettings = useCallback(() => ({ fontSize, darkMode, wordWrap, highlightMode, previewScale, previewWidth, splitRatio: ratioRef.current }), [fontSize, darkMode, wordWrap, highlightMode, previewScale, previewWidth]);
   const currentProfileData = useCallback(() => ProfileDomain.currentData({ code: html, editorTabs: getSyncedEditorTabs(), activeEditorTabId, settings: currentSettings() }), [html, getSyncedEditorTabs, activeEditorTabId, currentSettings]);
+  const getProfilesWithCurrentData = useCallback(() => ProfileDomain.saveCurrent(profiles, activeProfileId, currentProfileData()), [profiles, activeProfileId, currentProfileData]);
   const setHtml = useCallback((nextCode) => { setHtmlState(prev => { const value = typeof nextCode === "function" ? nextCode(prev) : nextCode; setEditorTabs(tabs => EditorDomain.syncCurrentTab(tabs, activeEditorTabId, value)); return value; }); }, [activeEditorTabId]);
   useEffect(() => { historyMuteRef.current = true; const nextHistory = HistoryDomain.reset(html, activeEditorTabId, "タブ切替"); setCodeHistory(nextHistory.history); setCodeHistoryIndex(nextHistory.index); const t = setTimeout(() => { historyMuteRef.current = false; }, 0); return () => clearTimeout(t); }, [activeEditorTabId]);
   useEffect(() => { if (historyMuteRef.current) return; const timer = setTimeout(() => { setCodeHistory(prev => { const nextHistory = HistoryDomain.push(prev, codeHistoryIndex, html, activeEditorTabId); setCodeHistoryIndex(nextHistory.index); return nextHistory.history; }); }, 900); return () => clearTimeout(timer); }, [html, activeEditorTabId, codeHistoryIndex]);
   useEffect(() => { const timer = setTimeout(() => { const data = currentProfileData(); const next = ProfileDomain.saveCurrent(profiles, activeProfileId, data); ProfileRepo.save(next); if (activeProfileId) ProfileRepo.saveActiveId(activeProfileId); }, 800); return () => clearTimeout(timer); }, [profiles, activeProfileId, currentProfileData]);
   const debouncedHtml = useDebounce(html, previewDelay);
   const srcDoc = useMemo(() => buildSrcDoc(debouncedHtml, activeEditorMode, { darkMode: previewDarkMode }), [debouncedHtml, activeEditorMode, previewDarkMode, previewKey]);
-  useEffect(() => { const onMsg = (event) => { const data = event.data; if (!data || typeof data !== "object") return; if (data.type === "__ht_console__") setConsoleLogs(prev => [...prev.slice(-299), { level: data.level || "log", msg: String(data.msg || ""), ts: data.ts || Date.now() }]); if (data.type === "__ht_dialog__") setPreviewDialog({ title: data.title || "Preview message", message: data.message || "" }); }; window.addEventListener("message", onMsg); return () => window.removeEventListener("message", onMsg); }, []);
-  useEffect(() => { const timer = setTimeout(() => { const hasErrors = consoleLogsRef.current.some(l => l.level === "error" && Date.now() - l.ts < 1200); if (!hasErrors && html.trim() && lastGoodCodeRef.current !== html) { lastGoodCodeRef.current = html; const snap = SnapshotDomain.create(html, "最後の正常表示", { isAuto: true, isLastGood: true, mode: activeEditorMode, tabId: activeEditorTabId, tabName: activeEditorTab?.name, profileId: activeProfileId }); setSnapshots(prev => SnapshotDomain.push(prev.filter(s => !s.isLastGood), snap)); } }, 1500); return () => clearTimeout(timer); }, [html, activeEditorMode, activeEditorTabId, activeEditorTab?.name, activeProfileId]);
-  const saveCurrentProfile = useCallback(() => { const data = currentProfileData(); const next = ProfileDomain.saveCurrent(profiles, activeProfileId, data); setProfiles(next); ProfileRepo.save(next); if (activeProfileId) ProfileRepo.saveActiveId(activeProfileId); toast("プロファイルを保存しました"); }, [profiles, activeProfileId, currentProfileData]);
+  const handlePreviewFrameWindow = useCallback((win) => {
+    previewWindowRef.current = win;
+    previewHasErrorRef.current = false;
+  }, []);
+  useEffect(() => {
+    const onMsg = (event) => {
+      if (event.source !== previewWindowRef.current) return;
+      const data = event.data;
+      if (!data || typeof data !== "object") return;
+
+      if (data.type === "__ht_console__") {
+        const level = ["log", "info", "warn", "error", "debug"].includes(data.level) ? data.level : "log";
+        if (level === "error") previewHasErrorRef.current = true;
+        setConsoleLogs(prev => [
+          ...prev.slice(-299),
+          {
+            level,
+            msg: String(data.msg || "").slice(0, 10000),
+            ts: data.ts || Date.now(),
+          },
+        ]);
+      }
+
+      if (data.type === "__ht_dialog__") {
+        setPreviewDialog({
+          title: String(data.title || "Preview message").slice(0, 200),
+          message: String(data.message || "").slice(0, 10000),
+        });
+      }
+    };
+    window.addEventListener("message", onMsg);
+    return () => window.removeEventListener("message", onMsg);
+  }, []);
+  useEffect(() => {
+    previewHasErrorRef.current = false;
+    const timer = setTimeout(() => {
+      if (!previewHasErrorRef.current && debouncedHtml.trim() && lastGoodCodeRef.current !== debouncedHtml) {
+        lastGoodCodeRef.current = debouncedHtml;
+        const snap = SnapshotDomain.create(debouncedHtml, "最後の正常表示", {
+          isAuto: true,
+          isLastGood: true,
+          mode: activeEditorMode,
+          tabId: activeEditorTabId,
+          tabName: activeEditorTab?.name,
+          profileId: activeProfileId,
+        });
+        setSnapshots(prev => SnapshotDomain.push(prev.filter(s => !s.isLastGood), snap));
+      }
+    }, 1200);
+    return () => clearTimeout(timer);
+  }, [debouncedHtml, activeEditorMode, activeEditorTabId, activeEditorTab?.name, activeProfileId]);
+  const saveCurrentProfile = useCallback(() => { const next = getProfilesWithCurrentData(); setProfiles(next); const ok = ProfileRepo.save(next); if (activeProfileId) ProfileRepo.saveActiveId(activeProfileId); toast(ok === false ? "保存に失敗しました" : "プロファイルを保存しました"); }, [getProfilesWithCurrentData, activeProfileId]);
   const switchProfile = useCallback((id) => { if (!id || id === activeProfileId) return; const savedProfiles = ProfileDomain.saveCurrent(profiles, activeProfileId, currentProfileData()); const p = savedProfiles.find(x => x.id === id); if (!p) return; const tabs = normalizeEditorTabs(p.data); const tabId = getInitialEditorTabId(p.data, tabs); const tab = tabs.find(t => t.id === tabId) || tabs[0]; setProfiles(savedProfiles); ProfileRepo.save(savedProfiles); setActiveProfileId(id); ProfileRepo.saveActiveId(id); setEditorTabs(tabs); setActiveEditorTabId(tabId); setHtmlState(tab?.code ?? p.data?.code ?? DEFAULT_HTML); const s = validateSettings(p.data?.settings); setDarkMode(s.darkMode); setFontSize(s.fontSize); setWordWrap(s.wordWrap); setHighlightMode(s.highlightMode); setPreviewScale(s.previewScale); setPreviewWidth(s.previewWidth); setRatio(s.splitRatio); setConsoleLogs([]); setSnapshots([]); toast(`「${p.name}」に切り替えました`); }, [profiles, activeProfileId, currentProfileData, setRatio]);
   const createNewProfile = () => { setProfileNewOpen(true); setProfileNewName("新しいプロファイル"); };
-  const applyNewProfile = () => { const name = profileNewName.trim() || "新しいプロファイル"; const profile = createProfile(name, { code: DEFAULT_HTML, editorTabs: [createEditorTab("index.html", DEFAULT_HTML, EDITOR_MODES.HTML)], settings: currentSettings() }); const next = [...ProfileDomain.saveCurrent(profiles, activeProfileId, currentProfileData()), profile].slice(-MAX_PROFILES); ProfileRepo.save(next); ProfileRepo.saveActiveId(profile.id); setProfiles(next); setActiveProfileId(profile.id); const tabs = normalizeEditorTabs(profile.data); setEditorTabs(tabs); setActiveEditorTabId(tabs[0]?.id || null); setHtmlState(tabs[0]?.code || DEFAULT_HTML); setProfileNewOpen(false); setConsoleLogs([]); setSnapshots([]); toast(`「${name}」を作成しました`); };
-  const renameProfile = (id, name) => { const next = ProfileDomain.rename(profiles, id, name); setProfiles(next); ProfileRepo.save(next); toast("プロファイル名を変更しました"); };
-  const duplicateProfile = (id) => { const res = ProfileDomain.duplicate(profiles, id); if (!res.ok) return toast(res.reason); setProfiles(res.profiles); ProfileRepo.save(res.profiles); toast("プロファイルを複製しました"); };
+  const applyNewProfile = () => { const name = profileNewName.trim() || "新しいプロファイル"; const profile = createProfile(name, { code: DEFAULT_HTML, editorTabs: [createEditorTab("index.html", DEFAULT_HTML, EDITOR_MODES.AUTO)], settings: currentSettings() }); const next = [...ProfileDomain.saveCurrent(profiles, activeProfileId, currentProfileData()), profile].slice(-MAX_PROFILES); ProfileRepo.save(next); ProfileRepo.saveActiveId(profile.id); setProfiles(next); setActiveProfileId(profile.id); const tabs = normalizeEditorTabs(profile.data); setEditorTabs(tabs); setActiveEditorTabId(tabs[0]?.id || null); setHtmlState(tabs[0]?.code || DEFAULT_HTML); setProfileNewOpen(false); setConsoleLogs([]); setSnapshots([]); toast(`「${name}」を作成しました`); };
+  const renameProfile = (id, name) => { const base = getProfilesWithCurrentData(); const next = ProfileDomain.rename(base, id, name); setProfiles(next); ProfileRepo.save(next); toast("プロファイル名を変更しました"); };
+  const duplicateProfile = (id) => { const base = getProfilesWithCurrentData(); const res = ProfileDomain.duplicate(base, id); if (!res.ok) return toast(res.reason); setProfiles(res.profiles); ProfileRepo.save(res.profiles); toast("プロファイルを複製しました"); };
   const loadProfileState = (profile, nextProfiles = profiles) => {
     if (!profile) return;
     const tabs = normalizeEditorTabs(profile.data);
@@ -1711,18 +2153,23 @@ function App() {
     setConsoleLogs([]); setSnapshots([]);
   };
   const deleteProfile = (id) => {
-    const next = ProfileDomain.remove(profiles, id);
+    const base = getProfilesWithCurrentData();
+    const next = ProfileDomain.remove(base, id);
     ProfileRepo.save(next); setProfiles(next);
     if (id === activeProfileId) loadProfileState(next[0], next);
     toast("プロファイルを削除しました");
   };
-  const importProfiles = (file) => { const reader = new FileReader(); reader.onload = () => { try { const imported = ProfileDomain.importPayload(JSON.parse(reader.result)); if (!imported.length) throw new Error("プロファイルが見つかりません"); const next = [...profiles, ...imported].slice(-MAX_PROFILES); setProfiles(next); ProfileRepo.save(next); toast(`${imported.length} 件をインポートしました`); } catch (e) { toast(`Import失敗: ${e.message || e}`); } }; reader.readAsText(file); };
+  const importProfiles = (file) => { const reader = new FileReader(); reader.onload = () => { try { const imported = ProfileDomain.importPayload(JSON.parse(reader.result)); if (!imported.length) throw new Error("プロファイルが見つかりません"); const next = [...getProfilesWithCurrentData(), ...imported].slice(-MAX_PROFILES); setProfiles(next); ProfileRepo.save(next); toast(`${imported.length} 件をインポートしました`); } catch (e) { toast(`Import失敗: ${e.message || e}`); } }; reader.readAsText(file); };
   const switchEditorTab = (id) => { const next = EditorDomain.switchTab(editorTabs, activeEditorTabId, html, id); if (!next.ok || next.unchanged) return; setEditorTabs(next.tabs); setActiveEditorTabId(next.activeEditorTabId); setHtmlState(next.code); setConsoleLogs([]); };
   const addEditorTab = (mode = EDITOR_MODES.HTML) => { const next = EditorDomain.addTab(editorTabs, activeEditorTabId, html, mode); if (!next.ok) return toast(next.reason); setEditorTabs(next.tabs); setActiveEditorTabId(next.activeEditorTabId); setHtmlState(next.code); setConsoleLogs([]); toast(`「${next.tab.name}」を追加しました`); };
   const closeEditorTab = (id) => { const next = EditorDomain.closeTab(editorTabs, activeEditorTabId, html, id); if (!next.ok) return toast(next.reason); setEditorTabs(next.tabs); setActiveEditorTabId(next.activeEditorTabId); setHtmlState(next.code); setConsoleLogs([]); };
   const applyEditorTabRename = () => { const name = safeDownloadFileName(tabRename?.name || ""); if (!tabRename || !name) { setTabRename(null); return; } setEditorTabs(tabs => EditorDomain.renameTab(tabs, tabRename.id, name)); setTabRename(null); toast("タブ名を変更しました"); };
   const duplicateEditorTab = () => { const next = EditorDomain.duplicateTab(editorTabs, activeEditorTabId, html); if (!next.ok) return toast(next.reason); setEditorTabs(next.tabs); setActiveEditorTabId(next.activeEditorTabId); setHtmlState(next.code); setConsoleLogs([]); };
-  const changeEditorTabMode = (mode) => { setEditorTabs(tabs => EditorDomain.changeMode(tabs, activeEditorTabId, mode)); toast(normalizeEditorMode(mode) === EDITOR_MODES.MARKDOWN ? "Markdownに切替" : "HTMLに切替"); };
+  const changeEditorTabMode = (mode) => {
+    const preference = normalizeModePreference(mode);
+    setEditorTabs(tabs => EditorDomain.changeMode(tabs, activeEditorTabId, preference));
+    toast(preference === EDITOR_MODES.AUTO ? "Auto判定に切替" : preference === EDITOR_MODES.MARKDOWN ? "Markdownに固定" : "HTMLに固定");
+  };
   const canUndoCode = codeHistoryIndex > 0;
   const canRedoCode = codeHistoryIndex < codeHistory.length - 1;
   const restoreCodeHistory = (index) => { const entry = codeHistory[index]; if (!entry) return; historyMuteRef.current = true; setCodeHistoryIndex(index); setHtml(entry.code); setTimeout(() => { historyMuteRef.current = false; }, 0); };
@@ -1736,40 +2183,49 @@ function App() {
   const downloadCode = () => { const name = safeDownloadFileName(activeEditorTab?.name || (activeEditorMode === EDITOR_MODES.MARKDOWN ? "notes.md" : "index.html")); const blob = new Blob([html], { type: "text/plain;charset=utf-8" }); const url = URL.createObjectURL(blob); const a = document.createElement("a"); a.href = url; a.download = name; a.click(); URL.revokeObjectURL(url); };
   const applyPatchCode = (code) => { setHtml(code); toast("差分を適用しました"); };
   const clearEditor = () => { setHtml(""); setConfirmClear(false); toast("クリアしました"); };
-  const resetProfile = () => { const tabs = [createEditorTab("index.html", DEFAULT_HTML, EDITOR_MODES.HTML)]; setEditorTabs(tabs); setActiveEditorTabId(tabs[0].id); setHtmlState(DEFAULT_HTML); setSnapshots([]); setConsoleLogs([]); setConfirmReset(false); toast("初期設定に戻しました"); };
+  const resetProfile = () => { const tabs = [createEditorTab("index.html", DEFAULT_HTML, EDITOR_MODES.AUTO)]; setEditorTabs(tabs); setActiveEditorTabId(tabs[0].id); setHtmlState(DEFAULT_HTML); setSnapshots([]); setConsoleLogs([]); setConfirmReset(false); toast("初期設定に戻しました"); };
   const fullReset = async () => { try { [STORAGE_KEY, STORAGE_PROFILES_KEY, STORAGE_ACTIVE_KEY].forEach(k => localStorage.removeItem(k)); await clearAllPlusCaches(); } catch {} const def = createProfile("デフォルト", { code: DEFAULT_HTML }); ProfileRepo.save([def]); ProfileRepo.saveActiveId(def.id); const tabs = normalizeEditorTabs(def.data); setProfiles([def]); setActiveProfileId(def.id); setEditorTabs(tabs); setActiveEditorTabId(tabs[0]?.id || null); setHtmlState(tabs[0]?.code || DEFAULT_HTML); setSnapshots([]); setConsoleLogs([]); setConfirmFullReset(false); setStorageOpen(false); toast("完全初期化しました"); };
   const toggleFullscreen = (pane) => setFullscreen(v => v === pane ? "none" : pane);
   const showEditor = fullscreen !== "preview";
   const showPreview = fullscreen !== "editor";
-  const showEditorPane = isMobile ? (fullscreen === "editor" || (fullscreen === "none" && mobileView === "editor")) : showEditor;
-  const showPreviewPane = isMobile ? (fullscreen === "preview" || (fullscreen === "none" && mobileView === "preview")) : showPreview;
+  const showEditorPane = showEditor;
+  const showPreviewPane = showPreview;
   const showHandle = !isMobile && fullscreen === "none" && showEditor && showPreview;
-  const editorSize = isMobile ? "100%" : fullscreen === "editor" ? "100%" : fullscreen === "preview" ? "0%" : `${ratio * 100}%`;
-  const previewSize = isMobile ? "100%" : fullscreen === "preview" ? "100%" : fullscreen === "editor" ? "0%" : `${(1 - ratio) * 100}%`;
+  const editorSize = fullscreen === "editor" ? "100%" : fullscreen === "preview" ? "0%" : isMobile ? "50%" : `${ratio * 100}%`;
+  const previewSize = fullscreen === "preview" ? "100%" : fullscreen === "editor" ? "0%" : isMobile ? "50%" : `${(1 - ratio) * 100}%`;
   const sizeKey = isWide ? "width" : "height";
   return (
-    <ThemeProvider theme={theme}>
+    <ThemeProvider theme={appTheme}>
       <CssBaseline />
-      <Box sx={{ display: "flex", flexDirection: "column", height: "100vh", overflow: "hidden", background: appDarkMode ? "#111827" : "#f0f2f5" }}>
-        <AppBar position="static" elevation={0} sx={{ background: "#1565c0", flexShrink: 0 }}>
-          <Toolbar variant="dense" sx={{ minHeight: { xs: 54, sm: 52 }, gap: 0.7, px: { xs: 0.75, sm: 1.2 }, overflowX: "auto" }}>
-            <Typography variant="subtitle2" fontWeight={800} sx={{ color: "#fff", flexShrink: 0, mr: 0.5 }}>Core Lean Secure</Typography>
-            <ProfileMenu profiles={profiles} activeId={activeProfileId} onSwitch={switchProfile} onSave={saveCurrentProfile} onNew={createNewProfile} onRename={renameProfile} onDuplicate={duplicateProfile} onDelete={deleteProfile} onExport={(id) => { const p = profiles.find(x => x.id === id); if (p) exportProfile(p); }} onExportAll={() => exportAllProfiles(profiles)} onImport={importProfiles} onReset={() => setConfirmReset(true)} />
-            <Box sx={{ flex: 1 }} />
-            <Tooltip title="保存"><IconButton size="small" onClick={saveCurrentProfile} sx={{ color: "#fff" }}><Icon name="save" size={19} /></IconButton></Tooltip>
-            <Tooltip title="コピー"><IconButton size="small" onClick={copyCode} sx={{ color: "#fff" }}><Icon name="content_copy" size={19} /></IconButton></Tooltip>
-            <Tooltip title="ダウンロード"><IconButton size="small" onClick={downloadCode} sx={{ color: "#fff" }}><Icon name="download" size={19} /></IconButton></Tooltip>
-            <Tooltip title="クリア"><IconButton size="small" onClick={() => setConfirmClear(true)} sx={{ color: "#fff" }}><Icon name="delete_outline" size={19} /></IconButton></Tooltip>
-            <Tooltip title="差分パッチ"><IconButton size="small" onClick={() => setPatchOpen(true)} sx={{ color: "#fff" }}><Icon name="difference" size={19} /></IconButton></Tooltip>
-            <Tooltip title="Console"><IconButton size="small" onClick={() => setConsoleOpen(true)} sx={{ color: "#fff" }}><Icon name="terminal" size={19} /></IconButton></Tooltip>
-            <Tooltip title="Security & Storage"><IconButton size="small" onClick={() => setStorageOpen(true)} sx={{ color: "#fff" }}><Icon name="security" size={19} /></IconButton></Tooltip>
-            <Tooltip title={appDarkMode ? "Light" : "Dark"}><IconButton size="small" onClick={() => setAppDarkMode(v => !v)} sx={{ color: "#fff" }}><Icon name={appDarkMode ? "light_mode" : "dark_mode"} size={19} /></IconButton></Tooltip>
+      <Box sx={{ display: "flex", flexDirection: "column", height: "100dvh", minHeight: 0, overflow: "hidden", background: appDarkMode ? "#111827" : "#f0f2f5" }}>
+        <AppBar position="static" elevation={0} sx={{ background: appDarkMode ? "#0f172a" : "#1565c0", flexShrink: 0, borderBottom: appDarkMode ? "1px solid rgba(255,255,255,0.08)" : "none" }}>
+          <Toolbar variant="dense" sx={{ minHeight: { xs: 54, sm: 52 }, gap: { xs: 0.45, sm: 0.7 }, px: { xs: 0.6, sm: 1.2 }, overflow: "hidden" }}>
+            <Tooltip title="メニュー"><IconButton size="small" onClick={() => setDrawerOpen(true)} sx={{ color: "#fff", flexShrink: 0 }}><Icon name="menu" size={22} /></IconButton></Tooltip>
+            <Box sx={{ minWidth: 0, flex: { xs: 1, md: "0 1 auto" }, mr: { xs: 0.2, sm: 0.8 } }}>
+              <Typography noWrap variant="subtitle2" fontWeight={900} sx={{ color: "#fff", lineHeight: 1.12, fontSize: { xs: 13, sm: 14 } }}>Core Lean Secure</Typography>
+              <Typography noWrap variant="caption" sx={{ display: { xs: "block", md: "none" }, color: "rgba(255,255,255,0.72)", lineHeight: 1.1 }}>{activeEditorTab?.name || "index.html"}</Typography>
+            </Box>
+            <Box sx={{ display: { xs: "none", md: "block" }, flexShrink: 0 }}>
+              <ProfileMenu profiles={profiles} activeId={activeProfileId} onSwitch={switchProfile} onSave={saveCurrentProfile} onNew={createNewProfile} onRename={renameProfile} onDuplicate={duplicateProfile} onDelete={deleteProfile} onExport={(id) => { const synced = getProfilesWithCurrentData(); const p = synced.find(x => x.id === id); if (p) exportProfile(p); }} onExportAll={() => exportAllProfiles(getProfilesWithCurrentData())} onImport={importProfiles} onReset={() => setConfirmReset(true)} />
+            </Box>
+            <Box sx={{ flex: 1, display: { xs: "none", md: "block" } }} />
+            <Tooltip title="保存"><IconButton size="small" onClick={saveCurrentProfile} sx={{ color: "#fff", flexShrink: 0 }}><Icon name="save" size={19} /></IconButton></Tooltip>
+            <Box sx={{ display: { xs: "none", sm: "flex" }, alignItems: "center", gap: 0.2, flexShrink: 0 }}>
+              <Tooltip title="コピー"><IconButton size="small" onClick={copyCode} sx={{ color: "#fff" }}><Icon name="content_copy" size={19} /></IconButton></Tooltip>
+              <Tooltip title="ダウンロード"><IconButton size="small" onClick={downloadCode} sx={{ color: "#fff" }}><Icon name="download" size={19} /></IconButton></Tooltip>
+              <Tooltip title="Console"><IconButton size="small" onClick={() => setConsoleOpen(true)} sx={{ color: "#fff" }}><Icon name="terminal" size={19} /></IconButton></Tooltip>
+            </Box>
+            <Box sx={{ display: { xs: "none", lg: "flex" }, alignItems: "center", gap: 0.2, flexShrink: 0 }}>
+              <Tooltip title="クリア"><IconButton size="small" onClick={() => setConfirmClear(true)} sx={{ color: "#fff" }}><Icon name="delete_outline" size={19} /></IconButton></Tooltip>
+              <Tooltip title="差分パッチ"><IconButton size="small" onClick={() => setPatchOpen(true)} sx={{ color: "#fff" }}><Icon name="difference" size={19} /></IconButton></Tooltip>
+              <Tooltip title="Security & Storage"><IconButton size="small" onClick={() => setStorageOpen(true)} sx={{ color: "#fff" }}><Icon name="security" size={19} /></IconButton></Tooltip>
+            </Box>
+            <Tooltip title={appDarkMode ? "Light" : "Dark"}><IconButton size="small" onClick={() => setAppDarkMode(v => !v)} sx={{ color: "#fff", flexShrink: 0 }}><Icon name={appDarkMode ? "light_mode" : "dark_mode"} size={19} /></IconButton></Tooltip>
           </Toolbar>
         </AppBar>
-        {isMobile && fullscreen === "none" && <ToggleButtonGroup value={mobileView} exclusive size="small" onChange={(_, v) => v && setMobileView(v)} sx={{ m: 0.6, alignSelf: "center" }}><ToggleButton value="editor"><Icon name="code" size={16} /></ToggleButton><ToggleButton value="preview"><Icon name="visibility" size={16} /></ToggleButton></ToggleButtonGroup>}
         <Box ref={containerRef} sx={{ flex: 1, minHeight: 0, display: "flex", flexDirection: isWide ? "row" : "column", overflow: "hidden" }}>
           {showEditorPane && <Box sx={{ [sizeKey]: editorSize, flexShrink: 0, minWidth: isWide ? 0 : "100%", minHeight: isWide ? "100%" : 0, display: "flex", flexDirection: "column", overflow: "hidden" }}>
-            <PaneHeader title="コード" fullscreen={fullscreen === "editor"} onToggleFullscreen={() => toggleFullscreen("editor")} darkMode={darkMode}>
+            <PaneHeader title="コード" fullscreen={fullscreen === "editor"} onToggleFullscreen={() => toggleFullscreen("editor")} darkMode={editorHeaderDark} showFullscreen={true}>
               <Tooltip title="Undo"><span><IconButton size="small" disabled={!canUndoCode} onClick={undoCode} sx={{ p: 0.4 }}><Icon name="undo" size={16} /></IconButton></span></Tooltip>
               <Tooltip title="Redo"><span><IconButton size="small" disabled={!canRedoCode} onClick={redoCode} sx={{ p: 0.4 }}><Icon name="redo" size={16} /></IconButton></span></Tooltip>
               <Tooltip title="Snapshot"><IconButton size="small" onClick={takeSnapshot} sx={{ p: 0.4 }}><Icon name="photo_camera" size={16} /></IconButton></Tooltip>
@@ -1781,21 +2237,57 @@ function App() {
               <IconButton size="small" onClick={() => setFontSize(s => clampValue(s + 1, UI_LIMITS.FONT_MIN, UI_LIMITS.FONT_MAX, UI_LIMITS.FONT_DEFAULT))} sx={{ p: 0.4 }}><Icon name="text_increase" size={15} /></IconButton>
               <Tooltip title="Editor dark"><IconButton size="small" onClick={() => setDarkMode(v => !v)} sx={{ p: 0.4 }}><Icon name={darkMode ? "light_mode" : "dark_mode"} size={16} /></IconButton></Tooltip>
             </PaneHeader>
-            <EditorTabBar tabs={editorTabs} activeId={activeEditorTabId} onSwitch={switchEditorTab} onNew={() => addEditorTab(EDITOR_MODES.HTML)} onClose={closeEditorTab} onRename={(id) => { const t = editorTabs.find(x => x.id === id); if (t) setTabRename({ id, name: t.name }); }} onDuplicate={duplicateEditorTab} onModeChange={changeEditorTabMode} activeMode={activeEditorMode} darkMode={darkMode} />
-            <CodeEditor value={html} onChange={setHtml} fontSize={fontSize} darkMode={darkMode} wordWrap={effectiveWordWrap} highlightMode={effectiveHighlightMode} perfMode={perfMode} showIndentGuides={perfMode === "normal"} mode={activeEditorMode} />
+            <EditorTabBar tabs={editorTabs} activeId={activeEditorTabId} onSwitch={switchEditorTab} onNew={() => addEditorTab(EDITOR_MODES.AUTO)} onClose={closeEditorTab} onRename={(id) => { const t = editorTabs.find(x => x.id === id); if (t) setTabRename({ id, name: t.name }); }} onDuplicate={duplicateEditorTab} onModeChange={changeEditorTabMode} activeMode={activeEditorMode} activeModePreference={activeEditorModePreference} darkMode={darkMode} />
+            <CodeEditor value={html} onChange={setHtml} fontSize={effectiveEditorFontSize} darkMode={darkMode} wordWrap={effectiveWordWrap} highlightMode={effectiveHighlightMode} perfMode={perfMode} showIndentGuides={perfMode === "normal"} mode={activeEditorMode} />
           </Box>}
           {showHandle && <SplitHandle isHorizontal={isWide} handleProps={handleProps} dragging={dragging} />}
-          {showPreviewPane && <Box sx={{ [sizeKey]: previewSize, flex: fullscreen === "preview" ? 1 : "unset", minWidth: 0, minHeight: 0, display: "flex", flexDirection: "column", overflow: "hidden" }}>
-            <PaneHeader title="プレビュー" fullscreen={fullscreen === "preview"} onToggleFullscreen={() => toggleFullscreen("preview")}>
+          {showPreviewPane && <Box sx={{ [sizeKey]: previewSize, flex: fullscreen === "preview" ? 1 : "unset", flexShrink: 0, minWidth: 0, minHeight: 0, display: "flex", flexDirection: "column", overflow: "hidden" }}>
+            <PaneHeader title="プレビュー" fullscreen={fullscreen === "preview"} onToggleFullscreen={() => toggleFullscreen("preview")} darkMode={previewHeaderDark} showFullscreen={true}>
               <Tooltip title="Preview dark"><IconButton size="small" onClick={() => setPreviewDarkMode(v => !v)} sx={{ p: 0.4 }}><Icon name={previewDarkMode ? "light_mode" : "dark_mode"} size={16} /></IconButton></Tooltip>
-              {!isMobile && <WidthSelector value={previewWidth} onChange={setPreviewWidth} />}
+              <WidthSelector value={previewWidth} onChange={setPreviewWidth} darkMode={previewHeaderDark} compact={isMobile} />
               {!isMobile && <><IconButton size="small" onClick={() => setPreviewScale(s => clampValue(s - UI_LIMITS.PREVIEW_SCALE_STEP, UI_LIMITS.PREVIEW_SCALE_MIN, UI_LIMITS.PREVIEW_SCALE_MAX, 100))} sx={{ p: 0.4 }}><Icon name="zoom_out" size={16} /></IconButton><Typography variant="caption" onClick={() => setPreviewScale(100)} sx={{ fontSize: 11, minWidth: 36, textAlign: "center", cursor: "pointer" }}>{previewScale}%</Typography><IconButton size="small" onClick={() => setPreviewScale(s => clampValue(s + UI_LIMITS.PREVIEW_SCALE_STEP, UI_LIMITS.PREVIEW_SCALE_MIN, UI_LIMITS.PREVIEW_SCALE_MAX, 100))} sx={{ p: 0.4 }}><Icon name="zoom_in" size={16} /></IconButton></>}
               <Tooltip title="再読み込み"><IconButton size="small" onClick={() => setPreviewKey(k => k + 1)}><Icon name="refresh" size={17} /></IconButton></Tooltip>
             </PaneHeader>
-            <PreviewFrame srcDoc={srcDoc} previewKey={previewKey} width={isMobile ? "100%" : previewWidth} scale={previewScale} darkMode={previewDarkMode} />
+            <PreviewFrame srcDoc={srcDoc} previewKey={previewKey} width={previewWidth} scale={effectivePreviewScale} darkMode={previewDarkMode} onFrameWindowChange={handlePreviewFrameWindow} fitToContainer={isMobile} />
           </Box>}
         </Box>
       </Box>
+      <CommandDrawer
+        open={drawerOpen}
+        onClose={() => setDrawerOpen(false)}
+        appDarkMode={appDarkMode}
+        activeProfileName={activeProfile?.name}
+        activeTab={activeEditorTab}
+        activeMode={activeEditorMode}
+        activeModePreference={activeEditorModePreference}
+        editorTabs={editorTabs}
+        activeEditorTabId={activeEditorTabId}
+        onSwitchTab={switchEditorTab}
+        onNewHtml={() => addEditorTab(EDITOR_MODES.HTML)}
+        onNewMarkdown={() => addEditorTab(EDITOR_MODES.MARKDOWN)}
+        onRenameTab={(id) => { const t = editorTabs.find(x => x.id === id); if (t) setTabRename({ id, name: t.name }); }}
+        onCloseTab={closeEditorTab}
+        onDuplicateTab={duplicateEditorTab}
+        codeHistory={codeHistory}
+        codeHistoryIndex={codeHistoryIndex}
+        onRestoreHistory={restoreCodeHistory}
+        onUndo={undoCode}
+        onRedo={redoCode}
+        canUndo={canUndoCode}
+        canRedo={canRedoCode}
+        snapshotsCount={snapshots.length}
+        consoleLogsCount={consoleLogs.length}
+        onSave={saveCurrentProfile}
+        onCopy={copyCode}
+        onDownload={downloadCode}
+        onClear={() => setConfirmClear(true)}
+        onPatch={() => setPatchOpen(true)}
+        onConsole={() => setConsoleOpen(true)}
+        onStorage={() => setStorageOpen(true)}
+        onSnapshots={() => setSnapshotOpen(true)}
+        onTakeSnapshot={takeSnapshot}
+        onToggleTheme={() => setAppDarkMode(v => !v)}
+      />
       <ConfirmDialog open={confirmClear} title="入力内容をクリア" message="現在のタブの内容を削除します。" confirmLabel="クリア" onConfirm={clearEditor} onCancel={() => setConfirmClear(false)} />
       <ConfirmDialog open={confirmReset} title="初期設定に戻す" message="現在のプロファイルを初期状態に戻します。" confirmLabel="初期化" onConfirm={resetProfile} onCancel={() => setConfirmReset(false)} />
       <ConfirmDialog open={confirmFullReset} title="完全初期化" message="localStorageのアプリデータとアプリ関連Cacheを削除します。必要なデータは先にExportしてください。" confirmLabel="完全初期化" onConfirm={fullReset} onCancel={() => setConfirmFullReset(false)} />
@@ -1805,7 +2297,7 @@ function App() {
       {patchOpen && <PatchDialog open={patchOpen} onClose={() => setPatchOpen(false)} currentCode={html} onApply={applyPatchCode} />}
       {consoleOpen && <ConsolePanel open={consoleOpen} onClose={() => setConsoleOpen(false)} logs={consoleLogs} onClear={() => setConsoleLogs([])} />}
       {snapshotOpen && <SnapshotPanel open={snapshotOpen} onClose={() => setSnapshotOpen(false)} snapshots={snapshots} onRestore={restoreSnapshot} onDelete={deleteSnapshot} onClearAll={clearSnapshots} darkMode={darkMode} />}
-      <SecurityStorageDialog open={storageOpen} onClose={() => setStorageOpen(false)} onExportAll={() => exportAllProfiles(profiles)} onFullReset={() => setConfirmFullReset(true)} onToast={toast} />
+      <SecurityStorageDialog open={storageOpen} onClose={() => setStorageOpen(false)} onExportAll={() => exportAllProfiles(getProfilesWithCurrentData())} onFullReset={() => setConfirmFullReset(true)} onToast={toast} />
       <Snackbar open={snackbar.open} autoHideDuration={2200} onClose={() => setSnackbar(s => ({ ...s, open: false }))} message={snackbar.msg} anchorOrigin={{ vertical: "bottom", horizontal: "center" }} />
     </ThemeProvider>
   );
@@ -1828,7 +2320,7 @@ createRoot(document.getElementById("root")).render(<React.StrictMode><App /></Re
     import mermaid from "https://esm.sh/mermaid@11.15.0";
 
     window.__HT_CM__ = { EditorView, basicSetup, cmHtml, cmMarkdown, oneDark };
-    window.__HT_MD__ = { marked, DOMPurify, mermaid, mermaidUrl: "https://esm.sh/mermaid@11.15.0" };
+    window.__HT_MD__ = { marked, DOMPurify, mermaid, mermaidUrl: "https://esm.sh/mermaid@11.15.0?bundle" };
 
     const CONSOLE_INTERCEPT = `<script>
 (function(){
