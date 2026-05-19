@@ -2,7 +2,7 @@
 <html lang="ja">
 <head>
   <meta charset="UTF-8" />
-  <title>HTML Modal Tester Full Stable v1.3 - Safe Markdown + Mermaid</title>
+  <title>HTML Modal Tester Full Stable v1.5 - UI Base + Storage Cache Plus</title>
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Roboto:wght@300;400;600;700&display=swap" />
   <link rel="stylesheet" href="https://fonts.googleapis.com/icon?family=Material+Icons" />
@@ -464,6 +464,8 @@ const STORAGE_ACTIVE_KEY   = "html-tester-active-profile";
 const STORAGE_SCHEMA_VERSION = 2;
 const MAX_PROFILES         = 20;
 const MAX_SNAPSHOTS        = 50;
+const MAX_CODE_HISTORY      = 80;
+const APP_BUILD_LABEL       = "Full Stable v1.5 UI Base + Storage Cache Plus";
 
 const DEFAULT_SETTINGS = {
   fontSize: 13,
@@ -661,7 +663,7 @@ function inferEditorMode(name, code, explicitMode) {
     lower.startsWith("<body") ||
     lower.startsWith("<script") ||
     lower.startsWith("<style") ||
-    /^<(div|section|main|article|header|footer|nav|p|h[1-6]|span|button|input|form|canvas|svg|table|ul|ol|li)/i.test(c)
+    /^<(div|section|main|article|header|footer|nav|p|h[1-6]|span|button|input|form|canvas|svg|table|ul|ol|li)\b/i.test(c)
   ) {
     return EDITOR_MODES.HTML;
   }
@@ -1741,6 +1743,596 @@ function DiagnosticsDialog({ open, results, onClose }) {
   );
 }
 
+
+
+
+const PLUS_IDB_NAME = "html-modal-tester-ui-plus";
+const PLUS_IDB_VERSION = 1;
+const PLUS_CACHE_NAME = "html-modal-tester-ui-plus-cache-v1";
+const PLUS_IDB_STORES = ["profiles", "tabs", "snapshots", "journal", "meta"];
+
+function formatBytes(n) {
+  const value = Number(n || 0);
+  if (value < 1024) return `${value} B`;
+  if (value < 1024 * 1024) return `${(value / 1024).toFixed(1)} KB`;
+  if (value < 1024 * 1024 * 1024) return `${(value / 1024 / 1024).toFixed(1)} MB`;
+  return `${(value / 1024 / 1024 / 1024).toFixed(2)} GB`;
+}
+
+function byteSizeOf(value) {
+  try { return new Blob([typeof value === "string" ? value : JSON.stringify(value)]).size; }
+  catch { return String(value ?? "").length; }
+}
+
+function openPlusDB() {
+  return new Promise((resolve, reject) => {
+    if (!window.indexedDB) { reject(new Error("IndexedDB is not available")); return; }
+    const req = indexedDB.open(PLUS_IDB_NAME, PLUS_IDB_VERSION);
+    req.onupgradeneeded = () => {
+      const db = req.result;
+      PLUS_IDB_STORES.forEach(name => {
+        if (!db.objectStoreNames.contains(name)) {
+          const store = db.createObjectStore(name, { keyPath: "id" });
+          if (name !== "meta") store.createIndex("updatedAt", "updatedAt", { unique: false });
+        }
+      });
+    };
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error || new Error("IndexedDB open failed"));
+    req.onblocked = () => reject(new Error("IndexedDB is blocked by another tab"));
+  });
+}
+
+function txDone(tx) {
+  return new Promise((resolve, reject) => {
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error || new Error("IndexedDB transaction failed"));
+    tx.onabort = () => reject(tx.error || new Error("IndexedDB transaction aborted"));
+  });
+}
+
+async function putPlusStore(storeName, records) {
+  const db = await openPlusDB();
+  try {
+    const tx = db.transaction(storeName, "readwrite");
+    const store = tx.objectStore(storeName);
+    for (const rec of records) store.put(rec);
+    await txDone(tx);
+  } finally {
+    db.close();
+  }
+}
+
+async function getPlusStoreAll(storeName) {
+  const db = await openPlusDB();
+  try {
+    return await new Promise((resolve, reject) => {
+      const tx = db.transaction(storeName, "readonly");
+      const req = tx.objectStore(storeName).getAll();
+      req.onsuccess = () => resolve(req.result || []);
+      req.onerror = () => reject(req.error || new Error("IndexedDB read failed"));
+    });
+  } finally {
+    db.close();
+  }
+}
+
+async function clearPlusStore(storeName) {
+  const db = await openPlusDB();
+  try {
+    const tx = db.transaction(storeName, "readwrite");
+    tx.objectStore(storeName).clear();
+    await txDone(tx);
+  } finally {
+    db.close();
+  }
+}
+
+async function mirrorWorkspaceToPlusDB(payload) {
+  const now = new Date().toISOString();
+  const profiles = (payload.profiles || []).map(p => ({ ...p, updatedAt: p.updatedAt || now }));
+  const tabs = (payload.editorTabs || []).map((t, index) => ({ ...t, order: index, active: t.id === payload.activeEditorTabId, updatedAt: t.updatedAt || now }));
+  const snapshots = (payload.snapshots || []).map(s => ({ ...s, id: s.id || `snap-${s.ts || Date.now()}-${Math.random().toString(36).slice(2)}`, updatedAt: s.updatedAt || now }));
+  const journal = (payload.codeHistory || []).map((h, index) => ({ ...h, id: h.id || `journal-${index}-${Date.now()}`, type: "code-history", updatedAt: now }));
+  const meta = [{
+    id: "workspace",
+    version: STORAGE_SCHEMA_VERSION,
+    build: APP_BUILD_LABEL,
+    activeProfileId: payload.activeProfileId,
+    activeEditorTabId: payload.activeEditorTabId,
+    settings: payload.settings || {},
+    mirroredAt: now,
+    updatedAt: now,
+  }];
+
+  await putPlusStore("profiles", profiles);
+  await putPlusStore("tabs", tabs);
+  await putPlusStore("snapshots", snapshots);
+  await putPlusStore("journal", journal);
+  await putPlusStore("meta", meta);
+  return { profiles: profiles.length, tabs: tabs.length, snapshots: snapshots.length, journal: journal.length, meta: meta.length };
+}
+
+function getLocalStorageSummary() {
+  const rows = [];
+  let total = 0;
+  try {
+    for (let i = 0; i < localStorage.length; i++) {
+      const key = localStorage.key(i);
+      const value = localStorage.getItem(key);
+      const size = byteSizeOf(key) + byteSizeOf(value);
+      total += size;
+      rows.push({ key, size, valuePreview: String(value || "").slice(0, 180) });
+    }
+  } catch (e) {
+    return { ok: false, error: e.message || String(e), total: 0, rows: [] };
+  }
+  rows.sort((a, b) => b.size - a.size);
+  return { ok: true, total, rows };
+}
+
+async function getIndexedDBSummary() {
+  const stores = [];
+  let total = 0;
+  for (const storeName of PLUS_IDB_STORES) {
+    try {
+      const rows = await getPlusStoreAll(storeName);
+      const size = rows.reduce((sum, row) => sum + byteSizeOf(row), 0);
+      total += size;
+      stores.push({ storeName, count: rows.length, size, ok: true });
+    } catch (e) {
+      stores.push({ storeName, count: 0, size: 0, ok: false, error: e.message || String(e) });
+    }
+  }
+  return { ok: true, total, stores };
+}
+
+async function getCacheSummary() {
+  if (!window.caches) return { ok: false, total: 0, caches: [], error: "Cache API is not available" };
+  const names = await caches.keys();
+  const list = [];
+  let total = 0;
+  for (const name of names) {
+    const cache = await caches.open(name);
+    const reqs = await cache.keys();
+    let size = 0;
+    for (const req of reqs) {
+      try {
+        const res = await cache.match(req);
+        const clone = res?.clone();
+        const blob = clone ? await clone.blob() : null;
+        size += blob ? blob.size : 0;
+      } catch {}
+    }
+    total += size;
+    list.push({ name, count: reqs.length, size });
+  }
+  return { ok: true, total, caches: list };
+}
+
+async function cacheCoreDependencies() {
+  if (!window.caches) throw new Error("Cache API is not available");
+  const cache = await caches.open(PLUS_CACHE_NAME);
+  const urls = [
+    "https://unpkg.com/@babel/standalone/babel.min.js",
+    "https://fonts.googleapis.com/icon?family=Material+Icons",
+    "https://esm.sh/react@19.2.0",
+    "https://esm.sh/react-dom@19.2.0/client",
+    "https://esm.sh/@mui/material@7.3.5?deps=react@19.2.0,react-dom@19.2.0",
+    "https://esm.sh/codemirror@6.0.2",
+    "https://esm.sh/@codemirror/lang-html@6.4.10",
+    "https://esm.sh/@codemirror/lang-markdown@6.3.4",
+    "https://esm.sh/@codemirror/theme-one-dark@6.1.3",
+    "https://esm.sh/marked@18.0.3",
+    "https://esm.sh/dompurify@3.4.5",
+    "https://esm.sh/mermaid@11.15.0",
+  ];
+  const results = [];
+  for (const url of urls) {
+    try {
+      await cache.add(url);
+      results.push({ url, ok: true });
+    } catch (e) {
+      results.push({ url, ok: false, error: e.message || String(e) });
+    }
+  }
+  return results;
+}
+
+async function clearAllPlusCaches() {
+  if (!window.caches) return 0;
+  const names = await caches.keys();
+  let count = 0;
+  for (const name of names) {
+    if (name.startsWith("html-modal-tester") || name.startsWith("html-editor")) {
+      const ok = await caches.delete(name);
+      if (ok) count++;
+    }
+  }
+  return count;
+}
+
+async function getStorageEstimateSafe() {
+  try {
+    if (!navigator.storage?.estimate) return null;
+    return await navigator.storage.estimate();
+  } catch {
+    return null;
+  }
+}
+
+async function requestPersistentStorageSafe() {
+  try {
+    if (!navigator.storage?.persist) return false;
+    return await navigator.storage.persist();
+  } catch {
+    return false;
+  }
+}
+
+function StorageManagerDialog({
+  open,
+  onClose,
+  profiles,
+  editorTabs,
+  snapshots,
+  codeHistory,
+  activeProfileId,
+  activeEditorTabId,
+  settings,
+  onExportAll,
+  onToast,
+}) {
+  const [tab, setTab] = useState("overview");
+  const [loading, setLoading] = useState(false);
+  const [summary, setSummary] = useState(null);
+  const [log, setLog] = useState("");
+
+  const refresh = useCallback(async () => {
+    if (!open) return;
+    setLoading(true);
+    try {
+      const [estimate, ls, idb, cache] = await Promise.all([
+        getStorageEstimateSafe(),
+        Promise.resolve(getLocalStorageSummary()),
+        getIndexedDBSummary().catch(e => ({ ok: false, total: 0, stores: [], error: e.message || String(e) })),
+        getCacheSummary().catch(e => ({ ok: false, total: 0, caches: [], error: e.message || String(e) })),
+      ]);
+      setSummary({ estimate, localStorage: ls, indexedDB: idb, cache });
+    } finally {
+      setLoading(false);
+    }
+  }, [open]);
+
+  useEffect(() => { refresh(); }, [refresh]);
+
+  const mirrorNow = useCallback(async () => {
+    setLoading(true);
+    try {
+      const res = await mirrorWorkspaceToPlusDB({ profiles, editorTabs, snapshots, codeHistory, activeProfileId, activeEditorTabId, settings });
+      setLog(`IndexedDBへミラー保存しました: profiles ${res.profiles}, tabs ${res.tabs}, snapshots ${res.snapshots}, journal ${res.journal}`);
+      onToast?.("IndexedDBへミラー保存しました");
+      await refresh();
+    } catch (e) {
+      setLog(`ミラー保存失敗: ${e.message || e}`);
+      onToast?.("IndexedDB保存に失敗しました");
+    } finally {
+      setLoading(false);
+    }
+  }, [profiles, editorTabs, snapshots, codeHistory, activeProfileId, activeEditorTabId, settings, refresh, onToast]);
+
+  const cacheDeps = useCallback(async () => {
+    setLoading(true);
+    try {
+      const results = await cacheCoreDependencies();
+      const ok = results.filter(r => r.ok).length;
+      setLog(`依存CDNをCache APIへ保存: ${ok}/${results.length} 件成功`);
+      onToast?.("依存CDNのキャッシュ処理を実行しました");
+      await refresh();
+    } catch (e) {
+      setLog(`キャッシュ失敗: ${e.message || e}`);
+    } finally {
+      setLoading(false);
+    }
+  }, [refresh, onToast]);
+
+  const clearCaches = useCallback(async () => {
+    setLoading(true);
+    try {
+      const count = await clearAllPlusCaches();
+      setLog(`アプリ関連Cache APIを ${count} 件削除しました`);
+      onToast?.("Cache APIを整理しました");
+      await refresh();
+    } finally {
+      setLoading(false);
+    }
+  }, [refresh, onToast]);
+
+  const persist = useCallback(async () => {
+    const ok = await requestPersistentStorageSafe();
+    setLog(ok ? "Persistent Storageが許可されました" : "Persistent Storageは未許可または未対応です");
+    onToast?.(ok ? "永続ストレージが許可されました" : "永続ストレージは許可されませんでした");
+    await refresh();
+  }, [refresh, onToast]);
+
+  const cleanupAutoSnapshots = useCallback(async () => {
+    try {
+      const rows = await getPlusStoreAll("snapshots");
+      const manual = rows.filter(s => !s.isAuto);
+      await clearPlusStore("snapshots");
+      await putPlusStore("snapshots", manual);
+      setLog(`IndexedDBミラー内のauto snapshotを削除しました: ${rows.length - manual.length} 件`);
+      await refresh();
+    } catch (e) {
+      setLog(`auto snapshot整理失敗: ${e.message || e}`);
+    }
+  }, [refresh]);
+
+  const usage = summary?.estimate?.usage || 0;
+  const quota = summary?.estimate?.quota || 0;
+  const ratio = quota ? Math.round((usage / quota) * 100) : 0;
+  const { LinearProgress, Tabs, Tab, Table, TableBody, TableCell, TableHead, TableRow, Chip } = MaterialUI;
+
+  return (
+    <Dialog open={open} onClose={onClose} maxWidth="lg" fullWidth PaperProps={{ sx: { borderRadius: 3, height: "82vh", display: "flex", flexDirection: "column" } }}>
+      <DialogTitle sx={{ py: 1.4, display: "flex", alignItems: "center", gap: 1 }}>
+        <Icon name="storage" size={20} />
+        <Typography variant="subtitle1" fontWeight={700} sx={{ flex: 1 }}>Storage / Cache Manager</Typography>
+        {loading && <Chip label="更新中" size="small" color="primary" />}
+      </DialogTitle>
+      <DialogContent sx={{ p: 0, display: "flex", flexDirection: "column", minHeight: 0 }}>
+        <Tabs value={tab} onChange={(_, v) => setTab(v)} variant="scrollable" scrollButtons="auto" sx={{ borderBottom: "1px solid #e5e7eb", px: 1 }}>
+          <Tab value="overview" label="Overview" />
+          <Tab value="idb" label="IndexedDB" />
+          <Tab value="local" label="localStorage" />
+          <Tab value="cache" label="Cache" />
+          <Tab value="cleanup" label="Cleanup" />
+        </Tabs>
+
+        <Box sx={{ p: 2, overflow: "auto", flex: 1 }}>
+          {tab === "overview" && (
+            <Stack spacing={1.5}>
+              <Typography variant="body2">ブラウザ保存領域: {formatBytes(usage)} / {quota ? formatBytes(quota) : "不明"} {quota ? `(${ratio}%)` : ""}</Typography>
+              <LinearProgress variant={quota ? "determinate" : "indeterminate"} value={Math.min(100, ratio)} />
+              <Stack direction="row" spacing={1} flexWrap="wrap">
+                <Button variant="contained" size="small" onClick={mirrorNow} startIcon={<Icon name="sync" size={16} />}>現在状態をIndexedDBへミラー</Button>
+                <Button variant="outlined" size="small" onClick={persist} startIcon={<Icon name="verified_user" size={16} />}>永続ストレージ要求</Button>
+                <Button variant="outlined" size="small" onClick={refresh} startIcon={<Icon name="refresh" size={16} />}>再計測</Button>
+                <Button variant="outlined" size="small" onClick={onExportAll} startIcon={<Icon name="download" size={16} />}>バックアップExport</Button>
+              </Stack>
+              <Typography variant="caption" color="text.secondary">localStorageは既存UI互換、IndexedDBはミラー/復旧/将来移行用として利用します。UIはv1.4を維持しています。</Typography>
+            </Stack>
+          )}
+
+          {tab === "idb" && (
+            <Table size="small">
+              <TableHead><TableRow><TableCell>Store</TableCell><TableCell align="right">件数</TableCell><TableCell align="right">推定サイズ</TableCell><TableCell>状態</TableCell></TableRow></TableHead>
+              <TableBody>
+                {(summary?.indexedDB?.stores || []).map(s => (
+                  <TableRow key={s.storeName}><TableCell>{s.storeName}</TableCell><TableCell align="right">{s.count}</TableCell><TableCell align="right">{formatBytes(s.size)}</TableCell><TableCell>{s.ok ? "OK" : s.error}</TableCell></TableRow>
+                ))}
+              </TableBody>
+            </Table>
+          )}
+
+          {tab === "local" && (
+            <Table size="small">
+              <TableHead><TableRow><TableCell>Key</TableCell><TableCell align="right">サイズ</TableCell><TableCell>Preview</TableCell></TableRow></TableHead>
+              <TableBody>
+                {(summary?.localStorage?.rows || []).map(row => (
+                  <TableRow key={row.key}><TableCell>{row.key}</TableCell><TableCell align="right">{formatBytes(row.size)}</TableCell><TableCell><Typography variant="caption" sx={{ wordBreak: "break-all" }}>{row.valuePreview}</Typography></TableCell></TableRow>
+                ))}
+              </TableBody>
+            </Table>
+          )}
+
+          {tab === "cache" && (
+            <Stack spacing={1.5}>
+              <Stack direction="row" spacing={1} flexWrap="wrap">
+                <Button variant="contained" size="small" onClick={cacheDeps} startIcon={<Icon name="cloud_download" size={16} />}>依存CDNをCache APIへ保存</Button>
+                <Button variant="outlined" color="error" size="small" onClick={clearCaches} startIcon={<Icon name="delete_sweep" size={16} />}>アプリ関連Cache削除</Button>
+              </Stack>
+              <Table size="small">
+                <TableHead><TableRow><TableCell>Cache</TableCell><TableCell align="right">件数</TableCell><TableCell align="right">推定サイズ</TableCell></TableRow></TableHead>
+                <TableBody>
+                  {(summary?.cache?.caches || []).map(c => (
+                    <TableRow key={c.name}><TableCell>{c.name}</TableCell><TableCell align="right">{c.count}</TableCell><TableCell align="right">{formatBytes(c.size)}</TableCell></TableRow>
+                  ))}
+                </TableBody>
+              </Table>
+            </Stack>
+          )}
+
+          {tab === "cleanup" && (
+            <Stack spacing={1.5}>
+              <Button variant="outlined" color="warning" onClick={cleanupAutoSnapshots} startIcon={<Icon name="auto_delete" size={16} />}>IndexedDBミラー内のauto snapshotを削除</Button>
+              <Button variant="outlined" color="error" onClick={clearCaches} startIcon={<Icon name="delete_sweep" size={16} />}>アプリ関連Cacheを削除</Button>
+              <Typography variant="caption" color="text.secondary">手動snapshotと現在のlocalStorageプロファイルは削除しません。危険操作はこの版では明示的な完全初期化にしていません。</Typography>
+            </Stack>
+          )}
+        </Box>
+
+        {log && <Box sx={{ px: 2, py: 1, borderTop: "1px solid #e5e7eb", background: "#f8fafc" }}><Typography variant="caption" sx={{ whiteSpace: "pre-wrap" }}>{log}</Typography></Box>}
+      </DialogContent>
+      <DialogActions sx={{ px: 2, py: 1 }}>
+        <Button onClick={onClose} variant="contained">閉じる</Button>
+      </DialogActions>
+    </Dialog>
+  );
+}
+
+function CommandPaletteDialog({ open, onClose, commands }) {
+  const [query, setQuery] = useState("");
+  useEffect(() => { if (open) setQuery(""); }, [open]);
+  const q = query.trim().toLowerCase();
+  const filtered = (commands || []).filter(c => !q || c.label.toLowerCase().includes(q) || String(c.group || "").toLowerCase().includes(q)).slice(0, 40);
+
+  const run = (cmd) => {
+    onClose();
+    setTimeout(() => cmd.run?.(), 0);
+  };
+
+  return (
+    <Dialog open={open} onClose={onClose} maxWidth="sm" fullWidth PaperProps={{ sx: { borderRadius: 3, overflow: "hidden" } }}>
+      <Box sx={{ p: 1.2, borderBottom: "1px solid #e5e7eb", display: "flex", alignItems: "center", gap: 1 }}>
+        <Icon name="manage_search" size={20} />
+        <MaterialUI.TextField autoFocus fullWidth size="small" placeholder="コマンドを検索... 例: 保存 / 履歴 / storage / preview" value={query} onChange={e => setQuery(e.target.value)} />
+      </Box>
+      <DialogContent sx={{ p: 0, maxHeight: 420 }}>
+        {filtered.map((cmd, i) => (
+          <Box key={`${cmd.label}-${i}`} onClick={() => run(cmd)} sx={{ px: 2, py: 1.1, borderBottom: "1px solid #f1f5f9", display: "flex", alignItems: "center", gap: 1, cursor: "pointer", "&:hover": { background: "#f8fafc" } }}>
+            <Icon name={cmd.icon || "bolt"} size={18} style={{ color: "#1976d2" }} />
+            <Box sx={{ minWidth: 0, flex: 1 }}>
+              <Typography variant="body2" fontWeight={700}>{cmd.label}</Typography>
+              {cmd.group && <Typography variant="caption" color="text.secondary">{cmd.group}</Typography>}
+            </Box>
+          </Box>
+        ))}
+        {filtered.length === 0 && <Box sx={{ p: 3, textAlign: "center", color: "#94a3b8" }}>該当コマンドなし</Box>}
+      </DialogContent>
+    </Dialog>
+  );
+}
+
+function InlineConsoleView({ logs, onClear, darkMode = false }) {
+  const cBg = darkMode ? "#11111b" : "#fafafa";
+  const emptyFg = darkMode ? "#6c7086" : "#aaa";
+  return (
+    <Box sx={{ height: "100%", display: "flex", flexDirection: "column", background: cBg, overflow: "hidden" }}>
+      <Box sx={{ px: 1.5, py: 1, display: "flex", alignItems: "center", gap: 1, borderBottom: `1px solid ${darkMode ? "#313244" : "#e0e0e0"}` }}>
+        <Icon name="terminal" size={17} style={{ color: darkMode ? "#cdd6f4" : "#555" }} />
+        <Typography variant="caption" fontWeight={700} sx={{ flex: 1, color: darkMode ? "#cdd6f4" : "#333" }}>Console</Typography>
+        <Typography variant="caption" sx={{ color: darkMode ? "#a6adc8" : "#777" }}>{logs.length} 件</Typography>
+        <Button size="small" variant="outlined" color="error" disabled={logs.length === 0} onClick={onClear} sx={{ py: 0.2, fontSize: 11 }}>Clear</Button>
+      </Box>
+      <Box sx={{ flex: 1, overflow: "auto", fontFamily: "ui-monospace,SFMono-Regular,Menlo,Consolas,monospace", fontSize: 12 }}>
+        {logs.length === 0 ? (
+          <Box sx={{ height: "100%", display: "grid", placeItems: "center", color: emptyFg }}>ログはありません</Box>
+        ) : logs.map((log, i) => {
+          const c = LOG_COLORS[log.level] || LOG_COLORS.log;
+          return (
+            <Box key={i} sx={{ display: "flex", alignItems: "flex-start", gap: 1, px: 1.5, py: 0.65, background: c.bg, borderBottom: "1px solid rgba(0,0,0,0.04)" }}>
+              <Icon name={c.icon} size={14} style={{ color: c.ic, flexShrink: 0, marginTop: 1 }} />
+              <Typography variant="caption" sx={{ color: "#aaa", flexShrink: 0, lineHeight: 1.6, fontFamily: "inherit", fontSize: 11 }}>{new Date(log.ts).toLocaleTimeString()}</Typography>
+              <Typography component="pre" sx={{ m: 0, color: c.fg, lineHeight: 1.6, fontFamily: "inherit", fontSize: 12, whiteSpace: "pre-wrap", wordBreak: "break-all", flex: 1 }}>{log.msg}</Typography>
+            </Box>
+          );
+        })}
+      </Box>
+    </Box>
+  );
+}
+
+function HistoryNavigator({
+  codeHistory,
+  codeHistoryIndex,
+  onUndo,
+  onRedo,
+  onRestoreHistory,
+  snapshots,
+  onRestoreSnapshot,
+  onTakeSnapshot,
+  logs,
+  activeTab,
+  activeMode,
+  canUndo,
+  canRedo,
+  darkMode = false,
+}) {
+  const { Chip, List, ListItemButton, ListItemText } = MaterialUI;
+  const border = darkMode ? "#313244" : "#e0e3e8";
+  const bg = darkMode ? "#181825" : "#fff";
+  const muted = darkMode ? "#a6adc8" : "#777";
+  const recentSnapshots = snapshots.slice(0, 8);
+  const recentHistory = codeHistory.slice(Math.max(0, codeHistory.length - 12)).reverse();
+
+  return (
+    <Box sx={{ height: "100%", display: "flex", flexDirection: "column", background: bg, color: darkMode ? "#cdd6f4" : "#1a1a2e", overflow: "hidden" }}>
+      <Box sx={{ p: 1.5, borderBottom: `1px solid ${border}`, display: "flex", flexDirection: "column", gap: 1 }}>
+        <Box sx={{ display: "flex", alignItems: "center", gap: 1 }}>
+          <Icon name="manage_history" size={18} style={{ color: "#1976d2" }} />
+          <Typography variant="subtitle2" fontWeight={800} sx={{ flex: 1 }}>History Navigator</Typography>
+          <Chip size="small" label={activeMode === EDITOR_MODES.MARKDOWN ? "MD" : "HTML"} sx={{ height: 20, fontSize: 10 }} />
+        </Box>
+        <Typography variant="caption" sx={{ color: muted }} noWrap>
+          {activeTab?.name || "untitled"} · {Number(activeTab?.code?.length || 0).toLocaleString()} chars
+        </Typography>
+        <Stack direction="row" spacing={1}>
+          <Button size="small" fullWidth variant="contained" disabled={!canUndo} startIcon={<Icon name="undo" size={15} />} onClick={onUndo}>Undo</Button>
+          <Button size="small" fullWidth variant="contained" disabled={!canRedo} startIcon={<Icon name="redo" size={15} />} onClick={onRedo}>Redo</Button>
+        </Stack>
+        <Button size="small" variant="outlined" startIcon={<Icon name="photo_camera" size={15} />} onClick={onTakeSnapshot}>Snapshot作成</Button>
+      </Box>
+
+      <Box sx={{ flex: 1, overflow: "auto" }}>
+        <Box sx={{ p: 1.5, borderBottom: `1px solid ${border}` }}>
+          <Typography variant="caption" fontWeight={800} sx={{ color: muted, display: "block", mb: 0.75 }}>コード履歴</Typography>
+          {recentHistory.length === 0 ? (
+            <Typography variant="caption" sx={{ color: muted }}>履歴はまだありません</Typography>
+          ) : (
+            <List dense disablePadding>
+              {recentHistory.map((h) => {
+                const idx = codeHistory.findIndex(x => x.id === h.id);
+                const selected = idx === codeHistoryIndex;
+                return (
+                  <ListItemButton key={h.id} selected={selected} onClick={() => onRestoreHistory(idx)} sx={{ borderRadius: 1, py: 0.45 }}>
+                    <ListItemText
+                      primary={<Typography variant="caption" noWrap fontWeight={selected ? 800 : 500}>{h.label}</Typography>}
+                      secondary={<Typography variant="caption" sx={{ color: muted }}>{new Date(h.ts).toLocaleTimeString("ja-JP")} · {h.code.length.toLocaleString()} chars</Typography>}
+                    />
+                  </ListItemButton>
+                );
+              })}
+            </List>
+          )}
+        </Box>
+
+        <Box sx={{ p: 1.5, borderBottom: `1px solid ${border}` }}>
+          <Typography variant="caption" fontWeight={800} sx={{ color: muted, display: "block", mb: 0.75 }}>Snapshots</Typography>
+          {recentSnapshots.length === 0 ? (
+            <Typography variant="caption" sx={{ color: muted }}>スナップショットはありません</Typography>
+          ) : (
+            <List dense disablePadding>
+              {recentSnapshots.map((s) => (
+                <ListItemButton key={s.id} onClick={() => onRestoreSnapshot(s.code)} sx={{ borderRadius: 1, py: 0.45 }}>
+                  <ListItemText
+                    primary={<Typography variant="caption" noWrap fontWeight={s.isLastGood ? 800 : 500}>{s.isLastGood ? "✓ " : ""}{s.label}</Typography>}
+                    secondary={<Typography variant="caption" sx={{ color: muted }}>{new Date(s.ts).toLocaleString("ja-JP")} · {s.code.length.toLocaleString()} chars</Typography>}
+                  />
+                </ListItemButton>
+              ))}
+            </List>
+          )}
+        </Box>
+
+        <Box sx={{ p: 1.5 }}>
+          <Typography variant="caption" fontWeight={800} sx={{ color: muted, display: "block", mb: 0.75 }}>Recent Logs</Typography>
+          {logs.slice(-5).reverse().map((l, i) => (
+            <Box key={i} sx={{ display: "flex", gap: 0.75, alignItems: "flex-start", py: 0.35 }}>
+              <Icon name={(LOG_COLORS[l.level] || LOG_COLORS.log).icon} size={13} style={{ color: (LOG_COLORS[l.level] || LOG_COLORS.log).ic, flexShrink: 0, marginTop: 2 }} />
+              <Typography variant="caption" sx={{ color: darkMode ? "#cdd6f4" : "#333", wordBreak: "break-all" }}>{l.msg}</Typography>
+            </Box>
+          ))}
+          {logs.length === 0 && <Typography variant="caption" sx={{ color: muted }}>ログはありません</Typography>}
+        </Box>
+      </Box>
+    </Box>
+  );
+}
+
+function HistoryDialog({ open, onClose, children }) {
+  return (
+    <Dialog open={open} onClose={onClose} maxWidth="md" fullWidth PaperProps={{ sx: { borderRadius: 3, height: "78vh", overflow: "hidden" } }}>
+      <DialogTitle sx={{ py: 1.4, display: "flex", alignItems: "center", gap: 1 }}>
+        <Icon name="manage_history" size={19} />
+        <Typography variant="subtitle1" fontWeight={800} sx={{ flex: 1 }}>History</Typography>
+        <IconButton size="small" onClick={onClose}><Icon name="close" size={17} /></IconButton>
+      </DialogTitle>
+      <DialogContent sx={{ p: 0, overflow: "hidden" }}>{children}</DialogContent>
+    </Dialog>
+  );
+}
+
 function App() {
   const isWide = useMediaQuery(theme.breakpoints.up("md"));
   const isMobile = useMediaQuery(theme.breakpoints.down("sm"));
@@ -1798,10 +2390,17 @@ function App() {
   const [consoleOpen, setConsoleOpen] = useState(false);
   const [snapshots, setSnapshots] = useState([]);
   const [snapshotOpen, setSnapshotOpen] = useState(false);
+  const [historyOpen, setHistoryOpen] = useState(false);
+  const [storageManagerOpen, setStorageManagerOpen] = useState(false);
+  const [commandPaletteOpen, setCommandPaletteOpen] = useState(false);
+  const [mobileView, setMobileView] = useState("editor");
   const [patchOpen, setPatchOpen] = useState(false);
   const [qualityState, qualityDispatch] = useReducer(qualityReducer, { open: false, results: [] });
   const lastGoodCodeRef = useRef(null);
   const consoleLogsRef = useRef([]);
+  const historyMuteRef = useRef(false);
+  const [codeHistory, setCodeHistory] = useState(() => [{ id: `hist-${Date.now()}-0`, code: html, label: "初期状態", ts: Date.now(), tabId: activeEditorTabId }]);
+  const [codeHistoryIndex, setCodeHistoryIndex] = useState(0);
   const [wins, setWins] = useState(() => activeProfile?.data?.windows ?? []);
 
   const lineCountForPerf = useMemo(() => html.split("\n").length, [html]);
@@ -1822,6 +2421,36 @@ function App() {
   useEffect(() => { setRatioRef.current = setRatio; }, [setRatio]);
   useEffect(() => { consoleLogsRef.current = consoleLogs; }, [consoleLogs]);
 
+  useEffect(() => {
+    historyMuteRef.current = true;
+    const entry = { id: `hist-${Date.now()}-${Math.random().toString(36).slice(2,6)}`, code: html, label: "タブ切替", ts: Date.now(), tabId: activeEditorTabId };
+    setCodeHistory([entry]);
+    setCodeHistoryIndex(0);
+    const t = setTimeout(() => { historyMuteRef.current = false; }, 0);
+    return () => clearTimeout(t);
+  }, [activeEditorTabId]);
+
+  useEffect(() => {
+    if (historyMuteRef.current) return;
+    const timer = setTimeout(() => {
+      setCodeHistory(prev => {
+        const current = prev[codeHistoryIndex];
+        if (current?.code === html) return prev;
+        const base = prev.slice(0, codeHistoryIndex + 1);
+        const next = [...base, {
+          id: `hist-${Date.now()}-${Math.random().toString(36).slice(2,6)}`,
+          code: html,
+          label: `編集 ${new Date().toLocaleTimeString("ja-JP")}`,
+          ts: Date.now(),
+          tabId: activeEditorTabId,
+        }].slice(-MAX_CODE_HISTORY);
+        setCodeHistoryIndex(next.length - 1);
+        return next;
+      });
+    }, 900);
+    return () => clearTimeout(timer);
+  }, [html, activeEditorTabId, codeHistoryIndex]);
+
   const toast = (msg) => setSnackbar({ open: true, msg });
 
   const getSyncedEditorTabs = useCallback(() => {
@@ -1837,6 +2466,29 @@ function App() {
       return value;
     });
   }, [activeEditorTabId]);
+
+  const canUndoCode = codeHistoryIndex > 0;
+  const canRedoCode = codeHistoryIndex < codeHistory.length - 1;
+
+  const restoreCodeHistory = useCallback((index) => {
+    const entry = codeHistory[index];
+    if (!entry) return;
+    historyMuteRef.current = true;
+    setCodeHistoryIndex(index);
+    setHtml(entry.code);
+    setTimeout(() => { historyMuteRef.current = false; }, 0);
+    toast("履歴から復元しました");
+  }, [codeHistory, setHtml]);
+
+  const undoCode = useCallback(() => {
+    if (!canUndoCode) return;
+    restoreCodeHistory(codeHistoryIndex - 1);
+  }, [canUndoCode, codeHistoryIndex, restoreCodeHistory]);
+
+  const redoCode = useCallback(() => {
+    if (!canRedoCode) return;
+    restoreCodeHistory(codeHistoryIndex + 1);
+  }, [canRedoCode, codeHistoryIndex, restoreCodeHistory]);
 
   const switchEditorTab = useCallback((id) => {
     if (id === activeEditorTabId) return;
@@ -2276,18 +2928,44 @@ function App() {
   useEffect(() => {
     const fn = (e) => {
       if (!(e.ctrlKey || e.metaKey)) return;
-      if (e.key === "Enter") { e.preventDefault(); reload(); }
-      if (e.key === "s") { e.preventDefault(); download(); }
+      const key = String(e.key || "").toLowerCase();
+      if (key === "enter") { e.preventDefault(); reload(); }
+      if (key === "s") { e.preventDefault(); download(); }
+      if (key === "z" && !e.shiftKey) { e.preventDefault(); undoCode(); }
+      if (key === "y" || (key === "z" && e.shiftKey)) { e.preventDefault(); redoCode(); }
+      if (key === "h" && e.shiftKey) { e.preventDefault(); setHistoryOpen(true); }
+      if (key === "k") { e.preventDefault(); setCommandPaletteOpen(true); }
+      if (key === "s" && e.shiftKey) { e.preventDefault(); setStorageManagerOpen(true); }
     };
     window.addEventListener("keydown", fn);
     return () => window.removeEventListener("keydown", fn);
-  }, [reload, download]);
+  }, [reload, download, undoCode, redoCode]);
+
+
+  const commandItems = useMemo(() => [
+    { label: "サンプル投入", group: "編集", icon: "article", run: sample },
+    { label: "コピー", group: "編集", icon: "content_copy", run: copy },
+    { label: "ダウンロード / Export current tab", group: "保存", icon: "download", run: download },
+    { label: "プレビュー再読み込み", group: "Preview", icon: "refresh", run: reload },
+    { label: "取り消し Undo", group: "履歴", icon: "undo", run: undoCode },
+    { label: "やり直し Redo", group: "履歴", icon: "redo", run: redoCode },
+    { label: "履歴ナビゲータを開く", group: "履歴", icon: "manage_history", run: () => setHistoryOpen(true) },
+    { label: "Storage / Cache Managerを開く", group: "Storage", icon: "storage", run: () => setStorageManagerOpen(true) },
+    { label: "診断パネルを開く", group: "Diagnostics", icon: "health_and_safety", run: openDiagnostics },
+    { label: "差分パッチを適用", group: "編集", icon: "difference", run: () => setPatchOpen(true) },
+    { label: "スナップショットを保存", group: "Recovery", icon: "photo_camera", run: takeSnapshot },
+    { label: "ブラウザウィンドウを追加", group: "Browser", icon: "add_circle_outline", run: addWin },
+  ], [sample, copy, download, reload, undoCode, redoCode, openDiagnostics, takeSnapshot, addWin]);
 
   const showEditor = fullscreen !== "preview";
   const showPreview = fullscreen !== "editor";
-  const showHandle = fullscreen === "none" && showEditor && showPreview;
-  const editorSize = fullscreen === "editor" ? "100%" : fullscreen === "preview" ? "0%" : `${ratio * 100}%`;
-  const previewSize = fullscreen === "preview" ? "100%" : fullscreen === "editor" ? "0%" : `${(1 - ratio) * 100}%`;
+  const showEditorPane = isMobile ? (fullscreen === "editor" || (fullscreen === "none" && mobileView === "editor")) : showEditor;
+  const showPreviewPane = isMobile ? (fullscreen === "preview" || (fullscreen === "none" && mobileView === "preview")) : showPreview;
+  const showHistoryPane = isMobile && fullscreen === "none" && mobileView === "history";
+  const showConsolePane = isMobile && fullscreen === "none" && mobileView === "console";
+  const showHandle = !isMobile && fullscreen === "none" && showEditor && showPreview;
+  const editorSize = isMobile ? "100%" : fullscreen === "editor" ? "100%" : fullscreen === "preview" ? "0%" : `${ratio * 100}%`;
+  const previewSize = isMobile ? "100%" : fullscreen === "preview" ? "100%" : fullscreen === "editor" ? "0%" : `${(1 - ratio) * 100}%`;
   const sizeKey = isWide ? "width" : "height";
 
   return (
@@ -2297,15 +2975,20 @@ function App() {
       <Box sx={{ display: "flex", flexDirection: "column", height: "100vh", overflow: "hidden" }}>
         <AppBar position="static" elevation={0} sx={{ background: "#1565c0", flexShrink: 0, minHeight: TOOLBAR_H }}>
           <Toolbar variant="dense" sx={{ gap: 0.5, minHeight: TOOLBAR_H, px: { xs: 1, sm: 2 } }}>
-            <Typography variant="subtitle1" fontWeight={700} noWrap sx={{ mr: 1.5, fontSize: { xs: 13, sm: 15 } }}>HTML Tester</Typography>
+            <Typography variant="subtitle1" fontWeight={700} noWrap sx={{ mr: 1.5, fontSize: { xs: 13, sm: 15 } }}>{APP_BUILD_LABEL}</Typography>
             <Divider orientation="vertical" flexItem sx={{ borderColor: "rgba(255,255,255,0.2)", mx: 0.5 }} />
             <Tooltip title="サンプル投入" arrow><IconButton size="small" onClick={sample} sx={{ color: "#fff" }}><Icon name="article" size={19} /></IconButton></Tooltip>
             <Tooltip title="コピー" arrow><IconButton size="small" onClick={copy} sx={{ color: "#fff" }}><Icon name="content_copy" size={19} /></IconButton></Tooltip>
             <Tooltip title={isMobile ? "ダウンロード" : "HTMLとして保存 (Ctrl+S)"} arrow><IconButton size="small" onClick={download} sx={{ color: "#fff" }}><Icon name="download" size={19} /></IconButton></Tooltip>
             <Tooltip title="プレビュー再読み込み (Ctrl+Enter)" arrow><IconButton size="small" onClick={reload} sx={{ color: "#fff" }}><Icon name="refresh" size={19} /></IconButton></Tooltip>
+            <Tooltip title="取り消し (Ctrl+Z)" arrow><span><IconButton size="small" onClick={undoCode} disabled={!canUndoCode} sx={{ color: canUndoCode ? "#fff" : "rgba(255,255,255,0.35)" }}><Icon name="undo" size={19} /></IconButton></span></Tooltip>
+            <Tooltip title="やり直し (Ctrl+Y / Ctrl+Shift+Z)" arrow><span><IconButton size="small" onClick={redoCode} disabled={!canRedoCode} sx={{ color: canRedoCode ? "#fff" : "rgba(255,255,255,0.35)" }}><Icon name="redo" size={19} /></IconButton></span></Tooltip>
+            <Tooltip title="履歴ナビゲータ (Ctrl+Shift+H)" arrow><IconButton size="small" onClick={() => setHistoryOpen(true)} sx={{ color: "#fff" }}><Icon name="manage_history" size={19} /></IconButton></Tooltip>
             <Tooltip title="クリア" arrow><IconButton size="small" onClick={() => setConfirmClear(true)} sx={{ color: "#ffb3b3" }}><Icon name="delete_outline" size={19} /></IconButton></Tooltip>
             <Tooltip title="差分パッチを適用" arrow><IconButton size="small" onClick={() => setPatchOpen(true)} sx={{ color: "#fff" }}><Icon name="difference" size={19} /></IconButton></Tooltip>
             <Tooltip title="診断パネル" arrow><IconButton size="small" onClick={openDiagnostics} sx={{ color: "#fff" }}><Icon name="health_and_safety" size={19} /></IconButton></Tooltip>
+            <Tooltip title="Storage / Cache Manager (Ctrl+Shift+S)" arrow><IconButton size="small" onClick={() => setStorageManagerOpen(true)} sx={{ color: "#fff" }}><Icon name="storage" size={19} /></IconButton></Tooltip>
+            <Tooltip title="Command Palette (Ctrl+K)" arrow><IconButton size="small" onClick={() => setCommandPaletteOpen(true)} sx={{ color: "#fff" }}><Icon name="manage_search" size={19} /></IconButton></Tooltip>
             <Divider orientation="vertical" flexItem sx={{ borderColor: "rgba(255,255,255,0.2)", mx: 0.5 }} />
             <Tooltip title="ブラウザウィンドウを追加" arrow><IconButton size="small" onClick={addWin} sx={{ color: "#a5d6ff" }}><Icon name="add_circle_outline" size={19} /></IconButton></Tooltip>
             {wins.map(w => {
@@ -2344,10 +3027,28 @@ function App() {
           </Toolbar>
         </AppBar>
 
+        {isMobile && (
+          <Box sx={{ flexShrink: 0, background: appDarkMode ? "#111827" : "#fff", borderBottom: `1px solid ${appDarkMode ? "#243044" : "#dde3ec"}` }}>
+            <MaterialUI.Tabs
+              value={mobileView}
+              onChange={(_, v) => setMobileView(v)}
+              variant="fullWidth"
+              textColor="primary"
+              indicatorColor="primary"
+              sx={{ minHeight: 42, "& .MuiTab-root": { minHeight: 42, py: 0.5, fontSize: 11 } }}
+            >
+              <MaterialUI.Tab value="editor" icon={<Icon name="code" size={17} />} iconPosition="start" label="編集" />
+              <MaterialUI.Tab value="preview" icon={<Icon name="visibility" size={17} />} iconPosition="start" label="Preview" />
+              <MaterialUI.Tab value="history" icon={<Icon name="manage_history" size={17} />} iconPosition="start" label="履歴" />
+              <MaterialUI.Tab value="console" icon={<Icon name="terminal" size={17} />} iconPosition="start" label="Log" />
+            </MaterialUI.Tabs>
+          </Box>
+        )}
+
         <Box ref={containerRef} sx={{ flex: 1, display: "flex", flexDirection: isWide ? "row" : "column", overflow: "hidden", background: "#b0b8c4", position: "relative", cursor: dragging ? (isWide ? "col-resize" : "row-resize") : "default" }}>
           {dragging && <Box sx={{ position: "absolute", inset: 0, zIndex: 100, cursor: isWide ? "col-resize" : "row-resize" }} {...handleProps} />}
 
-          {showEditor && (
+          {showEditorPane && (
             <Box sx={{ [sizeKey]: editorSize, flexShrink: 0, display: "flex", flexDirection: "column", overflow: "hidden", background: darkMode ? "#1e1e2e" : "#fff", minWidth: 0, minHeight: 0 }}>
               <PaneHeader title="コード" fullscreen={fullscreen === "editor"} onToggleFullscreen={() => toggleFullscreen("editor")} darkMode={darkMode}>
                 <Tooltip title={highlightMode === "prism" ? "プレーンモードに切り替え" : "シンタックスハイライト (CodeMirror)"} arrow><IconButton size="small" onClick={() => setHighlightMode(m => m === "prism" ? "plain" : "prism")} sx={{ p: 0.4, color: highlightMode === "prism" ? "#f59e0b" : (darkMode ? "rgba(205,214,244,0.4)" : "#bbb") }}><Icon name="format_color_text" size={16} /></IconButton></Tooltip>
@@ -2394,7 +3095,7 @@ function App() {
 
           {showHandle && <SplitHandle isHorizontal={isWide} handleProps={handleProps} dragging={dragging} />}
 
-          {showPreview && (
+          {showPreviewPane && (
             <Box sx={{ [sizeKey]: previewSize, flexShrink: 0, display: "flex", flexDirection: "column", overflow: "hidden", background: previewDarkMode ? "#1e1e2e" : "#fff", minWidth: 0, minHeight: 0 }}>
               <PaneHeader title="プレビュー" fullscreen={fullscreen === "preview"} onToggleFullscreen={() => toggleFullscreen("preview")}>
                 <Tooltip title={previewDarkMode ? "プレビュー: ライトモード" : "プレビュー: ダークモード"} arrow><IconButton size="small" onClick={() => setPreviewDarkMode(d => !d)} sx={{ p: 0.4, color: previewDarkMode ? "#ffd700" : "#aaa" }}><Icon name={previewDarkMode ? "light_mode" : "dark_mode"} size={16} /></IconButton></Tooltip>
@@ -2419,8 +3120,75 @@ function App() {
               <PreviewFrame srcDoc={srcDoc} previewKey={previewKey} width={isMobile ? "100%" : previewWidth} scale={previewScale} darkMode={previewDarkMode} />
             </Box>
           )}
+
+          {showHistoryPane && (
+            <Box sx={{ flex: 1, minHeight: 0, overflow: "hidden" }}>
+              <HistoryNavigator
+                codeHistory={codeHistory}
+                codeHistoryIndex={codeHistoryIndex}
+                onUndo={undoCode}
+                onRedo={redoCode}
+                onRestoreHistory={restoreCodeHistory}
+                snapshots={snapshots}
+                onRestoreSnapshot={restoreSnapshot}
+                onTakeSnapshot={takeSnapshot}
+                logs={consoleLogs}
+                activeTab={activeEditorTab}
+                activeMode={activeEditorMode}
+                canUndo={canUndoCode}
+                canRedo={canRedoCode}
+                darkMode={appDarkMode}
+              />
+            </Box>
+          )}
+
+          {showConsolePane && (
+            <Box sx={{ flex: 1, minHeight: 0, overflow: "hidden" }}>
+              <InlineConsoleView logs={consoleLogs} onClear={() => setConsoleLogs([])} darkMode={appDarkMode} />
+            </Box>
+          )}
         </Box>
       </Box>
+
+
+      <HistoryDialog open={historyOpen} onClose={() => setHistoryOpen(false)}>
+        <HistoryNavigator
+          codeHistory={codeHistory}
+          codeHistoryIndex={codeHistoryIndex}
+          onUndo={undoCode}
+          onRedo={redoCode}
+          onRestoreHistory={restoreCodeHistory}
+          snapshots={snapshots}
+          onRestoreSnapshot={restoreSnapshot}
+          onTakeSnapshot={takeSnapshot}
+          logs={consoleLogs}
+          activeTab={activeEditorTab}
+          activeMode={activeEditorMode}
+          canUndo={canUndoCode}
+          canRedo={canRedoCode}
+          darkMode={appDarkMode}
+        />
+      </HistoryDialog>
+
+      <StorageManagerDialog
+        open={storageManagerOpen}
+        onClose={() => setStorageManagerOpen(false)}
+        profiles={profiles}
+        editorTabs={getSyncedEditorTabs()}
+        snapshots={snapshots}
+        codeHistory={codeHistory}
+        activeProfileId={activeProfileId}
+        activeEditorTabId={activeEditorTabId}
+        settings={{ fontSize, darkMode, wordWrap, highlightMode, previewScale, previewWidth, splitRatio: ratio }}
+        onExportAll={handleProfileExportAll}
+        onToast={toast}
+      />
+
+      <CommandPaletteDialog
+        open={commandPaletteOpen}
+        onClose={() => setCommandPaletteOpen(false)}
+        commands={commandItems}
+      />
 
       <ConfirmDialog open={confirmClear} title="入力内容をクリア" message="テキストエリアの内容をすべて削除します。この操作は元に戻せません。" confirmLabel="クリアする" onConfirm={clearConfirm} onCancel={() => setConfirmClear(false)} />
       <ConfirmDialog open={confirmReset} title="初期設定に戻す" message="現在のプロファイルを初期設定に戻します。この操作は元に戻せません。" confirmLabel="初期化する" onConfirm={applyProfileReset} onCancel={() => setConfirmReset(false)} />
@@ -2545,7 +3313,7 @@ root.render(<React.StrictMode><App /></React.StrictMode>);
 
     const appCode = document.getElementById("app-code").textContent;
     const { code } = Babel.transform(appCode, { presets: ["react"] });
-    const runApp = new Function("React", "createRoot", "MaterialUI", "CONSOLE_INTERCEPT", code + "\n//# sourceURL=html-editor-full-stable-v1-3.jsx");
+    const runApp = new Function("React", "createRoot", "MaterialUI", "CONSOLE_INTERCEPT", code + "\n//# sourceURL=html-editor-full-stable-v1-4-responsive-history.jsx");
     runApp(React, createRoot, MaterialUI, CONSOLE_INTERCEPT);
   </script>
 </body>
