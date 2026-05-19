@@ -2047,7 +2047,7 @@ const DEFAULT_SUPPORT_AI_CONFIG = Object.freeze({
   enableAgents: true,
 
   // Browser-local runtime. Transformers.js is lazy-loaded only when AI is executed.
-  transformersCdnUrl: "https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.8.1/+esm",
+  transformersCdnUrl: "https://cdn.jsdelivr.net/npm/@huggingface/transformers@4/+esm",
   allowRemoteModels: true,
   allowLocalModels: true,
   // auto: use Cache API only when the current browsing context allows it.
@@ -2059,7 +2059,7 @@ const DEFAULT_SUPPORT_AI_CONFIG = Object.freeze({
   browserDevice: "auto", // auto | webgpu | wasm
 
   // Browser-local Text / Vision / ASR / TTS models.
-  browserTextModel: "LiquidAI/LFM2.5-350M-ONNX",
+  browserTextModel: "onnx-community/LFM2.5-350M-ONNX",
   browserTextTask: "text-generation",
   browserTextDtype: "q4",
   browserVisionModel: "LiquidAI/LFM2.5-VL-450M-ONNX",
@@ -2083,6 +2083,7 @@ const SUPPORT_AI_BROWSER_LOCAL = {
   moduleKey: "",
   modulePromise: null,
   pipelinePromises: new Map(),
+  logs: [],
   lastError: null,
   lastWarning: null,
   lastLoadedAt: null,
@@ -2091,11 +2092,68 @@ const SUPPORT_AI_BROWSER_LOCAL = {
   preparedAt: { runtime: null, text: null, vision: null, whisper: null, tts: null },
 };
 
+function supportAIAddInitLog(level, message, meta = {}) {
+  const entry = {
+    id: `ai-log-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+    ts: Date.now(),
+    level: ["info", "warn", "error", "success", "debug"].includes(level) ? level : "info",
+    message: String(message || ""),
+    meta: meta && typeof meta === "object" ? meta : {},
+  };
+  SUPPORT_AI_BROWSER_LOCAL.logs.push(entry);
+  SUPPORT_AI_BROWSER_LOCAL.logs = SUPPORT_AI_BROWSER_LOCAL.logs.slice(-400);
+  return entry;
+}
+
+function supportAIEmitInitLog(onLog, level, message, meta = {}) {
+  const entry = supportAIAddInitLog(level, message, meta);
+  if (typeof onLog === "function") {
+    try { onLog(entry); } catch {}
+  }
+  return entry;
+}
+
+function supportAIReadInitLogs(limit = 120) {
+  return SUPPORT_AI_BROWSER_LOCAL.logs.slice(-Math.max(1, limit));
+}
+
+function formatAIInitLogLine(entry) {
+  if (!entry || typeof entry !== "object") return String(entry ?? "");
+  const ts = entry.ts ? new Date(entry.ts) : new Date();
+  const time = Number.isFinite(ts.getTime())
+    ? ts.toLocaleTimeString("ja-JP", { hour: "2-digit", minute: "2-digit", second: "2-digit" })
+    : "--:--:--";
+  const level = String(entry.level || "info").toUpperCase();
+  const message = String(entry.message || "");
+  let metaText = "";
+  if (entry.meta && typeof entry.meta === "object" && Object.keys(entry.meta).length > 0) {
+    try {
+      metaText = ` ${JSON.stringify(entry.meta)}`;
+    } catch {
+      metaText = "";
+    }
+  }
+  return `[${time}] ${level} ${message}${metaText}`;
+}
+
+function supportAIClearInitLogs() {
+  SUPPORT_AI_BROWSER_LOCAL.logs = [];
+}
+
 function supportAIErrorMessage(error) {
   if (!error) return "Unknown error";
-  if (typeof error === "string") return error;
-  if (error.name === "AbortError") return "タイムアウトしました。モデルDL、Endpoint、CORS、モデル名を確認してください。";
-  return error.message || String(error);
+  const runtimeCodeHint = (value) => {
+    const s = String(value || "").trim();
+    return /^\d{5,}$/.test(s)
+      ? `ONNX/WebGPU Runtime error code ${s}。WebGPU実行またはモデルロードに失敗しました。AI設定でDeviceをWASMにするか、モデル名を確認してください。`
+      : s;
+  };
+  if (typeof error === "number" || typeof error === "bigint") return runtimeCodeHint(error);
+  if (typeof error === "string") return runtimeCodeHint(error);
+  if (error.name === "AbortError") return "タイムアウトしました。モデルDL、CORS、モデル名、端末メモリを確認してください。";
+  const message = runtimeCodeHint(error.message || error.reason || error.code || "");
+  if (message) return message;
+  try { return JSON.stringify(error); } catch { return String(error); }
 }
 
 function normalizeSupportAIProvider(value) {
@@ -2276,8 +2334,8 @@ function supportAIDisabledResult(feature, label) {
 
 function supportAIGetPreparedStatus(config) {
   const c = normalizeSupportAIConfig(config);
-  const device = supportAIResolveBrowserDevice(c);
-  SUPPORT_AI_BROWSER_LOCAL.activeDevice = device;
+  const resolvedDevice = supportAIResolveBrowserDevice(c);
+  const device = SUPPORT_AI_BROWSER_LOCAL.activeDevice || resolvedDevice;
   return {
     enabled: {
       localAI: Boolean(c.localAIEnabled),
@@ -2294,6 +2352,7 @@ function supportAIGetPreparedStatus(config) {
     device,
     webGPU: Boolean(typeof navigator !== "undefined" && navigator.gpu),
     loadedPipelines: SUPPORT_AI_BROWSER_LOCAL.pipelinePromises.size,
+    logs: supportAIReadInitLogs(50),
     lastError: SUPPORT_AI_BROWSER_LOCAL.lastError,
     lastWarning: SUPPORT_AI_BROWSER_LOCAL.lastWarning,
     cache: (() => {
@@ -2312,45 +2371,75 @@ function supportAIGetPreparedStatus(config) {
   };
 }
 
-async function supportAIPrepareBrowserLocalFeatures(features = [], rawConfig = DEFAULT_SUPPORT_AI_CONFIG) {
+async function supportAIPrepareBrowserLocalFeatures(features = [], rawConfig = DEFAULT_SUPPORT_AI_CONFIG, runtimeOptions = {}) {
   const config = normalizeSupportAIConfig(rawConfig);
-  if (!config.localAIEnabled) return { ok: false, error: "ローカルAIが無効です。", status: supportAIGetPreparedStatus(config) };
+  const onLog = runtimeOptions && typeof runtimeOptions.onLog === "function" ? runtimeOptions.onLog : null;
+  if (runtimeOptions.clearLogs) supportAIClearInitLogs();
+  if (!config.localAIEnabled) {
+    supportAIEmitInitLog(onLog, "warn", "ローカルAIが無効です。AI設定でローカルAI全体を有効化してください。");
+    return { ok: false, error: "ローカルAIが無効です。", status: supportAIGetPreparedStatus(config) };
+  }
   const selected = Array.from(new Set(features.filter(Boolean)));
   const results = [];
+  supportAIEmitInitLog(onLog, "info", `初期化開始: ${selected.length ? selected.join(", ") : "対象なし"}`);
   try {
-    await importSupportAITransformers(config);
+    supportAIEmitInitLog(onLog, "info", "Transformers.js Runtimeを読み込みます", { url: config.transformersCdnUrl });
+    await importSupportAITransformers(config, { onLog });
+    supportAIEmitInitLog(onLog, "success", "Runtime読込済み");
     const device = supportAIResolveBrowserDevice(config);
+    supportAIEmitInitLog(onLog, "info", `推論Device: ${device}`, { webGPU: Boolean(navigator?.gpu), requested: config.browserDevice });
+    const featureLabels = { text: "Text LLM", vision: "Vision画像理解", whisper: "Whisper ASR", tts: "TTS" };
     for (const feature of selected) {
       if (!supportAIFeatureEnabled(config, feature)) {
+        supportAIEmitInitLog(onLog, "warn", `${featureLabels[feature] || feature}: 無効のためスキップ`);
         results.push({ feature, ok: false, skipped: true, error: "disabled" });
         continue;
       }
+      let task = "";
+      let model = "";
+      let dtype = "";
       if (feature === "text") {
-        await supportAIGetBrowserPipeline(config.browserTextTask || "text-generation", config.browserTextModel, { device, dtype: config.browserTextDtype || "q4" }, config);
+        task = config.browserTextTask || "text-generation";
+        model = config.browserTextModel;
+        dtype = config.browserTextDtype || "q4";
       } else if (feature === "vision") {
-        await supportAIGetBrowserPipeline(config.browserVisionTask || "image-to-text", config.browserVisionModel, { device, dtype: config.browserVisionDtype || "q4" }, config);
+        task = config.browserVisionTask || "image-to-text";
+        model = config.browserVisionModel;
+        dtype = config.browserVisionDtype || "q4";
       } else if (feature === "whisper") {
-        await supportAIGetBrowserPipeline("automatic-speech-recognition", config.browserWhisperModel, { device, dtype: config.browserWhisperDtype || "q8" }, config);
+        task = "automatic-speech-recognition";
+        model = config.browserWhisperModel;
+        dtype = config.browserWhisperDtype || "q8";
       } else if (feature === "tts") {
-        await supportAIGetBrowserPipeline(config.browserTtsTask || "text-to-speech", config.browserTtsModel, { device, dtype: config.browserTtsDtype || "q8" }, config);
+        task = config.browserTtsTask || "text-to-speech";
+        model = config.browserTtsModel;
+        dtype = config.browserTtsDtype || "q8";
       } else {
+        supportAIEmitInitLog(onLog, "success", `${feature}: モデルロード不要`);
         results.push({ feature, ok: true, note: "no model load required" });
         continue;
       }
+      supportAIEmitInitLog(onLog, "info", `${featureLabels[feature] || feature}モデル準備開始`, { task, model, dtype, device });
+      await supportAIGetBrowserPipeline(task, model, { device, dtype }, config, { onLog, feature });
       SUPPORT_AI_BROWSER_LOCAL.prepared[feature] = true;
       SUPPORT_AI_BROWSER_LOCAL.preparedAt[feature] = Date.now();
-      SUPPORT_AI_BROWSER_LOCAL.activeDevice = device;
-      results.push({ feature, ok: true });
+      if (!SUPPORT_AI_BROWSER_LOCAL.activeDevice) SUPPORT_AI_BROWSER_LOCAL.activeDevice = device;
+      supportAIEmitInitLog(onLog, "success", `${featureLabels[feature] || feature}モデル準備完了`, { model });
+      results.push({ feature, ok: true, model, task, dtype });
     }
-    return { ok: results.every(r => r.ok || r.skipped), results, status: supportAIGetPreparedStatus(config) };
+    supportAIEmitInitLog(onLog, "success", "初期化完了", { results });
+    return { ok: results.every(r => r.ok || r.skipped), results, logs: supportAIReadInitLogs(120), status: supportAIGetPreparedStatus(config) };
   } catch (error) {
     SUPPORT_AI_BROWSER_LOCAL.lastError = supportAIErrorMessage(error);
-    return { ok: false, results, error: SUPPORT_AI_BROWSER_LOCAL.lastError, status: supportAIGetPreparedStatus(config) };
+    supportAIEmitInitLog(onLog, "error", `初期化失敗: ${SUPPORT_AI_BROWSER_LOCAL.lastError}`);
+    return { ok: false, results, logs: supportAIReadInitLogs(120), error: SUPPORT_AI_BROWSER_LOCAL.lastError, status: supportAIGetPreparedStatus(config) };
   }
 }
 
 async function supportAIClearBrowserModelCaches() {
   SUPPORT_AI_BROWSER_LOCAL.pipelinePromises.clear();
+  supportAIClearInitLogs();
+  supportAIAddInitLog("info", "モデルCache削除: メモリ上のpipeline参照を削除しました。");
   SUPPORT_AI_BROWSER_LOCAL.prepared = { runtime: false, text: false, vision: false, whisper: false, tts: false };
   SUPPORT_AI_BROWSER_LOCAL.preparedAt = { runtime: null, text: null, vision: null, whisper: null, tts: null };
   SUPPORT_AI_BROWSER_LOCAL.lastError = null;
@@ -2379,11 +2468,13 @@ async function supportAIClearBrowserModelCaches() {
   return { ok: true, deletedCacheStores: deleted, note: "メモリ上のpipeline参照と、検出できたTransformers/Hugging Face関連Cacheを削除しました。ブラウザHTTPキャッシュやIndexedDB内のモデル実体はブラウザ実装に依存します。" };
 }
 
-async function importSupportAITransformers(config) {
+async function importSupportAITransformers(config, runtimeOptions = {}) {
+  const onLog = runtimeOptions && typeof runtimeOptions.onLog === "function" ? runtimeOptions.onLog : null;
   const url = normalizeSupportAIConfig(config).transformersCdnUrl;
   if (!SUPPORT_AI_BROWSER_LOCAL.modulePromise || SUPPORT_AI_BROWSER_LOCAL.moduleKey !== url) {
     SUPPORT_AI_BROWSER_LOCAL.moduleKey = url;
     SUPPORT_AI_BROWSER_LOCAL.pipelinePromises.clear();
+    supportAIEmitInitLog(onLog, "info", "Transformers.js ESM import開始", { url });
     SUPPORT_AI_BROWSER_LOCAL.modulePromise = import(/* @vite-ignore */ url).then(mod => {
       try {
         const cfg = normalizeSupportAIConfig(config);
@@ -2399,8 +2490,10 @@ async function importSupportAITransformers(config) {
           if ("useFSCache" in mod.env) mod.env.useFSCache = false;
           if (!cacheResolved.useBrowserCache && cacheResolved.status.error) {
             SUPPORT_AI_BROWSER_LOCAL.lastWarning = `Cache API無効: ${cacheResolved.status.error}`;
+            supportAIEmitInitLog(onLog, "warn", SUPPORT_AI_BROWSER_LOCAL.lastWarning, { cache: cacheResolved });
           } else {
             SUPPORT_AI_BROWSER_LOCAL.lastWarning = null;
+            supportAIEmitInitLog(onLog, "info", cacheResolved.useBrowserCache ? "モデルCache: 利用可能" : "モデルCache: 無効", { cache: cacheResolved });
           }
           if (mod.env.backends?.onnx?.wasm) {
             mod.env.backends.onnx.wasm.proxy = false;
@@ -2410,9 +2503,11 @@ async function importSupportAITransformers(config) {
       SUPPORT_AI_BROWSER_LOCAL.lastLoadedAt = Date.now();
       SUPPORT_AI_BROWSER_LOCAL.prepared.runtime = true;
       SUPPORT_AI_BROWSER_LOCAL.preparedAt.runtime = Date.now();
+      supportAIEmitInitLog(onLog, "success", "Transformers.js Runtime読込完了");
       return mod;
     }).catch(error => {
       SUPPORT_AI_BROWSER_LOCAL.lastError = supportAIErrorMessage(error);
+      supportAIEmitInitLog(onLog, "error", `Transformers.js Runtime読込失敗: ${SUPPORT_AI_BROWSER_LOCAL.lastError}`);
       SUPPORT_AI_BROWSER_LOCAL.modulePromise = null;
       throw error;
     });
@@ -2420,13 +2515,23 @@ async function importSupportAITransformers(config) {
   return SUPPORT_AI_BROWSER_LOCAL.modulePromise;
 }
 
-async function supportAIGetBrowserPipeline(task, modelId, loadOptions, config) {
-  const tf = await importSupportAITransformers(config);
-  if (!tf.pipeline) throw new Error("Transformers.js pipeline が見つかりません。CDN URLを確認してください。");
-  const key = JSON.stringify({ task, modelId, loadOptions });
+function supportAIPipelineKey(task, modelId, loadOptions) {
+  return JSON.stringify({ task, modelId, loadOptions });
+}
+
+function supportAIShouldAutoFallbackToWasm(config, loadOptions) {
+  const c = normalizeSupportAIConfig(config);
+  return c.browserDevice === "auto" && loadOptions?.device === "webgpu";
+}
+
+async function supportAIStartBrowserPipeline(tf, task, modelId, loadOptions) {
+  const key = supportAIPipelineKey(task, modelId, loadOptions);
   if (!SUPPORT_AI_BROWSER_LOCAL.pipelinePromises.has(key)) {
     let promise;
-    promise = tf.pipeline(task, modelId, loadOptions).catch(error => {
+    promise = tf.pipeline(task, modelId, loadOptions).then(pipe => {
+      SUPPORT_AI_BROWSER_LOCAL.activeDevice = loadOptions?.device || SUPPORT_AI_BROWSER_LOCAL.activeDevice || "auto";
+      return pipe;
+    }).catch(error => {
       if (SUPPORT_AI_BROWSER_LOCAL.pipelinePromises.get(key) === promise) {
         SUPPORT_AI_BROWSER_LOCAL.pipelinePromises.delete(key);
       }
@@ -2435,6 +2540,40 @@ async function supportAIGetBrowserPipeline(task, modelId, loadOptions, config) {
     SUPPORT_AI_BROWSER_LOCAL.pipelinePromises.set(key, promise);
   }
   return SUPPORT_AI_BROWSER_LOCAL.pipelinePromises.get(key);
+}
+
+async function supportAIGetBrowserPipeline(task, modelId, loadOptions, config, runtimeOptions = {}) {
+  const onLog = runtimeOptions && typeof runtimeOptions.onLog === "function" ? runtimeOptions.onLog : null;
+  const tf = await importSupportAITransformers(config, { onLog });
+  if (!tf.pipeline) throw new Error("Transformers.js pipeline が見つかりません。CDN URLを確認してください。");
+  const normalizedOptions = { ...(loadOptions || {}) };
+  supportAIEmitInitLog(onLog, "info", `pipeline開始: ${task}`, { model: modelId, options: normalizedOptions });
+  try {
+    const pipe = await supportAIStartBrowserPipeline(tf, task, modelId, normalizedOptions);
+    supportAIEmitInitLog(onLog, "success", `pipeline準備成功: ${task}`, { model: modelId, device: normalizedOptions.device || "auto" });
+    return pipe;
+  } catch (error) {
+    const firstMessage = supportAIErrorMessage(error);
+    supportAIEmitInitLog(onLog, "error", `pipeline準備失敗: ${task} / ${firstMessage}`, { model: modelId, options: normalizedOptions });
+    if (supportAIShouldAutoFallbackToWasm(config, normalizedOptions)) {
+      const wasmOptions = { ...normalizedOptions, device: "wasm" };
+      SUPPORT_AI_BROWSER_LOCAL.lastWarning = `WebGPUでの${task}モデル準備に失敗したため、WASMへ自動切替しました。元エラー: ${firstMessage}`;
+      supportAIEmitInitLog(onLog, "warn", SUPPORT_AI_BROWSER_LOCAL.lastWarning, { model: modelId, fallbackDevice: "wasm" });
+      try {
+        supportAIEmitInitLog(onLog, "info", `WASMで再試行: ${task}`, { model: modelId, options: wasmOptions });
+        const pipe = await supportAIStartBrowserPipeline(tf, task, modelId, wasmOptions);
+        SUPPORT_AI_BROWSER_LOCAL.activeDevice = "wasm";
+        supportAIEmitInitLog(onLog, "success", `WASM fallback成功: ${task}`, { model: modelId });
+        return pipe;
+      } catch (wasmError) {
+        const wasmMessage = supportAIErrorMessage(wasmError);
+        SUPPORT_AI_BROWSER_LOCAL.lastError = `WebGPUとWASMの両方でモデル準備に失敗しました。WebGPU: ${firstMessage} / WASM: ${wasmMessage}`;
+        supportAIEmitInitLog(onLog, "error", SUPPORT_AI_BROWSER_LOCAL.lastError, { model: modelId });
+        throw new Error(SUPPORT_AI_BROWSER_LOCAL.lastError);
+      }
+    }
+    throw error;
+  }
 }
 
 function supportAIExtractPipelineText(output) {
@@ -2468,7 +2607,7 @@ async function supportAIBrowserGenerateText(prompt, options = {}, rawConfig = DE
     const pipe = await supportAIGetBrowserPipeline(task, model, { device, dtype }, config);
     SUPPORT_AI_BROWSER_LOCAL.prepared.text = true;
     SUPPORT_AI_BROWSER_LOCAL.preparedAt.text = Date.now();
-    SUPPORT_AI_BROWSER_LOCAL.activeDevice = device;
+    if (!SUPPORT_AI_BROWSER_LOCAL.activeDevice) SUPPORT_AI_BROWSER_LOCAL.activeDevice = device;
     const maxNewTokens = Math.min(config.maxTokens || 512, config.browserMaxNewTokens || 512);
     const output = await pipe(String(prompt || ""), {
       max_new_tokens: maxNewTokens,
@@ -2497,7 +2636,7 @@ async function supportAIBrowserAnalyzeImage(file, options = {}, rawConfig = DEFA
     const pipe = await supportAIGetBrowserPipeline(task, model, { device, dtype }, config);
     SUPPORT_AI_BROWSER_LOCAL.prepared.vision = true;
     SUPPORT_AI_BROWSER_LOCAL.preparedAt.vision = Date.now();
-    SUPPORT_AI_BROWSER_LOCAL.activeDevice = device;
+    if (!SUPPORT_AI_BROWSER_LOCAL.activeDevice) SUPPORT_AI_BROWSER_LOCAL.activeDevice = device;
     const output = await pipe(imageUrl, {
       prompt: options.instruction || options.prompt || "この画像を日本語で説明してください。",
       max_new_tokens: Math.min(config.maxTokens || 256, config.browserMaxNewTokens || 512),
@@ -2522,7 +2661,7 @@ async function supportAIBrowserTranscribeAudio(file, options = {}, rawConfig = D
     const pipe = await supportAIGetBrowserPipeline("automatic-speech-recognition", model, { device, dtype }, config);
     SUPPORT_AI_BROWSER_LOCAL.prepared.whisper = true;
     SUPPORT_AI_BROWSER_LOCAL.preparedAt.whisper = Date.now();
-    SUPPORT_AI_BROWSER_LOCAL.activeDevice = device;
+    if (!SUPPORT_AI_BROWSER_LOCAL.activeDevice) SUPPORT_AI_BROWSER_LOCAL.activeDevice = device;
     const output = await pipe(audioUrl, {
       language: options.language || config.language || "ja",
       task: "transcribe",
@@ -2612,7 +2751,7 @@ async function supportAIBrowserTextToSpeech(text, options = {}, rawConfig = DEFA
     const pipe = await supportAIGetBrowserPipeline(task, model, { device, dtype }, config);
     SUPPORT_AI_BROWSER_LOCAL.prepared.tts = true;
     SUPPORT_AI_BROWSER_LOCAL.preparedAt.tts = Date.now();
-    SUPPORT_AI_BROWSER_LOCAL.activeDevice = device;
+    if (!SUPPORT_AI_BROWSER_LOCAL.activeDevice) SUPPORT_AI_BROWSER_LOCAL.activeDevice = device;
     const output = await pipe(content, { language: options.language || config.language || "ja" });
     const blob = supportAIExtractAudioBlob(output);
     if (blob) {
@@ -2824,9 +2963,11 @@ function createSupportAIProviders(rawConfig = DEFAULT_SUPPORT_AI_CONFIG) {
     },
     vision: { analyze: analyzeImage },
     browserLocal: {
-      importRuntime: () => importSupportAITransformers(config),
-      prepare: (features = []) => supportAIPrepareBrowserLocalFeatures(features, config),
+      importRuntime: (options = {}) => importSupportAITransformers(config, options),
+      prepare: (features = [], options = {}) => supportAIPrepareBrowserLocalFeatures(features, config, options),
       status: () => supportAIGetPreparedStatus(config),
+      readLogs: () => supportAIReadInitLogs(120),
+      clearLogs: () => supportAIClearInitLogs(),
       clearCache: () => supportAIClearBrowserModelCaches(),
     },
   };
@@ -3277,13 +3418,26 @@ function buildMarkdownDevPrompt({ theme, currentMarkdown = "", errors = [], mode
 }
 
 function SupportAIDialog({ open, onClose, appDarkMode, activeMode, editorApiRef, fallbackText, onFallbackSetText, onToast, onForceMarkdown, onForceHtml }) {
-  const [tab, setTab] = useState("basic");
+  const [tab, setTab] = useState("chat");
   const [instruction, setInstruction] = useState("自然で読みやすくしてください");
   const [themeText, setThemeText] = useState("美しいTODOアプリを単一HTMLで作って");
   const [result, setResult] = useState(null);
   const [busy, setBusy] = useState(false);
+  const [aiPhase, setAIPhase] = useState("idle");
+  const [aiTaskLabel, setAITaskLabel] = useState("");
+  const activeRunIdRef = useRef(null);
+  const aiAbortRef = useRef(null);
   const [lastSnapshot, setLastSnapshot] = useState(null);
   const [aiConfig, setAIConfig] = useState(() => loadSupportAIConfig());
+  const [aiInitLogs, setAIInitLogs] = useState(() => supportAIReadInitLogs(80));
+  const [chatInput, setChatInput] = useState("");
+  const [chatMessages, setChatMessages] = useState(() => [{
+    id: "welcome",
+    role: "assistant",
+    text: "こんにちは。ここでは、文章相談・コード相談・画像理解・音声文字起こし・RAG/Knowledge/Agentをまとめて扱えます。下の入力欄から普通に話しかけてください。",
+    ts: Date.now(),
+  }]);
+  const chatMessagesEndRef = useRef(null);
   const audioInputRef = useRef(null);
   const imageInputRef = useRef(null);
   const { Tabs, Tab } = MaterialUI;
@@ -3295,6 +3449,10 @@ function SupportAIDialog({ open, onClose, appDarkMode, activeMode, editorApiRef,
   const [knowledgePredicate, setKnowledgePredicate] = useState("contains");
   const [knowledgeObject, setKnowledgeObject] = useState("Ghost.AI.generate");
   useEffect(() => { installOOSGhostRuntime(ghostRuntime); }, [ghostRuntime]);
+  useEffect(() => {
+    if (tab !== "chat") return;
+    chatMessagesEndRef.current?.scrollIntoView?.({ block: "end", behavior: "smooth" });
+  }, [tab, chatMessages.length, busy]);
   const updateAIConfig = useCallback((patch) => {
     setAIConfig(prev => {
       const next = normalizeSupportAIConfig({ ...prev, ...patch });
@@ -3308,6 +3466,13 @@ function SupportAIDialog({ open, onClose, appDarkMode, activeMode, editorApiRef,
     setAIConfig(next);
     onToast?.("SupportAI設定を初期化しました");
   }, [onToast]);
+  const pushAIInitLog = useCallback((entry) => {
+    setAIInitLogs(prev => [...prev, entry].slice(-160));
+  }, []);
+  const clearAIInitLogView = useCallback(() => {
+    providers.browserLocal.clearLogs?.();
+    setAIInitLogs([]);
+  }, [providers]);
   const dark = Boolean(appDarkMode);
   const supportAIFullScreen = useMediaQuery("(max-width:640px)");
   const border = dark ? "rgba(255,255,255,0.10)" : "#e5e9f2";
@@ -3325,20 +3490,69 @@ function SupportAIDialog({ open, onClose, appDarkMode, activeMode, editorApiRef,
   }, [getEditor, getText]);
 
   const run = useCallback(async (label, fn) => {
+    const runId = `support-ai-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    const controller = new AbortController();
+    activeRunIdRef.current = runId;
+    aiAbortRef.current = controller;
     setBusy(true);
+    setAIPhase("running");
+    setAITaskLabel(label);
     setResult(null);
     try {
-      const value = await fn();
+      const value = await fn({ signal: controller.signal, runId });
+      if (activeRunIdRef.current !== runId || controller.signal.aborted) return;
       setResult({ label, ...value });
+      setAIPhase(value.ok ? "idle" : "error");
       if (!value.ok) onToast?.(`SupportAI失敗: ${value.error || "unknown"}`);
     } catch (e) {
+      if (activeRunIdRef.current !== runId || controller.signal.aborted) return;
       const message = supportAIErrorMessage(e);
       setResult({ ok: false, label, text: "", suggestion: "", error: message });
+      setAIPhase("error");
       onToast?.(`SupportAI失敗: ${message}`);
     } finally {
-      setBusy(false);
+      if (activeRunIdRef.current === runId) {
+        setBusy(false);
+        aiAbortRef.current = null;
+      }
     }
   }, [onToast]);
+
+  useEffect(() => {
+    if (!aiConfig.localAIEnabled) {
+      setAIPhase("disabled");
+      setAITaskLabel("AI停止中");
+    } else if (aiPhase === "disabled") {
+      setAIPhase("idle");
+      setAITaskLabel("");
+    }
+  }, [aiConfig.localAIEnabled, aiPhase]);
+
+  const stopAI = useCallback((message = "停止しました") => {
+    try { aiAbortRef.current?.abort(); } catch {}
+    activeRunIdRef.current = null;
+    aiAbortRef.current = null;
+    setBusy(false);
+    setAIPhase("stopped");
+    setAITaskLabel(message);
+    try { window.speechSynthesis?.cancel?.(); } catch {}
+    setResult(prev => prev || { ok: false, label: "stopped", type: "runtime", text: message, suggestion: "", error: null });
+    onToast?.(message);
+  }, [onToast]);
+
+  const emergencyStopAI = useCallback(() => {
+    try { aiAbortRef.current?.abort(); } catch {}
+    activeRunIdRef.current = null;
+    aiAbortRef.current = null;
+    setBusy(false);
+    setAIPhase("disabled");
+    setAITaskLabel("緊急停止");
+    try { window.speechSynthesis?.cancel?.(); } catch {}
+    try { providers.browserLocal.clearCache?.(); } catch {}
+    updateAIConfig({ localAIEnabled: false });
+    setResult({ ok: false, label: "emergency-stop", type: "runtime", text: "緊急停止しました。実行中のAI結果は破棄され、ローカルAIはOFFになりました。必要ならAI ONで再開してください。", suggestion: "", error: null });
+    onToast?.("緊急停止しました");
+  }, [onToast, providers, updateAIConfig]);
 
   const testAIConnection = useCallback(() => run("local-inference-test", async () => {
     if (!aiConfig.enableText) return { ok: false, type: "text", command: "local-inference-test", text: "", suggestion: "", error: "Text LLMが無効です。AI設定でTextを有効化してください。" };
@@ -3358,13 +3572,18 @@ function SupportAIDialog({ open, onClose, appDarkMode, activeMode, editorApiRef,
   const prepareSelectedModels = useCallback(() => run("prepare-selected-models", async () => {
     const features = enabledModelFeatures();
     if (!features.length) return { ok: false, type: "runtime", text: "", error: "事前DL対象のモデル機能が有効化されていません。" };
-    const response = await providers.browserLocal.prepare(features);
-    return { ok: response.ok, type: "runtime", command: "prepare-selected-models", text: JSON.stringify(response, null, 2), suggestion: "", error: response.error || null };
-  }), [enabledModelFeatures, providers, run]);
+    setAIInitLogs([]);
+    const response = await providers.browserLocal.prepare(features, { clearLogs: true, onLog: pushAIInitLog });
+    const logs = response.logs || providers.browserLocal.readLogs?.() || [];
+    const logText = logs.map(formatAIInitLogLine).join("\n");
+    return { ok: response.ok, type: "runtime", command: "prepare-selected-models", text: `${logText}\n\n--- raw result ---\n${JSON.stringify(response, null, 2)}`, suggestion: "", error: response.error || null, logs };
+  }), [enabledModelFeatures, providers, pushAIInitLog, run]);
 
   const clearModelCache = useCallback(() => run("clear-browser-model-cache", async () => {
     const response = await providers.browserLocal.clearCache();
-    return { ok: response.ok, type: "runtime", command: "clear-browser-model-cache", text: JSON.stringify(response, null, 2), suggestion: "", error: response.error || null };
+    const logs = providers.browserLocal.readLogs?.() || [];
+    setAIInitLogs(logs);
+    return { ok: response.ok, type: "runtime", command: "clear-browser-model-cache", text: JSON.stringify({ ...response, logs }, null, 2), suggestion: "", error: response.error || null };
   }), [providers, run]);
 
   const runTextCommand = useCallback((command, extraInstruction = "") => run(command, async () => {
@@ -3502,12 +3721,134 @@ function SupportAIDialog({ open, onClose, appDarkMode, activeMode, editorApiRef,
     return { ok: response.ok, type: "text", command: "ghost-agent", scope: target.scope, range: target.range, original: target.text, suggestion: response.text || "", text: response.text || "", error: response.error || null };
   }), [getTarget, ghostRuntime, instruction, run]);
 
+  const chatSend = useCallback(() => {
+    const message = (chatInput || instruction || "現在の内容について、必要な支援をしてください。").trim();
+    if (!message) return onToast?.("送信する内容を入力してください");
+    const target = getTarget();
+    const userMessage = {
+      id: `user-${Date.now()}-${Math.random().toString(36).slice(2)}`,
+      role: "user",
+      text: message,
+      ts: Date.now(),
+      scope: target.scope,
+    };
+    setChatMessages(prev => [...prev, userMessage]);
+    setChatInput("");
+
+    run("ai-chat", async ({ signal }) => {
+      const prompt = [
+        message,
+        target.text ? `参照対象（${target.scope === "selection" ? "選択範囲" : "現在の文書"}）:\n${target.text}` : "",
+      ].filter(Boolean).join("\n\n");
+      const response = await ghostRuntime.AI.generate({
+        prompt,
+        rag: { enabled: Boolean(aiConfig.enableRag) },
+        knowledge: { enabled: Boolean(aiConfig.enableKnowledge) },
+      });
+      const assistantText = response.text || response.error || "";
+      if (!signal?.aborted) {
+        setChatMessages(prev => [...prev, {
+          id: `assistant-${Date.now()}-${Math.random().toString(36).slice(2)}`,
+          role: "assistant",
+          text: assistantText || "応答が空でした。",
+          ts: Date.now(),
+          ok: response.ok,
+        }]);
+      }
+      return { ok: response.ok, type: "text", command: "ai-chat", scope: target.scope, range: target.range, original: target.text, suggestion: response.text || "", text: response.text || "", contextText: response.contextText, knowledgeSources: response.knowledgeSources, error: response.error || null };
+    });
+  }, [aiConfig.enableKnowledge, aiConfig.enableRag, chatInput, getTarget, ghostRuntime, instruction, onToast, run]);
+
+  const clearChatMessages = useCallback(() => {
+    setChatMessages([{ id: `welcome-${Date.now()}`, role: "assistant", text: "会話をクリアしました。新しい相談を入力してください。", ts: Date.now() }]);
+  }, []);
+
+  const toggleAIEnabled = useCallback(async () => {
+    if (aiConfig.localAIEnabled) {
+      stopAI("AI停止中");
+      updateAIConfig({ localAIEnabled: false });
+      setAIPhase("disabled");
+      setAITaskLabel("AI停止中");
+      return;
+    }
+
+    const nextConfig = normalizeSupportAIConfig({ ...aiConfig, localAIEnabled: true });
+    saveSupportAIConfig(nextConfig);
+    setAIConfig(nextConfig);
+    setAIPhase("loading-runtime");
+    setAITaskLabel("Runtime読込中");
+    setAIInitLogs([]);
+
+    try {
+      const activationProviders = createSupportAIProviders(nextConfig);
+      const response = await activationProviders.browserLocal.prepare([], { clearLogs: true, onLog: pushAIInitLog });
+      const logs = response.logs || activationProviders.browserLocal.readLogs?.() || [];
+      setAIInitLogs(logs);
+      if (response.ok) {
+        setAIPhase("idle");
+        setAITaskLabel("AI待機中");
+        onToast?.("ローカルAIを有効化しました");
+      } else {
+        setAIPhase("error");
+        setAITaskLabel("Runtime読込失敗");
+        setResult({ ok: false, label: "ai-enable", type: "runtime", text: logs.map(formatAIInitLogLine).join("\n"), suggestion: "", error: response.error || "Runtime読込に失敗しました" });
+        onToast?.(`AI有効化に失敗: ${response.error || "unknown"}`);
+      }
+    } catch (error) {
+      const message = supportAIErrorMessage(error);
+      setAIPhase("error");
+      setAITaskLabel("Runtime読込失敗");
+      setResult({ ok: false, label: "ai-enable", type: "runtime", text: "", suggestion: "", error: message });
+      onToast?.(`AI有効化に失敗: ${message}`);
+    }
+  }, [aiConfig, onToast, pushAIInitLog, stopAI, updateAIConfig]);
+
+  const aiStatusText = !aiConfig.localAIEnabled
+    ? "未有効"
+    : aiPhase === "loading-runtime"
+      ? "Runtime読込中"
+      : aiPhase === "preparing-model"
+        ? "モデル準備中"
+        : busy
+          ? `実行中${aiTaskLabel ? `: ${aiTaskLabel}` : ""}`
+          : aiPhase === "error"
+            ? "エラー"
+            : aiPhase === "stopped"
+              ? "停止済み"
+              : "待機中";
+  const aiStatusColor = !aiConfig.localAIEnabled ? "default" : (busy || aiPhase === "loading-runtime" || aiPhase === "preparing-model") ? "primary" : aiPhase === "error" ? "error" : aiPhase === "stopped" ? "warning" : "success";
+  const latestAIInitLog = aiInitLogs.length ? aiInitLogs[aiInitLogs.length - 1] : null;
+  const aiHeaderBusy = busy || aiPhase === "loading-runtime" || aiPhase === "preparing-model";
+  const aiHeaderDetail = latestAIInitLog?.message || aiTaskLabel || (providerStatus.preparedStatus?.prepared?.runtime ? "Runtime読込済み" : "Runtime未読込");
   const resultText = result?.text || result?.suggestion || "";
+
+  const StatusItem = ({ name, value, color = "default" }) => (
+    <Box sx={{ display: "flex", alignItems: "center", gap: 0.75 }}>
+      <Typography variant="caption" sx={{ flex: 1, color: muted }}>{name}</Typography>
+      <MaterialUI.Chip size="small" color={color} label={value} sx={{ height: 20, fontSize: 10 }} />
+    </Box>
+  );
+
+  const FeatureSwitch = ({ label, checked, onChange, disabled = false }) => (
+    <MaterialUI.FormControlLabel
+      control={<MaterialUI.Checkbox size="small" checked={checked} disabled={disabled} onChange={e => onChange(e.target.checked)} />}
+      label={<Typography variant="caption">{label}</Typography>}
+      sx={{ m: 0 }}
+    />
+  );
+
+  const ActionButton = ({ children, onClick, disabled = false, variant = "outlined", color = "primary" }) => (
+    <Button size="small" variant={variant} color={color} disabled={busy || disabled || !aiConfig.localAIEnabled} onClick={onClick} sx={{ minHeight: 34, lineHeight: 1.2 }}>
+      {children}
+    </Button>
+  );
+
+  const settingDisabled = busy;
 
   return (
     <Dialog
       open={open}
-      onClose={onClose}
+      onClose={busy ? undefined : onClose}
       maxWidth="lg"
       fullWidth
       fullScreen={supportAIFullScreen}
@@ -3524,207 +3865,226 @@ function SupportAIDialog({ open, onClose, appDarkMode, activeMode, editorApiRef,
         },
       }}
     >
-      <DialogTitle sx={{ display: "flex", alignItems: "center", gap: 1, py: { xs: 1, sm: 1.4 }, px: { xs: 1.25, sm: 2 }, borderBottom: `1px solid ${border}`, flexShrink: 0 }}>
+      <DialogTitle sx={{ display: "flex", alignItems: "center", gap: 1, py: { xs: 0.9, sm: 1.2 }, px: { xs: 1, sm: 2 }, borderBottom: `1px solid ${border}`, flexShrink: 0 }}>
         <Icon name="auto_awesome" size={21} />
         <Box sx={{ minWidth: 0, flex: 1 }}>
           <Typography variant="subtitle1" fontWeight={900}>SupportAI</Typography>
-          <Typography noWrap variant="caption" sx={{ color: muted, display: "block", maxWidth: { xs: "58vw", sm: "72vw" } }}>{providerStatus.label} · {providerStatus.textModel} · {providerStatus.endpoint}</Typography>
+          <Box sx={{ display: "flex", alignItems: "center", gap: 0.75, minWidth: 0, flexWrap: "wrap" }}>
+            <MaterialUI.Chip size="small" color={aiStatusColor} label={aiStatusText} sx={{ height: 20, fontSize: 10 }} />
+            <Typography noWrap variant="caption" sx={{ color: muted, maxWidth: { xs: "46vw", sm: "56vw" } }}>{providerStatus.label} · {providerStatus.textModel}</Typography>
+          </Box>
         </Box>
-        <Button size="small" variant="outlined" onClick={undoLast} startIcon={<Icon name="undo" size={16} />} sx={{ flexShrink: 0, minWidth: { xs: 42, sm: 96 }, px: { xs: 0.8, sm: 1.2 }, "& .MuiButton-startIcon": { mr: { xs: 0, sm: 0.5 } } }}><Box component="span" sx={{ display: { xs: "none", sm: "inline" } }}>AI Undo</Box></Button>
-        <IconButton onClick={onClose}><Icon name="close" size={20} /></IconButton>
+        <Button size="small" variant={aiConfig.localAIEnabled ? "contained" : "outlined"} color={aiConfig.localAIEnabled ? "success" : "primary"} onClick={toggleAIEnabled} disabled={busy} sx={{ flexShrink: 0, minWidth: { xs: 52, sm: 76 }, px: { xs: 0.8, sm: 1.2 } }}>{aiConfig.localAIEnabled ? "AI ON" : "AI OFF"}</Button>
+        <Button size="small" variant="outlined" color="warning" onClick={() => stopAI()} disabled={!busy} sx={{ flexShrink: 0, minWidth: { xs: 44, sm: 68 }, px: { xs: 0.8, sm: 1.2 } }}>停止</Button>
+        <Button size="small" variant="contained" color="error" onClick={emergencyStopAI} sx={{ flexShrink: 0, minWidth: { xs: 44, sm: 92 }, px: { xs: 0.8, sm: 1.2 } }}><Box component="span" sx={{ display: { xs: "none", sm: "inline" } }}>緊急停止</Box><Box component="span" sx={{ display: { xs: "inline", sm: "none" } }}>緊急</Box></Button>
+        <IconButton onClick={onClose} disabled={busy}><Icon name="close" size={20} /></IconButton>
       </DialogTitle>
+      <Box sx={{ px: { xs: 1, sm: 2 }, py: aiHeaderBusy ? 0.65 : 0.45, borderBottom: `1px solid ${border}`, flexShrink: 0, background: dark ? "rgba(15,23,42,0.92)" : "#f8fafc" }}>
+        <Box sx={{ display: "flex", alignItems: "center", gap: 1, minWidth: 0 }}>
+          <Typography variant="caption" sx={{ fontWeight: 900, flexShrink: 0 }}>AI初期化</Typography>
+          <Typography variant="caption" noWrap sx={{ color: muted, flex: 1 }}>{aiHeaderDetail}</Typography>
+          <Typography variant="caption" sx={{ color: muted, flexShrink: 0 }}>{providerStatus.browserDevice === "webgpu" ? "WebGPU" : "WASM"}</Typography>
+        </Box>
+        {aiHeaderBusy && <MaterialUI.LinearProgress sx={{ mt: 0.6, borderRadius: 999 }} />}
+      </Box>
+
       <DialogContent sx={{ p: 0, display: "flex", flexDirection: "column", minHeight: 0, flex: 1, overflow: "hidden" }}>
         <Box sx={{ px: { xs: 0.5, sm: 1.25 }, borderBottom: `1px solid ${border}`, flexShrink: 0, minWidth: 0 }}>
           <Tabs
             value={tab}
             onChange={(_, v) => setTab(v)}
-            variant="scrollable"
-            scrollButtons="auto"
-            allowScrollButtonsMobile
+            variant="fullWidth"
             sx={{
               minHeight: 42,
-              "& .MuiTab-root": {
-                minHeight: 42,
-                px: { xs: 1, sm: 1.4 },
-                fontSize: { xs: 12, sm: 13 },
-                fontWeight: 800,
-                whiteSpace: "nowrap",
-              },
+              "& .MuiTab-root": { minHeight: 42, px: { xs: 0.5, sm: 1.2 }, fontSize: { xs: 12, sm: 13 }, fontWeight: 900, whiteSpace: "nowrap" },
             }}
           >
-            <Tab value="basic" label="基本" />
-            <Tab value="direct" label="直接修正" />
-            <Tab value="agents" label="収束AI" />
-            <Tab value="media" label="音声/画像" />
-            <Tab value="dev" label="開発支援" />
-            <Tab value="runtime" label="Ghost Runtime" />
+            <Tab value="chat" label="AIチャット" />
+            <Tab value="work" label="作業・自動化" />
             <Tab value="settings" label="AI設定" />
           </Tabs>
         </Box>
-        <Box sx={{ p: { xs: 1, sm: 2 }, display: "grid", gridTemplateColumns: { xs: "1fr", md: "300px minmax(0, 1fr)" }, gridTemplateRows: { xs: "auto minmax(320px, 1fr)", md: "minmax(0, 1fr)" }, gap: { xs: 1, sm: 1.5 }, minHeight: 0, flex: 1, overflow: { xs: "auto", md: "hidden" }, alignItems: "stretch", WebkitOverflowScrolling: "touch" }}>
+
+        <Box sx={{ p: { xs: 1, sm: 1.5 }, display: "grid", gridTemplateColumns: { xs: "1fr", md: "340px minmax(0, 1fr)" }, gridTemplateRows: { xs: "auto minmax(320px, 1fr)", md: "minmax(0, 1fr)" }, gap: { xs: 1, sm: 1.5 }, minHeight: 0, flex: 1, overflow: { xs: "auto", md: "hidden" }, alignItems: "stretch", WebkitOverflowScrolling: "touch" }}>
           <Box sx={{ display: "flex", flexDirection: "column", gap: 1, minHeight: 0, maxHeight: { xs: "none", md: "100%" }, overflow: { xs: "visible", md: "auto" } }}>
-            <MaterialUI.TextField label="追加指示" value={instruction} onChange={e => setInstruction(e.target.value)} size="small" multiline minRows={2} />
-            <MaterialUI.TextField label="生成テーマ / Dev指示" value={themeText} onChange={e => setThemeText(e.target.value)} size="small" multiline minRows={2} />
-            <Box sx={{ display: "grid", gridTemplateColumns: { xs: "1fr 1fr", sm: "1fr 1fr" }, gap: 0.75, "& .MuiButton-root": { minHeight: 34, lineHeight: 1.25 } }}>
-              {tab === "basic" && <>
-                <Button size="small" variant="outlined" disabled={!aiConfig.localAIEnabled || !aiConfig.enableText} onClick={() => runTextCommand("summarize")}>要約</Button>
-                <Button size="small" variant="outlined" disabled={!aiConfig.localAIEnabled || !aiConfig.enableText} onClick={() => runTextCommand("fix")}>校正</Button>
-                <Button size="small" variant="outlined" disabled={!aiConfig.localAIEnabled || !aiConfig.enableText} onClick={() => runTextCommand("rewrite")}>リライト</Button>
-                <Button size="small" variant="outlined" disabled={!aiConfig.localAIEnabled || !aiConfig.enableText} onClick={() => runTextCommand("explain")}>説明</Button>
-                <Button size="small" variant="outlined" disabled={!aiConfig.localAIEnabled || !aiConfig.enableText} onClick={() => runTextCommand("shorten")}>短く</Button>
-                <Button size="small" variant="outlined" disabled={!aiConfig.localAIEnabled || !aiConfig.enableText} onClick={() => runTextCommand("expand")}>詳しく</Button>
-              </>}
-              {tab === "direct" && <>
-                <Button size="small" variant="contained" onClick={directFix}>選択/全文を校正</Button>
-                <Button size="small" variant="outlined" onClick={() => runTextCommand("rewrite")}>候補だけ作る</Button>
-                <Button size="small" variant="outlined" onClick={undoLast}>AI修正を戻す</Button>
-              </>}
-              {tab === "agents" && <>
-                <Button size="small" variant="contained" disabled={!aiConfig.localAIEnabled || !aiConfig.enableText || !aiConfig.enableAgents} onClick={agentRewrite}>レビュー付きリライト</Button>
-                <Button size="small" variant="outlined" onClick={() => runTextCommand("fix", "厳密に検証してから修正してください")}>検証して修正</Button>
-              </>}
-              {tab === "media" && <>
-                <Button size="small" variant="contained" onClick={() => audioInputRef.current?.click()}>音声→文字</Button>
-                <Button size="small" variant="outlined" onClick={() => imageInputRef.current?.click()}>画像を読む</Button>
-                <Button size="small" variant="outlined" disabled={!aiConfig.localAIEnabled || !aiConfig.enableTts} onClick={runLocalTTS}>本文→音声</Button>
-              </>}
-              {tab === "dev" && <>
-                <Button size="small" variant="contained" onClick={htmlAutoComplete}>HTML生成/修正</Button>
-                <Button size="small" variant="outlined" onClick={markdownAutoComplete}>Markdown生成/整形</Button>
-                <Button size="small" variant="outlined" onClick={checkMarkdown}>Markdown検証</Button>
-                <Button size="small" variant="outlined" onClick={onForceMarkdown}>MD固定</Button>
-                <Button size="small" variant="outlined" onClick={onForceHtml}>HTML固定</Button>
-              </>}
-              {tab === "runtime" && <>
-                <Button size="small" variant="contained" onClick={showGhostStatus}>Status</Button>
-                <Button size="small" variant="outlined" onClick={addCurrentToRAG}>文書をRAG登録</Button>
-                <Button size="small" variant="outlined" onClick={addKnowledgeFact}>Fact登録</Button>
-                <Button size="small" variant="outlined" onClick={ghostGenerateWithKnowledge}>RAG+Knowledge生成</Button>
-                <Button size="small" variant="outlined" onClick={ghostRunAgent}>Agent実行</Button>
-              </>}
-            </Box>
-            {tab === "runtime" && <Box sx={{ display: "flex", flexDirection: "column", gap: 1, p: 1, border: `1px solid ${border}`, borderRadius: 2 }}>
-              <Typography variant="caption" sx={{ color: muted }}>Ghost.AI.generate を正規入口にした最小Runtimeです。RAG/KnowledgeはlocalStorageへ保存されます。</Typography>
-              <MaterialUI.TextField label="Fact subject" value={knowledgeSubject} onChange={e => setKnowledgeSubject(e.target.value)} size="small" />
-              <MaterialUI.TextField label="Fact predicate" value={knowledgePredicate} onChange={e => setKnowledgePredicate(e.target.value)} size="small" />
-              <MaterialUI.TextField label="Fact object" value={knowledgeObject} onChange={e => setKnowledgeObject(e.target.value)} size="small" multiline minRows={2} />
-              {runtimeInfo && <Typography variant="caption" sx={{ color: muted }}>RAG {runtimeInfo.storage?.ragDocuments || 0}件 / Knowledge {runtimeInfo.storage?.knowledgeFacts || 0}件 / WebGPU {runtimeInfo.capabilities?.webGPU ? "ON" : "OFF"}</Typography>}
+            {tab === "work" && <>
+              <MaterialUI.TextField label="AIへの指示" value={instruction} onChange={e => setInstruction(e.target.value)} size="small" multiline minRows={2} placeholder="例：選択範囲を自然で読みやすく直して" />
+              <MaterialUI.TextField label="生成テーマ / Dev指示" value={themeText} onChange={e => setThemeText(e.target.value)} size="small" multiline minRows={2} placeholder="例：美しいTODOアプリを単一HTMLで作って" />
+            </>}
+
+            {tab === "chat" && <Box sx={{ display: "flex", flexDirection: "column", gap: 1 }}>
+              <Box sx={{ p: 1, border: `1px solid ${border}`, borderRadius: 2, background: dark ? "rgba(255,255,255,0.035)" : "#f8fafc" }}>
+                <Typography variant="caption" fontWeight={900}>会話モード</Typography>
+                <Typography variant="caption" sx={{ display: "block", color: muted, lineHeight: 1.6, mt: 0.5 }}>下のチャット欄に入力すると、現在の選択範囲または文書を必要に応じて参照しながら応答します。画像・音声・RAG・Knowledge・Agentもここから使えます。</Typography>
+              </Box>
+              <Box sx={{ display: "grid", gridTemplateColumns: { xs: "1fr 1fr", sm: "1fr 1fr" }, gap: 0.75 }}>
+                <ActionButton variant="contained" onClick={chatSend} disabled={!aiConfig.enableText}>送信</ActionButton>
+                <Button size="small" variant="outlined" onClick={clearChatMessages} disabled={busy}>会話クリア</Button>
+                <ActionButton onClick={ghostGenerateWithKnowledge} disabled={!aiConfig.enableText || (!aiConfig.enableRag && !aiConfig.enableKnowledge)}>RAG+Knowledge</ActionButton>
+                <ActionButton onClick={ghostRunAgent} disabled={!aiConfig.enableText || !aiConfig.enableAgents}>Agentで検討</ActionButton>
+                <ActionButton onClick={() => imageInputRef.current?.click()} disabled={!aiConfig.enableVision}>画像を読む</ActionButton>
+                <ActionButton onClick={() => audioInputRef.current?.click()} disabled={!aiConfig.enableWhisper}>音声→文字</ActionButton>
+                <ActionButton onClick={runLocalTTS} disabled={!aiConfig.enableTts}>本文→音声</ActionButton>
+              </Box>
+              <Box sx={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 0.6 }}>
+                <MaterialUI.Chip size="small" label={aiConfig.enableRag ? "RAG ON" : "RAG OFF"} color={aiConfig.enableRag ? "success" : "default"} />
+                <MaterialUI.Chip size="small" label={aiConfig.enableKnowledge ? "Knowledge ON" : "Knowledge OFF"} color={aiConfig.enableKnowledge ? "success" : "default"} />
+                <MaterialUI.Chip size="small" label={aiConfig.enableAgents ? "Agent ON" : "Agent OFF"} color={aiConfig.enableAgents ? "success" : "default"} />
+              </Box>
             </Box>}
-            {tab === "settings" && <Box sx={{ display: "flex", flexDirection: "column", gap: 1, p: 1, border: `1px solid ${border}`, borderRadius: 2 }}>
+
+            {tab === "work" && <Box sx={{ display: "flex", flexDirection: "column", gap: 1 }}>
+              <Box sx={{ p: 1, border: `1px solid ${border}`, borderRadius: 2, background: dark ? "rgba(255,255,255,0.035)" : "#f8fafc" }}>
+                <Typography variant="caption" fontWeight={900}>エディタを直接よくする</Typography>
+                <Typography variant="caption" sx={{ display: "block", color: muted, lineHeight: 1.6, mt: 0.5 }}>要約・校正・リライト・生成・検証・Undoをまとめました。反映前にSnapshotを取るので戻せます。</Typography>
+              </Box>
+              <Box sx={{ display: "grid", gridTemplateColumns: { xs: "1fr 1fr", sm: "1fr 1fr" }, gap: 0.75 }}>
+                <ActionButton onClick={() => runTextCommand("summarize")} disabled={!aiConfig.enableText}>要約</ActionButton>
+                <ActionButton variant="contained" onClick={() => runTextCommand("fix")} disabled={!aiConfig.enableText}>校正</ActionButton>
+                <ActionButton onClick={() => runTextCommand("rewrite")} disabled={!aiConfig.enableText}>リライト</ActionButton>
+                <ActionButton onClick={() => runTextCommand("explain")} disabled={!aiConfig.enableText}>説明</ActionButton>
+                <ActionButton onClick={() => runTextCommand("shorten")} disabled={!aiConfig.enableText}>短く</ActionButton>
+                <ActionButton onClick={() => runTextCommand("expand")} disabled={!aiConfig.enableText}>詳しく</ActionButton>
+                <ActionButton variant="contained" onClick={directFix} disabled={!aiConfig.enableText}>選択/全文を校正</ActionButton>
+                <Button size="small" variant="outlined" onClick={undoLast} disabled={!lastSnapshot || busy}>AI Undo</Button>
+                <ActionButton variant="contained" onClick={htmlAutoComplete} disabled={!aiConfig.enableText}>HTML生成/修正</ActionButton>
+                <ActionButton onClick={markdownAutoComplete} disabled={!aiConfig.enableText}>Markdown生成/整形</ActionButton>
+                <Button size="small" variant="outlined" onClick={checkMarkdown} disabled={busy}>Markdown検証</Button>
+                <Button size="small" variant="outlined" onClick={onForceMarkdown} disabled={busy}>MD固定</Button>
+                <Button size="small" variant="outlined" onClick={onForceHtml} disabled={busy}>HTML固定</Button>
+              </Box>
+            </Box>}
+
+            {tab === "settings" && <Box sx={{ display: "flex", flexDirection: "column", gap: 1 }}>
               <Box sx={{ p: 1, border: `1px solid ${border}`, borderRadius: 2, background: dark ? "rgba(255,255,255,0.035)" : "#f8fafc" }}>
                 <Typography variant="caption" fontWeight={900}>AI状態</Typography>
-                <Box sx={{ display: "grid", gridTemplateColumns: "1fr", gap: 0.4, mt: 0.8 }}>
-                  {[
-                    ["ローカルAI", aiConfig.localAIEnabled ? "有効" : "未有効", aiConfig.localAIEnabled ? "success" : "default"],
-                    ["Runtime", providerStatus.preparedStatus?.prepared?.runtime ? "読込済み" : "未読込", providerStatus.preparedStatus?.prepared?.runtime ? "success" : "default"],
-                    ["Text", providerStatus.preparedStatus?.prepared?.text ? "準備済み" : (aiConfig.enableText ? "未準備" : "無効"), providerStatus.preparedStatus?.prepared?.text ? "success" : "default"],
-                    ["Vision", providerStatus.preparedStatus?.prepared?.vision ? "準備済み" : (aiConfig.enableVision ? "未準備" : "無効"), providerStatus.preparedStatus?.prepared?.vision ? "success" : "default"],
-                    ["Whisper", providerStatus.preparedStatus?.prepared?.whisper ? "準備済み" : (aiConfig.enableWhisper ? "未準備" : "無効"), providerStatus.preparedStatus?.prepared?.whisper ? "success" : "default"],
-                    ["TTS", providerStatus.preparedStatus?.prepared?.tts ? "準備済み" : (aiConfig.enableTts ? "未準備" : "無効"), providerStatus.preparedStatus?.prepared?.tts ? "success" : "default"],
-                    ["Device", providerStatus.browserDevice === "webgpu" ? "WebGPU使用中" : "WASM使用中", providerStatus.browserDevice === "webgpu" ? "primary" : "default"],
-                    ["Model Cache", providerStatus.preparedStatus?.cache?.useBrowserCache ? "利用中" : (providerStatus.preparedStatus?.cache?.blocked ? "sandboxで無効" : "無効"), providerStatus.preparedStatus?.cache?.useBrowserCache ? "success" : "default"],
-                  ].map(([name, value, color]) => (
-                    <Box key={name} sx={{ display: "flex", alignItems: "center", gap: 0.75 }}>
-                      <Typography variant="caption" sx={{ flex: 1, color: muted }}>{name}</Typography>
-                      <MaterialUI.Chip size="small" color={color} label={value} sx={{ height: 20, fontSize: 10 }} />
-                    </Box>
-                  ))}
+                <Box sx={{ display: "grid", gridTemplateColumns: "1fr", gap: 0.45, mt: 0.8 }}>
+                  <StatusItem name="ローカルAI" value={aiConfig.localAIEnabled ? "有効" : "未有効"} color={aiConfig.localAIEnabled ? "success" : "default"} />
+                  <StatusItem name="Runtime" value={providerStatus.preparedStatus?.prepared?.runtime ? "読込済み" : "未読込"} color={providerStatus.preparedStatus?.prepared?.runtime ? "success" : "default"} />
+                  <StatusItem name="Text" value={providerStatus.preparedStatus?.prepared?.text ? "準備済み" : (aiConfig.enableText ? "未準備" : "無効")} color={providerStatus.preparedStatus?.prepared?.text ? "success" : "default"} />
+                  <StatusItem name="Vision" value={providerStatus.preparedStatus?.prepared?.vision ? "準備済み" : (aiConfig.enableVision ? "未準備" : "無効")} color={providerStatus.preparedStatus?.prepared?.vision ? "success" : "default"} />
+                  <StatusItem name="Whisper" value={providerStatus.preparedStatus?.prepared?.whisper ? "準備済み" : (aiConfig.enableWhisper ? "未準備" : "無効")} color={providerStatus.preparedStatus?.prepared?.whisper ? "success" : "default"} />
+                  <StatusItem name="TTS" value={providerStatus.preparedStatus?.prepared?.tts ? "準備済み" : (aiConfig.enableTts ? "未準備" : "無効")} color={providerStatus.preparedStatus?.prepared?.tts ? "success" : "default"} />
+                  <StatusItem name="Device" value={providerStatus.browserDevice === "webgpu" ? "WebGPU使用中" : "WASM使用中"} color={providerStatus.browserDevice === "webgpu" ? "primary" : "default"} />
+                  <StatusItem name="Model Cache" value={providerStatus.preparedStatus?.cache?.useBrowserCache ? "利用中" : (providerStatus.preparedStatus?.cache?.blocked ? "sandboxで無効" : "無効")} color={providerStatus.preparedStatus?.cache?.useBrowserCache ? "success" : "default"} />
                 </Box>
-                {providerStatus.preparedStatus?.cache?.blocked && (
-                  <Typography variant="caption" sx={{ display: "block", color: "warning.main", lineHeight: 1.5, mt: 0.75 }}>
-                    現在の表示環境はsandboxのため、ブラウザのモデルCache APIを利用できません。推論自体はCacheなしで試行します。初回DL後の永続Cache利用・明示再DLは、HTMLを通常のブラウザタブで開いた環境で有効になります。
-                  </Typography>
-                )}
-                {providerStatus.preparedStatus?.lastWarning && (
-                  <Typography variant="caption" sx={{ display: "block", color: "warning.main", lineHeight: 1.5, mt: 0.75 }}>
-                    {providerStatus.preparedStatus.lastWarning}
-                  </Typography>
-                )}
               </Box>
+
               <Box sx={{ p: 1, border: `1px solid ${border}`, borderRadius: 2 }}>
                 <Typography variant="caption" fontWeight={900}>有効化する範囲</Typography>
-                <Box sx={{ display: "grid", gridTemplateColumns: { xs: "1fr", sm: "1fr 1fr" }, gap: 0.25, mt: 0.7 }}>
-                  <MaterialUI.FormControlLabel control={<MaterialUI.Checkbox size="small" checked={aiConfig.localAIEnabled} onChange={e => updateAIConfig({ localAIEnabled: e.target.checked })} />} label={<Typography variant="caption">ローカルAI全体</Typography>} />
-                  <MaterialUI.FormControlLabel control={<MaterialUI.Checkbox size="small" checked={aiConfig.enableText} onChange={e => updateAIConfig({ enableText: e.target.checked })} />} label={<Typography variant="caption">Text LLM</Typography>} />
-                  <MaterialUI.FormControlLabel control={<MaterialUI.Checkbox size="small" checked={aiConfig.enableVision} onChange={e => updateAIConfig({ enableVision: e.target.checked })} />} label={<Typography variant="caption">Vision画像理解</Typography>} />
-                  <MaterialUI.FormControlLabel control={<MaterialUI.Checkbox size="small" checked={aiConfig.enableWhisper} onChange={e => updateAIConfig({ enableWhisper: e.target.checked })} />} label={<Typography variant="caption">Whisper ASR</Typography>} />
-                  <MaterialUI.FormControlLabel control={<MaterialUI.Checkbox size="small" checked={aiConfig.enableTts} onChange={e => updateAIConfig({ enableTts: e.target.checked })} />} label={<Typography variant="caption">TTS / Interleaved</Typography>} />
-                  <MaterialUI.FormControlLabel control={<MaterialUI.Checkbox size="small" checked={aiConfig.enableAgents} onChange={e => updateAIConfig({ enableAgents: e.target.checked })} />} label={<Typography variant="caption">Agent / Team</Typography>} />
-                  <MaterialUI.FormControlLabel control={<MaterialUI.Checkbox size="small" checked={aiConfig.enableRag} onChange={e => updateAIConfig({ enableRag: e.target.checked })} />} label={<Typography variant="caption">RAG</Typography>} />
-                  <MaterialUI.FormControlLabel control={<MaterialUI.Checkbox size="small" checked={aiConfig.enableKnowledge} onChange={e => updateAIConfig({ enableKnowledge: e.target.checked })} />} label={<Typography variant="caption">Knowledge</Typography>} />
+                <Box sx={{ display: "grid", gridTemplateColumns: { xs: "1fr", sm: "1fr 1fr" }, gap: 0.2, mt: 0.5 }}>
+                  <FeatureSwitch label="ローカルAI全体" checked={aiConfig.localAIEnabled} disabled={settingDisabled} onChange={v => updateAIConfig({ localAIEnabled: v })} />
+                  <FeatureSwitch label="Text LLM" checked={aiConfig.enableText} disabled={settingDisabled} onChange={v => updateAIConfig({ enableText: v })} />
+                  <FeatureSwitch label="Vision画像理解" checked={aiConfig.enableVision} disabled={settingDisabled} onChange={v => updateAIConfig({ enableVision: v })} />
+                  <FeatureSwitch label="Whisper ASR" checked={aiConfig.enableWhisper} disabled={settingDisabled} onChange={v => updateAIConfig({ enableWhisper: v })} />
+                  <FeatureSwitch label="TTS / Interleaved" checked={aiConfig.enableTts} disabled={settingDisabled} onChange={v => updateAIConfig({ enableTts: v })} />
+                  <FeatureSwitch label="Agent / Team" checked={aiConfig.enableAgents} disabled={settingDisabled} onChange={v => updateAIConfig({ enableAgents: v })} />
+                  <FeatureSwitch label="RAG" checked={aiConfig.enableRag} disabled={settingDisabled} onChange={v => updateAIConfig({ enableRag: v })} />
+                  <FeatureSwitch label="Knowledge" checked={aiConfig.enableKnowledge} disabled={settingDisabled} onChange={v => updateAIConfig({ enableKnowledge: v })} />
                 </Box>
-                <Typography variant="caption" sx={{ display: "block", color: muted, lineHeight: 1.5, mt: 0.5 }}>
-                  有効化した範囲だけが遅延ロードまたは事前DL対象になります。Textを無効にすると要約・校正・Agent・Dev生成は実行されません。
-                </Typography>
               </Box>
-              <MaterialUI.TextField select SelectProps={{ native: true }} label="AI実行方式" value={aiConfig.provider} onChange={e => updateAIConfig({ provider: e.target.value })} size="small">
-                {SUPPORT_AI_PROVIDER_OPTIONS.map(p => <option key={p.value} value={p.value}>{p.label}</option>)}
-              </MaterialUI.TextField>
-              <MaterialUI.TextField label="Transformers.js ESM URL" value={aiConfig.transformersCdnUrl} onChange={e => updateAIConfig({ transformersCdnUrl: e.target.value })} size="small" />
+
               <Box sx={{ display: "grid", gridTemplateColumns: { xs: "1fr", sm: "1fr 1fr" }, gap: 0.75 }}>
                 <MaterialUI.TextField select SelectProps={{ native: true }} label="初回モデルDL" value={aiConfig.allowRemoteModels ? "true" : "false"} onChange={e => updateAIConfig({ allowRemoteModels: e.target.value === "true" })} size="small">
-                  <option value="true">許可：初回のみ取得、以後キャッシュ利用</option>
+                  <option value="true">許可：初回のみ取得、以後Cache利用</option>
                   <option value="false">禁止：完全オフライン ./models のみ</option>
                 </MaterialUI.TextField>
-                <MaterialUI.TextField label="Local model path" value={aiConfig.localModelPath} onChange={e => updateAIConfig({ localModelPath: e.target.value })} size="small" />
-                <MaterialUI.TextField select SelectProps={{ native: true }} label="モデルCache" value={aiConfig.browserCacheMode || "auto"} onChange={e => updateAIConfig({ browserCacheMode: e.target.value })} size="small">
-                  <option value="auto">自動：使える時だけCache利用</option>
-                  <option value="on">要求：Cache利用を試みる</option>
-                  <option value="off">無効：Cache APIに触れない</option>
-                </MaterialUI.TextField>
-              </Box>
-              <Box sx={{ display: "grid", gridTemplateColumns: { xs: "1fr", sm: "1fr 1fr" }, gap: 0.75 }}>
                 <MaterialUI.TextField select SelectProps={{ native: true }} label="Browser Device" value={aiConfig.browserDevice} onChange={e => updateAIConfig({ browserDevice: e.target.value })} size="small">
                   <option value="auto">auto WebGPU→WASM</option>
                   <option value="webgpu">webgpu</option>
                   <option value="wasm">wasm</option>
                 </MaterialUI.TextField>
-                <MaterialUI.TextField label="Browser max new tokens" type="number" value={aiConfig.browserMaxNewTokens} onChange={e => updateAIConfig({ browserMaxNewTokens: e.target.value })} size="small" inputProps={{ step: 64, min: 16, max: 4096 }} />
-              </Box>
-              {aiConfig.enableText && <>
-                <MaterialUI.TextField label="Browser Text Model" value={aiConfig.browserTextModel} onChange={e => updateAIConfig({ browserTextModel: e.target.value })} size="small" />
-                <Box sx={{ display: "grid", gridTemplateColumns: { xs: "1fr", sm: "1fr 1fr" }, gap: 0.75 }}>
-                  <MaterialUI.TextField label="Text task" value={aiConfig.browserTextTask} onChange={e => updateAIConfig({ browserTextTask: e.target.value })} size="small" />
-                  <MaterialUI.TextField label="Text dtype" value={aiConfig.browserTextDtype} onChange={e => updateAIConfig({ browserTextDtype: e.target.value })} size="small" />
-                </Box>
-              </>}
-              {aiConfig.enableVision && <>
-                <MaterialUI.TextField label="Browser Vision Model" value={aiConfig.browserVisionModel} onChange={e => updateAIConfig({ browserVisionModel: e.target.value })} size="small" />
-                <Box sx={{ display: "grid", gridTemplateColumns: { xs: "1fr", sm: "1fr 1fr" }, gap: 0.75 }}>
-                  <MaterialUI.TextField label="Vision task" value={aiConfig.browserVisionTask} onChange={e => updateAIConfig({ browserVisionTask: e.target.value })} size="small" />
-                  <MaterialUI.TextField label="Vision dtype" value={aiConfig.browserVisionDtype} onChange={e => updateAIConfig({ browserVisionDtype: e.target.value })} size="small" />
-                </Box>
-              </>}
-              {aiConfig.enableWhisper && <Box sx={{ display: "grid", gridTemplateColumns: { xs: "1fr", sm: "1fr 1fr" }, gap: 0.75 }}>
-                <MaterialUI.TextField label="Whisper / ASR Model" value={aiConfig.browserWhisperModel} onChange={e => updateAIConfig({ browserWhisperModel: e.target.value })} size="small" />
-                <MaterialUI.TextField label="ASR dtype" value={aiConfig.browserWhisperDtype} onChange={e => updateAIConfig({ browserWhisperDtype: e.target.value })} size="small" />
-              </Box>}
-              {aiConfig.enableTts && <>
-                <MaterialUI.TextField label="Browser TTS Model" value={aiConfig.browserTtsModel} onChange={e => updateAIConfig({ browserTtsModel: e.target.value })} size="small" />
-                <Box sx={{ display: "grid", gridTemplateColumns: { xs: "1fr", sm: "1fr 1fr" }, gap: 0.75 }}>
-                  <MaterialUI.TextField label="TTS task" value={aiConfig.browserTtsTask} onChange={e => updateAIConfig({ browserTtsTask: e.target.value })} size="small" />
-                  <MaterialUI.TextField label="TTS dtype" value={aiConfig.browserTtsDtype} onChange={e => updateAIConfig({ browserTtsDtype: e.target.value })} size="small" />
-                </Box>
-              </>}
-              <Box sx={{ display: "grid", gridTemplateColumns: { xs: "1fr", sm: "1fr 1fr" }, gap: 0.75 }}>
-                <MaterialUI.TextField label="Temperature" type="number" value={aiConfig.temperature} onChange={e => updateAIConfig({ temperature: e.target.value })} size="small" inputProps={{ step: 0.1, min: 0, max: 2 }} />
-                <MaterialUI.TextField label="Max tokens" type="number" value={aiConfig.maxTokens} onChange={e => updateAIConfig({ maxTokens: e.target.value })} size="small" inputProps={{ step: 128, min: 128 }} />
+                <MaterialUI.TextField select SelectProps={{ native: true }} label="モデルCache" value={aiConfig.browserCacheMode || "auto"} onChange={e => updateAIConfig({ browserCacheMode: e.target.value })} size="small">
+                  <option value="auto">自動：使える時だけCache利用</option>
+                  <option value="on">要求：Cache利用を試みる</option>
+                  <option value="off">無効：Cache APIに触れない</option>
+                </MaterialUI.TextField>
+                <MaterialUI.TextField label="Local model path" value={aiConfig.localModelPath} onChange={e => updateAIConfig({ localModelPath: e.target.value })} size="small" />
+                <MaterialUI.TextField label="Text Model" value={aiConfig.browserTextModel} onChange={e => updateAIConfig({ browserTextModel: e.target.value })} size="small" />
+                <MaterialUI.TextField label="Vision Model" value={aiConfig.browserVisionModel} onChange={e => updateAIConfig({ browserVisionModel: e.target.value })} size="small" />
+                <MaterialUI.TextField label="Whisper Model" value={aiConfig.browserWhisperModel} onChange={e => updateAIConfig({ browserWhisperModel: e.target.value })} size="small" />
+                <MaterialUI.TextField label="TTS Model" value={aiConfig.browserTtsModel} onChange={e => updateAIConfig({ browserTtsModel: e.target.value })} size="small" />
+                <MaterialUI.TextField label="Max new tokens" type="number" value={aiConfig.browserMaxNewTokens} onChange={e => updateAIConfig({ browserMaxNewTokens: e.target.value })} size="small" inputProps={{ step: 64, min: 16, max: 4096 }} />
                 <MaterialUI.TextField label="Timeout ms" type="number" value={aiConfig.timeoutMs} onChange={e => updateAIConfig({ timeoutMs: e.target.value })} size="small" inputProps={{ step: 1000, min: 5000 }} />
-                <MaterialUI.TextField label="Language" value={aiConfig.language} onChange={e => updateAIConfig({ language: e.target.value })} size="small" />
               </Box>
+
+              <Box sx={{ p: 1, border: `1px solid ${border}`, borderRadius: 2, background: dark ? "#020617" : "#f8fafc" }}>
+                <Box sx={{ display: "flex", alignItems: "center", gap: 1, mb: 0.6 }}>
+                  <Typography variant="caption" fontWeight={900} sx={{ flex: 1 }}>初期化ログ</Typography>
+                  <Button size="small" variant="text" onClick={clearAIInitLogView}>クリア</Button>
+                </Box>
+                <Box component="pre" sx={{ m: 0, maxHeight: 180, overflow: "auto", whiteSpace: "pre-wrap", wordBreak: "break-word", fontFamily: EDITOR_FONT, fontSize: 11.5, lineHeight: 1.55, color: dark ? "#dbeafe" : "#1f2937" }}>
+                  {aiInitLogs.length ? aiInitLogs.map(formatAIInitLogLine).join("\n") : "まだログはありません。[有効モデルを準備] を押すと、Runtime読込・Cache判定・Device選択・モデルDL/ロード・WebGPU→WASM fallbackを時系列で表示します。"}
+                </Box>
+              </Box>
+
               <Box sx={{ display: "grid", gridTemplateColumns: { xs: "1fr", sm: "1fr 1fr" }, gap: 0.75 }}>
-                <Button size="small" variant="contained" disabled={!aiConfig.localAIEnabled || !enabledModelFeatures().length} onClick={prepareSelectedModels}>有効モデルを準備</Button>
-                <Button size="small" variant="outlined" disabled={!aiConfig.localAIEnabled || !aiConfig.enableText} onClick={testAIConnection}>Text推論テスト</Button>
-                <Button size="small" variant="outlined" color="warning" onClick={clearModelCache}>モデルCache削除</Button>
-                <Button size="small" variant="outlined" color="warning" onClick={resetAIConfig}>初期化</Button>
+                <Button size="small" variant="contained" disabled={busy || !aiConfig.localAIEnabled || !enabledModelFeatures().length} onClick={prepareSelectedModels}>有効モデルを準備</Button>
+                <Button size="small" variant="outlined" disabled={busy || !aiConfig.localAIEnabled || !aiConfig.enableText} onClick={testAIConnection}>Text推論テスト</Button>
+                <Button size="small" variant="outlined" disabled={busy} onClick={showGhostStatus}>Ghost Status</Button>
+                <Button size="small" variant="outlined" disabled={busy} onClick={addCurrentToRAG}>文書をRAG登録</Button>
+                <Button size="small" variant="outlined" disabled={busy} onClick={addKnowledgeFact}>Fact登録</Button>
+                <Button size="small" variant="outlined" color="warning" disabled={busy} onClick={clearModelCache}>モデルCache削除</Button>
+                <Button size="small" variant="outlined" color="warning" disabled={busy} onClick={resetAIConfig}>AI設定初期化</Button>
               </Box>
+              <Box sx={{ display: "grid", gridTemplateColumns: { xs: "1fr", sm: "1fr 1fr 1fr" }, gap: 0.75 }}>
+                <MaterialUI.TextField label="Fact subject" value={knowledgeSubject} onChange={e => setKnowledgeSubject(e.target.value)} size="small" />
+                <MaterialUI.TextField label="Fact predicate" value={knowledgePredicate} onChange={e => setKnowledgePredicate(e.target.value)} size="small" />
+                <MaterialUI.TextField label="Fact object" value={knowledgeObject} onChange={e => setKnowledgeObject(e.target.value)} size="small" />
+              </Box>
+              <Typography variant="caption" sx={{ color: muted, lineHeight: 1.6 }}>基本方針は完全ローカル推論です。本文・画像・音声は外部LLMサービスへ送信されません。必要なモデルだけを有効化し、必要時に遅延ロードします。</Typography>
             </Box>}
-                        <Typography variant="caption" sx={{ color: muted, lineHeight: 1.6 }}>
-              基本方針は完全ローカル推論です。本文・画像・音声は外部LLMサービスへ送信されません。Text/Vision/Whisper ASR/TTS/InterleavedはBrowser Local Runtimeで動作します。初回モデルDLを禁止する場合はAI設定で「完全オフライン ./models のみ」を選び、./models/ にモデル一式を置いてください。
-            </Typography>
+
             <input ref={audioInputRef} type="file" accept="audio/*" style={{ display: "none" }} onChange={e => { handleAudioFile(e.target.files?.[0]); e.target.value = ""; }} />
             <input ref={imageInputRef} type="file" accept="image/*" style={{ display: "none" }} onChange={e => { handleImageFile(e.target.files?.[0]); e.target.value = ""; }} />
           </Box>
+
+          {tab === "chat" ? (
+            <Box sx={{ display: "flex", flexDirection: "column", minHeight: { xs: 420, md: 0 }, height: { xs: "min(62dvh, 620px)", md: "auto" }, border: `1px solid ${border}`, borderRadius: 2, overflow: "hidden", background: dark ? "#020617" : "#fbfdff" }}>
+              <Box sx={{ px: 1.2, py: 0.8, display: "flex", alignItems: "center", gap: 1, borderBottom: `1px solid ${border}` }}>
+                <Typography variant="caption" fontWeight={900} sx={{ flex: 1 }}>会話</Typography>
+                {busy && <MaterialUI.Chip size="small" color="primary" label="AI応答中" />}
+                <MaterialUI.Chip size="small" label={`${chatMessages.length} 件`} />
+              </Box>
+              {busy && <MaterialUI.LinearProgress />}
+              <Box sx={{ flex: 1, minHeight: 0, overflow: "auto", p: { xs: 1, sm: 1.25 }, display: "flex", flexDirection: "column", gap: 1, WebkitOverflowScrolling: "touch" }}>
+                {chatMessages.map(msg => {
+                  const isUser = msg.role === "user";
+                  return (
+                    <Box key={msg.id} sx={{ display: "flex", justifyContent: isUser ? "flex-end" : "flex-start" }}>
+                      <Box sx={{ maxWidth: "86%", px: 1.2, py: 0.9, borderRadius: 2.2, border: `1px solid ${isUser ? "transparent" : border}`, background: isUser ? "#1976d2" : (dark ? "rgba(255,255,255,0.06)" : "#ffffff"), color: isUser ? "#fff" : (dark ? "#e5e7eb" : "#111827"), boxShadow: isUser ? "none" : "0 2px 8px rgba(15,23,42,0.05)" }}>
+                        <Typography variant="caption" sx={{ display: "block", opacity: 0.72, fontWeight: 900, mb: 0.35 }}>{isUser ? "You" : "SupportAI"} · {new Date(msg.ts || Date.now()).toLocaleTimeString("ja-JP", { hour: "2-digit", minute: "2-digit", second: "2-digit" })}</Typography>
+                        <Typography component="pre" sx={{ m: 0, whiteSpace: "pre-wrap", wordBreak: "break-word", fontFamily: "inherit", fontSize: 13.5, lineHeight: 1.65 }}>{msg.text}</Typography>
+                      </Box>
+                    </Box>
+                  );
+                })}
+                <Box ref={chatMessagesEndRef} />
+              </Box>
+              <Box sx={{ p: 1, borderTop: `1px solid ${border}`, display: "grid", gridTemplateColumns: { xs: "1fr", sm: "1fr auto" }, gap: 0.75, background: dark ? "#0f172a" : "#f8fafc" }}>
+                <MaterialUI.TextField
+                  value={chatInput}
+                  onChange={e => setChatInput(e.target.value)}
+                  placeholder="SupportAIに相談する。Shift+Enterで改行 / Enterで送信"
+                  multiline
+                  minRows={2}
+                  maxRows={5}
+                  size="small"
+                  onKeyDown={e => {
+                    if (e.key === "Enter" && !e.shiftKey) {
+                      e.preventDefault();
+                      if (!busy) chatSend();
+                    }
+                  }}
+                />
+                <Box sx={{ display: "grid", gridTemplateColumns: { xs: "1fr 1fr 1fr", sm: "1fr" }, gap: 0.5, alignContent: "end" }}>
+                  <Button size="small" variant="contained" onClick={chatSend} disabled={busy || !aiConfig.enableText}>送信</Button>
+                  <Button size="small" variant="outlined" onClick={() => imageInputRef.current?.click()} disabled={busy || !aiConfig.enableVision}>画像</Button>
+                  <Button size="small" variant="outlined" onClick={() => audioInputRef.current?.click()} disabled={busy || !aiConfig.enableWhisper}>音声</Button>
+                </Box>
+              </Box>
+            </Box>
+          ) : (
           <Box sx={{ display: "flex", flexDirection: "column", minHeight: { xs: 360, md: 0 }, height: { xs: "min(52dvh, 520px)", md: "auto" }, border: `1px solid ${border}`, borderRadius: 2, overflow: "hidden" }}>
             <Box sx={{ px: 1.2, py: 0.8, display: "flex", alignItems: "center", gap: 1, borderBottom: `1px solid ${border}` }}>
               <Typography variant="caption" fontWeight={800} sx={{ flex: 1 }}>{result?.label || "結果"}</Typography>
@@ -3735,12 +4095,14 @@ function SupportAIDialog({ open, onClose, appDarkMode, activeMode, editorApiRef,
             <Box component="textarea" value={resultText || result?.error || ""} onChange={e => setResult(r => r ? { ...r, text: e.target.value, suggestion: e.target.value, ok: true } : { ok: true, text: e.target.value, suggestion: e.target.value })} spellCheck={false} style={{ flex: 1, width: "100%", minHeight: supportAIFullScreen ? 220 : 260, resize: "none", border: 0, outline: 0, padding: 14, fontFamily: EDITOR_FONT, fontSize: 16, lineHeight: 1.65, background: dark ? "#020617" : "#fbfdff", color: dark ? "#e5e7eb" : "#111827" }} />
             {result?.history && <Box sx={{ px: 1.2, py: 0.7, borderTop: `1px solid ${border}`, maxHeight: 80, overflow: "auto" }}>{result.history.map((h, i) => <Typography key={i} variant="caption" sx={{ display: "block", color: muted }}>{i + 1}. {h.role}: {h.ok ? "OK" : h.error}</Typography>)}</Box>}
           </Box>
+          )}
         </Box>
       </DialogContent>
+
       <DialogActions sx={{ px: { xs: 1, sm: 2 }, py: 1, borderTop: `1px solid ${border}`, gap: 1, flexShrink: 0, display: "grid", gridTemplateColumns: { xs: "1fr 1fr", sm: "auto auto auto" }, justifyContent: { xs: "stretch", sm: "flex-end" }, "& .MuiButton-root": { m: 0 } }}>
         <Button onClick={() => navigator.clipboard.writeText(resultText || "").then(() => onToast?.("AI結果をコピーしました")).catch(() => onToast?.("コピーに失敗しました"))} disabled={!resultText}>結果コピー</Button>
-        <Button onClick={() => applySuggestion(result, true)} disabled={!resultText} variant="outlined">カーソルへ挿入</Button>
-        <Button onClick={() => applySuggestion(result, false)} disabled={!resultText} variant="contained" sx={{ gridColumn: { xs: "1 / -1", sm: "auto" } }}>結果を反映</Button>
+        <Button onClick={() => applySuggestion(result, true)} disabled={!resultText || busy} variant="outlined">カーソルへ挿入</Button>
+        <Button onClick={() => applySuggestion(result, false)} disabled={!resultText || busy} variant="contained" sx={{ gridColumn: { xs: "1 / -1", sm: "auto" } }}>結果を反映</Button>
       </DialogActions>
     </Dialog>
   );
