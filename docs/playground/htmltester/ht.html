@@ -465,7 +465,7 @@ const STORAGE_SCHEMA_VERSION = 2;
 const MAX_PROFILES         = 20;
 const MAX_SNAPSHOTS        = 50;
 const MAX_CODE_HISTORY      = 80;
-const APP_BUILD_LABEL       = "Full Stable v1.5 UI Base + Storage Cache Plus";
+const APP_BUILD_LABEL       = "Full Stable v1.7 Drawer Navigation";
 
 const DEFAULT_SETTINGS = {
   fontSize: 13,
@@ -1970,6 +1970,347 @@ async function requestPersistentStorageSafe() {
   }
 }
 
+// -----------------------------------------------------------------------------
+// Layered architecture facade
+// -----------------------------------------------------------------------------
+// The UI stays compatible with Full Stable v1.4/v1.5, while state-changing work is
+// routed through explicit layers. This keeps the single-file distribution, but
+// makes responsibilities visible and harder to accidentally mix.
+const APP_COMMANDS = Object.freeze({
+  SAMPLE: "SAMPLE",
+  COPY: "COPY",
+  DOWNLOAD: "DOWNLOAD",
+  RELOAD_PREVIEW: "RELOAD_PREVIEW",
+  UNDO: "UNDO",
+  REDO: "REDO",
+  OPEN_HISTORY: "OPEN_HISTORY",
+  OPEN_STORAGE: "OPEN_STORAGE",
+  OPEN_DRAWER: "OPEN_DRAWER",
+  OPEN_DIAGNOSTICS: "OPEN_DIAGNOSTICS",
+  OPEN_PATCH: "OPEN_PATCH",
+  TAKE_SNAPSHOT: "TAKE_SNAPSHOT",
+  ADD_BROWSER: "ADD_BROWSER",
+  CLEAR_EDITOR: "CLEAR_EDITOR",
+  SAVE_PROFILE: "SAVE_PROFILE",
+  NEW_HTML_TAB: "NEW_HTML_TAB",
+  NEW_MARKDOWN_TAB: "NEW_MARKDOWN_TAB",
+});
+
+const AppAdapters = Object.freeze({
+  localStorage: {
+    loadProfiles,
+    saveProfiles,
+    loadActiveProfileId,
+    saveActiveProfileId,
+    summary: getLocalStorageSummary,
+  },
+  indexedDB: {
+    open: openPlusDB,
+    put: putPlusStore,
+    getAll: getPlusStoreAll,
+    clear: clearPlusStore,
+    mirrorWorkspace: mirrorWorkspaceToPlusDB,
+    summary: getIndexedDBSummary,
+  },
+  cache: {
+    summary: getCacheSummary,
+    cacheCoreDependencies,
+    clearAll: clearAllPlusCaches,
+  },
+  browser: {
+    estimateStorage: getStorageEstimateSafe,
+    requestPersistentStorage: requestPersistentStorageSafe,
+    formatBytes,
+    byteSizeOf,
+    downloadJson(name, payload) {
+      const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = safeDownloadFileName(name || "html-editor-backup.json");
+      a.click();
+      URL.revokeObjectURL(url);
+    },
+    async copyText(text) {
+      await navigator.clipboard.writeText(String(text ?? ""));
+    },
+  },
+});
+
+const AppStateSelectors = Object.freeze({
+  activeProfile(profiles, activeProfileId) {
+    return profiles.find(p => p.id === activeProfileId) || profiles[0] || null;
+  },
+  activeEditorTab(editorTabs, activeEditorTabId) {
+    return editorTabs.find(tab => tab.id === activeEditorTabId) || editorTabs[0] || null;
+  },
+  settingsSnapshot({ fontSize, darkMode, wordWrap, highlightMode, previewScale, previewWidth, splitRatio }) {
+    return { fontSize, darkMode, wordWrap, highlightMode, previewScale, previewWidth, splitRatio };
+  },
+  workspaceSnapshot({ profiles, editorTabs, snapshots, codeHistory, activeProfileId, activeEditorTabId, settings }) {
+    return {
+      version: STORAGE_SCHEMA_VERSION,
+      build: APP_BUILD_LABEL,
+      exportedAt: new Date().toISOString(),
+      profiles: profiles || [],
+      editorTabs: editorTabs || [],
+      snapshots: snapshots || [],
+      codeHistory: codeHistory || [],
+      activeProfileId,
+      activeEditorTabId,
+      settings: settings || {},
+    };
+  },
+});
+
+const AppServices = Object.freeze({
+  editor: {
+    createTab: createEditorTab,
+    normalizeTabs: normalizeEditorTabs,
+    inferMode: inferEditorMode,
+    normalizeMode: normalizeEditorMode,
+    getUniqueTabName,
+    renameForMode,
+    safeDownloadFileName,
+  },
+  profile: {
+    create: createProfile,
+    normalizeRecord: normalizeProfileRecord,
+    migratePayload: migrateProfilePayload,
+    validateSettings,
+    exportOne: exportProfile,
+    exportAll: exportAllProfiles,
+  },
+  preview: {
+    build: buildSrcDoc,
+    buildHtml: buildHtmlSrcDoc,
+    buildMarkdown: buildMarkdownSrcDoc,
+    escapeHtml,
+  },
+  storage: {
+    async overview() {
+      const [estimate, localStorageSummary, indexedDBSummary, cacheSummary] = await Promise.all([
+        AppAdapters.browser.estimateStorage(),
+        Promise.resolve(AppAdapters.localStorage.summary()),
+        AppAdapters.indexedDB.summary().catch(e => ({ ok: false, total: 0, stores: [], error: e.message || String(e) })),
+        AppAdapters.cache.summary().catch(e => ({ ok: false, total: 0, caches: [], error: e.message || String(e) })),
+      ]);
+      return { estimate, localStorage: localStorageSummary, indexedDB: indexedDBSummary, cache: cacheSummary };
+    },
+    mirrorWorkspace(payload) {
+      return AppAdapters.indexedDB.mirrorWorkspace(payload);
+    },
+    cacheDependencies() {
+      return AppAdapters.cache.cacheCoreDependencies();
+    },
+    clearCaches() {
+      return AppAdapters.cache.clearAll();
+    },
+    requestPersistent() {
+      return AppAdapters.browser.requestPersistentStorage();
+    },
+    exportWorkspace(name, payload) {
+      return AppAdapters.browser.downloadJson(name, payload);
+    },
+  },
+  diagnostics: {
+    run: runQualityDiagnostics,
+  },
+});
+
+function createCommandBus(handlers, journalRef) {
+  return {
+    run(type, payload) {
+      const handler = handlers?.[type];
+      if (!handler) {
+        console.warn("Unknown command:", type);
+        return undefined;
+      }
+      const event = { id: `cmd-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`, type, payload, ts: Date.now() };
+      try {
+        journalRef?.current?.push(event);
+        if (journalRef?.current?.length > 200) journalRef.current.shift();
+      } catch {}
+      return handler(payload);
+    },
+  };
+}
+
+function commandItem(type, label, group, icon, commandBus, disabled = false) {
+  return {
+    type,
+    label,
+    group,
+    icon,
+    disabled,
+    run: () => { if (!disabled) commandBus.run(type); },
+  };
+}
+
+
+
+function DrawerNavigation({
+  open,
+  onClose,
+  isMobile,
+  appDarkMode,
+  commandItems,
+  activeEditorTab,
+  activeEditorMode,
+  profiles,
+  snapshots,
+  consoleLogs,
+  wins,
+  codeHistory,
+  onToggleAppDarkMode,
+  previewDarkMode,
+  onTogglePreviewDarkMode,
+  onSetMobileView,
+}) {
+  const {
+    Drawer, List, ListItemButton, ListItemIcon, ListItemText,
+    ListSubheader, Chip, Switch, Paper,
+  } = MaterialUI;
+
+  const grouped = useMemo(() => {
+    const map = new Map();
+    (commandItems || []).forEach(item => {
+      const group = item.group || "Other";
+      if (!map.has(group)) map.set(group, []);
+      map.get(group).push(item);
+    });
+    return Array.from(map.entries());
+  }, [commandItems]);
+
+  const runAndClose = useCallback((item) => {
+    if (!item || item.disabled) return;
+    item.run?.();
+    if (isMobile) onClose?.();
+  }, [isMobile, onClose]);
+
+  const drawerWidth = isMobile ? "100vw" : 352;
+  const paperSx = {
+    width: drawerWidth,
+    maxWidth: "100vw",
+    height: isMobile ? "86vh" : "100vh",
+    borderRadius: isMobile ? "18px 18px 0 0" : 0,
+    overflow: "hidden",
+    background: appDarkMode ? "#111827" : "#ffffff",
+    color: appDarkMode ? "#e5e7eb" : "#1f2937",
+  };
+  const borderColor = appDarkMode ? "#243044" : "#e5e7eb";
+  const subtleBg = appDarkMode ? "#0b1220" : "#f8fafc";
+
+  return (
+    <Drawer
+      anchor={isMobile ? "bottom" : "left"}
+      open={open}
+      onClose={onClose}
+      PaperProps={{ sx: paperSx }}
+      ModalProps={{ keepMounted: true }}
+    >
+      <Box sx={{ height: "100%", display: "flex", flexDirection: "column" }}>
+        <Box sx={{ p: 1.5, borderBottom: `1px solid ${borderColor}`, background: subtleBg }}>
+          <Stack direction="row" alignItems="center" spacing={1}>
+            <Icon name="menu_open" size={22} style={{ color: appDarkMode ? "#93c5fd" : "#1565c0" }} />
+            <Box sx={{ flex: 1, minWidth: 0 }}>
+              <Typography variant="subtitle2" fontWeight={900} noWrap>Drawer Menu</Typography>
+              <Typography variant="caption" sx={{ color: appDarkMode ? "#9ca3af" : "#64748b" }} noWrap>
+                Toolbar / Command Palette と同じ操作を整理表示
+              </Typography>
+            </Box>
+            <Tooltip title="閉じる" arrow>
+              <IconButton size="small" onClick={onClose} sx={{ color: appDarkMode ? "#e5e7eb" : "#334155" }}>
+                <Icon name="close" size={18} />
+              </IconButton>
+            </Tooltip>
+          </Stack>
+        </Box>
+
+        <Box sx={{ p: 1.25, borderBottom: `1px solid ${borderColor}` }}>
+          <Paper variant="outlined" sx={{ p: 1.1, borderRadius: 2, background: subtleBg, borderColor }}>
+            <Stack spacing={0.6}>
+              <Stack direction="row" spacing={0.75} alignItems="center">
+                <Chip size="small" label={activeEditorMode === EDITOR_MODES.MARKDOWN ? "Markdown" : "HTML"} color={activeEditorMode === EDITOR_MODES.MARKDOWN ? "secondary" : "primary"} sx={{ height: 20, fontSize: 10 }} />
+                <Typography variant="caption" fontWeight={800} noWrap sx={{ flex: 1 }}>{activeEditorTab?.name || "untitled"}</Typography>
+              </Stack>
+              <Typography variant="caption" sx={{ color: appDarkMode ? "#9ca3af" : "#64748b" }}>
+                profiles {profiles?.length || 0} / snapshots {snapshots?.length || 0} / history {codeHistory?.length || 0} / logs {consoleLogs?.length || 0} / windows {wins?.length || 0}
+              </Typography>
+            </Stack>
+          </Paper>
+        </Box>
+
+        {isMobile && (
+          <Box sx={{ p: 1, borderBottom: `1px solid ${borderColor}` }}>
+            <Typography variant="caption" fontWeight={900} sx={{ px: 0.5, color: appDarkMode ? "#93c5fd" : "#1565c0" }}>Mobile View</Typography>
+            <Stack direction="row" spacing={0.75} sx={{ mt: 0.75 }}>
+              {[
+                ["editor", "code", "編集"],
+                ["preview", "visibility", "Preview"],
+                ["history", "manage_history", "履歴"],
+                ["console", "terminal", "Log"],
+              ].map(([value, icon, label]) => (
+                <Button key={value} size="small" variant="outlined" fullWidth onClick={() => { onSetMobileView?.(value); onClose?.(); }} startIcon={<Icon name={icon} size={15} />} sx={{ minWidth: 0 }}>
+                  {label}
+                </Button>
+              ))}
+            </Stack>
+          </Box>
+        )}
+
+        <Box sx={{ flex: 1, overflow: "auto" }}>
+          {grouped.map(([group, items]) => (
+            <List key={group} dense disablePadding subheader={
+              <ListSubheader disableSticky sx={{ lineHeight: "28px", fontSize: 11, fontWeight: 900, letterSpacing: 0.4, color: appDarkMode ? "#93c5fd" : "#1565c0", background: appDarkMode ? "#111827" : "#fff" }}>
+                {group}
+              </ListSubheader>
+            }>
+              {items.map(item => (
+                <ListItemButton
+                  key={item.type}
+                  disabled={item.disabled}
+                  onClick={() => runAndClose(item)}
+                  sx={{ mx: 0.75, mb: 0.25, borderRadius: 1.5, py: 0.7 }}
+                >
+                  <ListItemIcon sx={{ minWidth: 34, color: appDarkMode ? "#bfdbfe" : "#1565c0" }}>
+                    <Icon name={item.icon || "chevron_right"} size={18} />
+                  </ListItemIcon>
+                  <ListItemText
+                    primary={item.label}
+                    primaryTypographyProps={{ fontSize: 12.5, fontWeight: 700, noWrap: true }}
+                    secondary={item.type}
+                    secondaryTypographyProps={{ fontSize: 10, color: appDarkMode ? "#6b7280" : "#94a3b8", noWrap: true }}
+                  />
+                </ListItemButton>
+              ))}
+              <Divider sx={{ my: 0.5, borderColor }} />
+            </List>
+          ))}
+        </Box>
+
+        <Box sx={{ p: 1.25, borderTop: `1px solid ${borderColor}`, background: subtleBg }}>
+          <Stack spacing={0.75}>
+            <Stack direction="row" alignItems="center" spacing={1}>
+              <Icon name="dark_mode" size={17} />
+              <Typography variant="caption" sx={{ flex: 1, fontWeight: 800 }}>App Dark Mode</Typography>
+              <Switch size="small" checked={!!appDarkMode} onChange={onToggleAppDarkMode} />
+            </Stack>
+            <Stack direction="row" alignItems="center" spacing={1}>
+              <Icon name="contrast" size={17} />
+              <Typography variant="caption" sx={{ flex: 1, fontWeight: 800 }}>Preview Dark Mode</Typography>
+              <Switch size="small" checked={!!previewDarkMode} onChange={onTogglePreviewDarkMode} />
+            </Stack>
+            <Button size="small" variant="contained" onClick={() => { const item = commandItems?.find(i => i.type === APP_COMMANDS.OPEN_STORAGE); runAndClose(item); }} startIcon={<Icon name="storage" size={16} />}>
+              Storage / Cacheを確認
+            </Button>
+          </Stack>
+        </Box>
+      </Box>
+    </Drawer>
+  );
+}
+
 function StorageManagerDialog({
   open,
   onClose,
@@ -1992,13 +2333,7 @@ function StorageManagerDialog({
     if (!open) return;
     setLoading(true);
     try {
-      const [estimate, ls, idb, cache] = await Promise.all([
-        getStorageEstimateSafe(),
-        Promise.resolve(getLocalStorageSummary()),
-        getIndexedDBSummary().catch(e => ({ ok: false, total: 0, stores: [], error: e.message || String(e) })),
-        getCacheSummary().catch(e => ({ ok: false, total: 0, caches: [], error: e.message || String(e) })),
-      ]);
-      setSummary({ estimate, localStorage: ls, indexedDB: idb, cache });
+      setSummary(await AppServices.storage.overview());
     } finally {
       setLoading(false);
     }
@@ -2009,7 +2344,7 @@ function StorageManagerDialog({
   const mirrorNow = useCallback(async () => {
     setLoading(true);
     try {
-      const res = await mirrorWorkspaceToPlusDB({ profiles, editorTabs, snapshots, codeHistory, activeProfileId, activeEditorTabId, settings });
+      const res = await AppServices.storage.mirrorWorkspace(AppStateSelectors.workspaceSnapshot({ profiles, editorTabs, snapshots, codeHistory, activeProfileId, activeEditorTabId, settings }));
       setLog(`IndexedDBへミラー保存しました: profiles ${res.profiles}, tabs ${res.tabs}, snapshots ${res.snapshots}, journal ${res.journal}`);
       onToast?.("IndexedDBへミラー保存しました");
       await refresh();
@@ -2024,7 +2359,7 @@ function StorageManagerDialog({
   const cacheDeps = useCallback(async () => {
     setLoading(true);
     try {
-      const results = await cacheCoreDependencies();
+      const results = await AppServices.storage.cacheDependencies();
       const ok = results.filter(r => r.ok).length;
       setLog(`依存CDNをCache APIへ保存: ${ok}/${results.length} 件成功`);
       onToast?.("依存CDNのキャッシュ処理を実行しました");
@@ -2039,7 +2374,7 @@ function StorageManagerDialog({
   const clearCaches = useCallback(async () => {
     setLoading(true);
     try {
-      const count = await clearAllPlusCaches();
+      const count = await AppServices.storage.clearCaches();
       setLog(`アプリ関連Cache APIを ${count} 件削除しました`);
       onToast?.("Cache APIを整理しました");
       await refresh();
@@ -2049,7 +2384,7 @@ function StorageManagerDialog({
   }, [refresh, onToast]);
 
   const persist = useCallback(async () => {
-    const ok = await requestPersistentStorageSafe();
+    const ok = await AppServices.storage.requestPersistent();
     setLog(ok ? "Persistent Storageが許可されました" : "Persistent Storageは未許可または未対応です");
     onToast?.(ok ? "永続ストレージが許可されました" : "永続ストレージは許可されませんでした");
     await refresh();
@@ -2180,7 +2515,7 @@ function CommandPaletteDialog({ open, onClose, commands }) {
       </Box>
       <DialogContent sx={{ p: 0, maxHeight: 420 }}>
         {filtered.map((cmd, i) => (
-          <Box key={`${cmd.label}-${i}`} onClick={() => run(cmd)} sx={{ px: 2, py: 1.1, borderBottom: "1px solid #f1f5f9", display: "flex", alignItems: "center", gap: 1, cursor: "pointer", "&:hover": { background: "#f8fafc" } }}>
+          <Box key={`${cmd.label}-${i}`} onClick={() => !cmd.disabled && run(cmd)} sx={{ px: 2, py: 1.1, borderBottom: "1px solid #f1f5f9", display: "flex", alignItems: "center", gap: 1, cursor: cmd.disabled ? "not-allowed" : "pointer", opacity: cmd.disabled ? 0.45 : 1, "&:hover": { background: cmd.disabled ? "transparent" : "#f8fafc" } }}>
             <Icon name={cmd.icon || "bolt"} size={18} style={{ color: "#1976d2" }} />
             <Box sx={{ minWidth: 0, flex: 1 }}>
               <Typography variant="body2" fontWeight={700}>{cmd.label}</Typography>
@@ -2355,7 +2690,7 @@ function App() {
   });
 
   const [confirmSwitch, setConfirmSwitch] = useState(null);
-  const activeProfile = profiles.find(p => p.id === activeProfileId) || profiles[0];
+  const activeProfile = AppStateSelectors.activeProfile(profiles, activeProfileId);
   const initS = validateSettings(activeProfile?.data?.settings || DEFAULT_SETTINGS);
 
   const initialEditorTabs = useMemo(() => normalizeEditorTabs(activeProfile?.data), []);
@@ -2367,7 +2702,7 @@ function App() {
     const activeTab = initialEditorTabs.find(t => t.id === initialEditorTabId) || initialEditorTabs[0];
     return activeTab?.code ?? activeProfile?.data?.code ?? DEFAULT_HTML;
   });
-  const activeEditorTab = useMemo(() => editorTabs.find(tab => tab.id === activeEditorTabId) || editorTabs[0] || null, [editorTabs, activeEditorTabId]);
+  const activeEditorTab = useMemo(() => AppStateSelectors.activeEditorTab(editorTabs, activeEditorTabId), [editorTabs, activeEditorTabId]);
   const activeEditorMode = inferEditorMode(activeEditorTab?.name, html, activeEditorTab?.mode);
   const [previewKey, setPreviewKey] = useState(0);
   const [previewWidth, setPreviewWidth] = useState(initS.previewWidth);
@@ -2393,12 +2728,14 @@ function App() {
   const [historyOpen, setHistoryOpen] = useState(false);
   const [storageManagerOpen, setStorageManagerOpen] = useState(false);
   const [commandPaletteOpen, setCommandPaletteOpen] = useState(false);
+  const [drawerOpen, setDrawerOpen] = useState(false);
   const [mobileView, setMobileView] = useState("editor");
   const [patchOpen, setPatchOpen] = useState(false);
   const [qualityState, qualityDispatch] = useReducer(qualityReducer, { open: false, results: [] });
   const lastGoodCodeRef = useRef(null);
   const consoleLogsRef = useRef([]);
   const historyMuteRef = useRef(false);
+  const commandJournalRef = useRef([]);
   const [codeHistory, setCodeHistory] = useState(() => [{ id: `hist-${Date.now()}-0`, code: html, label: "初期状態", ts: Date.now(), tabId: activeEditorTabId }]);
   const [codeHistoryIndex, setCodeHistoryIndex] = useState(0);
   const [wins, setWins] = useState(() => activeProfile?.data?.windows ?? []);
@@ -2925,37 +3262,72 @@ function App() {
   const clearConfirm = useCallback(() => { setHtml(""); setConfirmClear(false); toast("クリアしました"); }, []);
   const toggleFullscreen = useCallback((pane) => setFullscreen(f => f === pane ? "none" : pane), []);
 
+  const commandBus = useMemo(() => createCommandBus({
+    [APP_COMMANDS.SAMPLE]: sample,
+    [APP_COMMANDS.COPY]: copy,
+    [APP_COMMANDS.DOWNLOAD]: download,
+    [APP_COMMANDS.RELOAD_PREVIEW]: reload,
+    [APP_COMMANDS.UNDO]: undoCode,
+    [APP_COMMANDS.REDO]: redoCode,
+    [APP_COMMANDS.OPEN_HISTORY]: () => setHistoryOpen(true),
+    [APP_COMMANDS.OPEN_STORAGE]: () => setStorageManagerOpen(true),
+    [APP_COMMANDS.OPEN_DRAWER]: () => setDrawerOpen(true),
+    [APP_COMMANDS.OPEN_DIAGNOSTICS]: openDiagnostics,
+    [APP_COMMANDS.OPEN_PATCH]: () => setPatchOpen(true),
+    [APP_COMMANDS.TAKE_SNAPSHOT]: takeSnapshot,
+    [APP_COMMANDS.ADD_BROWSER]: addWin,
+    [APP_COMMANDS.CLEAR_EDITOR]: () => setConfirmClear(true),
+    [APP_COMMANDS.SAVE_PROFILE]: handleProfileSave,
+    [APP_COMMANDS.NEW_HTML_TAB]: addEditorTab,
+    [APP_COMMANDS.NEW_MARKDOWN_TAB]: () => {
+      const synced = getSyncedEditorTabs();
+      if (synced.length >= MAX_EDITOR_TABS) { toast(`コードタブは最大 ${MAX_EDITOR_TABS} 個までです`); return; }
+      const tab = createEditorTab(getUniqueTabName(synced, `notes-${synced.length + 1}.md`), DEFAULT_MARKDOWN, EDITOR_MODES.MARKDOWN);
+      setEditorTabs([...synced, tab]);
+      setActiveEditorTabId(tab.id);
+      setHtmlState(tab.code);
+      setConsoleLogs([]);
+      toast(`「${tab.name}」を追加しました`);
+    },
+  }, commandJournalRef), [sample, copy, download, reload, undoCode, redoCode, openDiagnostics, takeSnapshot, addWin, handleProfileSave, addEditorTab, getSyncedEditorTabs]);
+
   useEffect(() => {
     const fn = (e) => {
       if (!(e.ctrlKey || e.metaKey)) return;
       const key = String(e.key || "").toLowerCase();
-      if (key === "enter") { e.preventDefault(); reload(); }
-      if (key === "s") { e.preventDefault(); download(); }
-      if (key === "z" && !e.shiftKey) { e.preventDefault(); undoCode(); }
-      if (key === "y" || (key === "z" && e.shiftKey)) { e.preventDefault(); redoCode(); }
-      if (key === "h" && e.shiftKey) { e.preventDefault(); setHistoryOpen(true); }
+      if (key === "enter") { e.preventDefault(); commandBus.run(APP_COMMANDS.RELOAD_PREVIEW); }
+      if (key === "s" && e.shiftKey) { e.preventDefault(); commandBus.run(APP_COMMANDS.OPEN_STORAGE); return; }
+      if (key === "s") { e.preventDefault(); commandBus.run(APP_COMMANDS.DOWNLOAD); }
+      if (key === "z" && !e.shiftKey) { e.preventDefault(); commandBus.run(APP_COMMANDS.UNDO); }
+      if (key === "y" || (key === "z" && e.shiftKey)) { e.preventDefault(); commandBus.run(APP_COMMANDS.REDO); }
+      if (key === "h" && e.shiftKey) { e.preventDefault(); commandBus.run(APP_COMMANDS.OPEN_HISTORY); }
+      if (key === "m" && e.shiftKey) { e.preventDefault(); commandBus.run(APP_COMMANDS.OPEN_DRAWER); }
       if (key === "k") { e.preventDefault(); setCommandPaletteOpen(true); }
-      if (key === "s" && e.shiftKey) { e.preventDefault(); setStorageManagerOpen(true); }
     };
     window.addEventListener("keydown", fn);
     return () => window.removeEventListener("keydown", fn);
-  }, [reload, download, undoCode, redoCode]);
+  }, [commandBus]);
 
 
   const commandItems = useMemo(() => [
-    { label: "サンプル投入", group: "編集", icon: "article", run: sample },
-    { label: "コピー", group: "編集", icon: "content_copy", run: copy },
-    { label: "ダウンロード / Export current tab", group: "保存", icon: "download", run: download },
-    { label: "プレビュー再読み込み", group: "Preview", icon: "refresh", run: reload },
-    { label: "取り消し Undo", group: "履歴", icon: "undo", run: undoCode },
-    { label: "やり直し Redo", group: "履歴", icon: "redo", run: redoCode },
-    { label: "履歴ナビゲータを開く", group: "履歴", icon: "manage_history", run: () => setHistoryOpen(true) },
-    { label: "Storage / Cache Managerを開く", group: "Storage", icon: "storage", run: () => setStorageManagerOpen(true) },
-    { label: "診断パネルを開く", group: "Diagnostics", icon: "health_and_safety", run: openDiagnostics },
-    { label: "差分パッチを適用", group: "編集", icon: "difference", run: () => setPatchOpen(true) },
-    { label: "スナップショットを保存", group: "Recovery", icon: "photo_camera", run: takeSnapshot },
-    { label: "ブラウザウィンドウを追加", group: "Browser", icon: "add_circle_outline", run: addWin },
-  ], [sample, copy, download, reload, undoCode, redoCode, openDiagnostics, takeSnapshot, addWin]);
+    commandItem(APP_COMMANDS.SAMPLE, "サンプル投入", "編集", "article", commandBus),
+    commandItem(APP_COMMANDS.COPY, "コピー", "編集", "content_copy", commandBus),
+    commandItem(APP_COMMANDS.DOWNLOAD, "ダウンロード / Export current tab", "保存", "download", commandBus),
+    commandItem(APP_COMMANDS.RELOAD_PREVIEW, "プレビュー再読み込み", "Preview", "refresh", commandBus),
+    commandItem(APP_COMMANDS.UNDO, "取り消し Undo", "履歴", "undo", commandBus, !canUndoCode),
+    commandItem(APP_COMMANDS.REDO, "やり直し Redo", "履歴", "redo", commandBus, !canRedoCode),
+    commandItem(APP_COMMANDS.OPEN_HISTORY, "履歴ナビゲータを開く", "履歴", "manage_history", commandBus),
+    commandItem(APP_COMMANDS.OPEN_STORAGE, "Storage / Cache Managerを開く", "Storage", "storage", commandBus),
+    commandItem(APP_COMMANDS.OPEN_DRAWER, "Drawer Menuを開く", "Navigation", "menu_open", commandBus),
+    commandItem(APP_COMMANDS.OPEN_DIAGNOSTICS, "診断パネルを開く", "Diagnostics", "health_and_safety", commandBus),
+    commandItem(APP_COMMANDS.OPEN_PATCH, "差分パッチを適用", "編集", "difference", commandBus),
+    commandItem(APP_COMMANDS.CLEAR_EDITOR, "エディタをクリア", "編集", "delete_outline", commandBus),
+    commandItem(APP_COMMANDS.TAKE_SNAPSHOT, "スナップショットを保存", "Recovery", "photo_camera", commandBus),
+    commandItem(APP_COMMANDS.SAVE_PROFILE, "プロファイルを保存", "保存", "save", commandBus),
+    commandItem(APP_COMMANDS.NEW_HTML_TAB, "新規HTMLタブ", "タブ", "code", commandBus),
+    commandItem(APP_COMMANDS.NEW_MARKDOWN_TAB, "新規Markdownタブ", "タブ", "article", commandBus),
+    commandItem(APP_COMMANDS.ADD_BROWSER, "ブラウザウィンドウを追加", "Browser", "add_circle_outline", commandBus),
+  ], [commandBus, canUndoCode, canRedoCode]);
 
   const showEditor = fullscreen !== "preview";
   const showPreview = fullscreen !== "editor";
@@ -2972,55 +3344,166 @@ function App() {
     <ThemeProvider theme={theme}>
       <CssBaseline />
 
+      <DrawerNavigation
+        open={drawerOpen}
+        onClose={() => setDrawerOpen(false)}
+        isMobile={isMobile}
+        appDarkMode={appDarkMode}
+        commandItems={commandItems}
+        activeEditorTab={activeEditorTab}
+        activeEditorMode={activeEditorMode}
+        profiles={profiles}
+        snapshots={snapshots}
+        consoleLogs={consoleLogs}
+        wins={wins}
+        codeHistory={codeHistory}
+        previewDarkMode={previewDarkMode}
+        onToggleAppDarkMode={() => setAppDarkMode(d => !d)}
+        onTogglePreviewDarkMode={() => setPreviewDarkMode(d => !d)}
+        onSetMobileView={setMobileView}
+      />
+
       <Box sx={{ display: "flex", flexDirection: "column", height: "100vh", overflow: "hidden" }}>
-        <AppBar position="static" elevation={0} sx={{ background: "#1565c0", flexShrink: 0, minHeight: TOOLBAR_H }}>
-          <Toolbar variant="dense" sx={{ gap: 0.5, minHeight: TOOLBAR_H, px: { xs: 1, sm: 2 } }}>
-            <Typography variant="subtitle1" fontWeight={700} noWrap sx={{ mr: 1.5, fontSize: { xs: 13, sm: 15 } }}>{APP_BUILD_LABEL}</Typography>
-            <Divider orientation="vertical" flexItem sx={{ borderColor: "rgba(255,255,255,0.2)", mx: 0.5 }} />
-            <Tooltip title="サンプル投入" arrow><IconButton size="small" onClick={sample} sx={{ color: "#fff" }}><Icon name="article" size={19} /></IconButton></Tooltip>
-            <Tooltip title="コピー" arrow><IconButton size="small" onClick={copy} sx={{ color: "#fff" }}><Icon name="content_copy" size={19} /></IconButton></Tooltip>
-            <Tooltip title={isMobile ? "ダウンロード" : "HTMLとして保存 (Ctrl+S)"} arrow><IconButton size="small" onClick={download} sx={{ color: "#fff" }}><Icon name="download" size={19} /></IconButton></Tooltip>
-            <Tooltip title="プレビュー再読み込み (Ctrl+Enter)" arrow><IconButton size="small" onClick={reload} sx={{ color: "#fff" }}><Icon name="refresh" size={19} /></IconButton></Tooltip>
-            <Tooltip title="取り消し (Ctrl+Z)" arrow><span><IconButton size="small" onClick={undoCode} disabled={!canUndoCode} sx={{ color: canUndoCode ? "#fff" : "rgba(255,255,255,0.35)" }}><Icon name="undo" size={19} /></IconButton></span></Tooltip>
-            <Tooltip title="やり直し (Ctrl+Y / Ctrl+Shift+Z)" arrow><span><IconButton size="small" onClick={redoCode} disabled={!canRedoCode} sx={{ color: canRedoCode ? "#fff" : "rgba(255,255,255,0.35)" }}><Icon name="redo" size={19} /></IconButton></span></Tooltip>
-            <Tooltip title="履歴ナビゲータ (Ctrl+Shift+H)" arrow><IconButton size="small" onClick={() => setHistoryOpen(true)} sx={{ color: "#fff" }}><Icon name="manage_history" size={19} /></IconButton></Tooltip>
-            <Tooltip title="クリア" arrow><IconButton size="small" onClick={() => setConfirmClear(true)} sx={{ color: "#ffb3b3" }}><Icon name="delete_outline" size={19} /></IconButton></Tooltip>
-            <Tooltip title="差分パッチを適用" arrow><IconButton size="small" onClick={() => setPatchOpen(true)} sx={{ color: "#fff" }}><Icon name="difference" size={19} /></IconButton></Tooltip>
-            <Tooltip title="診断パネル" arrow><IconButton size="small" onClick={openDiagnostics} sx={{ color: "#fff" }}><Icon name="health_and_safety" size={19} /></IconButton></Tooltip>
-            <Tooltip title="Storage / Cache Manager (Ctrl+Shift+S)" arrow><IconButton size="small" onClick={() => setStorageManagerOpen(true)} sx={{ color: "#fff" }}><Icon name="storage" size={19} /></IconButton></Tooltip>
-            <Tooltip title="Command Palette (Ctrl+K)" arrow><IconButton size="small" onClick={() => setCommandPaletteOpen(true)} sx={{ color: "#fff" }}><Icon name="manage_search" size={19} /></IconButton></Tooltip>
-            <Divider orientation="vertical" flexItem sx={{ borderColor: "rgba(255,255,255,0.2)", mx: 0.5 }} />
-            <Tooltip title="ブラウザウィンドウを追加" arrow><IconButton size="small" onClick={addWin} sx={{ color: "#a5d6ff" }}><Icon name="add_circle_outline" size={19} /></IconButton></Tooltip>
-            {wins.map(w => {
-              const aTab = w.tabs.find(t => t.id === w.activeTab) || w.tabs[0];
-              return (
-                <Tooltip key={w.id} title={w.minimized ? `展開: ${aTab.title}` : `最小化: ${aTab.title}`} arrow>
-                  <Box onClick={() => updateWin(w.id, { minimized: !w.minimized })} sx={{ display: "flex", alignItems: "center", gap: 0.4, px: 1, py: 0.3, borderRadius: 1, cursor: "pointer", background: w.minimized ? "rgba(255,255,255,0.22)" : "rgba(255,255,255,0.08)", border: w.minimized ? "1px solid rgba(255,255,255,0.5)" : "1px solid rgba(255,255,255,0.2)", maxWidth: 130 }}>
-                    <Icon name="language" size={13} style={{ color: w.minimized ? "#fff" : "#a5d6ff", flexShrink: 0 }} />
-                    <Typography noWrap variant="caption" sx={{ fontSize: 11, color: "rgba(255,255,255,0.9)", lineHeight: 1, fontWeight: w.minimized ? 700 : 400 }}>{aTab.title.length > 12 ? aTab.title.slice(0, 12) + "…" : aTab.title}</Typography>
-                    {w.minimized && <Box sx={{ width: 5, height: 5, borderRadius: "50%", background: "#ffd700", flexShrink: 0, ml: 0.3 }} />}
-                  </Box>
-                </Tooltip>
-              );
-            })}
-            <Divider orientation="vertical" flexItem sx={{ borderColor: "rgba(255,255,255,0.2)", mx: 0.5 }} />
-            <Box sx={{ flex: 1 }} />
-            <ProfileMenu
-              profiles={profiles}
-              activeId={activeProfileId}
-              onSwitch={handleProfileSwitch}
-              onSave={handleProfileSave}
-              onNew={handleProfileNew}
-              onRename={handleProfileRename}
-              onDuplicate={handleProfileDuplicate}
-              onDelete={handleProfileDelete}
-              onExport={handleProfileExport}
-              onExportAll={handleProfileExportAll}
-              onImport={handleProfileImport}
-              onReset={handleProfileReset}
-            />
+        <AppBar
+          position="static"
+          elevation={0}
+          sx={{
+            background: "#1565c0",
+            flexShrink: 0,
+            overflow: "visible",
+            borderBottom: "1px solid rgba(255,255,255,0.12)",
+          }}
+        >
+          <Toolbar
+            variant="dense"
+            sx={{
+              gap: { xs: 0.25, sm: 0.5 },
+              minHeight: { xs: 46, sm: TOOLBAR_H },
+              px: { xs: 0.5, sm: 1, md: 2 },
+              py: { xs: 0.35, md: 0 },
+              width: "100%",
+              maxWidth: "100vw",
+              flexWrap: { xs: "wrap", md: "nowrap" },
+              alignContent: "center",
+              overflow: "visible",
+              "& .MuiIconButton-root": { flexShrink: 0 },
+            }}
+          >
+            <Tooltip title="Drawer Menu (Ctrl+Shift+M)" arrow>
+              <IconButton size="small" onClick={() => setDrawerOpen(true)} sx={{ color: "#fff", mr: { xs: 0, sm: 0.25 } }}>
+                <Icon name="menu" size={21} />
+              </IconButton>
+            </Tooltip>
+
+            <Typography
+              variant="subtitle1"
+              fontWeight={700}
+              noWrap
+              sx={{
+                display: { xs: "none", sm: "block" },
+                mr: { sm: 0.5, md: 1.5 },
+                fontSize: { sm: 13, md: 15 },
+                maxWidth: { sm: 190, md: 280, lg: 360 },
+                minWidth: 0,
+                color: "#fff",
+              }}
+            >
+              {APP_BUILD_LABEL}
+            </Typography>
+
+            <Typography
+              variant="caption"
+              fontWeight={700}
+              noWrap
+              sx={{
+                display: { xs: "block", sm: "none" },
+                flex: 1,
+                minWidth: 0,
+                maxWidth: "calc(100vw - 230px)",
+                color: "#fff",
+                fontSize: 12,
+              }}
+            >
+              {activeEditorTab?.name || APP_BUILD_LABEL}
+            </Typography>
+
+            <Box sx={{ display: { xs: "flex", md: "none" }, alignItems: "center", gap: 0.1, ml: "auto", flexShrink: 0 }}>
+              <Tooltip title="保存 / ダウンロード" arrow>
+                <IconButton size="small" onClick={download} sx={{ color: "#fff" }}><Icon name="download" size={19} /></IconButton>
+              </Tooltip>
+              <Tooltip title="履歴" arrow>
+                <IconButton size="small" onClick={() => setHistoryOpen(true)} sx={{ color: "#fff" }}><Icon name="manage_history" size={19} /></IconButton>
+              </Tooltip>
+              <Tooltip title="Storage / Cache" arrow>
+                <IconButton size="small" onClick={() => setStorageManagerOpen(true)} sx={{ color: "#fff" }}><Icon name="storage" size={19} /></IconButton>
+              </Tooltip>
+              <Tooltip title="Command Palette" arrow>
+                <IconButton size="small" onClick={() => setCommandPaletteOpen(true)} sx={{ color: "#fff" }}><Icon name="manage_search" size={19} /></IconButton>
+              </Tooltip>
+              <Tooltip title={appDarkMode ? "ライトモード" : "ダークモード"} arrow>
+                <IconButton size="small" onClick={() => setAppDarkMode(d => !d)} sx={{ color: appDarkMode ? "#ffd700" : "rgba(255,255,255,0.72)" }}>
+                  <Icon name={appDarkMode ? "light_mode" : "dark_mode"} size={19} />
+                </IconButton>
+              </Tooltip>
+            </Box>
+
+            <Divider orientation="vertical" flexItem sx={{ display: { xs: "none", md: "block" }, borderColor: "rgba(255,255,255,0.2)", mx: 0.5 }} />
+
+            <Box sx={{ display: { xs: "none", md: "flex" }, alignItems: "center", gap: 0.25, flexShrink: 0 }}>
+              <Tooltip title="サンプル投入" arrow><IconButton size="small" onClick={sample} sx={{ color: "#fff" }}><Icon name="article" size={19} /></IconButton></Tooltip>
+              <Tooltip title="コピー" arrow><IconButton size="small" onClick={copy} sx={{ color: "#fff" }}><Icon name="content_copy" size={19} /></IconButton></Tooltip>
+              <Tooltip title="HTMLとして保存 (Ctrl+S)" arrow><IconButton size="small" onClick={download} sx={{ color: "#fff" }}><Icon name="download" size={19} /></IconButton></Tooltip>
+              <Tooltip title="プレビュー再読み込み (Ctrl+Enter)" arrow><IconButton size="small" onClick={reload} sx={{ color: "#fff" }}><Icon name="refresh" size={19} /></IconButton></Tooltip>
+              <Tooltip title="取り消し (Ctrl+Z)" arrow><span><IconButton size="small" onClick={undoCode} disabled={!canUndoCode} sx={{ color: canUndoCode ? "#fff" : "rgba(255,255,255,0.35)" }}><Icon name="undo" size={19} /></IconButton></span></Tooltip>
+              <Tooltip title="やり直し (Ctrl+Y / Ctrl+Shift+Z)" arrow><span><IconButton size="small" onClick={redoCode} disabled={!canRedoCode} sx={{ color: canRedoCode ? "#fff" : "rgba(255,255,255,0.35)" }}><Icon name="redo" size={19} /></IconButton></span></Tooltip>
+              <Tooltip title="履歴ナビゲータ (Ctrl+Shift+H)" arrow><IconButton size="small" onClick={() => setHistoryOpen(true)} sx={{ color: "#fff" }}><Icon name="manage_history" size={19} /></IconButton></Tooltip>
+              <Tooltip title="クリア" arrow><IconButton size="small" onClick={() => setConfirmClear(true)} sx={{ color: "#ffb3b3" }}><Icon name="delete_outline" size={19} /></IconButton></Tooltip>
+              <Tooltip title="差分パッチを適用" arrow><IconButton size="small" onClick={() => setPatchOpen(true)} sx={{ color: "#fff" }}><Icon name="difference" size={19} /></IconButton></Tooltip>
+              <Tooltip title="診断パネル" arrow><IconButton size="small" onClick={openDiagnostics} sx={{ color: "#fff" }}><Icon name="health_and_safety" size={19} /></IconButton></Tooltip>
+              <Tooltip title="Storage / Cache Manager (Ctrl+Shift+S)" arrow><IconButton size="small" onClick={() => setStorageManagerOpen(true)} sx={{ color: "#fff" }}><Icon name="storage" size={19} /></IconButton></Tooltip>
+              <Tooltip title="Command Palette (Ctrl+K)" arrow><IconButton size="small" onClick={() => setCommandPaletteOpen(true)} sx={{ color: "#fff" }}><Icon name="manage_search" size={19} /></IconButton></Tooltip>
+            </Box>
+
+            <Divider orientation="vertical" flexItem sx={{ display: { xs: "none", md: "block" }, borderColor: "rgba(255,255,255,0.2)", mx: 0.5 }} />
+
+            <Box sx={{ display: { xs: "none", md: "flex" }, alignItems: "center", gap: 0.4, flexShrink: 0, minWidth: 0 }}>
+              <Tooltip title="ブラウザウィンドウを追加" arrow><IconButton size="small" onClick={addWin} sx={{ color: "#a5d6ff" }}><Icon name="add_circle_outline" size={19} /></IconButton></Tooltip>
+              <Box sx={{ display: { xs: "none", lg: "flex" }, alignItems: "center", gap: 0.4, minWidth: 0, maxWidth: { lg: 320, xl: 520 }, overflow: "hidden" }}>
+                {wins.map(w => {
+                  const aTab = w.tabs.find(t => t.id === w.activeTab) || w.tabs[0];
+                  return (
+                    <Tooltip key={w.id} title={w.minimized ? `展開: ${aTab.title}` : `最小化: ${aTab.title}`} arrow>
+                      <Box onClick={() => updateWin(w.id, { minimized: !w.minimized })} sx={{ display: "flex", alignItems: "center", gap: 0.4, px: 1, py: 0.3, borderRadius: 1, cursor: "pointer", background: w.minimized ? "rgba(255,255,255,0.22)" : "rgba(255,255,255,0.08)", border: w.minimized ? "1px solid rgba(255,255,255,0.5)" : "1px solid rgba(255,255,255,0.2)", maxWidth: 130, flexShrink: 1, minWidth: 44 }}>
+                        <Icon name="language" size={13} style={{ color: w.minimized ? "#fff" : "#a5d6ff", flexShrink: 0 }} />
+                        <Typography noWrap variant="caption" sx={{ fontSize: 11, color: "rgba(255,255,255,0.9)", lineHeight: 1, fontWeight: w.minimized ? 700 : 400 }}>{aTab.title.length > 12 ? aTab.title.slice(0, 12) + "…" : aTab.title}</Typography>
+                        {w.minimized && <Box sx={{ width: 5, height: 5, borderRadius: "50%", background: "#ffd700", flexShrink: 0, ml: 0.3 }} />}
+                      </Box>
+                    </Tooltip>
+                  );
+                })}
+              </Box>
+            </Box>
+
+            <Box sx={{ flex: 1, minWidth: { xs: 0, md: 12 } }} />
+
+            <Box sx={{ display: { xs: "none", sm: "block" }, flexShrink: 0, maxWidth: { sm: 170, md: 190 } }}>
+              <ProfileMenu
+                profiles={profiles}
+                activeId={activeProfileId}
+                onSwitch={handleProfileSwitch}
+                onSave={handleProfileSave}
+                onNew={handleProfileNew}
+                onRename={handleProfileRename}
+                onDuplicate={handleProfileDuplicate}
+                onDelete={handleProfileDelete}
+                onExport={handleProfileExport}
+                onExportAll={handleProfileExportAll}
+                onImport={handleProfileImport}
+                onReset={handleProfileReset}
+              />
+            </Box>
             <Tooltip title={appDarkMode ? "アプリ全体: ライトモード" : "アプリ全体: ダークモード"} arrow>
-              <IconButton size="small" onClick={() => setAppDarkMode(d => !d)} sx={{ color: appDarkMode ? "#ffd700" : "rgba(255,255,255,0.6)" }}>
+              <IconButton size="small" onClick={() => setAppDarkMode(d => !d)} sx={{ display: { xs: "none", md: "inline-flex" }, color: appDarkMode ? "#ffd700" : "rgba(255,255,255,0.6)" }}>
                 <Icon name={appDarkMode ? "light_mode" : "dark_mode"} size={19} />
               </IconButton>
             </Tooltip>
@@ -3313,7 +3796,7 @@ root.render(<React.StrictMode><App /></React.StrictMode>);
 
     const appCode = document.getElementById("app-code").textContent;
     const { code } = Babel.transform(appCode, { presets: ["react"] });
-    const runApp = new Function("React", "createRoot", "MaterialUI", "CONSOLE_INTERCEPT", code + "\n//# sourceURL=html-editor-full-stable-v1-4-responsive-history.jsx");
+    const runApp = new Function("React", "createRoot", "MaterialUI", "CONSOLE_INTERCEPT", code + "\n//# sourceURL=html-editor-full-stable-v1-6-layered-architecture.jsx");
     runApp(React, createRoot, MaterialUI, CONSOLE_INTERCEPT);
   </script>
 </body>
