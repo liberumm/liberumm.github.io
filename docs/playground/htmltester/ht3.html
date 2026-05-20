@@ -2034,7 +2034,12 @@ const SUPPORT_AI_PROVIDER_OPTIONS = Object.freeze([
 const DEFAULT_SUPPORT_AI_CONFIG = Object.freeze({
   // Local-complete policy: the app never sends document/image/audio content to an external LLM endpoint.
   // Runtime/model files may be downloaded on first use, then reused from the browser cache.
+  // iPhone Local LLM Policy:
+  // - App remains a single HTML file; model files may be fetched on first run and cached by the browser.
+  // - No external LLM API is used.
+  // - Explicit WebGPU mode must not silently downgrade to server inference or WASM.
   provider: "browser-local",
+  policyVersion: "iphone-webgpu-local-llm-v1",
 
   // Selective enable policy. Only enabled capabilities may lazy-load models.
   localAIEnabled: true,
@@ -2053,10 +2058,10 @@ const DEFAULT_SUPPORT_AI_CONFIG = Object.freeze({
   // auto: use Cache API only when the current browsing context allows it.
   // off: never touch Cache API. This avoids sandbox errors such as missing allow-same-origin.
   // on: request Cache API, but automatically falls back to off if blocked.
-  browserCacheMode: "auto", // auto | on | off
+  browserCacheMode: "on", // auto | on | off
   allowSandboxNoCacheFallback: true,
   localModelPath: "./models/",
-  browserDevice: "auto", // auto | webgpu | wasm
+  browserDevice: "webgpu", // auto | webgpu | wasm
 
   // Browser-local Text / Vision / ASR / TTS models.
   browserTextModel: "onnx-community/LFM2.5-350M-ONNX",
@@ -2207,6 +2212,7 @@ function normalizeSupportAIConfig(config) {
     maxTokens: Math.round(n(c.maxTokens, DEFAULT_SUPPORT_AI_CONFIG.maxTokens, 128, 32000)),
     timeoutMs: Math.round(n(c.timeoutMs, DEFAULT_SUPPORT_AI_CONFIG.timeoutMs, 5000, 300000)),
     language: s(c.language, DEFAULT_SUPPORT_AI_CONFIG.language),
+    policyVersion: s(c.policyVersion, DEFAULT_SUPPORT_AI_CONFIG.policyVersion),
   };
 }
 
@@ -2214,7 +2220,19 @@ function loadSupportAIConfig() {
   try {
     const raw = localStorage.getItem(SUPPORT_AI_CONFIG_KEY);
     if (!raw) return { ...DEFAULT_SUPPORT_AI_CONFIG };
-    return normalizeSupportAIConfig(JSON.parse(raw));
+    const parsed = JSON.parse(raw);
+    const loaded = normalizeSupportAIConfig(parsed);
+    if (parsed?.policyVersion !== DEFAULT_SUPPORT_AI_CONFIG.policyVersion) {
+      const migrated = normalizeSupportAIConfig({
+        ...loaded,
+        browserCacheMode: DEFAULT_SUPPORT_AI_CONFIG.browserCacheMode,
+        browserDevice: DEFAULT_SUPPORT_AI_CONFIG.browserDevice,
+        policyVersion: DEFAULT_SUPPORT_AI_CONFIG.policyVersion,
+      });
+      try { localStorage.setItem(SUPPORT_AI_CONFIG_KEY, JSON.stringify(migrated)); } catch {}
+      return migrated;
+    }
+    return loaded;
   } catch {
     return { ...DEFAULT_SUPPORT_AI_CONFIG };
   }
@@ -2303,11 +2321,26 @@ function supportAIResolveBrowserCacheUse(config) {
   return { useBrowserCache: false, status, reason: status.blocked ? "blocked-by-sandbox" : "unavailable" };
 }
 
-function supportAIResolveBrowserDevice(config) {
+function supportAIHasWebGPU() {
+  return typeof navigator !== "undefined" && Boolean(navigator.gpu);
+}
+
+function supportAIWebGPURequiredMessage() {
+  return "iPhoneローカルLLMにはWebGPU対応Safariが必要です。iOS/Safari 26以降で、HTTPSまたは安全なコンテキストから開き、WebGPUが有効な環境で実行してください。";
+}
+
+function supportAIResolveBrowserDevice(config, options = {}) {
   const c = normalizeSupportAIConfig(config);
-  if (c.browserDevice === "webgpu") return "webgpu";
+  const strict = options.strict !== false;
+  if (c.browserDevice === "webgpu") {
+    if (!supportAIHasWebGPU()) {
+      if (strict) throw new Error(supportAIWebGPURequiredMessage());
+      return "webgpu";
+    }
+    return "webgpu";
+  }
   if (c.browserDevice === "wasm") return "wasm";
-  return typeof navigator !== "undefined" && navigator.gpu ? "webgpu" : "wasm";
+  return supportAIHasWebGPU() ? "webgpu" : "wasm";
 }
 
 function supportAIFeatureEnabled(config, feature) {
@@ -2334,7 +2367,7 @@ function supportAIDisabledResult(feature, label) {
 
 function supportAIGetPreparedStatus(config) {
   const c = normalizeSupportAIConfig(config);
-  const resolvedDevice = supportAIResolveBrowserDevice(c);
+  const resolvedDevice = supportAIResolveBrowserDevice(c, { strict: false });
   const device = SUPPORT_AI_BROWSER_LOCAL.activeDevice || resolvedDevice;
   return {
     enabled: {
@@ -2350,10 +2383,10 @@ function supportAIGetPreparedStatus(config) {
     prepared: { ...SUPPORT_AI_BROWSER_LOCAL.prepared },
     preparedAt: { ...SUPPORT_AI_BROWSER_LOCAL.preparedAt },
     device,
-    webGPU: Boolean(typeof navigator !== "undefined" && navigator.gpu),
+    webGPU: supportAIHasWebGPU(),
     loadedPipelines: SUPPORT_AI_BROWSER_LOCAL.pipelinePromises.size,
     logs: supportAIReadInitLogs(50),
-    lastError: SUPPORT_AI_BROWSER_LOCAL.lastError,
+    lastError: SUPPORT_AI_BROWSER_LOCAL.lastError || (c.browserDevice === "webgpu" && !supportAIHasWebGPU() ? supportAIWebGPURequiredMessage() : null),
     lastWarning: SUPPORT_AI_BROWSER_LOCAL.lastWarning,
     cache: (() => {
       const resolved = supportAIResolveBrowserCacheUse(c);
@@ -2387,7 +2420,7 @@ async function supportAIPrepareBrowserLocalFeatures(features = [], rawConfig = D
     await importSupportAITransformers(config, { onLog });
     supportAIEmitInitLog(onLog, "success", "Runtime読込済み");
     const device = supportAIResolveBrowserDevice(config);
-    supportAIEmitInitLog(onLog, "info", `推論Device: ${device}`, { webGPU: Boolean(navigator?.gpu), requested: config.browserDevice });
+    supportAIEmitInitLog(onLog, "info", `推論Device: ${device}`, { webGPU: supportAIHasWebGPU(), requested: config.browserDevice });
     const featureLabels = { text: "Text LLM", vision: "Vision画像理解", whisper: "Whisper ASR", tts: "TTS" };
     for (const feature of selected) {
       if (!supportAIFeatureEnabled(config, feature)) {
@@ -2521,6 +2554,7 @@ function supportAIPipelineKey(task, modelId, loadOptions) {
 
 function supportAIShouldAutoFallbackToWasm(config, loadOptions) {
   const c = normalizeSupportAIConfig(config);
+  // Explicit WebGPU mode is the iPhone local LLM target, so only auto mode may downgrade to WASM.
   return c.browserDevice === "auto" && loadOptions?.device === "webgpu";
 }
 
@@ -2773,12 +2807,13 @@ function supportAIChatReferenceForMessage(message, target) {
 async function supportAIBrowserGenerateText(prompt, options = {}, rawConfig = DEFAULT_SUPPORT_AI_CONFIG) {
   const config = normalizeSupportAIConfig({ ...rawConfig, ...options });
   if (!supportAIFeatureEnabled(config, "text")) return supportAIDisabledResult("text", "Text LLM");
-  const device = supportAIResolveBrowserDevice(config);
+  let device = "";
   const model = options.model || config.browserTextModel;
   const task = options.task || config.browserTextTask || "text-generation";
   const dtype = options.dtype || config.browserTextDtype || "q4";
   const useChatInput = Boolean(options.chat);
   try {
+    device = supportAIResolveBrowserDevice(config);
     const pipe = await supportAIGetBrowserPipeline(task, model, { device, dtype }, config);
     SUPPORT_AI_BROWSER_LOCAL.prepared.text = true;
     SUPPORT_AI_BROWSER_LOCAL.preparedAt.text = Date.now();
@@ -2822,12 +2857,13 @@ async function supportAIBrowserAnalyzeImage(file, options = {}, rawConfig = DEFA
   if (!file) return { ok: false, text: "", error: "画像ファイルが選択されていません。" };
   const config = normalizeSupportAIConfig({ ...rawConfig, ...options });
   if (!supportAIFeatureEnabled(config, "vision")) return supportAIDisabledResult("vision", "Vision画像理解");
-  const device = supportAIResolveBrowserDevice(config);
+  let device = "";
   const model = options.model || config.browserVisionModel;
   const task = options.task || config.browserVisionTask || "image-to-text";
   const dtype = options.dtype || config.browserVisionDtype || "q4";
   const imageUrl = await fileToDataUrl(file);
   try {
+    device = supportAIResolveBrowserDevice(config);
     const pipe = await supportAIGetBrowserPipeline(task, model, { device, dtype }, config);
     SUPPORT_AI_BROWSER_LOCAL.prepared.vision = true;
     SUPPORT_AI_BROWSER_LOCAL.preparedAt.vision = Date.now();
@@ -2848,11 +2884,12 @@ async function supportAIBrowserTranscribeAudio(file, options = {}, rawConfig = D
   if (!file) return { ok: false, text: "", error: "音声ファイルが選択されていません。" };
   const config = normalizeSupportAIConfig({ ...rawConfig, ...options });
   if (!supportAIFeatureEnabled(config, "whisper")) return supportAIDisabledResult("whisper", "Whisper ASR");
-  const device = supportAIResolveBrowserDevice(config);
+  let device = "";
   const model = options.model || config.browserWhisperModel;
   const dtype = options.dtype || config.browserWhisperDtype || "q8";
   const audioUrl = URL.createObjectURL(file);
   try {
+    device = supportAIResolveBrowserDevice(config);
     const pipe = await supportAIGetBrowserPipeline("automatic-speech-recognition", model, { device, dtype }, config);
     SUPPORT_AI_BROWSER_LOCAL.prepared.whisper = true;
     SUPPORT_AI_BROWSER_LOCAL.preparedAt.whisper = Date.now();
@@ -2938,11 +2975,12 @@ async function supportAIBrowserTextToSpeech(text, options = {}, rawConfig = DEFA
   if (!content) return { ok: false, text: "", audioUrl: "", error: "TTS対象テキストが空です。" };
   const config = normalizeSupportAIConfig({ ...rawConfig, ...options });
   if (!supportAIFeatureEnabled(config, "tts")) return { ...supportAIDisabledResult("tts", "TTS"), audioUrl: "", text: content };
-  const device = supportAIResolveBrowserDevice(config);
+  let device = "";
   const model = options.model || config.browserTtsModel;
   const task = options.task || config.browserTtsTask || "text-to-speech";
   const dtype = options.dtype || config.browserTtsDtype || "q8";
   try {
+    device = supportAIResolveBrowserDevice(config);
     const pipe = await supportAIGetBrowserPipeline(task, model, { device, dtype }, config);
     SUPPORT_AI_BROWSER_LOCAL.prepared.tts = true;
     SUPPORT_AI_BROWSER_LOCAL.preparedAt.tts = Date.now();
@@ -3105,7 +3143,9 @@ function createSupportAIProviders(rawConfig = DEFAULT_SUPPORT_AI_CONFIG) {
   return {
     config,
     status() {
-      const device = supportAIResolveBrowserDevice(config);
+      const device = supportAIResolveBrowserDevice(config, { strict: false });
+      const webGPU = supportAIHasWebGPU();
+      const deviceError = config.browserDevice === "webgpu" && !webGPU ? supportAIWebGPURequiredMessage() : null;
       return {
         provider: config.provider,
         label: supportAIProviderLabel(config.provider),
@@ -3113,11 +3153,11 @@ function createSupportAIProviders(rawConfig = DEFAULT_SUPPORT_AI_CONFIG) {
         transformersCdnUrl: config.transformersCdnUrl,
         browserDevice: device,
         requestedBrowserDevice: config.browserDevice,
-        webGPU: Boolean(navigator.gpu),
+        webGPU,
         transformersLoaded: Boolean(SUPPORT_AI_BROWSER_LOCAL.modulePromise),
         preparedStatus: supportAIGetPreparedStatus(config),
         loadedPipelines: SUPPORT_AI_BROWSER_LOCAL.pipelinePromises.size,
-        lastBrowserLocalError: SUPPORT_AI_BROWSER_LOCAL.lastError,
+        lastBrowserLocalError: SUPPORT_AI_BROWSER_LOCAL.lastError || deviceError,
         endpoint: "browser-local-only",
         textModel: config.browserTextModel,
         visionModel: config.browserVisionModel,
@@ -3484,7 +3524,7 @@ function createOOSGhostRuntime({ providers, config }) {
           rag: Boolean(runtimeConfig.enableRag),
           knowledge: Boolean(runtimeConfig.enableKnowledge),
           agent: Boolean(runtimeConfig.localAIEnabled && runtimeConfig.enableAgents && runtimeConfig.enableText),
-          webGPU: Boolean(navigator.gpu),
+          webGPU: supportAIHasWebGPU(),
         },
         storage: Storage.status(),
         uptimeMs: Date.now() - startedAt,
@@ -3829,6 +3869,12 @@ function SupportAIDialog({ open, onClose, appDarkMode, activeMode, editorApiRef,
     providers.browserLocal.clearLogs?.();
     setAIInitLogs([]);
   }, [providers]);
+  const copyAIInitLogs = useCallback(() => {
+    const text = aiInitLogs.length
+      ? aiInitLogs.map(formatAIInitLogLine).join("\n")
+      : "まだログはありません。";
+    supportAICopyText(text).then(() => onToast?.("AI初期化ログをコピーしました")).catch(() => onToast?.("コピーに失敗しました"));
+  }, [aiInitLogs, onToast]);
   const dark = Boolean(appDarkMode);
   const supportAIFullScreen = useMediaQuery("(max-width:640px)");
   const border = dark ? "rgba(255,255,255,0.10)" : "#e5e9f2";
@@ -4469,6 +4515,7 @@ function SupportAIDialog({ open, onClose, appDarkMode, activeMode, editorApiRef,
               <Box sx={{ p: 1, border: `1px solid ${border}`, borderRadius: 2, background: dark ? "#020617" : "#f8fafc" }}>
                 <Box sx={{ display: "flex", alignItems: "center", gap: 1, mb: 0.6 }}>
                   <Typography variant="caption" fontWeight={900} sx={{ flex: 1 }}>初期化ログ</Typography>
+                  <Button size="small" variant="text" onClick={copyAIInitLogs} disabled={!aiInitLogs.length} sx={{ flexShrink: 0, minWidth: 0, px: 0.8 }}>コピー</Button>
                   <Button size="small" variant="text" onClick={clearAIInitLogView} sx={{ flexShrink: 0, minWidth: 0, px: 0.8 }}>クリア</Button>
                 </Box>
                 <Box component="pre" sx={{ m: 0, maxHeight: 180, overflow: "auto", whiteSpace: "pre-wrap", wordBreak: "break-word", fontFamily: EDITOR_FONT, fontSize: 11.5, lineHeight: 1.55, color: dark ? "#dbeafe" : "#1f2937" }}>
