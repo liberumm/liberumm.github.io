@@ -123,6 +123,9 @@ const HANDLE_SIZE   = 6;
 const RATIO_MIN     = 0.15;
 const RATIO_MAX     = 0.85;
 const RATIO_DEFAULT = 0.5;
+const SUPPORT_AI_PANEL_SIZE_KEY = "html-tester-supportai-panel-size";
+const SUPPORT_AI_PANEL_DEFAULT_SIZE = Object.freeze({ width: 1120, height: 760 });
+const SUPPORT_AI_PANEL_MIN_SIZE = Object.freeze({ width: 420, height: 460 });
 
 function useSplitPane(containerRef, isHorizontal, initialRatio) {
   const [ratio, setRatio]       = useState(initialRatio ?? RATIO_DEFAULT);
@@ -200,6 +203,143 @@ function SplitHandle({ isHorizontal, handleProps, dragging }) {
           }} />
         ))}
       </Box>
+    </Box>
+  );
+}
+
+function readSupportAIPanelSize() {
+  try {
+    const raw = localStorage.getItem(SUPPORT_AI_PANEL_SIZE_KEY);
+    if (!raw) return { ...SUPPORT_AI_PANEL_DEFAULT_SIZE };
+    const parsed = JSON.parse(raw);
+    const width = Number(parsed?.width);
+    const height = Number(parsed?.height);
+    return {
+      width: Number.isFinite(width) ? width : SUPPORT_AI_PANEL_DEFAULT_SIZE.width,
+      height: Number.isFinite(height) ? height : SUPPORT_AI_PANEL_DEFAULT_SIZE.height,
+    };
+  } catch {
+    return { ...SUPPORT_AI_PANEL_DEFAULT_SIZE };
+  }
+}
+
+function clampSupportAIPanelSize(size) {
+  const maxWidth = Math.max(SUPPORT_AI_PANEL_MIN_SIZE.width, (window.innerWidth || SUPPORT_AI_PANEL_DEFAULT_SIZE.width) - 32);
+  const maxHeight = Math.max(SUPPORT_AI_PANEL_MIN_SIZE.height, (window.innerHeight || SUPPORT_AI_PANEL_DEFAULT_SIZE.height) - 32);
+  return {
+    width: Math.round(Math.min(maxWidth, Math.max(SUPPORT_AI_PANEL_MIN_SIZE.width, Number(size?.width) || SUPPORT_AI_PANEL_DEFAULT_SIZE.width))),
+    height: Math.round(Math.min(maxHeight, Math.max(SUPPORT_AI_PANEL_MIN_SIZE.height, Number(size?.height) || SUPPORT_AI_PANEL_DEFAULT_SIZE.height))),
+  };
+}
+
+function saveSupportAIPanelSize(size) {
+  try { localStorage.setItem(SUPPORT_AI_PANEL_SIZE_KEY, JSON.stringify(clampSupportAIPanelSize(size))); } catch {}
+}
+
+function useSupportAIPanelResize(disabled = false) {
+  const [size, setSize] = useState(() => {
+    if (typeof window === "undefined") return { ...SUPPORT_AI_PANEL_DEFAULT_SIZE };
+    return clampSupportAIPanelSize(readSupportAIPanelSize());
+  });
+  const [draggingEdge, setDraggingEdge] = useState("");
+  const dragRef = useRef(null);
+
+  useEffect(() => {
+    if (disabled || typeof window === "undefined") return;
+    const onResize = () => setSize(prev => clampSupportAIPanelSize(prev));
+    window.addEventListener("resize", onResize);
+    return () => window.removeEventListener("resize", onResize);
+  }, [disabled]);
+
+  const startResize = useCallback((edge, event) => {
+    if (disabled) return;
+    event.preventDefault();
+    event.stopPropagation();
+    const pointer = event;
+    dragRef.current = {
+      edge,
+      startX: pointer.clientX,
+      startY: pointer.clientY,
+      startWidth: size.width,
+      startHeight: size.height,
+    };
+    setDraggingEdge(edge);
+    event.currentTarget.setPointerCapture?.(event.pointerId);
+  }, [disabled, size.height, size.width]);
+
+  const onPointerMove = useCallback((event) => {
+    const drag = dragRef.current;
+    if (!drag || disabled) return;
+    const next = {
+      width: drag.edge.includes("right") ? drag.startWidth + (event.clientX - drag.startX) : drag.startWidth,
+      height: drag.edge.includes("bottom") ? drag.startHeight + (event.clientY - drag.startY) : drag.startHeight,
+    };
+    setSize(clampSupportAIPanelSize(next));
+  }, [disabled]);
+
+  const onPointerUp = useCallback(() => {
+    if (!dragRef.current) return;
+    dragRef.current = null;
+    setDraggingEdge("");
+    setSize(prev => {
+      const next = clampSupportAIPanelSize(prev);
+      saveSupportAIPanelSize(next);
+      return next;
+    });
+  }, []);
+
+  const resetSize = useCallback((event) => {
+    event?.preventDefault?.();
+    const next = clampSupportAIPanelSize(SUPPORT_AI_PANEL_DEFAULT_SIZE);
+    setSize(next);
+    saveSupportAIPanelSize(next);
+  }, []);
+
+  const handleProps = useCallback((edge) => ({
+    onPointerDown: (event) => startResize(edge, event),
+    onPointerMove,
+    onPointerUp,
+    onPointerCancel: onPointerUp,
+    onDoubleClick: resetSize,
+  }), [onPointerMove, onPointerUp, resetSize, startResize]);
+
+  return { size, draggingEdge, handleProps, resetSize };
+}
+
+function SupportAIResizeHandle({ edge, handleProps, active }) {
+  const isRight = edge === "right";
+  const isBottom = edge === "bottom";
+  const isCorner = edge === "right-bottom";
+  return (
+    <Box
+      {...handleProps(edge)}
+      title="ドラッグでサイズ調整 / ダブルクリックで標準サイズ"
+      sx={{
+        position: "absolute",
+        zIndex: 20,
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "center",
+        userSelect: "none",
+        touchAction: "none",
+        cursor: isCorner ? "nwse-resize" : isRight ? "col-resize" : "row-resize",
+        right: isRight || isCorner ? 0 : 16,
+        bottom: isBottom || isCorner ? 0 : 16,
+        top: isRight ? 64 : "auto",
+        width: isRight ? 10 : isCorner ? 22 : "calc(100% - 32px)",
+        height: isBottom ? 10 : isCorner ? 22 : "calc(100% - 80px)",
+        background: active ? "rgba(25,118,210,0.24)" : "transparent",
+        borderRight: isRight ? "2px solid transparent" : 0,
+        borderBottom: isBottom ? "2px solid transparent" : 0,
+        "&:hover": {
+          background: "rgba(25,118,210,0.18)",
+          borderColor: "rgba(25,118,210,0.9)",
+        },
+      }}
+    >
+      {isCorner && (
+        <Box sx={{ width: 12, height: 12, borderRight: "2px solid rgba(25,118,210,0.85)", borderBottom: "2px solid rgba(25,118,210,0.85)", pointerEvents: "none" }} />
+      )}
     </Box>
   );
 }
@@ -2039,7 +2179,7 @@ const DEFAULT_SUPPORT_AI_CONFIG = Object.freeze({
   // - No external LLM API is used.
   // - Explicit WebGPU mode must not silently downgrade to server inference or WASM.
   provider: "browser-local",
-  policyVersion: "iphone-webgpu-local-llm-v2",
+  policyVersion: "iphone-webgpu-local-llm-v6",
 
   // Selective enable policy. Only enabled capabilities may lazy-load models.
   localAIEnabled: true,
@@ -2052,8 +2192,8 @@ const DEFAULT_SUPPORT_AI_CONFIG = Object.freeze({
   enableAgents: true,
 
   // Browser-local runtime. Transformers.js is lazy-loaded only when AI is executed.
-  // Use the package CDN entrypoint directly. jsDelivr +esm can rewrite ONNX Runtime WebGPU assets
-  // and produce "webgpuInit is not a function" during pipeline initialization.
+  // Use the package CDN entrypoint because the explicit web bundle contains a bare
+  // "onnxruntime-web/webgpu" import that single-file HTML cannot resolve without an import map.
   transformersCdnUrl: "https://cdn.jsdelivr.net/npm/@huggingface/transformers@4.2.0",
   allowRemoteModels: true,
   allowLocalModels: true,
@@ -2066,7 +2206,7 @@ const DEFAULT_SUPPORT_AI_CONFIG = Object.freeze({
   browserDevice: "webgpu", // auto | webgpu | wasm
 
   // Browser-local Text / Vision / ASR / TTS models.
-  browserTextModel: "onnx-community/LFM2.5-350M-ONNX",
+  browserTextModel: "LiquidAI/LFM2.5-350M-ONNX",
   browserTextTask: "text-generation",
   browserTextDtype: "q4",
   browserVisionModel: "LiquidAI/LFM2.5-VL-450M-ONNX",
@@ -2086,6 +2226,41 @@ const DEFAULT_SUPPORT_AI_CONFIG = Object.freeze({
   language: "ja",
 });
 
+const SUPPORT_AI_MODEL_PRESETS = Object.freeze([
+  { kind: "text", modelId: "LiquidAI/LFM2.5-350M-ONNX", label: "LFM2.5 350M ONNX / Text Stable", role: "default", patch: { browserTextModel: "LiquidAI/LFM2.5-350M-ONNX", browserTextTask: "text-generation", browserTextDtype: "q4", browserDevice: "webgpu", enableText: true } },
+  { kind: "text", modelId: "Xenova/distilgpt2", label: "DistilGPT2 / Text WASM fallback", role: "text-fallback", patch: { browserTextModel: "Xenova/distilgpt2", browserTextTask: "text-generation", browserTextDtype: "fp32", browserDevice: "wasm", enableText: true } },
+  { kind: "text", modelId: "LiquidAI/LFM2.5-1.2B-Instruct-ONNX", label: "LFM2.5 1.2B Instruct ONNX / Text", role: "chat", patch: { browserTextModel: "LiquidAI/LFM2.5-1.2B-Instruct-ONNX", browserTextTask: "text-generation", browserTextDtype: "q4", browserDevice: "webgpu", enableText: true } },
+  { kind: "text", modelId: "LiquidAI/LFM2.5-1.2B-JP-ONNX", label: "LFM2.5 1.2B JP ONNX / Text", role: "japanese", patch: { browserTextModel: "LiquidAI/LFM2.5-1.2B-JP-ONNX", browserTextTask: "text-generation", browserTextDtype: "q4", browserDevice: "webgpu", enableText: true, language: "ja" } },
+  { kind: "text", modelId: "onnx-community/LFM2-1.2B-RAG-ONNX", label: "LFM2 1.2B RAG ONNX / Text", role: "rag", patch: { browserTextModel: "onnx-community/LFM2-1.2B-RAG-ONNX", browserTextTask: "text-generation", browserTextDtype: "q4", browserDevice: "webgpu", enableText: true, enableRag: true } },
+  { kind: "vision", modelId: "HuggingFaceTB/SmolVLM-256M-Instruct", label: "SmolVLM 256M Instruct / Vision-Language", role: "vision-language", patch: { browserVisionModel: "HuggingFaceTB/SmolVLM-256M-Instruct", browserVisionTask: "image-to-text", browserVisionDtype: "q4", enableVision: true } },
+  { kind: "vision", modelId: "LiquidAI/LFM2.5-VL-450M-ONNX", label: "LFM2.5 VL 450M ONNX / Vision-Language Experimental", role: "vision-language-experimental", patch: { browserVisionModel: "LiquidAI/LFM2.5-VL-450M-ONNX", browserVisionTask: "image-to-text", browserVisionDtype: "q4", enableVision: true } },
+  { kind: "audio", modelId: "LiquidAI/LFM2.5-Audio-1.5B-ONNX", label: "LFM2.5 Audio 1.5B / ASR・TTS・Interleaved WebGPU", role: "audio-primary", patch: { browserWhisperModel: "LiquidAI/LFM2.5-Audio-1.5B-ONNX", browserWhisperDtype: "q4", browserTtsModel: "LiquidAI/LFM2.5-Audio-1.5B-ONNX", browserTtsTask: "text-to-speech", browserTtsDtype: "q4", browserDevice: "webgpu", enableWhisper: true, enableTts: true } },
+  { kind: "audio", modelId: "onnx-community/whisper-tiny", label: "Whisper tiny / Audio ASR WASM", role: "asr-fallback", patch: { browserWhisperModel: "onnx-community/whisper-tiny", browserWhisperDtype: "q8", enableWhisper: true } },
+]);
+
+function supportAIModelPresets(kind) {
+  return SUPPORT_AI_MODEL_PRESETS.filter(p => p.kind === kind);
+}
+
+function supportAIModelPresetFor(kind, modelId) {
+  return supportAIModelPresets(kind).find(p => p.modelId === modelId) || null;
+}
+
+function supportAIModelPresetLabel(kind, modelId) {
+  const preset = supportAIModelPresetFor(kind, modelId);
+  return preset ? `${preset.label} [${preset.role}]` : `カスタム: ${modelId || "未設定"}`;
+}
+
+function supportAIInvalidatePreparedFeatures(features = []) {
+  SUPPORT_AI_BROWSER_LOCAL.pipelinePromises.clear();
+  for (const feature of features) {
+    if (Object.prototype.hasOwnProperty.call(SUPPORT_AI_BROWSER_LOCAL.prepared, feature)) {
+      SUPPORT_AI_BROWSER_LOCAL.prepared[feature] = false;
+      SUPPORT_AI_BROWSER_LOCAL.preparedAt[feature] = null;
+    }
+  }
+}
+
 const SUPPORT_AI_BROWSER_LOCAL = {
   moduleKey: "",
   modulePromise: null,
@@ -2098,6 +2273,9 @@ const SUPPORT_AI_BROWSER_LOCAL = {
   prepared: { runtime: false, text: false, vision: false, whisper: false, tts: false },
   preparedAt: { runtime: null, text: null, vision: null, whisper: null, tts: null },
 };
+
+const SUPPORT_AI_ONNX_RUNTIME_WEB_VERSION = "1.26.0-dev.20260416-b7804b056c";
+const SUPPORT_AI_ONNX_RUNTIME_DIST_BASE = `https://cdn.jsdelivr.net/npm/onnxruntime-web@${SUPPORT_AI_ONNX_RUNTIME_WEB_VERSION}/dist/`;
 
 function supportAIAddInitLog(level, message, meta = {}) {
   const entry = {
@@ -2226,7 +2404,8 @@ function loadSupportAIConfig() {
     const loaded = normalizeSupportAIConfig(parsed);
     const needsMigration =
       parsed?.policyVersion !== DEFAULT_SUPPORT_AI_CONFIG.policyVersion ||
-      String(parsed?.transformersCdnUrl || "").includes("/+esm");
+      String(parsed?.transformersCdnUrl || "").includes("/+esm") ||
+      String(parsed?.transformersCdnUrl || "").includes("/dist/transformers.web");
     if (needsMigration) {
       const migrated = normalizeSupportAIConfig({
         ...loaded,
@@ -2477,6 +2656,8 @@ async function supportAIPrepareBrowserLocalFeatures(features = [], rawConfig = D
 
 async function supportAIClearBrowserModelCaches() {
   SUPPORT_AI_BROWSER_LOCAL.pipelinePromises.clear();
+  SUPPORT_AI_BROWSER_LOCAL.modulePromise = null;
+  SUPPORT_AI_BROWSER_LOCAL.moduleKey = "";
   supportAIClearInitLogs();
   supportAIAddInitLog("info", "モデルCache削除: メモリ上のpipeline参照を削除しました。");
   SUPPORT_AI_BROWSER_LOCAL.prepared = { runtime: false, text: false, vision: false, whisper: false, tts: false };
@@ -2509,7 +2690,8 @@ async function supportAIClearBrowserModelCaches() {
 
 async function importSupportAITransformers(config, runtimeOptions = {}) {
   const onLog = runtimeOptions && typeof runtimeOptions.onLog === "function" ? runtimeOptions.onLog : null;
-  const url = normalizeSupportAIConfig(config).transformersCdnUrl;
+  const cfg = normalizeSupportAIConfig(config);
+  const url = cfg.transformersCdnUrl;
   if (!SUPPORT_AI_BROWSER_LOCAL.modulePromise || SUPPORT_AI_BROWSER_LOCAL.moduleKey !== url) {
     SUPPORT_AI_BROWSER_LOCAL.moduleKey = url;
     SUPPORT_AI_BROWSER_LOCAL.pipelinePromises.clear();
@@ -2534,6 +2716,7 @@ async function importSupportAITransformers(config, runtimeOptions = {}) {
             SUPPORT_AI_BROWSER_LOCAL.lastWarning = null;
             supportAIEmitInitLog(onLog, "info", cacheResolved.useBrowserCache ? "モデルCache: 利用可能" : "モデルCache: 無効", { cache: cacheResolved });
           }
+          supportAIConfigureOnnxWebGpuRuntime(mod, cfg, onLog);
           if (mod.env.backends?.onnx?.wasm) {
             mod.env.backends.onnx.wasm.proxy = false;
           }
@@ -2562,6 +2745,20 @@ function supportAIShouldAutoFallbackToWasm(config, loadOptions) {
   const c = normalizeSupportAIConfig(config);
   // Explicit WebGPU mode is the iPhone local LLM target, so only auto mode may downgrade to WASM.
   return c.browserDevice === "auto" && loadOptions?.device === "webgpu";
+}
+
+function supportAIConfigureOnnxWebGpuRuntime(mod, config, onLog) {
+  const cfg = normalizeSupportAIConfig(config);
+  const wasm = mod?.env?.backends?.onnx?.wasm;
+  if (!wasm || cfg.browserDevice !== "webgpu") return;
+  wasm.wasmPaths = {
+    mjs: `${SUPPORT_AI_ONNX_RUNTIME_DIST_BASE}ort-wasm-simd-threaded.asyncify.mjs`,
+    wasm: `${SUPPORT_AI_ONNX_RUNTIME_DIST_BASE}ort-wasm-simd-threaded.asyncify.wasm`,
+  };
+  supportAIEmitInitLog(onLog, "info", "ONNX Runtime WebGPU WASMをasyncify版に固定", {
+    onnxRuntimeWeb: SUPPORT_AI_ONNX_RUNTIME_WEB_VERSION,
+    wasmPaths: wasm.wasmPaths,
+  });
 }
 
 async function supportAIStartBrowserPipeline(tf, task, modelId, loadOptions) {
@@ -3857,6 +4054,17 @@ function SupportAIDialog({ open, onClose, appDarkMode, activeMode, editorApiRef,
       return next;
     });
   }, []);
+  const updateAIModelConfig = useCallback((patch, features = []) => {
+    supportAIInvalidatePreparedFeatures(features);
+    updateAIConfig(patch);
+  }, [updateAIConfig]);
+  const applyModelPreset = useCallback((kind, value) => {
+    const preset = SUPPORT_AI_MODEL_PRESETS.find(item => item.kind === kind && item.modelId === value);
+    if (!preset) return;
+    const features = kind === "text" ? ["text"] : kind === "vision" ? ["vision"] : ["whisper", "tts"];
+    updateAIModelConfig(preset.patch, features);
+    onToast?.(`${preset.label} に切り替えました`);
+  }, [onToast, updateAIModelConfig]);
   const resetAIConfig = useCallback(() => {
     const next = { ...DEFAULT_SUPPORT_AI_CONFIG };
     saveSupportAIConfig(next);
@@ -3883,6 +4091,7 @@ function SupportAIDialog({ open, onClose, appDarkMode, activeMode, editorApiRef,
   }, [aiInitLogs, onToast]);
   const dark = Boolean(appDarkMode);
   const supportAIFullScreen = useMediaQuery("(max-width:640px)");
+  const supportAIResize = useSupportAIPanelResize(supportAIFullScreen);
   const border = dark ? "rgba(255,255,255,0.10)" : "#e5e9f2";
   const surface = dark ? "#0f172a" : "#fff";
   const muted = dark ? "rgba(229,231,235,0.66)" : "#667085";
@@ -4358,19 +4567,23 @@ function SupportAIDialog({ open, onClose, appDarkMode, activeMode, editorApiRef,
     <Dialog
       open={open}
       onClose={busy ? undefined : onClose}
-      maxWidth="lg"
-      fullWidth
+      maxWidth={false}
+      fullWidth={false}
       fullScreen={supportAIFullScreen}
       PaperProps={{
         sx: {
           borderRadius: supportAIFullScreen ? 0 : 3,
-          width: supportAIFullScreen ? "100%" : "min(1120px, calc(100vw - 32px))",
-          height: supportAIFullScreen ? "100dvh" : { xs: "94dvh", sm: "86vh" },
+          width: supportAIFullScreen ? "100%" : `${supportAIResize.size.width}px`,
+          height: supportAIFullScreen ? "100dvh" : `${supportAIResize.size.height}px`,
+          minWidth: supportAIFullScreen ? "100%" : `${SUPPORT_AI_PANEL_MIN_SIZE.width}px`,
+          minHeight: supportAIFullScreen ? "100dvh" : `${SUPPORT_AI_PANEL_MIN_SIZE.height}px`,
+          maxWidth: supportAIFullScreen ? "100%" : "calc(100vw - 32px)",
           maxHeight: supportAIFullScreen ? "100dvh" : "calc(100dvh - 32px)",
           display: "flex",
           flexDirection: "column",
           background: surface,
           overflow: "hidden",
+          position: "relative",
         },
       }}
     >
@@ -4483,39 +4696,52 @@ function SupportAIDialog({ open, onClose, appDarkMode, activeMode, editorApiRef,
               <Box sx={{ p: 1, border: `1px solid ${border}`, borderRadius: 2 }}>
                 <Typography variant="caption" fontWeight={900}>有効化する範囲</Typography>
                 <Grid container spacing={0.35} sx={{ mt: 0.5, minWidth: 0 }}>
-                  <Grid size={{ xs: 12, sm: 6 }}><FeatureSwitch label="ローカルAI全体" checked={aiConfig.localAIEnabled} disabled={settingDisabled} onChange={v => updateAIConfig({ localAIEnabled: v })} /></Grid>
-                  <Grid size={{ xs: 12, sm: 6 }}><FeatureSwitch label="Text LLM" checked={aiConfig.enableText} disabled={settingDisabled} onChange={v => updateAIConfig({ enableText: v })} /></Grid>
-                  <Grid size={{ xs: 12, sm: 6 }}><FeatureSwitch label="Vision画像理解" checked={aiConfig.enableVision} disabled={settingDisabled} onChange={v => updateAIConfig({ enableVision: v })} /></Grid>
-                  <Grid size={{ xs: 12, sm: 6 }}><FeatureSwitch label="Whisper ASR" checked={aiConfig.enableWhisper} disabled={settingDisabled} onChange={v => updateAIConfig({ enableWhisper: v })} /></Grid>
-                  <Grid size={{ xs: 12, sm: 6 }}><FeatureSwitch label="TTS / Interleaved" checked={aiConfig.enableTts} disabled={settingDisabled} onChange={v => updateAIConfig({ enableTts: v })} /></Grid>
-                  <Grid size={{ xs: 12, sm: 6 }}><FeatureSwitch label="Agent / Team" checked={aiConfig.enableAgents} disabled={settingDisabled} onChange={v => updateAIConfig({ enableAgents: v })} /></Grid>
-                  <Grid size={{ xs: 12, sm: 6 }}><FeatureSwitch label="RAG" checked={aiConfig.enableRag} disabled={settingDisabled} onChange={v => updateAIConfig({ enableRag: v })} /></Grid>
-                  <Grid size={{ xs: 12, sm: 6 }}><FeatureSwitch label="Knowledge" checked={aiConfig.enableKnowledge} disabled={settingDisabled} onChange={v => updateAIConfig({ enableKnowledge: v })} /></Grid>
+                  <Grid size={{ xs: 12 }}><FeatureSwitch label="ローカルAI全体" checked={aiConfig.localAIEnabled} disabled={settingDisabled} onChange={v => updateAIConfig({ localAIEnabled: v })} /></Grid>
+                  <Grid size={{ xs: 12 }}><FeatureSwitch label="Text LLM" checked={aiConfig.enableText} disabled={settingDisabled} onChange={v => updateAIConfig({ enableText: v })} /></Grid>
+                  <Grid size={{ xs: 12 }}><FeatureSwitch label="Vision画像理解" checked={aiConfig.enableVision} disabled={settingDisabled} onChange={v => updateAIConfig({ enableVision: v })} /></Grid>
+                  <Grid size={{ xs: 12 }}><FeatureSwitch label="Whisper ASR" checked={aiConfig.enableWhisper} disabled={settingDisabled} onChange={v => updateAIConfig({ enableWhisper: v })} /></Grid>
+                  <Grid size={{ xs: 12 }}><FeatureSwitch label="TTS / Interleaved" checked={aiConfig.enableTts} disabled={settingDisabled} onChange={v => updateAIConfig({ enableTts: v })} /></Grid>
+                  <Grid size={{ xs: 12 }}><FeatureSwitch label="Agent / Team" checked={aiConfig.enableAgents} disabled={settingDisabled} onChange={v => updateAIConfig({ enableAgents: v })} /></Grid>
+                  <Grid size={{ xs: 12 }}><FeatureSwitch label="RAG" checked={aiConfig.enableRag} disabled={settingDisabled} onChange={v => updateAIConfig({ enableRag: v })} /></Grid>
+                  <Grid size={{ xs: 12 }}><FeatureSwitch label="Knowledge" checked={aiConfig.enableKnowledge} disabled={settingDisabled} onChange={v => updateAIConfig({ enableKnowledge: v })} /></Grid>
                 </Grid>
               </Box>
 
               <Grid container spacing={0.75} sx={{ minWidth: 0, "& .MuiFormControl-root": { minWidth: 0 }, "& .MuiInputBase-root": { minWidth: 0 } }}>
-                <Grid size={{ xs: 12, sm: 6 }}><MaterialUI.TextField fullWidth select SelectProps={{ native: true }} label="初回モデルDL" value={aiConfig.allowRemoteModels ? "true" : "false"} onChange={e => updateAIConfig({ allowRemoteModels: e.target.value === "true" })} size="small">
+                <Grid size={{ xs: 12 }}><MaterialUI.TextField fullWidth select SelectProps={{ native: true }} label="初回モデルDL" value={aiConfig.allowRemoteModels ? "true" : "false"} onChange={e => updateAIConfig({ allowRemoteModels: e.target.value === "true" })} size="small">
                   <option value="true">許可：初回のみ取得、以後Cache利用</option>
                   <option value="false">禁止：完全オフライン ./models のみ</option>
                 </MaterialUI.TextField></Grid>
-                <Grid size={{ xs: 12, sm: 6 }}><MaterialUI.TextField fullWidth select SelectProps={{ native: true }} label="Browser Device" value={aiConfig.browserDevice} onChange={e => updateAIConfig({ browserDevice: e.target.value })} size="small">
+                <Grid size={{ xs: 12 }}><MaterialUI.TextField fullWidth select SelectProps={{ native: true }} label="Browser Device" value={aiConfig.browserDevice} onChange={e => updateAIModelConfig({ browserDevice: e.target.value }, ["text", "vision", "whisper", "tts"])} size="small">
                   <option value="auto">auto WebGPU→WASM</option>
                   <option value="webgpu">webgpu</option>
                   <option value="wasm">wasm</option>
                 </MaterialUI.TextField></Grid>
-                <Grid size={{ xs: 12, sm: 6 }}><MaterialUI.TextField fullWidth select SelectProps={{ native: true }} label="モデルCache" value={aiConfig.browserCacheMode || "auto"} onChange={e => updateAIConfig({ browserCacheMode: e.target.value })} size="small">
+                <Grid size={{ xs: 12 }}><MaterialUI.TextField fullWidth select SelectProps={{ native: true }} label="モデルCache" value={aiConfig.browserCacheMode || "auto"} onChange={e => updateAIConfig({ browserCacheMode: e.target.value })} size="small">
                   <option value="auto">自動：使える時だけCache利用</option>
                   <option value="on">要求：Cache利用を試みる</option>
                   <option value="off">無効：Cache APIに触れない</option>
                 </MaterialUI.TextField></Grid>
-                <Grid size={{ xs: 12, sm: 6 }}><MaterialUI.TextField fullWidth label="Local model path" value={aiConfig.localModelPath} onChange={e => updateAIConfig({ localModelPath: e.target.value })} size="small" /></Grid>
-                <Grid size={{ xs: 12, sm: 6 }}><MaterialUI.TextField fullWidth label="Text Model" value={aiConfig.browserTextModel} onChange={e => updateAIConfig({ browserTextModel: e.target.value })} size="small" /></Grid>
-                <Grid size={{ xs: 12, sm: 6 }}><MaterialUI.TextField fullWidth label="Vision Model" value={aiConfig.browserVisionModel} onChange={e => updateAIConfig({ browserVisionModel: e.target.value })} size="small" /></Grid>
-                <Grid size={{ xs: 12, sm: 6 }}><MaterialUI.TextField fullWidth label="Whisper Model" value={aiConfig.browserWhisperModel} onChange={e => updateAIConfig({ browserWhisperModel: e.target.value })} size="small" /></Grid>
-                <Grid size={{ xs: 12, sm: 6 }}><MaterialUI.TextField fullWidth label="TTS Model" value={aiConfig.browserTtsModel} onChange={e => updateAIConfig({ browserTtsModel: e.target.value })} size="small" /></Grid>
-                <Grid size={{ xs: 12, sm: 6 }}><MaterialUI.TextField fullWidth label="Max new tokens" type="number" value={aiConfig.browserMaxNewTokens} onChange={e => updateAIConfig({ browserMaxNewTokens: e.target.value })} size="small" inputProps={{ step: 64, min: 16, max: 4096 }} /></Grid>
-                <Grid size={{ xs: 12, sm: 6 }}><MaterialUI.TextField fullWidth label="Timeout ms" type="number" value={aiConfig.timeoutMs} onChange={e => updateAIConfig({ timeoutMs: e.target.value })} size="small" inputProps={{ step: 1000, min: 5000 }} /></Grid>
+                <Grid size={{ xs: 12 }}><MaterialUI.TextField fullWidth label="Local model path" value={aiConfig.localModelPath} onChange={e => updateAIConfig({ localModelPath: e.target.value })} size="small" /></Grid>
+                <Grid size={{ xs: 12 }}><MaterialUI.TextField fullWidth select SelectProps={{ native: true }} label="Text Preset" value={supportAIModelPresetFor("text", aiConfig.browserTextModel)?.modelId || "__custom__"} onChange={e => applyModelPreset("text", e.target.value)} size="small">
+                  <option value="__custom__">{supportAIModelPresetLabel("text", aiConfig.browserTextModel)}</option>
+                  {supportAIModelPresets("text").map(p => <option key={`${p.kind}-${p.role}`} value={p.modelId}>{p.label} / {p.role}</option>)}
+                </MaterialUI.TextField></Grid>
+                <Grid size={{ xs: 12 }}><MaterialUI.TextField fullWidth select SelectProps={{ native: true }} label="Vision Preset" value={supportAIModelPresetFor("vision", aiConfig.browserVisionModel)?.modelId || "__custom__"} onChange={e => applyModelPreset("vision", e.target.value)} size="small">
+                  <option value="__custom__">{supportAIModelPresetLabel("vision", aiConfig.browserVisionModel)}</option>
+                  {supportAIModelPresets("vision").map(p => <option key={`${p.kind}-${p.role}`} value={p.modelId}>{p.label} / {p.role}</option>)}
+                </MaterialUI.TextField></Grid>
+                <Grid size={{ xs: 12 }}><MaterialUI.TextField fullWidth select SelectProps={{ native: true }} label="Audio Preset" value={supportAIModelPresetFor("audio", aiConfig.browserWhisperModel)?.modelId || "__custom__"} onChange={e => applyModelPreset("audio", e.target.value)} size="small">
+                  <option value="__custom__">{supportAIModelPresetLabel("audio", aiConfig.browserWhisperModel)}</option>
+                  {supportAIModelPresets("audio").map(p => <option key={`${p.kind}-${p.role}`} value={p.modelId}>{p.label} / {p.role}</option>)}
+                </MaterialUI.TextField></Grid>
+                <Grid size={{ xs: 12 }}><MaterialUI.TextField fullWidth label="Text Model ID" value={aiConfig.browserTextModel} onChange={e => updateAIModelConfig({ browserTextModel: e.target.value }, ["text"])} size="small" /></Grid>
+                <Grid size={{ xs: 12 }}><MaterialUI.TextField fullWidth label="Vision Model ID" value={aiConfig.browserVisionModel} onChange={e => updateAIModelConfig({ browserVisionModel: e.target.value }, ["vision"])} size="small" /></Grid>
+                <Grid size={{ xs: 12 }}><MaterialUI.TextField fullWidth label="ASR Model ID" value={aiConfig.browserWhisperModel} onChange={e => updateAIModelConfig({ browserWhisperModel: e.target.value }, ["whisper"])} size="small" /></Grid>
+                <Grid size={{ xs: 12 }}><MaterialUI.TextField fullWidth label="TTS Model ID" value={aiConfig.browserTtsModel} onChange={e => updateAIModelConfig({ browserTtsModel: e.target.value }, ["tts"])} size="small" /></Grid>
+                <Grid size={{ xs: 12 }}><MaterialUI.TextField fullWidth label="Text dtype" value={aiConfig.browserTextDtype} onChange={e => updateAIModelConfig({ browserTextDtype: e.target.value }, ["text"])} size="small" /></Grid>
+                <Grid size={{ xs: 12 }}><MaterialUI.TextField fullWidth label="Max new tokens" type="number" value={aiConfig.browserMaxNewTokens} onChange={e => updateAIConfig({ browserMaxNewTokens: e.target.value })} size="small" inputProps={{ step: 64, min: 16, max: 4096 }} /></Grid>
+                <Grid size={{ xs: 12 }}><MaterialUI.TextField fullWidth label="Timeout ms" type="number" value={aiConfig.timeoutMs} onChange={e => updateAIConfig({ timeoutMs: e.target.value })} size="small" inputProps={{ step: 1000, min: 5000 }} /></Grid>
               </Grid>
 
               <Box sx={{ p: 1, border: `1px solid ${border}`, borderRadius: 2, background: dark ? "#020617" : "#f8fafc" }}>
@@ -4530,18 +4756,18 @@ function SupportAIDialog({ open, onClose, appDarkMode, activeMode, editorApiRef,
               </Box>
 
               <Grid container spacing={0.75} sx={{ minWidth: 0 }}>
-                <Grid size={{ xs: 12, sm: 6 }}><Button size="small" variant="contained" disabled={busy || !aiConfig.localAIEnabled || !enabledModelFeatures().length} onClick={prepareSelectedModels} sx={responsiveButtonSx}>有効モデルを準備</Button></Grid>
-                <Grid size={{ xs: 12, sm: 6 }}><Button size="small" variant="outlined" disabled={busy || !textRunnable} onClick={testAIConnection} sx={responsiveButtonSx}>Text推論テスト</Button></Grid>
-                <Grid size={{ xs: 12, sm: 6 }}><Button size="small" variant="outlined" disabled={busy} onClick={showGhostStatus} sx={responsiveButtonSx}>Ghost Status</Button></Grid>
-                <Grid size={{ xs: 12, sm: 6 }}><Button size="small" variant="outlined" disabled={busy} onClick={addCurrentToRAG} sx={responsiveButtonSx}>文書をRAG登録</Button></Grid>
-                <Grid size={{ xs: 12, sm: 6 }}><Button size="small" variant="outlined" disabled={busy} onClick={addKnowledgeFact} sx={responsiveButtonSx}>Fact登録</Button></Grid>
-                <Grid size={{ xs: 12, sm: 6 }}><Button size="small" variant="outlined" color="warning" disabled={busy} onClick={clearModelCache} sx={responsiveButtonSx}>モデルCache削除</Button></Grid>
-                <Grid size={{ xs: 12, sm: 6 }}><Button size="small" variant="outlined" color="warning" disabled={busy} onClick={resetAIConfig} sx={responsiveButtonSx}>AI設定初期化</Button></Grid>
+                <Grid size={{ xs: 12 }}><Button size="small" variant="contained" disabled={busy || !aiConfig.localAIEnabled || !enabledModelFeatures().length} onClick={prepareSelectedModels} sx={responsiveButtonSx}>有効モデルを準備</Button></Grid>
+                <Grid size={{ xs: 12 }}><Button size="small" variant="outlined" disabled={busy || !textRunnable} onClick={testAIConnection} sx={responsiveButtonSx}>Text推論テスト</Button></Grid>
+                <Grid size={{ xs: 12 }}><Button size="small" variant="outlined" disabled={busy} onClick={showGhostStatus} sx={responsiveButtonSx}>Ghost Status</Button></Grid>
+                <Grid size={{ xs: 12 }}><Button size="small" variant="outlined" disabled={busy} onClick={addCurrentToRAG} sx={responsiveButtonSx}>文書をRAG登録</Button></Grid>
+                <Grid size={{ xs: 12 }}><Button size="small" variant="outlined" disabled={busy} onClick={addKnowledgeFact} sx={responsiveButtonSx}>Fact登録</Button></Grid>
+                <Grid size={{ xs: 12 }}><Button size="small" variant="outlined" color="warning" disabled={busy} onClick={clearModelCache} sx={responsiveButtonSx}>モデルCache削除</Button></Grid>
+                <Grid size={{ xs: 12 }}><Button size="small" variant="outlined" color="warning" disabled={busy} onClick={resetAIConfig} sx={responsiveButtonSx}>AI設定初期化</Button></Grid>
               </Grid>
               <Grid container spacing={0.75} sx={{ minWidth: 0, "& .MuiFormControl-root": { minWidth: 0 } }}>
-                <Grid size={{ xs: 12, sm: 4 }}><MaterialUI.TextField fullWidth label="Fact subject" value={knowledgeSubject} onChange={e => setKnowledgeSubject(e.target.value)} size="small" /></Grid>
-                <Grid size={{ xs: 12, sm: 4 }}><MaterialUI.TextField fullWidth label="Fact predicate" value={knowledgePredicate} onChange={e => setKnowledgePredicate(e.target.value)} size="small" /></Grid>
-                <Grid size={{ xs: 12, sm: 4 }}><MaterialUI.TextField fullWidth label="Fact object" value={knowledgeObject} onChange={e => setKnowledgeObject(e.target.value)} size="small" /></Grid>
+                <Grid size={{ xs: 12 }}><MaterialUI.TextField fullWidth label="Fact subject" value={knowledgeSubject} onChange={e => setKnowledgeSubject(e.target.value)} size="small" /></Grid>
+                <Grid size={{ xs: 12 }}><MaterialUI.TextField fullWidth label="Fact predicate" value={knowledgePredicate} onChange={e => setKnowledgePredicate(e.target.value)} size="small" /></Grid>
+                <Grid size={{ xs: 12 }}><MaterialUI.TextField fullWidth label="Fact object" value={knowledgeObject} onChange={e => setKnowledgeObject(e.target.value)} size="small" /></Grid>
               </Grid>
               <Typography variant="caption" sx={{ color: muted, lineHeight: 1.6 }}>基本方針は完全ローカル推論です。本文・画像・音声は外部LLMサービスへ送信されません。必要なモデルだけを有効化し、必要時に遅延ロードします。</Typography>
             </Box>}
@@ -4667,6 +4893,11 @@ function SupportAIDialog({ open, onClose, appDarkMode, activeMode, editorApiRef,
           <Button onClick={() => applySuggestion(result, false)} disabled={!resultText || busy} variant="contained">結果を反映</Button>
         </Stack>
       </DialogActions>
+      {!supportAIFullScreen && <>
+        <SupportAIResizeHandle edge="right" handleProps={supportAIResize.handleProps} active={supportAIResize.draggingEdge === "right"} />
+        <SupportAIResizeHandle edge="bottom" handleProps={supportAIResize.handleProps} active={supportAIResize.draggingEdge === "bottom"} />
+        <SupportAIResizeHandle edge="right-bottom" handleProps={supportAIResize.handleProps} active={supportAIResize.draggingEdge === "right-bottom"} />
+      </>}
     </Dialog>
   );
 }
