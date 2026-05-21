@@ -2055,18 +2055,103 @@ async function getCacheSummary() {
   return { ok: true, total, caches: list };
 }
 
-async function clearAllPlusCaches() {
+async function clearAppCachesOnly() {
   const cacheStatus = supportAIGetBrowserCacheStatus();
-  if (!cacheStatus.available) return 0;
-  const names = await globalThis.caches.keys();
   let count = 0;
-  for (const name of names) {
-    if (name.startsWith("html-modal-tester") || name.startsWith("html-editor")) {
-      const ok = await globalThis.caches.delete(name);
-      if (ok) count++;
+  if (cacheStatus.available) {
+    const names = await globalThis.caches.keys();
+    for (const name of names) {
+      if (name.startsWith("html-modal-tester") || name.startsWith("html-editor")) {
+        const ok = await globalThis.caches.delete(name);
+        if (ok) count++;
+      }
     }
   }
   return count;
+}
+
+async function clearAllPlusCaches() {
+  await supportAIDeleteIndexedDBDatabase(SUPPORT_AI_IDB_NAME);
+  return await clearAppCachesOnly();
+}
+
+function isAppLocalStorageKey(key) {
+  return String(key || "").startsWith("html-tester-");
+}
+
+function clearLocalStorageKeys(keys = []) {
+  let count = 0;
+  const unique = Array.from(new Set(keys.filter(Boolean)));
+  for (const key of unique) {
+    try {
+      if (localStorage.getItem(key) !== null) count += 1;
+      localStorage.removeItem(key);
+    } catch {}
+  }
+  return count;
+}
+
+function clearAppLocalStorage() {
+  const keys = [];
+  try {
+    for (let i = 0; i < localStorage.length; i++) {
+      const key = localStorage.key(i);
+      if (isAppLocalStorageKey(key)) keys.push(key);
+    }
+  } catch {}
+  return clearLocalStorageKeys(keys);
+}
+
+async function clearSupportAIChatStorage() {
+  const localCount = clearLocalStorageKeys([SUPPORT_AI_CHAT_SESSIONS_KEY, SUPPORT_AI_CHAT_ACTIVE_SESSION_KEY]);
+  const idbDeleted = await supportAIIDBDelete(SUPPORT_AI_CHAT_SESSIONS_IDB_KEY);
+  return { localCount, idbDeleted };
+}
+
+function clearSupportAISettingsStorage() {
+  return clearLocalStorageKeys([
+    SUPPORT_AI_CONFIG_KEY,
+    SUPPORT_AI_ADMIN_STORAGE_KEY,
+    SUPPORT_AI_SCHEDULED_TASKS_KEY,
+    SUPPORT_AI_PANE_MODE_KEY,
+  ]);
+}
+
+function clearSupportAIKnowledgeStorage() {
+  return clearLocalStorageKeys([OOS_GHOST_RUNTIME_STORAGE_KEY]);
+}
+
+async function clearAppIndexedDBStorage() {
+  const deleted = await supportAIDeleteIndexedDBDatabase(SUPPORT_AI_IDB_NAME);
+  return deleted ? 1 : 0;
+}
+
+function classifyIndexedDBName(name) {
+  const value = String(name || "");
+  return {
+    name: value,
+    app: value === SUPPORT_AI_IDB_NAME,
+    modelLike: /huggingface|transformers|onnx|ort|xenova|lfm|whisper/i.test(value),
+  };
+}
+
+async function getIndexedDBSummary() {
+  if (!supportAIHasIndexedDB()) return { ok: false, available: false, databases: [], error: "IndexedDB is not available" };
+  if (typeof indexedDB.databases !== "function") {
+    return {
+      ok: false,
+      available: true,
+      databases: [],
+      error: "このブラウザではIndexedDB名の一覧取得に未対応です。削除操作は既知のアプリDB名に対して実行できます。",
+    };
+  }
+  const names = await supportAIListIndexedDBNames();
+  const databases = names.map(classifyIndexedDBName).sort((a, b) => {
+    if (a.app !== b.app) return a.app ? -1 : 1;
+    if (a.modelLike !== b.modelLike) return a.modelLike ? -1 : 1;
+    return a.name.localeCompare(b.name);
+  });
+  return { ok: true, available: true, databases };
 }
 
 async function getStorageEstimateSafe() {
@@ -2119,34 +2204,120 @@ const AppStateSelectors = Object.freeze({
 });
 
 function SecurityStorageDialog({ open, onClose, onExportAll, onFullReset, onToast }) {
-  const [summary, setSummary] = useState({ local: null, cache: null, estimate: null });
+  const [summary, setSummary] = useState({ local: null, cache: null, idb: null, estimate: null });
   const [busy, setBusy] = useState(false);
   const refresh = useCallback(async () => {
     const local = getLocalStorageSummary();
     const cache = await getCacheSummary().catch(e => ({ ok: false, caches: [], total: 0, error: e.message || String(e) }));
+    const idb = await getIndexedDBSummary().catch(e => ({ ok: false, available: false, databases: [], error: e.message || String(e) }));
     const estimate = await getStorageEstimateSafe();
-    setSummary({ local, cache, estimate });
+    setSummary({ local, cache, idb, estimate });
   }, []);
   useEffect(() => { if (open) refresh(); }, [open, refresh]);
-  const clearCaches = async () => {
+  const runClear = async (action, doneMessage) => {
     setBusy(true);
     try {
-      const count = await clearAllPlusCaches();
-      onToast?.(`${count} 件のアプリ関連Cacheを削除しました`);
+      const result = await action();
+      onToast?.(typeof doneMessage === "function" ? doneMessage(result) : doneMessage);
       await refresh();
     } finally { setBusy(false); }
   };
   const usage = summary.estimate?.usage || 0;
   const quota = summary.estimate?.quota || 0;
-  const appKeys = (summary.local?.rows || []).filter(r => String(r.key || '').startsWith('html-tester-'));
+  const appKeys = (summary.local?.rows || []).filter(r => isAppLocalStorageKey(r.key));
   const appCaches = (summary.cache?.caches || []).filter(c => String(c.name || '').startsWith('html-modal-tester') || String(c.name || '').startsWith('html-editor'));
+  const idbDatabases = summary.idb?.databases || [];
+  const appIDB = idbDatabases.filter(db => db.app);
+  const modelIDB = idbDatabases.filter(db => db.modelLike && !db.app);
+  const clearTargets = [
+    {
+      label: "localStorage",
+      caption: "エディター、プロファイル、SupportAI設定などのアプリキー",
+      icon: "storage",
+      color: "warning",
+      action: () => clearAppLocalStorage(),
+      message: count => `${count} 件のlocalStorageアプリキーを削除しました`,
+    },
+    {
+      label: "AIチャット",
+      caption: "通常セッション、一時セッション、復元用フォールバック",
+      icon: "forum",
+      color: "warning",
+      action: () => clearSupportAIChatStorage(),
+      message: r => `AIチャット保存を削除しました localStorage ${r.localCount} 件 / IndexedDB ${r.idbDeleted ? 1 : 0} 件`,
+    },
+    {
+      label: "AI設定・管理",
+      caption: "現行設定、組織、チーム、エージェント、タスク、ペイン状態",
+      icon: "settings",
+      color: "warning",
+      action: () => clearSupportAISettingsStorage(),
+      message: count => `${count} 件のAI設定・管理データを削除しました`,
+    },
+    {
+      label: "RAG/ナレッジ",
+      caption: "OOS Ghost RuntimeのRAG、ナレッジ、参照保存",
+      icon: "hub",
+      color: "warning",
+      action: () => clearSupportAIKnowledgeStorage(),
+      message: count => `${count} 件のRAG/ナレッジ保存を削除しました`,
+    },
+    {
+      label: "App IndexedDB",
+      caption: "SupportAIの大きめの永続データ用DB",
+      icon: "database",
+      color: "warning",
+      action: () => clearAppIndexedDBStorage(),
+      message: count => `${count} 件のアプリIndexedDBを削除しました`,
+    },
+    {
+      label: "App Cache",
+      caption: "html-modal-tester / html-editor 系のCache API",
+      icon: "delete_sweep",
+      color: "warning",
+      action: () => clearAppCachesOnly(),
+      message: count => `${count} 件のアプリ関連Cacheを削除しました`,
+    },
+    {
+      label: "AIモデルCache",
+      caption: "メモリ上のpipeline、Transformers/Hugging Face/ONNX系Cache",
+      icon: "memory",
+      color: "error",
+      action: () => supportAIClearBrowserModelCaches(),
+      message: r => r?.note || `AIモデルCacheを削除しました Cache ${r?.deletedCacheStores || 0} 件 / IndexedDB ${r?.deletedIndexedDB || 0} 件`,
+    },
+  ];
   return (
-    <Dialog open={open} onClose={onClose} maxWidth="sm" fullWidth PaperProps={{ sx: { borderRadius: 3 } }}>
+    <Dialog open={open} onClose={onClose} maxWidth="md" fullWidth PaperProps={{ sx: { borderRadius: 3 } }}>
       <DialogTitle sx={{ display: 'flex', alignItems: 'center', gap: 1, fontWeight: 800 }}><Icon name="security" size={20} />Security & Storage</DialogTitle>
       <DialogContent sx={{ display: 'flex', flexDirection: 'column', gap: 1.5 }}>
         <Box sx={{ p: 1.5, border: '1px solid #e0e3e8', borderRadius: 2 }}>
           <Typography variant="body2" fontWeight={700}>ブラウザ保存領域</Typography>
           <Typography variant="caption" color="text.secondary">{formatBytes(usage)} / {quota ? formatBytes(quota) : '不明'}</Typography>
+        </Box>
+        <Box sx={{ p: 1.5, border: '1px solid #e0e3e8', borderRadius: 2 }}>
+          <Typography variant="body2" fontWeight={700}>クリア範囲</Typography>
+          <Typography variant="caption" color="text.secondary">削除できる範囲を用途別に分けています。現在開いているメモリ上の画面状態は、再読み込み後に完全反映されます。</Typography>
+          <Grid container spacing={1} sx={{ mt: 1 }}>
+            {clearTargets.map(target => (
+              <Grid key={target.label} size={{ xs: 12, sm: 6 }}>
+                <Button
+                  fullWidth
+                  variant="outlined"
+                  color={target.color}
+                  disabled={busy}
+                  onClick={() => runClear(target.action, target.message)}
+                  startIcon={<Icon name={target.icon} size={16} />}
+                  sx={{ justifyContent: 'flex-start', alignItems: 'flex-start', textAlign: 'left', minHeight: 64, py: 1 }}
+                >
+                  <Box>
+                    <Typography variant="body2" fontWeight={800}>{target.label}</Typography>
+                    <Typography variant="caption" color="text.secondary" sx={{ display: 'block', whiteSpace: 'normal', lineHeight: 1.35 }}>{target.caption}</Typography>
+                  </Box>
+                </Button>
+              </Grid>
+            ))}
+          </Grid>
         </Box>
         <Box sx={{ p: 1.5, border: '1px solid #e0e3e8', borderRadius: 2 }}>
           <Typography variant="body2" fontWeight={700}>localStorage</Typography>
@@ -2164,12 +2335,25 @@ function SecurityStorageDialog({ open, onClose, onExportAll, onFullReset, onToas
             {appCaches.length === 0 && <Typography variant="caption" color="text.secondary">アプリ関連Cacheなし</Typography>}
           </Box>
         </Box>
-        <Typography variant="caption" color="text.secondary">IndexedDBミラー、CDN強制キャッシュ、永続保存要求は使わず、保存箇所をlocalStorage中心に絞ります。</Typography>
+        <Box sx={{ p: 1.5, border: '1px solid #e0e3e8', borderRadius: 2 }}>
+          <Typography variant="body2" fontWeight={700}>IndexedDB</Typography>
+          <Typography variant="caption" color="text.secondary">
+            アプリDB {appIDB.length} 件 / AIモデル候補DB {modelIDB.length} 件 / 検出 {idbDatabases.length} 件
+          </Typography>
+          <Box sx={{ mt: 1, maxHeight: 120, overflow: 'auto' }}>
+            {idbDatabases.map(db => (
+              <Typography key={db.name} variant="caption" sx={{ display: 'block', wordBreak: 'break-all' }}>
+                {db.name}{db.app ? ' · App' : ''}{db.modelLike ? ' · AI Model' : ''}
+              </Typography>
+            ))}
+            {idbDatabases.length === 0 && <Typography variant="caption" color="text.secondary">{summary.idb?.error || 'IndexedDB保存データなし'}</Typography>}
+          </Box>
+        </Box>
+        <Typography variant="caption" color="text.secondary">チャット等の大きめのデータはIndexedDBを優先し、localStorageは復元用フォールバックとして使います。SafariのHTTPキャッシュはJavaScriptから完全削除できません。</Typography>
       </DialogContent>
       <DialogActions sx={{ px: 3, pb: 2, gap: 1, flexWrap: 'wrap' }}>
         <Button onClick={refresh} variant="outlined" disabled={busy}>再読込</Button>
         <Button onClick={onExportAll} variant="outlined" startIcon={<Icon name="download" size={16} />}>Export</Button>
-        <Button onClick={clearCaches} variant="outlined" color="warning" disabled={busy} startIcon={<Icon name="delete_sweep" size={16} />}>Cache削除</Button>
         <Button onClick={onFullReset} variant="contained" color="error" startIcon={<Icon name="restart_alt" size={16} />}>完全初期化</Button>
         <Box sx={{ flex: 1 }} /><Button onClick={onClose} variant="contained">閉じる</Button>
       </DialogActions>
@@ -2193,7 +2377,7 @@ const DEFAULT_SUPPORT_AI_CONFIG = Object.freeze({
   // - No external LLM API is used.
   // - Explicit WebGPU mode must not silently downgrade to server inference or WASM.
   provider: "browser-local",
-  policyVersion: "iphone-webgpu-local-llm-v6",
+  policyVersion: "iphone-webgpu-local-llm-v7",
 
   // Selective enable policy. Only enabled capabilities may lazy-load models.
   localAIEnabled: true,
@@ -2226,8 +2410,12 @@ const DEFAULT_SUPPORT_AI_CONFIG = Object.freeze({
   browserVisionModel: "LiquidAI/LFM2.5-VL-450M-ONNX",
   browserVisionTask: "image-to-text",
   browserVisionDtype: "q4",
+  audioTranscribeProvider: "whisper",
   browserWhisperModel: "onnx-community/whisper-tiny",
   browserWhisperDtype: "q8",
+  voiceConversationProvider: "lfm-audio",
+  browserLfmAudioModel: "LiquidAI/LFM2.5-Audio-1.5B-ONNX",
+  browserLfmAudioPrecision: "q4",
   browserTtsModel: "Xenova/speecht5_tts",
   browserTtsTask: "text-to-speech",
   browserTtsDtype: "q8",
@@ -2248,8 +2436,8 @@ const SUPPORT_AI_MODEL_PRESETS = Object.freeze([
   { kind: "text", modelId: "onnx-community/LFM2-1.2B-RAG-ONNX", label: "LFM2 1.2B RAG ONNX / Text", role: "rag", patch: { browserTextModel: "onnx-community/LFM2-1.2B-RAG-ONNX", browserTextTask: "text-generation", browserTextDtype: "q4", browserDevice: "webgpu", enableText: true, enableRag: true } },
   { kind: "vision", modelId: "HuggingFaceTB/SmolVLM-256M-Instruct", label: "SmolVLM 256M Instruct / Vision-Language", role: "vision-language", patch: { browserVisionModel: "HuggingFaceTB/SmolVLM-256M-Instruct", browserVisionTask: "image-to-text", browserVisionDtype: "q4", enableVision: true } },
   { kind: "vision", modelId: "LiquidAI/LFM2.5-VL-450M-ONNX", label: "LFM2.5 VL 450M ONNX / Vision-Language Experimental", role: "vision-language-experimental", patch: { browserVisionModel: "LiquidAI/LFM2.5-VL-450M-ONNX", browserVisionTask: "image-to-text", browserVisionDtype: "q4", enableVision: true } },
-  { kind: "audio", modelId: "LiquidAI/LFM2.5-Audio-1.5B-ONNX", label: "LFM2.5 Audio 1.5B / ASR・TTS・Interleaved WebGPU", role: "audio-primary", patch: { browserWhisperModel: "LiquidAI/LFM2.5-Audio-1.5B-ONNX", browserWhisperDtype: "q4", browserTtsModel: "LiquidAI/LFM2.5-Audio-1.5B-ONNX", browserTtsTask: "text-to-speech", browserTtsDtype: "q4", browserDevice: "webgpu", enableWhisper: true, enableTts: true } },
-  { kind: "audio", modelId: "onnx-community/whisper-tiny", label: "Whisper tiny / Audio ASR WASM", role: "asr-fallback", patch: { browserWhisperModel: "onnx-community/whisper-tiny", browserWhisperDtype: "q8", enableWhisper: true } },
+  { kind: "audio", modelId: "onnx-community/whisper-tiny", label: "Whisper tiny / Audio ASR WASM", role: "asr-fallback", patch: { audioTranscribeProvider: "whisper", browserWhisperModel: "onnx-community/whisper-tiny", browserWhisperDtype: "q8", enableWhisper: true } },
+  { kind: "voice", modelId: "LiquidAI/LFM2.5-Audio-1.5B-ONNX", label: "LFM2.5 Audio 1.5B / Voice Conversation Experimental", role: "voice-conversation-experimental", patch: { voiceConversationProvider: "lfm-audio", browserLfmAudioModel: "LiquidAI/LFM2.5-Audio-1.5B-ONNX", browserLfmAudioPrecision: "q4", browserDevice: "webgpu", enableTts: true } },
 ]);
 
 function supportAIModelPresets(kind) {
@@ -2279,18 +2467,24 @@ const SUPPORT_AI_BROWSER_LOCAL = {
   moduleKey: "",
   modulePromise: null,
   pipelinePromises: new Map(),
+  lfmAudioRuntimeKey: "",
+  lfmAudioRuntimePromise: null,
+  lfmAudioModelKey: "",
+  lfmAudioModelPromise: null,
+  lfmAudioModel: null,
   objectUrls: new Set(),
   logs: [],
   lastError: null,
   lastWarning: null,
   lastLoadedAt: null,
   activeDevice: "",
-  prepared: { runtime: false, text: false, vision: false, whisper: false, tts: false },
-  preparedAt: { runtime: null, text: null, vision: null, whisper: null, tts: null },
+  prepared: { runtime: false, text: false, vision: false, whisper: false, tts: false, lfmAudio: false },
+  preparedAt: { runtime: null, text: null, vision: null, whisper: null, tts: null, lfmAudio: null },
 };
 
 const SUPPORT_AI_ONNX_RUNTIME_WEB_VERSION = "1.26.0-dev.20260416-b7804b056c";
 const SUPPORT_AI_ONNX_RUNTIME_DIST_BASE = `https://cdn.jsdelivr.net/npm/onnxruntime-web@${SUPPORT_AI_ONNX_RUNTIME_WEB_VERSION}/dist/`;
+const SUPPORT_AI_LFM_AUDIO_SPACE_BASE = "https://huggingface.co/spaces/LiquidAI/LFM2.5-Audio-1.5B-transformers-js/raw/main";
 
 const SUPPORT_AI_MEMORY_LIMITS = Object.freeze({
   maxInitLogs: 240,
@@ -2362,6 +2556,17 @@ function supportAIClearPipelineRefs() {
     }).catch(() => {});
   }
   SUPPORT_AI_BROWSER_LOCAL.pipelinePromises.clear();
+}
+
+function supportAIClearLfmAudioRefs() {
+  try { SUPPORT_AI_BROWSER_LOCAL.lfmAudioModel?.dispose?.(); } catch {}
+  SUPPORT_AI_BROWSER_LOCAL.lfmAudioModel = null;
+  SUPPORT_AI_BROWSER_LOCAL.lfmAudioModelPromise = null;
+  SUPPORT_AI_BROWSER_LOCAL.lfmAudioModelKey = "";
+  SUPPORT_AI_BROWSER_LOCAL.lfmAudioRuntimePromise = null;
+  SUPPORT_AI_BROWSER_LOCAL.lfmAudioRuntimeKey = "";
+  SUPPORT_AI_BROWSER_LOCAL.prepared.lfmAudio = false;
+  SUPPORT_AI_BROWSER_LOCAL.preparedAt.lfmAudio = null;
 }
 
 function supportAIAddInitLog(level, message, meta = {}) {
@@ -2468,8 +2673,12 @@ function normalizeSupportAIConfig(config) {
     browserVisionModel: s(c.browserVisionModel ?? c.visionModel, DEFAULT_SUPPORT_AI_CONFIG.browserVisionModel),
     browserVisionTask: s(c.browserVisionTask, DEFAULT_SUPPORT_AI_CONFIG.browserVisionTask),
     browserVisionDtype: s(c.browserVisionDtype, DEFAULT_SUPPORT_AI_CONFIG.browserVisionDtype),
+    audioTranscribeProvider: ["whisper"].includes(c.audioTranscribeProvider) ? c.audioTranscribeProvider : DEFAULT_SUPPORT_AI_CONFIG.audioTranscribeProvider,
     browserWhisperModel: s(c.browserWhisperModel, DEFAULT_SUPPORT_AI_CONFIG.browserWhisperModel),
     browserWhisperDtype: s(c.browserWhisperDtype, DEFAULT_SUPPORT_AI_CONFIG.browserWhisperDtype),
+    voiceConversationProvider: ["lfm-audio"].includes(c.voiceConversationProvider) ? c.voiceConversationProvider : DEFAULT_SUPPORT_AI_CONFIG.voiceConversationProvider,
+    browserLfmAudioModel: s(c.browserLfmAudioModel, DEFAULT_SUPPORT_AI_CONFIG.browserLfmAudioModel),
+    browserLfmAudioPrecision: s(c.browserLfmAudioPrecision, DEFAULT_SUPPORT_AI_CONFIG.browserLfmAudioPrecision),
     browserTtsModel: s(c.browserTtsModel, DEFAULT_SUPPORT_AI_CONFIG.browserTtsModel),
     browserTtsTask: s(c.browserTtsTask, DEFAULT_SUPPORT_AI_CONFIG.browserTtsTask),
     browserTtsDtype: s(c.browserTtsDtype, DEFAULT_SUPPORT_AI_CONFIG.browserTtsDtype),
@@ -2494,11 +2703,23 @@ function loadSupportAIConfig() {
       String(parsed?.transformersCdnUrl || "").includes("/+esm") ||
       String(parsed?.transformersCdnUrl || "").includes("/dist/transformers.web");
     if (needsMigration) {
+      const oldWhisperModel = String(parsed?.browserWhisperModel || loaded.browserWhisperModel || "");
+      const oldTtsModel = String(parsed?.browserTtsModel || loaded.browserTtsModel || "");
+      const lfmAudioWasMixedIntoPipelines = /LFM2\.5-Audio|LiquidAI\/LFM2\.5-Audio/i.test(`${oldWhisperModel} ${oldTtsModel}`);
       const migrated = normalizeSupportAIConfig({
         ...loaded,
         transformersCdnUrl: DEFAULT_SUPPORT_AI_CONFIG.transformersCdnUrl,
         browserCacheMode: DEFAULT_SUPPORT_AI_CONFIG.browserCacheMode,
         browserDevice: DEFAULT_SUPPORT_AI_CONFIG.browserDevice,
+        audioTranscribeProvider: "whisper",
+        browserWhisperModel: lfmAudioWasMixedIntoPipelines ? DEFAULT_SUPPORT_AI_CONFIG.browserWhisperModel : loaded.browserWhisperModel,
+        browserWhisperDtype: lfmAudioWasMixedIntoPipelines ? DEFAULT_SUPPORT_AI_CONFIG.browserWhisperDtype : loaded.browserWhisperDtype,
+        voiceConversationProvider: "lfm-audio",
+        browserLfmAudioModel: loaded.browserLfmAudioModel || DEFAULT_SUPPORT_AI_CONFIG.browserLfmAudioModel,
+        browserLfmAudioPrecision: loaded.browserLfmAudioPrecision || DEFAULT_SUPPORT_AI_CONFIG.browserLfmAudioPrecision,
+        browserTtsModel: lfmAudioWasMixedIntoPipelines ? DEFAULT_SUPPORT_AI_CONFIG.browserTtsModel : loaded.browserTtsModel,
+        browserTtsTask: lfmAudioWasMixedIntoPipelines ? DEFAULT_SUPPORT_AI_CONFIG.browserTtsTask : loaded.browserTtsTask,
+        browserTtsDtype: lfmAudioWasMixedIntoPipelines ? DEFAULT_SUPPORT_AI_CONFIG.browserTtsDtype : loaded.browserTtsDtype,
         policyVersion: DEFAULT_SUPPORT_AI_CONFIG.policyVersion,
       });
       try { localStorage.setItem(SUPPORT_AI_CONFIG_KEY, JSON.stringify(migrated)); } catch {}
@@ -2593,6 +2814,115 @@ function supportAIResolveBrowserCacheUse(config) {
   return { useBrowserCache: false, status, reason: status.blocked ? "blocked-by-sandbox" : "unavailable" };
 }
 
+const SUPPORT_AI_IDB_NAME = "html-tester-support-ai-v1";
+const SUPPORT_AI_IDB_STORE = "kv";
+
+function supportAIHasIndexedDB() {
+  try {
+    return typeof indexedDB !== "undefined" && typeof indexedDB.open === "function";
+  } catch {
+    return false;
+  }
+}
+
+function supportAIIDBOpen() {
+  return new Promise((resolve, reject) => {
+    if (!supportAIHasIndexedDB()) return reject(new Error("IndexedDB is not available"));
+    const req = indexedDB.open(SUPPORT_AI_IDB_NAME, 1);
+    req.onupgradeneeded = () => {
+      const db = req.result;
+      if (!db.objectStoreNames.contains(SUPPORT_AI_IDB_STORE)) db.createObjectStore(SUPPORT_AI_IDB_STORE);
+    };
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error || new Error("IndexedDB open failed"));
+    req.onblocked = () => reject(new Error("IndexedDB open blocked"));
+  });
+}
+
+async function supportAIIDBGet(key, fallback = null) {
+  let db = null;
+  try {
+    db = await supportAIIDBOpen();
+    return await new Promise((resolve, reject) => {
+      const tx = db.transaction(SUPPORT_AI_IDB_STORE, "readonly");
+      const req = tx.objectStore(SUPPORT_AI_IDB_STORE).get(key);
+      req.onsuccess = () => resolve(req.result ?? fallback);
+      req.onerror = () => reject(req.error || new Error("IndexedDB get failed"));
+    });
+  } catch {
+    return fallback;
+  } finally {
+    try { db?.close?.(); } catch {}
+  }
+}
+
+async function supportAIIDBSet(key, value) {
+  let db = null;
+  try {
+    db = await supportAIIDBOpen();
+    await new Promise((resolve, reject) => {
+      const tx = db.transaction(SUPPORT_AI_IDB_STORE, "readwrite");
+      tx.oncomplete = () => resolve(true);
+      tx.onerror = () => reject(tx.error || new Error("IndexedDB set failed"));
+      tx.objectStore(SUPPORT_AI_IDB_STORE).put(value, key);
+    });
+    return true;
+  } catch {
+    return false;
+  } finally {
+    try { db?.close?.(); } catch {}
+  }
+}
+
+async function supportAIIDBDelete(key) {
+  let db = null;
+  try {
+    db = await supportAIIDBOpen();
+    await new Promise((resolve, reject) => {
+      const tx = db.transaction(SUPPORT_AI_IDB_STORE, "readwrite");
+      tx.oncomplete = () => resolve(true);
+      tx.onerror = () => reject(tx.error || new Error("IndexedDB delete failed"));
+      tx.objectStore(SUPPORT_AI_IDB_STORE).delete(key);
+    });
+    return true;
+  } catch {
+    return false;
+  } finally {
+    try { db?.close?.(); } catch {}
+  }
+}
+
+async function supportAIListIndexedDBNames() {
+  try {
+    if (!supportAIHasIndexedDB() || typeof indexedDB.databases !== "function") return [];
+    const list = await indexedDB.databases();
+    return (Array.isArray(list) ? list : []).map(item => item?.name).filter(Boolean);
+  } catch {
+    return [];
+  }
+}
+
+function supportAIDeleteIndexedDBDatabase(name) {
+  return new Promise(resolve => {
+    if (!supportAIHasIndexedDB() || !name) return resolve(false);
+    let settled = false;
+    const finish = value => {
+      if (settled) return;
+      settled = true;
+      resolve(value);
+    };
+    try {
+      const req = indexedDB.deleteDatabase(name);
+      req.onsuccess = () => finish(true);
+      req.onerror = () => finish(false);
+      req.onblocked = () => finish(false);
+      setTimeout(() => finish(false), 2500);
+    } catch {
+      finish(false);
+    }
+  });
+}
+
 function supportAIHasWebGPU() {
   return typeof navigator !== "undefined" && Boolean(navigator.gpu);
 }
@@ -2622,6 +2952,7 @@ function supportAIFeatureEnabled(config, feature) {
   if (feature === "vision") return Boolean(c.enableVision);
   if (feature === "whisper") return Boolean(c.enableWhisper);
   if (feature === "tts") return Boolean(c.enableTts);
+  if (feature === "lfmAudio") return Boolean(c.enableTts && c.voiceConversationProvider === "lfm-audio");
   if (feature === "rag") return Boolean(c.enableRag);
   if (feature === "knowledge") return Boolean(c.enableKnowledge);
   if (feature === "agents") return Boolean(c.enableAgents && c.enableText);
@@ -2694,11 +3025,16 @@ async function supportAIPrepareBrowserLocalFeatures(features = [], rawConfig = D
     supportAIEmitInitLog(onLog, "success", "Runtime読込済み");
     const device = supportAIResolveBrowserDevice(config);
     supportAIEmitInitLog(onLog, "info", `推論Device: ${device}`, { webGPU: supportAIHasWebGPU(), requested: config.browserDevice });
-    const featureLabels = { text: "Text LLM", vision: "Vision画像理解", whisper: "Whisper ASR", tts: "TTS" };
+    const featureLabels = { text: "Text LLM", vision: "Vision画像理解", whisper: "Whisper ASR", tts: "TTS", lfmAudio: "LFM Audio Voice" };
     for (const feature of selected) {
       if (!supportAIFeatureEnabled(config, feature)) {
         supportAIEmitInitLog(onLog, "warn", `${featureLabels[feature] || feature}: 無効のためスキップ`);
         results.push({ feature, ok: false, skipped: true, error: "disabled" });
+        continue;
+      }
+      if (feature === "lfmAudio") {
+        await supportAIGetLfmAudioModel(config, { onLog });
+        results.push({ feature, ok: true, model: config.browserLfmAudioModel, task: "lfm-audio-direct", dtype: config.browserLfmAudioPrecision || "q4" });
         continue;
       }
       let task = "";
@@ -2744,23 +3080,44 @@ async function supportAIPrepareBrowserLocalFeatures(features = [], rawConfig = D
 
 async function supportAIClearBrowserModelCaches() {
   supportAIClearPipelineRefs();
+  supportAIClearLfmAudioRefs();
   supportAIRevokeAllObjectUrls();
   SUPPORT_AI_BROWSER_LOCAL.modulePromise = null;
   SUPPORT_AI_BROWSER_LOCAL.moduleKey = "";
   supportAIClearInitLogs();
-  supportAIAddInitLog("info", "モデルCache削除: メモリ上のpipeline参照を削除しました。");
-  SUPPORT_AI_BROWSER_LOCAL.prepared = { runtime: false, text: false, vision: false, whisper: false, tts: false };
-  SUPPORT_AI_BROWSER_LOCAL.preparedAt = { runtime: null, text: null, vision: null, whisper: null, tts: null };
+  supportAIAddInitLog("info", "モデルCache削除: メモリ上のpipeline参照とLFM Audio参照を削除しました。");
+  SUPPORT_AI_BROWSER_LOCAL.prepared = { runtime: false, text: false, vision: false, whisper: false, tts: false, lfmAudio: false };
+  SUPPORT_AI_BROWSER_LOCAL.preparedAt = { runtime: null, text: null, vision: null, whisper: null, tts: null, lfmAudio: null };
   SUPPORT_AI_BROWSER_LOCAL.lastError = null;
   SUPPORT_AI_BROWSER_LOCAL.lastWarning = null;
   let deleted = 0;
+  let deletedIndexedDB = 0;
+  const indexedDBNames = await supportAIListIndexedDBNames();
+  const knownModelDBNames = [
+    "transformers-cache",
+    "huggingface-cache",
+    "onnxruntime-web",
+    "onnxruntime-web-cache",
+    "onnx-model-cache",
+    "onnx-models-v1",
+    "ort-wasm-cache",
+    "xenova-cache",
+  ];
+  const modelDBNames = Array.from(new Set([
+    ...knownModelDBNames,
+    ...indexedDBNames.filter(name => /huggingface|transformers|onnx|ort|xenova|lfm|whisper/i.test(name)),
+  ]));
+  for (const name of modelDBNames) {
+    if (name === SUPPORT_AI_IDB_NAME) continue;
+    if (await supportAIDeleteIndexedDBDatabase(name)) deletedIndexedDB += 1;
+  }
   const cacheStatus = supportAIGetBrowserCacheStatus();
   if (!cacheStatus.available) {
     const note = cacheStatus.blocked
-      ? "この画面はsandbox内で実行されているためCache APIを利用できません。メモリ上のpipeline参照だけ削除しました。ダウンロード済みモデルの永続Cache削除/再DL制御は、この画面を通常のタブで開いた場合に利用できます。"
-      : "Cache APIを利用できません。メモリ上のpipeline参照だけ削除しました。";
+      ? `この画面はsandbox内で実行されているためCache APIを利用できません。メモリ上のpipeline参照とIndexedDBモデルDB ${deletedIndexedDB} 件を削除しました。ブラウザHTTPキャッシュはSafari側の管理です。`
+      : `Cache APIを利用できません。メモリ上のpipeline参照とIndexedDBモデルDB ${deletedIndexedDB} 件を削除しました。ブラウザHTTPキャッシュはSafari側の管理です。`;
     SUPPORT_AI_BROWSER_LOCAL.lastWarning = note;
-    return { ok: true, deletedCacheStores: 0, cacheUnavailable: true, note };
+    return { ok: true, deletedCacheStores: 0, deletedIndexedDB, cacheUnavailable: true, note };
   }
   try {
     const keys = await globalThis.caches.keys();
@@ -2772,9 +3129,9 @@ async function supportAIClearBrowserModelCaches() {
   } catch (error) {
     const note = `Cache API削除は利用できませんでした: ${supportAIErrorMessage(error)}。メモリ上のpipeline参照は削除済みです。`;
     SUPPORT_AI_BROWSER_LOCAL.lastWarning = note;
-    return { ok: true, deletedCacheStores: deleted, cacheUnavailable: true, note };
+    return { ok: true, deletedCacheStores: deleted, deletedIndexedDB, cacheUnavailable: true, note };
   }
-  return { ok: true, deletedCacheStores: deleted, note: "メモリ上のpipeline参照と、検出できたTransformers/Hugging Face関連Cacheを削除しました。ブラウザHTTPキャッシュやIndexedDB内のモデル実体はブラウザ実装に依存します。" };
+  return { ok: true, deletedCacheStores: deleted, deletedIndexedDB, note: `メモリ上のpipeline参照、検出できたTransformers/Hugging Face関連Cache ${deleted} 件、IndexedDBモデルDB ${deletedIndexedDB} 件を削除しました。SafariのHTTPキャッシュや未列挙DBはブラウザ側の管理です。` };
 }
 
 async function importSupportAITransformers(config, runtimeOptions = {}) {
@@ -2848,6 +3205,119 @@ function supportAIConfigureOnnxWebGpuRuntime(mod, config, onLog) {
     onnxRuntimeWeb: SUPPORT_AI_ONNX_RUNTIME_WEB_VERSION,
     wasmPaths: wasm.wasmPaths,
   });
+}
+
+async function importSupportAIOnnxRuntimeWebGpu(onLog = null) {
+  const url = `${SUPPORT_AI_ONNX_RUNTIME_DIST_BASE}ort.webgpu.min.mjs`;
+  supportAIEmitInitLog(onLog, "info", "ONNX Runtime WebGPU直接読込開始", { url });
+  const ortModule = await import(/* @vite-ignore */ url);
+  const ort = ortModule?.default?.InferenceSession ? ortModule.default : ortModule;
+  try {
+    if (ort.env?.wasm) {
+      ort.env.wasm.numThreads = 1;
+      ort.env.wasm.wasmPaths = {
+        mjs: `${SUPPORT_AI_ONNX_RUNTIME_DIST_BASE}ort-wasm-simd-threaded.asyncify.mjs`,
+        wasm: `${SUPPORT_AI_ONNX_RUNTIME_DIST_BASE}ort-wasm-simd-threaded.asyncify.wasm`,
+      };
+    }
+  } catch {}
+  supportAIEmitInitLog(onLog, "success", "ONNX Runtime WebGPU直接読込完了", { onnxRuntimeWeb: SUPPORT_AI_ONNX_RUNTIME_WEB_VERSION });
+  return ort;
+}
+
+async function supportAIFetchText(url) {
+  const res = await fetch(url, { mode: "cors", credentials: "omit" });
+  if (!res.ok) throw new Error(`Failed to fetch ${url}: ${res.status}`);
+  return await res.text();
+}
+
+function supportAIRewriteLfmAudioModelSource(source, audioProcessorUrl) {
+  return String(source || "")
+    .replace(/import\s+\*\s+as\s+ort\s+from\s+['"]onnxruntime-web['"]\s*;/, "const ort = globalThis.__SupportAIOrt;")
+    .replace(/import\s+\{\s*AutoTokenizer\s*,\s*env\s*\}\s+from\s+['"]@huggingface\/transformers['"]\s*;/, "const { AutoTokenizer, env } = globalThis.__SupportAITransformers;")
+    .replace(/import\s+\{\s*loadMelConfig\s*,\s*computeMelSpectrogram\s*,\s*loadAudioFile\s*\}\s+from\s+['"]\.\/audio-processor\.js['"]\s*;/, `import { loadMelConfig, computeMelSpectrogram, loadAudioFile } from "${audioProcessorUrl}";`);
+}
+
+async function importSupportAILfmAudioRuntime(config, runtimeOptions = {}) {
+  const onLog = runtimeOptions && typeof runtimeOptions.onLog === "function" ? runtimeOptions.onLog : null;
+  const key = `${SUPPORT_AI_LFM_AUDIO_SPACE_BASE}|${config.transformersCdnUrl}|${SUPPORT_AI_ONNX_RUNTIME_WEB_VERSION}`;
+  if (SUPPORT_AI_BROWSER_LOCAL.lfmAudioRuntimePromise && SUPPORT_AI_BROWSER_LOCAL.lfmAudioRuntimeKey === key) {
+    return SUPPORT_AI_BROWSER_LOCAL.lfmAudioRuntimePromise;
+  }
+  SUPPORT_AI_BROWSER_LOCAL.lfmAudioRuntimeKey = key;
+  SUPPORT_AI_BROWSER_LOCAL.lfmAudioRuntimePromise = (async () => {
+    const [ort, transformers] = await Promise.all([
+      importSupportAIOnnxRuntimeWebGpu(onLog),
+      importSupportAITransformers(config, { onLog }),
+    ]);
+    globalThis.__SupportAIOrt = ort;
+    globalThis.__SupportAITransformers = transformers;
+    supportAIEmitInitLog(onLog, "info", "LFM Audio公式runtimeソース取得開始", { base: SUPPORT_AI_LFM_AUDIO_SPACE_BASE });
+    const [processorSource, modelSource] = await Promise.all([
+      supportAIFetchText(`${SUPPORT_AI_LFM_AUDIO_SPACE_BASE}/audio-processor.js`),
+      supportAIFetchText(`${SUPPORT_AI_LFM_AUDIO_SPACE_BASE}/audio-model.js`),
+    ]);
+    const processorUrl = supportAIRegisterObjectUrl(URL.createObjectURL(new Blob([processorSource], { type: "text/javascript" })));
+    const patchedModelSource = supportAIRewriteLfmAudioModelSource(modelSource, processorUrl);
+    const modelUrl = supportAIRegisterObjectUrl(URL.createObjectURL(new Blob([patchedModelSource], { type: "text/javascript" })));
+    const mod = await import(/* @vite-ignore */ modelUrl);
+    supportAIEmitInitLog(onLog, "success", "LFM Audio公式runtime読込完了");
+    return mod;
+  })().catch(error => {
+    SUPPORT_AI_BROWSER_LOCAL.lfmAudioRuntimePromise = null;
+    SUPPORT_AI_BROWSER_LOCAL.lfmAudioRuntimeKey = "";
+    throw error;
+  });
+  return SUPPORT_AI_BROWSER_LOCAL.lfmAudioRuntimePromise;
+}
+
+function supportAILfmAudioModelBase(modelId) {
+  const value = String(modelId || DEFAULT_SUPPORT_AI_CONFIG.browserLfmAudioModel).trim();
+  if (/^https?:\/\//i.test(value)) return value.replace(/\/$/, "");
+  return `https://huggingface.co/${value}/resolve/main`;
+}
+
+async function supportAIGetLfmAudioModel(rawConfig = DEFAULT_SUPPORT_AI_CONFIG, runtimeOptions = {}) {
+  const config = normalizeSupportAIConfig(rawConfig);
+  const onLog = runtimeOptions && typeof runtimeOptions.onLog === "function" ? runtimeOptions.onLog : null;
+  if (!supportAIHasWebGPU()) throw new Error(supportAIWebGPURequiredMessage());
+  const modelId = config.browserLfmAudioModel;
+  const precision = config.browserLfmAudioPrecision || "q4";
+  const key = `${modelId}|${precision}|${config.browserDevice}|${SUPPORT_AI_ONNX_RUNTIME_WEB_VERSION}`;
+  if (SUPPORT_AI_BROWSER_LOCAL.lfmAudioModelPromise && SUPPORT_AI_BROWSER_LOCAL.lfmAudioModelKey === key) {
+    return SUPPORT_AI_BROWSER_LOCAL.lfmAudioModelPromise;
+  }
+  supportAIClearLfmAudioRefs();
+  SUPPORT_AI_BROWSER_LOCAL.lfmAudioModelKey = key;
+  SUPPORT_AI_BROWSER_LOCAL.lfmAudioModelPromise = (async () => {
+    const runtime = await importSupportAILfmAudioRuntime(config, { onLog });
+    const model = new runtime.AudioModel();
+    const modelBase = supportAILfmAudioModelBase(modelId);
+    supportAIEmitInitLog(onLog, "info", "LFM Audioモデル準備開始", { model: modelId, precision, modelBase });
+    await model.load(modelBase, {
+      device: "webgpu",
+      quantization: precision,
+      progressCallback: info => {
+        if (!info) return;
+        supportAIEmitInitLog(onLog, "info", `LFM Audio load: ${info.file || info.status || ""}`, { progress: info.progress || 0, status: info.status || "" });
+      },
+    });
+    SUPPORT_AI_BROWSER_LOCAL.lfmAudioModel = model;
+    SUPPORT_AI_BROWSER_LOCAL.prepared.lfmAudio = true;
+    SUPPORT_AI_BROWSER_LOCAL.preparedAt.lfmAudio = Date.now();
+    SUPPORT_AI_BROWSER_LOCAL.prepared.tts = true;
+    SUPPORT_AI_BROWSER_LOCAL.preparedAt.tts = Date.now();
+    SUPPORT_AI_BROWSER_LOCAL.activeDevice = "webgpu";
+    supportAIEmitInitLog(onLog, "success", "LFM Audioモデル準備完了", { model: modelId, precision });
+    return { model, runtime };
+  })().catch(error => {
+    SUPPORT_AI_BROWSER_LOCAL.lfmAudioModelPromise = null;
+    SUPPORT_AI_BROWSER_LOCAL.lfmAudioModelKey = "";
+    SUPPORT_AI_BROWSER_LOCAL.lastError = supportAIErrorMessage(error);
+    supportAIEmitInitLog(onLog, "error", `LFM Audioモデル準備失敗: ${SUPPORT_AI_BROWSER_LOCAL.lastError}`);
+    throw error;
+  });
+  return SUPPORT_AI_BROWSER_LOCAL.lfmAudioModelPromise;
 }
 
 async function supportAIStartBrowserPipeline(tf, task, modelId, loadOptions) {
@@ -3176,6 +3646,10 @@ async function supportAIBrowserTranscribeAudio(file, options = {}, rawConfig = D
   if (!file) return { ok: false, text: "", error: "音声ファイルが選択されていません。" };
   const config = normalizeSupportAIConfig({ ...rawConfig, ...options });
   if (!supportAIFeatureEnabled(config, "whisper")) return supportAIDisabledResult("whisper", "Whisper ASR");
+  const provider = options.provider || config.audioTranscribeProvider || "whisper";
+  if (provider !== "whisper") {
+    return { ok: false, text: "", provider, error: "通常の音声→文字はWhisper専用です。LFM Audioは音声会話専用ルートで実行してください。" };
+  }
   let device = "";
   const model = options.model || config.browserWhisperModel;
   const dtype = options.dtype || config.browserWhisperDtype || "q8";
@@ -3199,6 +3673,107 @@ async function supportAIBrowserTranscribeAudio(file, options = {}, rawConfig = D
     return { ok: false, text: "", provider: "browser-local-whisper", model, device, error: SUPPORT_AI_BROWSER_LOCAL.lastError };
   } finally {
     URL.revokeObjectURL(audioUrl);
+  }
+}
+
+async function supportAIBrowserLfmAudioInterleaved(input = {}, rawConfig = DEFAULT_SUPPORT_AI_CONFIG) {
+  const config = normalizeSupportAIConfig({ ...rawConfig, ...input });
+  const audio = input.audio || input.file || null;
+  const textPrompt = String(input.prompt || input.text || "").trim();
+  if ((!audio || typeof audio === "string") && !textPrompt) return { ok: false, text: "", transcript: "", audioUrl: "", error: "LFM Audio音声会話はFile/Blob音声またはテキストを指定してください。" };
+  if (!supportAIFeatureEnabled(config, "tts")) return { ...supportAIDisabledResult("tts", "LFM Audio Voice Conversation"), transcript: "", audioUrl: "" };
+  const startedAt = performance.now();
+  try {
+    const onLog = input.onLog || null;
+    const { model, runtime } = await supportAIGetLfmAudioModel(config, { onLog });
+    const maxNewTokens = Math.min(Number(input.maxNewTokens || config.browserMaxNewTokens || 512), 1024);
+    const options = {
+      maxNewTokens,
+      textTemperature: Number(input.textTemperature ?? config.temperature ?? 0.7),
+      audioTemperature: Number(input.audioTemperature ?? 0.8),
+      audioTopK: Number(input.audioTopK ?? 64),
+      systemPrompt: input.systemPrompt || "Respond with interleaved text and audio.",
+      onToken: typeof input.onToken === "function" ? input.onToken : undefined,
+    };
+    let generated;
+    if (audio && typeof audio !== "string") {
+      const loaded = await runtime.loadAudioFile(audio);
+      generated = await model.generateInterleaved(loaded.audioData, loaded.sampleRate, textPrompt, options);
+    } else {
+      generated = await model.generateInterleavedFromText(textPrompt, options);
+    }
+    let audioUrl = "";
+    if (Array.isArray(generated?.audioCodes) && generated.audioCodes.length && typeof model.decodeAudioCodes === "function") {
+      const waveform = await model.decodeAudioCodes(generated.audioCodes);
+      if (waveform?.length) {
+        const blob = supportAIEncodeWav(waveform, 24000);
+        audioUrl = supportAIRegisterObjectUrl(URL.createObjectURL(blob));
+      }
+    }
+    const text = String(generated?.text || generated?.textOutput || "").trim();
+    return {
+      ok: Boolean(text || audioUrl),
+      provider: "browser-local-lfm-audio",
+      model: config.browserLfmAudioModel,
+      precision: config.browserLfmAudioPrecision || "q4",
+      text,
+      transcript: "",
+      audioUrl,
+      raw: { audioFrames: generated?.audioCodes?.length || 0, durationMs: Math.round(performance.now() - startedAt) },
+      error: text || audioUrl ? null : "LFM Audio推論は完了しましたが、テキストまたは音声を生成できませんでした。",
+    };
+  } catch (error) {
+    SUPPORT_AI_BROWSER_LOCAL.lastError = supportAIErrorMessage(error);
+    return { ok: false, provider: "browser-local-lfm-audio", model: config.browserLfmAudioModel, precision: config.browserLfmAudioPrecision || "q4", text: "", transcript: "", audioUrl: "", error: SUPPORT_AI_BROWSER_LOCAL.lastError };
+  }
+}
+
+async function supportAIBrowserLfmAudioTranscribe(input = {}, rawConfig = DEFAULT_SUPPORT_AI_CONFIG) {
+  const config = normalizeSupportAIConfig({ ...rawConfig, ...input });
+  const audio = input.audio || input.file || null;
+  if (!audio || typeof audio === "string") return { ok: false, text: "", error: "LFM Audio ASRはFile/Blob音声を指定してください。" };
+  const startedAt = performance.now();
+  try {
+    const { model, runtime } = await supportAIGetLfmAudioModel(config, { onLog: input.onLog || null });
+    const loaded = await runtime.loadAudioFile(audio);
+    const result = await model.transcribe(loaded.audioData, loaded.sampleRate, {
+      maxNewTokens: Math.min(Number(input.maxNewTokens || config.browserMaxNewTokens || 256), 512),
+      temperature: Number(input.temperature ?? 0),
+      systemPrompt: input.systemPrompt || "Perform ASR.",
+      onToken: typeof input.onToken === "function" ? input.onToken : undefined,
+    });
+    const text = String(result?.text || result || "").trim();
+    return { ok: Boolean(text), provider: "browser-local-lfm-audio-asr", model: config.browserLfmAudioModel, precision: config.browserLfmAudioPrecision || "q4", text, raw: { durationMs: Math.round(performance.now() - startedAt) }, error: text ? null : "LFM Audio ASRは完了しましたが、空の結果でした。" };
+  } catch (error) {
+    SUPPORT_AI_BROWSER_LOCAL.lastError = supportAIErrorMessage(error);
+    return { ok: false, provider: "browser-local-lfm-audio-asr", model: config.browserLfmAudioModel, text: "", error: SUPPORT_AI_BROWSER_LOCAL.lastError };
+  }
+}
+
+async function supportAIBrowserLfmAudioSpeech(input = {}, rawConfig = DEFAULT_SUPPORT_AI_CONFIG) {
+  const config = normalizeSupportAIConfig({ ...rawConfig, ...input });
+  const text = String(input.prompt || input.text || "").trim();
+  if (!text) return { ok: false, text: "", audioUrl: "", error: "LFM Audio TTS対象テキストが空です。" };
+  const startedAt = performance.now();
+  try {
+    const { model } = await supportAIGetLfmAudioModel(config, { onLog: input.onLog || null });
+    const result = await model.generateSpeech(text, {
+      maxNewTokens: Math.min(Number(input.maxNewTokens || config.browserMaxNewTokens || 512), 1024),
+      textTemperature: Number(input.textTemperature ?? config.temperature ?? 0.7),
+      audioTemperature: Number(input.audioTemperature ?? 0.8),
+      audioTopK: Number(input.audioTopK ?? 64),
+      systemPrompt: input.systemPrompt || "Perform TTS. Use the UK female voice.",
+      onToken: typeof input.onToken === "function" ? input.onToken : undefined,
+    });
+    let audioUrl = "";
+    if (Array.isArray(result?.audioCodes) && result.audioCodes.length) {
+      const waveform = await model.decodeAudioCodes(result.audioCodes);
+      if (waveform?.length) audioUrl = supportAIRegisterObjectUrl(URL.createObjectURL(supportAIEncodeWav(waveform, 24000)));
+    }
+    return { ok: Boolean(audioUrl), provider: "browser-local-lfm-audio-tts", model: config.browserLfmAudioModel, precision: config.browserLfmAudioPrecision || "q4", text: result?.textOutput || text, audioUrl, raw: { audioFrames: result?.audioCodes?.length || 0, durationMs: Math.round(performance.now() - startedAt) }, error: audioUrl ? null : "LFM Audio TTSは完了しましたが、音声を生成できませんでした。" };
+  } catch (error) {
+    SUPPORT_AI_BROWSER_LOCAL.lastError = supportAIErrorMessage(error);
+    return { ok: false, provider: "browser-local-lfm-audio-tts", model: config.browserLfmAudioModel, text, audioUrl: "", error: SUPPORT_AI_BROWSER_LOCAL.lastError };
   }
 }
 
@@ -3407,7 +3982,7 @@ function createSupportAIProviders(rawConfig = DEFAULT_SUPPORT_AI_CONFIG) {
       const form = new FormData();
       form.append("file", file);
       form.append("audio", file);
-      form.append("model", options.model || merged.textModel);
+      form.append("model", options.model || merged.whisperModel || merged.browserWhisperModel || "whisper-1");
       form.append("language", options.language || merged.language || "ja");
       const response = await fetch(endpoint, { method: "POST", body: form, signal: controller.signal });
       const bodyText = await response.text().catch(() => "");
@@ -3454,7 +4029,11 @@ function createSupportAIProviders(rawConfig = DEFAULT_SUPPORT_AI_CONFIG) {
         endpoint: "browser-local-only",
         textModel: config.browserTextModel,
         visionModel: config.browserVisionModel,
+        audioTranscribeProvider: config.audioTranscribeProvider,
         whisperModel: config.browserWhisperModel,
+        voiceConversationProvider: config.voiceConversationProvider,
+        lfmAudioModel: config.browserLfmAudioModel,
+        lfmAudioPrecision: config.browserLfmAudioPrecision,
         ttsModel: config.browserTtsModel,
         hasAudioEndpoint: false,
         hasTtsEndpoint: true,
@@ -3472,21 +4051,7 @@ function createSupportAIProviders(rawConfig = DEFAULT_SUPPORT_AI_CONFIG) {
       transcribe: transcribeAudio,
       tts: (text, options = {}) => supportAIBrowserTextToSpeech(text, options, config),
       interleaved: async (input = {}) => {
-        const audio = input.audio || input.file || null;
-        let transcript = input.transcript || "";
-        if (audio) {
-          const asr = await transcribeAudio(audio, input);
-          if (!asr.ok) return { ...asr, modality: "browser-local-interleaved" };
-          transcript = asr.text || "";
-        }
-        const prompt = [
-          input.prompt || "次の音声内容に自然に応答してください。",
-          transcript ? `音声内容:\n${transcript}` : "",
-        ].filter(Boolean).join("\n\n");
-        const reply = await askText(prompt, input);
-        if (!reply.ok) return { ...reply, transcript, modality: "browser-local-interleaved" };
-        const speech = await supportAIBrowserTextToSpeech(reply.text, input, config);
-        return { ok: speech.ok, modality: "browser-local-interleaved", text: reply.text || "", transcript, audioUrl: speech.audioUrl || "", spoken: speech.spoken || false, raw: { reply, speech }, error: speech.error || null };
+        return supportAIBrowserLfmAudioInterleaved(input, config);
       },
     },
     vision: { analyze: analyzeImage },
@@ -3956,21 +4521,25 @@ function createOOSGhostRuntime({ providers, config }) {
     async transcribe(input = {}) {
       const audio = input.audio || input.file;
       if (!audio || typeof audio === "string") return { ok: false, modality: "audio", text: "", error: "ブラウザ版ASRはFile/Blob音声を指定してください。" };
-      const result = await providers.audio.transcribe(audio, { ...input, endpoint: runtimeConfig.whisperEndpoint || runtimeConfig.audioEndpoint });
+      const result = await providers.audio.transcribe(audio, { ...input, provider: "whisper", model: input.model || runtimeConfig.browserWhisperModel, endpoint: runtimeConfig.whisperEndpoint || runtimeConfig.audioEndpoint });
       return { ok: result.ok, modality: "audio", text: result.text || "", raw: result.raw || null, error: result.error || null };
     },
     async lfmASR(input = {}) {
       const audio = input.audio || input.file;
       if (!audio || typeof audio === "string") return { ok: false, modality: "lfm-audio-asr", text: "", error: "LFM-Audio ASRはFile/Blob音声を指定してください。" };
-      const result = await providers.audio.transcribe(audio, { ...input, endpoint: runtimeConfig.audioEndpoint || runtimeConfig.whisperEndpoint });
+      const result = await supportAIBrowserLfmAudioTranscribe(input, runtimeConfig);
       return { ok: result.ok, modality: "lfm-audio-asr", text: result.text || "", raw: result.raw || null, error: result.error || null };
     },
-    async lfmTTS(input = {}) {
+    async tts(input = {}) {
       const result = await providers.audio.tts(input.prompt || input.text || "", input);
-      return { ok: result.ok, modality: "lfm-audio-tts", text: result.text || input.prompt || input.text || "", audioUrl: result.audioUrl || "", spoken: Boolean(result.spoken), raw: result.raw || null, error: result.error || null };
+      return { ok: result.ok, modality: "tts", text: result.text || input.prompt || input.text || "", audioUrl: result.audioUrl || "", spoken: Boolean(result.spoken), raw: result.raw || null, error: result.error || null };
+    },
+    async lfmTTS(input = {}) {
+      const result = await supportAIBrowserLfmAudioSpeech(input, runtimeConfig);
+      return { ok: result.ok, modality: "lfm-audio-tts", text: result.text || input.prompt || input.text || "", audioUrl: result.audioUrl || "", spoken: false, raw: result.raw || null, error: result.error || null };
     },
     async lfmInterleaved(input = {}) {
-      const result = await providers.audio.interleaved(input);
+      const result = await providers.audio.interleaved({ ...input, model: input.model || runtimeConfig.browserLfmAudioModel, precision: input.precision || runtimeConfig.browserLfmAudioPrecision });
       return { ok: result.ok, modality: "lfm-audio-interleaved", text: result.text || "", transcript: result.transcript || "", audioUrl: result.audioUrl || "", spoken: Boolean(result.spoken), raw: result.raw || null, error: result.error || null };
     },
   };
@@ -4005,8 +4574,8 @@ function createOOSGhostRuntime({ providers, config }) {
           text: Boolean(runtimeConfig.localAIEnabled && runtimeConfig.enableText),
           visionLanguage: Boolean(runtimeConfig.localAIEnabled && runtimeConfig.enableVision),
           whisperASR: Boolean(runtimeConfig.localAIEnabled && runtimeConfig.enableWhisper),
-          lfmAudioDirect: Boolean(runtimeConfig.localAIEnabled && runtimeConfig.enableTts),
-          lfmAudioBrowserLocal: Boolean(runtimeConfig.localAIEnabled && runtimeConfig.enableTts),
+          lfmAudioDirect: Boolean(runtimeConfig.localAIEnabled && runtimeConfig.enableTts && runtimeConfig.voiceConversationProvider === "lfm-audio"),
+          lfmAudioBrowserLocal: Boolean(runtimeConfig.localAIEnabled && runtimeConfig.enableTts && runtimeConfig.voiceConversationProvider === "lfm-audio"),
           rag: Boolean(runtimeConfig.enableRag),
           knowledge: Boolean(runtimeConfig.enableKnowledge),
           agent: Boolean(runtimeConfig.localAIEnabled && runtimeConfig.enableAgents && runtimeConfig.enableText),
@@ -4020,6 +4589,8 @@ function createOOSGhostRuntime({ providers, config }) {
       const mode = input.mode || "auto";
       if (mode === "agent") return Agent.run(input);
       if (mode === "team") return Agent.runTeam(input);
+      if (mode === "transcribe") return Audio.transcribe(input);
+      if (mode === "tts") return Audio.tts(input);
       if (mode === "lfm-asr") return Audio.lfmASR(input);
       if (mode === "lfm-tts") return Audio.lfmTTS(input);
       if (mode === "lfm-interleaved") return Audio.lfmInterleaved(input);
@@ -4282,6 +4853,7 @@ function buildSupportAIChatMessages(messages = [], currentUserText = "", referen
 
 const SUPPORT_AI_CHAT_SESSIONS_KEY = "html-tester-support-ai-chat-sessions-v1";
 const SUPPORT_AI_CHAT_ACTIVE_SESSION_KEY = "html-tester-support-ai-chat-active-session-v1";
+const SUPPORT_AI_CHAT_SESSIONS_IDB_KEY = "chat-sessions";
 
 function createSupportAIWelcomeMessage(text = "こんにちは。ここでは、文章相談・コード相談・画像理解・音声文字起こし・RAG/Knowledge/Agentをまとめて扱えます。下の入力欄から普通に話しかけてください。") {
   return { id: `welcome-${Date.now()}`, role: "assistant", text, ts: Date.now() };
@@ -4291,6 +4863,36 @@ function supportAIChatSessionTitle(messages = []) {
   const firstUser = (Array.isArray(messages) ? messages : []).find(msg => msg?.role === "user" && String(msg.text || "").trim());
   const text = String(firstUser?.text || "").trim().replace(/\s+/g, " ");
   return text ? text.slice(0, 32) : "新しいチャット";
+}
+
+function supportAINormalizeIdList(value) {
+  return Array.from(new Set((Array.isArray(value) ? value : []).map(id => String(id || "").trim()).filter(Boolean)));
+}
+
+const SUPPORT_AI_CHAT_WORKFLOW_STEPS = [
+  { id: "research", label: "リサーチ", detail: "事実、事例、根拠、制約を集める" },
+  { id: "discussion", label: "ディスカッション", detail: "目的、前提、論点を整理する" },
+  { id: "brainstorm", label: "ブレスト", detail: "多様なアイデアを広げる" },
+  { id: "debate", label: "ディベート", detail: "賛否、弱点、リスクを検証する" },
+  { id: "pitch", label: "ピッチ", detail: "価値が伝わる形にまとめる" },
+  { id: "judge", label: "ジャッジ", detail: "複数案から最良案を選ぶ" },
+  { id: "prototype", label: "プロトタイプ", detail: "実行可能な形にする" },
+];
+
+const SUPPORT_AI_CHAT_CONTEXT_OPTIONS = [
+  { id: "memory", label: "文脈保持", detail: "このセッション内の過去の会話を回答の前提にする" },
+  { id: "reference", label: "文書取り込み", detail: "選択範囲または現在の文書を参照対象として取り込む" },
+  { id: "deliberate", label: "検討して回答", detail: "内部で段階的に検討し、結論・根拠・次の行動だけを整理して返す" },
+];
+
+function supportAINormalizeWorkflowSteps(value) {
+  const allowed = new Set(SUPPORT_AI_CHAT_WORKFLOW_STEPS.map(step => step.id));
+  return supportAINormalizeIdList(value).filter(id => allowed.has(id));
+}
+
+function supportAINormalizeContextOptions(value) {
+  const allowed = new Set(SUPPORT_AI_CHAT_CONTEXT_OPTIONS.map(option => option.id));
+  return supportAINormalizeIdList(value).filter(id => allowed.has(id));
 }
 
 function normalizeSupportAIChatSession(session, fallbackId = null) {
@@ -4303,6 +4905,11 @@ function normalizeSupportAIChatSession(session, fallbackId = null) {
     id,
     title: String(session?.title || supportAIChatSessionTitle(messages)),
     messages,
+    organizationIds: supportAINormalizeIdList(session?.organizationIds),
+    teamIds: supportAINormalizeIdList(session?.teamIds),
+    agentIds: supportAINormalizeIdList(session?.agentIds),
+    workflowStepIds: supportAINormalizeWorkflowSteps(session?.workflowStepIds),
+    contextOptionIds: supportAINormalizeContextOptions(session?.contextOptionIds),
     createdAt: Number(session?.createdAt || updatedAt),
     updatedAt,
   };
@@ -4327,8 +4934,18 @@ function saveSupportAIChatSessions(sessions = []) {
       .map(session => normalizeSupportAIChatSession(session))
       .sort((a, b) => b.updatedAt - a.updatedAt)
       .slice(0, 24);
-    localStorage.setItem(SUPPORT_AI_CHAT_SESSIONS_KEY, JSON.stringify({ version: 1, sessions: value }));
+    const payload = { version: 1, sessions: value, updatedAt: Date.now() };
+    localStorage.setItem(SUPPORT_AI_CHAT_SESSIONS_KEY, JSON.stringify(payload));
+    supportAIIDBSet(SUPPORT_AI_CHAT_SESSIONS_IDB_KEY, payload);
   } catch {}
+}
+
+async function loadSupportAIChatSessionsFromIndexedDB() {
+  const payload = await supportAIIDBGet(SUPPORT_AI_CHAT_SESSIONS_IDB_KEY, null);
+  const sessions = Array.isArray(payload?.sessions)
+    ? payload.sessions.map(normalizeSupportAIChatSession)
+    : [];
+  return sessions.length ? sessions.sort((a, b) => b.updatedAt - a.updatedAt).slice(0, 24) : [];
 }
 
 function loadSupportAIActiveChatSessionId(sessions = []) {
@@ -4359,6 +4976,8 @@ function SupportAIDialog({ open, onClose, appDarkMode, activeMode, editorApiRef,
   const [aiConfig, setAIConfig] = useState(() => loadSupportAIConfig());
   const [aiInitLogs, setAIInitLogs] = useState(() => supportAIReadInitLogs(80));
   const [chatInput, setChatInput] = useState("");
+  const [contextPreviewOpen, setContextPreviewOpen] = useState(false);
+  const [contextPreviewText, setContextPreviewText] = useState("");
   const initialChatSessionsRef = useRef(null);
   if (!initialChatSessionsRef.current) initialChatSessionsRef.current = loadSupportAIChatSessions();
   const [chatSessions, setChatSessions] = useState(() => initialChatSessionsRef.current);
@@ -4369,6 +4988,7 @@ function SupportAIDialog({ open, onClose, appDarkMode, activeMode, editorApiRef,
   const chatMessagesEndRef = useRef(null);
   const activeChatAssistantIdRef = useRef(null);
   const audioInputRef = useRef(null);
+  const voiceAudioInputRef = useRef(null);
   const imageInputRef = useRef(null);
   const initialAIAdminRef = useRef(null);
   if (!initialAIAdminRef.current) initialAIAdminRef.current = loadSupportAIAdminState();
@@ -4393,7 +5013,6 @@ function SupportAIDialog({ open, onClose, appDarkMode, activeMode, editorApiRef,
   const [adminOrgDraft, setAdminOrgDraft] = useState({ label: "", description: "", prompt: "", ragEnabled: true, knowledgeEnabled: true, enabled: true });
   const [adminAgentDraft, setAdminAgentDraft] = useState({ label: "", description: "", role: "editor", prompt: "", model: "", ragEnabled: true, knowledgeEnabled: true, enabled: true });
   const [adminTeamDraft, setAdminTeamDraft] = useState({ label: "", description: "", prompt: "", ragEnabled: true, knowledgeEnabled: true, enabled: true });
-  const [agentTaskText, setAgentTaskText] = useState("選択範囲または全文を確認し、改善方針と実行結果を簡潔に出してください。");
   const [scheduledTaskState, setScheduledTaskState] = useState(() => loadSupportAIScheduledTasks());
   const [activeScheduledTaskId, setActiveScheduledTaskId] = useState(() => loadSupportAIScheduledTasks().tasks[0]?.id || "");
   const [taskTypeFilter, setTaskTypeFilter] = useState("all");
@@ -4477,6 +5096,59 @@ function SupportAIDialog({ open, onClose, appDarkMode, activeMode, editorApiRef,
   const activeAdminOrg = adminOrganizations.find(org => org.id === activeAdminOrgId) || adminOrganizations[0] || null;
   const activeOrgAgents = adminAgents.filter(agent => !activeAdminOrg?.id || agent.organizationId === activeAdminOrg.id);
   const activeOrgTeams = adminTeams.filter(team => !activeAdminOrg?.id || team.organizationId === activeAdminOrg.id);
+  const chatSessionOrganizationIds = supportAINormalizeIdList(activeChatSession?.organizationIds);
+  const chatSessionTeamIds = supportAINormalizeIdList(activeChatSession?.teamIds);
+  const chatSessionAgentIds = supportAINormalizeIdList(activeChatSession?.agentIds);
+  const chatSessionWorkflowStepIds = supportAINormalizeWorkflowSteps(activeChatSession?.workflowStepIds);
+  const chatSessionContextOptionIds = supportAINormalizeContextOptions(activeChatSession?.contextOptionIds);
+  const chatSessionOrganizations = chatSessionOrganizationIds.map(id => adminOrganizations.find(org => org.id === id)).filter(org => org?.enabled !== false);
+  const chatSessionTeams = chatSessionTeamIds.map(id => adminTeams.find(team => team.id === id)).filter(team => team?.enabled !== false);
+  const chatSessionAgents = chatSessionAgentIds.map(id => adminAgents.find(agent => agent.id === id)).filter(agent => agent?.enabled !== false);
+  const chatParticipantCount = chatSessionOrganizations.length + chatSessionTeams.length + chatSessionAgents.length;
+  const chatWorkflowSteps = SUPPORT_AI_CHAT_WORKFLOW_STEPS.filter(step => chatSessionWorkflowStepIds.includes(step.id));
+  const chatContextOptions = SUPPORT_AI_CHAT_CONTEXT_OPTIONS.filter(option => chatSessionContextOptionIds.includes(option.id));
+  const chatUsesMemoryContext = chatSessionContextOptionIds.includes("memory");
+  const chatUsesReferenceContext = chatSessionContextOptionIds.includes("reference");
+  const chatUsesDeliberateMode = chatSessionContextOptionIds.includes("deliberate");
+  const toggleChatParticipantId = (key, id) => {
+    const current = key === "organizationIds" ? chatSessionOrganizationIds : key === "teamIds" ? chatSessionTeamIds : chatSessionAgentIds;
+    const next = current.includes(id) ? current.filter(item => item !== id) : [...current, id];
+    updateActiveChatSessionMeta({ [key]: next });
+  };
+  const toggleChatWorkflowStep = (id) => {
+    const next = chatSessionWorkflowStepIds.includes(id)
+      ? chatSessionWorkflowStepIds.filter(item => item !== id)
+      : SUPPORT_AI_CHAT_WORKFLOW_STEPS.map(step => step.id).filter(stepId => stepId === id || chatSessionWorkflowStepIds.includes(stepId));
+    updateActiveChatSessionMeta({ workflowStepIds: next });
+  };
+  const toggleChatContextOption = (id) => {
+    const next = chatSessionContextOptionIds.includes(id)
+      ? chatSessionContextOptionIds.filter(item => item !== id)
+      : SUPPORT_AI_CHAT_CONTEXT_OPTIONS.map(option => option.id).filter(optionId => optionId === id || chatSessionContextOptionIds.includes(optionId));
+    updateActiveChatSessionMeta({ contextOptionIds: next });
+  };
+  const chatParticipantContext = [
+    chatSessionOrganizations.length ? `参加Organization:\n${chatSessionOrganizations.map(org => `- ${org.label} (${org.id})\n  説明: ${org.description || ""}\n  プロンプト: ${org.prompt || ""}`).join("\n")}` : "",
+    chatSessionTeams.length ? `参加Team:\n${chatSessionTeams.map(team => {
+      const org = adminOrganizations.find(org => org.id === team.organizationId);
+      const agents = (team.agentIds || []).map(id => adminAgents.find(agent => agent.id === id)).filter(Boolean);
+      return `- ${team.label} (${team.id}) / Organization: ${org?.label || team.organizationId || "未設定"}\n  説明: ${team.description || ""}\n  プロンプト: ${team.prompt || team.policy || ""}\n  所属Agent:\n${agents.map(agent => `    - ${agent.label} (${agent.id}) / ${agent.role || ""}: ${agent.prompt || agent.system || ""}`).join("\n") || "    なし"}`;
+    }).join("\n")}` : "",
+    chatSessionAgents.length ? `参加Agent:\n${chatSessionAgents.map(agent => {
+      const org = adminOrganizations.find(org => org.id === agent.organizationId);
+      return `- ${agent.label} (${agent.id}) / role: ${agent.role || ""} / Organization: ${org?.label || agent.organizationId || "未設定"}\n  説明: ${agent.description || ""}\n  モデル: ${agent.model || aiConfig.browserTextModel || "default"}\n  プロンプト: ${agent.prompt || agent.system || ""}`;
+    }).join("\n")}` : "",
+  ].filter(Boolean).join("\n\n");
+  const chatWorkflowContext = chatWorkflowSteps.length
+    ? `このセッションでは、テーマに対して次のステップを順番に実施してください。\n${chatWorkflowSteps.map((step, index) => `${index + 1}. ${step.label}モード: ${step.detail}`).join("\n")}\n\n各ステップでは、選択されているOrganization / Team / Agentの方針と役割を使って検討し、最後にユーザーが次に実行できる形でまとめてください。`
+    : "";
+  const chatContextInstruction = [
+    chatUsesMemoryContext ? "このセッション内の過去の会話を前提として、話題の継続性を保ってください。" : "",
+    chatUsesReferenceContext ? "参照対象がある場合は、選択範囲または現在の文書を回答根拠として使ってください。" : "",
+    chatUsesDeliberateMode ? "内部で段階的に検討してください。ただし推論過程を長く開示せず、結論、根拠、注意点、次の行動だけを簡潔に出してください。" : "",
+  ].filter(Boolean).join("\n");
+  const ragDocuments = ghostRuntime.RAG.list().documents || [];
+  const knowledgeFacts = ghostRuntime.Knowledge.list().facts || [];
   const activeAdminAgent = activeOrgAgents.find(agent => agent.id === activeAdminAgentId) || activeOrgAgents[0] || null;
   const activeAdminTeam = activeOrgTeams.find(team => team.id === activeAdminTeamId) || activeOrgTeams[0] || null;
   const saveAIAdmin = useCallback((updater) => {
@@ -4640,6 +5312,14 @@ function SupportAIDialog({ open, onClose, appDarkMode, activeMode, editorApiRef,
       return changed ? next : base;
     });
   }, [activeChatSessionId]);
+  const updateActiveChatSessionMeta = useCallback((patch) => {
+    setChatSessions(prev => {
+      const now = Date.now();
+      const base = prev.length ? prev : [normalizeSupportAIChatSession({ id: `chat-${now}`, messages: [createSupportAIWelcomeMessage()] })];
+      const activeId = activeChatSessionId || base[0]?.id;
+      return base.map(session => session.id === activeId ? { ...normalizeSupportAIChatSession({ ...session, ...patch, updatedAt: now }), temporary: session.temporary } : session);
+    });
+  }, [activeChatSessionId]);
   const updateChatMessage = useCallback((id, patch) => {
     setActiveChatMessages(prev => prev.map(msg => msg.id === id
       ? { ...msg, ...(typeof patch === "function" ? patch(msg) : patch) }
@@ -4669,6 +5349,20 @@ function SupportAIDialog({ open, onClose, appDarkMode, activeMode, editorApiRef,
     saveSupportAIChatSessions(chatSessions);
     if (activeChatSessionId && !chatSessionTemporary) saveSupportAIActiveChatSessionId(activeChatSessionId);
   }, [activeChatSessionId, chatSessionTemporary, chatSessions]);
+
+  useEffect(() => {
+    let cancelled = false;
+    loadSupportAIChatSessionsFromIndexedDB().then(sessions => {
+      if (cancelled || !sessions.length) return;
+      setChatSessions(prev => {
+        const temp = prev.filter(session => session.temporary);
+        const newestPrev = Math.max(...prev.filter(session => !session.temporary).map(session => Number(session.updatedAt || 0)), 0);
+        const newestIDB = Math.max(...sessions.map(session => Number(session.updatedAt || 0)), 0);
+        return newestIDB > newestPrev ? [...temp, ...sessions] : prev;
+      });
+    });
+    return () => { cancelled = true; };
+  }, []);
 
   const getEditor = useCallback(() => editorApiRef?.current || null, [editorApiRef]);
   const getText = useCallback(() => getEditor()?.getText?.() ?? fallbackText ?? "", [getEditor, fallbackText]);
@@ -4771,9 +5465,9 @@ function SupportAIDialog({ open, onClose, appDarkMode, activeMode, editorApiRef,
     if (aiConfig.enableText) list.push("text");
     if (aiConfig.enableVision) list.push("vision");
     if (aiConfig.enableWhisper) list.push("whisper");
-    if (aiConfig.enableTts) list.push("tts");
+    if (aiConfig.enableTts) list.push(aiConfig.voiceConversationProvider === "lfm-audio" ? "lfmAudio" : "tts");
     return list;
-  }, [aiConfig.enableText, aiConfig.enableVision, aiConfig.enableWhisper, aiConfig.enableTts]);
+  }, [aiConfig.enableText, aiConfig.enableVision, aiConfig.enableWhisper, aiConfig.enableTts, aiConfig.voiceConversationProvider]);
 
   const prepareSelectedModels = useCallback(() => run("prepare-selected-models", async () => {
     const features = enabledModelFeatures();
@@ -4868,10 +5562,40 @@ function SupportAIDialog({ open, onClose, appDarkMode, activeMode, editorApiRef,
   const handleAudioFile = useCallback((file) => {
     if (!file) return;
     run("audio-transcribe", async () => {
-      const response = await ghostRuntime.AI.generate({ audio: file });
+      const response = await ghostRuntime.AI.generate({
+        mode: "transcribe",
+        audio: file,
+        model: aiConfig.browserWhisperModel,
+        provider: "whisper",
+      });
       return { ok: response.ok, type: "audio", command: "transcribe", scope: "insert", suggestion: response.text || "", text: response.text || "", error: response.error || null };
     });
-  }, [ghostRuntime, run]);
+  }, [aiConfig.browserWhisperModel, ghostRuntime, run]);
+
+  const handleVoiceConversationFile = useCallback((file) => {
+    if (!file) return;
+    run("voice-conversation", async () => {
+      const response = await ghostRuntime.AI.generate({
+        mode: "lfm-interleaved",
+        audio: file,
+        model: aiConfig.browserLfmAudioModel,
+        precision: aiConfig.browserLfmAudioPrecision || "q4",
+      });
+      if (response.audioUrl) {
+        setTimeout(() => {
+          try {
+            const audio = new Audio(response.audioUrl);
+            audio.onended = () => supportAIRevokeObjectUrl(response.audioUrl);
+            audio.onerror = () => supportAIRevokeObjectUrl(response.audioUrl);
+            audio.play().catch(() => supportAIRevokeObjectUrl(response.audioUrl));
+          } catch {
+            supportAIRevokeObjectUrl(response.audioUrl);
+          }
+        }, 0);
+      }
+      return { ok: response.ok, type: "audio", command: "voice-conversation", scope: "insert", suggestion: response.text || response.transcript || "", text: response.text || response.transcript || "", transcript: response.transcript || "", audioUrl: response.audioUrl || "", error: response.error || null };
+    });
+  }, [aiConfig.browserLfmAudioModel, aiConfig.browserLfmAudioPrecision, ghostRuntime, run]);
 
   const handleImageFile = useCallback((file) => {
     if (!file) return;
@@ -4883,7 +5607,7 @@ function SupportAIDialog({ open, onClose, appDarkMode, activeMode, editorApiRef,
   const runLocalTTS = useCallback(() => run("browser-local-tts", async () => {
     const target = getTarget();
     const text = target.text || instruction || themeText || "こんにちは。ブラウザ内ローカル音声合成のテストです。";
-    const response = await ghostRuntime.AI.generate({ mode: "lfm-tts", prompt: text });
+    const response = await ghostRuntime.AI.generate({ mode: "tts", prompt: text });
     if (response.audioUrl) {
       setTimeout(() => {
         try {
@@ -4922,6 +5646,44 @@ function SupportAIDialog({ open, onClose, appDarkMode, activeMode, editorApiRef,
     setResult({ ok: res.ok, label: "knowledge-add", type: "runtime", text: JSON.stringify(res, null, 2), suggestion: "", error: res.error || null });
     onToast?.(res.ok ? "Knowledge Factを登録しました" : res.error);
   }, [ghostRuntime, knowledgeObject, knowledgePredicate, knowledgeSubject, onToast]);
+  const clearRAGDocuments = useCallback(() => {
+    const res = ghostRuntime.RAG.clear();
+    setRuntimeInfo(ghostRuntime.AI.status());
+    setResult({ ok: res.ok, label: "rag-clear", type: "runtime", text: JSON.stringify(res, null, 2), suggestion: "" });
+    onToast?.("RAG文書をクリアしました");
+  }, [ghostRuntime, onToast]);
+  const clearKnowledgeFacts = useCallback(() => {
+    const res = ghostRuntime.Knowledge.clear();
+    setRuntimeInfo(ghostRuntime.AI.status());
+    setResult({ ok: res.ok, label: "knowledge-clear", type: "runtime", text: JSON.stringify(res, null, 2), suggestion: "" });
+    onToast?.("Knowledge Factをクリアしました");
+  }, [ghostRuntime, onToast]);
+  const openContextPreview = useCallback(() => {
+    const target = getTarget();
+    const reference = chatUsesReferenceContext ? supportAIChatReferenceForMessage(chatInput || instruction || "", target) : { scope: "none", text: "", label: "" };
+    const conversationContext = chatUsesMemoryContext ? buildSupportAIConversationContext(chatMessages, 10) : "";
+    const preview = [
+      "# セッションコンテキストプレビュー",
+      `作成日時: ${new Date().toLocaleString("ja-JP")}`,
+      "",
+      "## コンテキスト設定",
+      chatContextOptions.length ? chatContextOptions.map(option => `- ${option.label}: ${option.detail}`).join("\n") : "- 未使用",
+      "",
+      "## セッションステップ",
+      chatWorkflowContext || "未選択: 通常回答",
+      "",
+      "## 参加メンバー",
+      chatParticipantContext || "未選択",
+      "",
+      "## 会話履歴",
+      conversationContext || "未使用",
+      "",
+      "## 参照対象",
+      reference.text ? `対象: ${reference.label}\n\n${reference.text}` : "未使用",
+    ].join("\n");
+    setContextPreviewText(preview);
+    setContextPreviewOpen(true);
+  }, [chatContextOptions, chatInput, chatMessages, chatParticipantContext, chatUsesMemoryContext, chatUsesReferenceContext, chatWorkflowContext, getTarget, instruction]);
 
   const ghostGenerateWithKnowledge = useCallback(() => run("ghost-generate", async () => {
     const target = getTarget();
@@ -4941,10 +5703,10 @@ function SupportAIDialog({ open, onClose, appDarkMode, activeMode, editorApiRef,
     if (!agent) return { ok: false, type: "text", command: `agent-${agentId}`, text: "", suggestion: "", error: "実行するAgentがありません。" };
     const org = adminOrganizations.find(item => item.id === agent.organizationId);
     if (org?.enabled === false || agent.enabled === false) return { ok: false, type: "text", command: `agent-${agentId}`, text: "", suggestion: "", error: "OrganizationまたはAgentが無効です。" };
-    const prompt = [org?.prompt, agent.prompt || agent.system, agentTaskText].filter(Boolean).join("\n\n");
+    const prompt = [org?.prompt, agent.prompt || agent.system, instruction].filter(Boolean).join("\n\n");
     const response = await ghostRuntime.AI.generate({ prompt: `${prompt}\n\n対象:\n${target.text}`, model: agent.model || undefined, rag: { enabled: agent.ragEnabled !== false && org?.ragEnabled !== false }, knowledge: { enabled: agent.knowledgeEnabled !== false && org?.knowledgeEnabled !== false } });
     return { ok: response.ok, type: "text", command: `agent-${agentId}`, scope: target.scope, range: target.range, original: target.text, suggestion: response.text || "", text: response.text || "", error: response.error || null };
-  }), [activeAdminAgent, adminAgents, adminOrganizations, agentTaskText, getTarget, ghostRuntime, run]);
+  }), [activeAdminAgent, adminAgents, adminOrganizations, getTarget, ghostRuntime, instruction, run]);
 
   const selectedTeamAgentIds = activeAdminTeam?.agentIds || [];
   const runManagedTeam = useCallback((teamId = activeAdminTeam?.id) => run("team-managed", async () => {
@@ -4957,7 +5719,7 @@ function SupportAIDialog({ open, onClose, appDarkMode, activeMode, editorApiRef,
     if (!agents.length) return { ok: false, type: "text", command: "team-managed", text: "", suggestion: "", error: "Teamに有効なAgentがありません。" };
     const outputs = [];
     for (const agent of agents) {
-      const prompt = [org?.prompt, team.prompt || team.policy, agent.prompt || agent.system, agentTaskText].filter(Boolean).join("\n\n");
+      const prompt = [org?.prompt, team.prompt || team.policy, agent.prompt || agent.system, instruction].filter(Boolean).join("\n\n");
       const result = await ghostRuntime.AI.generate({ prompt: `${prompt}\n\n対象:\n${target.text}`, model: agent.model || undefined, rag: { enabled: org?.ragEnabled !== false && team.ragEnabled !== false && agent.ragEnabled !== false }, knowledge: { enabled: org?.knowledgeEnabled !== false && team.knowledgeEnabled !== false && agent.knowledgeEnabled !== false } });
       outputs.push({ ok: result.ok, agentId: agent.id, role: agent.role, text: result.text || "", error: result.error || null });
     }
@@ -4972,7 +5734,7 @@ function SupportAIDialog({ open, onClose, appDarkMode, activeMode, editorApiRef,
       knowledge: { enabled: org?.knowledgeEnabled !== false && team.knowledgeEnabled !== false },
     });
     return { ok: response.ok, type: "text", command: "team-managed", scope: target.scope, range: target.range, original: target.text, suggestion: response.text || "", text: response.text || "", history: outputs, error: response.error || null };
-  }), [activeAdminTeam, adminAgents, adminOrganizations, adminTeams, agentTaskText, getTarget, ghostRuntime, run]);
+  }), [activeAdminTeam, adminAgents, adminOrganizations, adminTeams, getTarget, ghostRuntime, instruction, run]);
 
   const chatSend = useCallback(() => {
     const message = (chatInput || instruction || "現在の内容について、必要な支援をしてください。").trim();
@@ -4989,7 +5751,9 @@ function SupportAIDialog({ open, onClose, appDarkMode, activeMode, editorApiRef,
       return;
     }
     const target = getTarget();
-    const chatReference = supportAIChatReferenceForMessage(message, target);
+    const chatReference = chatUsesReferenceContext
+      ? supportAIChatReferenceForMessage(message, target)
+      : { scope: "none", text: "", range: null, label: "" };
     const ts = Date.now();
     const userMessage = {
       id: `user-${ts}-${Math.random().toString(36).slice(2)}`,
@@ -5016,14 +5780,20 @@ function SupportAIDialog({ open, onClose, appDarkMode, activeMode, editorApiRef,
     run("ai-chat", async ({ signal, runId }) => {
       const startedAt = performance.now();
       updateChatMessage(assistantId, { text: "推論準備中です。初回はRuntime/モデルの読み込みに時間がかかります...", pending: true });
-      const useConversationHistory = supportAIShouldUseConversationHistory(message);
-      const conversationContext = useConversationHistory ? buildSupportAIConversationContext(chatMessages, 10) : "";
+      const conversationContext = chatUsesMemoryContext ? buildSupportAIConversationContext(chatMessages, 10) : "";
       const prompt = [
+        chatParticipantContext ? `このチャットセッションの参加メンバー設定:\n${chatParticipantContext}` : "",
+        chatWorkflowContext ? `このチャットセッションの実施ステップ:\n${chatWorkflowContext}` : "",
+        chatContextInstruction ? `このチャットセッションのコンテキスト設定:\n${chatContextInstruction}` : "",
         conversationContext ? `これまでの会話:\n${conversationContext}` : "",
         `今回のユーザー発言:\n${message}`,
         chatReference.text ? `参照対象（${chatReference.label}）:\n${chatReference.text}` : "",
       ].filter(Boolean).join("\n\n");
-      const messages = buildSupportAIChatMessages(chatMessages, message, chatReference, aiConfig, 10);
+      const messages = buildSupportAIChatMessages(chatUsesMemoryContext ? chatMessages : [], message, chatReference, aiConfig, 10).map((item, index) => (
+        index === 0 && (chatParticipantContext || chatWorkflowContext || chatContextInstruction)
+          ? { ...item, content: `${item.content}${chatParticipantContext ? `\n\nこのセッションでは、以下のOrganization / Team / Agentの方針を会話の前提として扱ってください。\n${chatParticipantContext}` : ""}${chatWorkflowContext ? `\n\n以下の実施ステップが選択されています。未選択の場合は通常回答でよいですが、選択されている場合はこの順番で進めてください。\n${chatWorkflowContext}` : ""}${chatContextInstruction ? `\n\n以下のコンテキスト設定に従ってください。\n${chatContextInstruction}` : ""}` }
+          : item
+      ));
       if (!signal?.aborted) {
         updateChatMessage(assistantId, { text: "生成中です。受信した文字からこのカードに表示します...", pending: true });
       }
@@ -5101,7 +5871,7 @@ function SupportAIDialog({ open, onClose, appDarkMode, activeMode, editorApiRef,
       activeChatAssistantIdRef.current = null;
       return { ok: response.ok, type: "text", command: "ai-chat", scope: chatReference.scope, range: chatReference.range, original: chatReference.text, suggestion: assistantText, text: assistantText, contextText: response.contextText, knowledgeSources: response.knowledgeSources, error: response.error || null };
     });
-  }, [aiConfig, chatInput, chatMessages, getTarget, ghostRuntime, instruction, onToast, run, runtimeReady, setActiveChatMessages, textReady, textRunnable, updateChatMessage]);
+  }, [aiConfig, chatInput, chatMessages, chatContextInstruction, chatParticipantContext, chatUsesMemoryContext, chatUsesReferenceContext, chatWorkflowContext, getTarget, ghostRuntime, instruction, onToast, run, runtimeReady, setActiveChatMessages, textReady, textRunnable, updateChatMessage]);
 
   const clearChatMessages = useCallback(() => {
     setActiveChatMessages([createSupportAIWelcomeMessage("会話をクリアしました。新しい相談を入力してください。")], { title: "新しいチャット" });
@@ -5123,7 +5893,7 @@ function SupportAIDialog({ open, onClose, appDarkMode, activeMode, editorApiRef,
     if (nextConfig.enableText) features.push("text");
     if (nextConfig.enableVision) features.push("vision");
     if (nextConfig.enableWhisper) features.push("whisper");
-    if (nextConfig.enableTts) features.push("tts");
+    if (nextConfig.enableTts) features.push(nextConfig.voiceConversationProvider === "lfm-audio" ? "lfmAudio" : "tts");
     setAIPhase(features.length ? "preparing-model" : "loading-runtime");
     setAITaskLabel(features.length ? "有効モデル準備中" : "Runtime読込中");
     setAIInitLogs([]);
@@ -5293,6 +6063,25 @@ function SupportAIDialog({ open, onClose, appDarkMode, activeMode, editorApiRef,
     />
   );
 
+  const SettingStatusCard = ({ label, value, color = "default" }) => (
+    <Box sx={{ p: 0.85, border: `1px solid ${border}`, borderRadius: 2, background: dark ? "rgba(255,255,255,0.035)" : "#ffffff", minWidth: 0 }}>
+      <Typography variant="caption" sx={{ display: "block", color: muted, fontWeight: 800, lineHeight: 1.25 }}>{label}</Typography>
+      <MaterialUI.Chip size="small" color={color} label={value} sx={{ mt: 0.55, height: 22, maxWidth: "100%", "& .MuiChip-label": { overflow: "hidden", textOverflow: "ellipsis" } }} />
+    </Box>
+  );
+
+  const SettingToggleChip = ({ label, checked, onChange, disabled = false }) => (
+    <MaterialUI.Chip
+      clickable={!disabled}
+      disabled={disabled}
+      color={checked ? "primary" : "default"}
+      variant={checked ? "filled" : "outlined"}
+      label={`${label} ${checked ? "ON" : "OFF"}`}
+      onClick={() => !disabled && onChange(!checked)}
+      sx={{ width: "100%", justifyContent: "flex-start", height: "auto", minHeight: 34, py: 0.35, borderRadius: 2, fontWeight: 900, "& .MuiChip-label": { whiteSpace: "normal", overflowWrap: "anywhere" } }}
+    />
+  );
+
   const responsiveButtonSx = {
     width: "100%",
     minWidth: 0,
@@ -5433,8 +6222,8 @@ function SupportAIDialog({ open, onClose, appDarkMode, activeMode, editorApiRef,
   const supportAIPaneSizeKey = supportAIPaneHorizontal ? "width" : "height";
   const leftPaneSize = paneMode === "left" ? "100%" : paneMode === "right" ? "0%" : `${supportAIPaneSplit.ratio * 100}%`;
   const rightPaneSize = paneMode === "right" ? "100%" : paneMode === "left" ? "0%" : `${(1 - supportAIPaneSplit.ratio) * 100}%`;
-  const leftPaneTitle = tab === "chat" ? "チャット操作" : tab === "work" ? "タスク操作" : tab === "settings" ? "AI設定操作" : "モニタ操作";
-  const rightPaneTitle = tab === "chat" ? "会話エリア" : tab === "work" ? "タスク管理" : tab === "settings" ? "管理エリア" : tab === "monitor" ? "AIモニタ" : "結果";
+  const leftPaneTitle = tab === "chat" ? "チャット操作" : tab === "work" ? "タスク操作" : tab === "settings" ? "AI設定操作" : tab === "rag" ? "RAG操作" : tab === "knowledge" ? "Knowledge操作" : "モニタ操作";
+  const rightPaneTitle = tab === "chat" ? "会話エリア" : tab === "work" ? "タスク管理" : tab === "settings" ? "管理エリア" : tab === "rag" ? "RAG管理" : tab === "knowledge" ? "Knowledge管理" : tab === "monitor" ? "AIモニタ" : "結果";
   const PaneControls = ({ side }) => {
     const maximized = paneMode === side;
     return (
@@ -5510,6 +6299,8 @@ function SupportAIDialog({ open, onClose, appDarkMode, activeMode, editorApiRef,
             <Tab value="chat" label="AIチャット" />
             <Tab value="work" label="ワーク" />
             <Tab value="settings" label="AI設定" />
+            <Tab value="rag" label="RAG管理" />
+            <Tab value="knowledge" label="Knowledge管理" />
             <Tab value="monitor" label="AIモニタ" />
           </Tabs>
         </Box>
@@ -5540,6 +6331,129 @@ function SupportAIDialog({ open, onClose, appDarkMode, activeMode, editorApiRef,
                 </Stack>
               </Box>
               <Box sx={{ p: 1, border: `1px solid ${border}`, borderRadius: 2, background: dark ? "rgba(255,255,255,0.035)" : "#f8fafc" }}>
+                <Box sx={{ display: "flex", alignItems: "center", gap: 0.75, flexWrap: "wrap", mb: 0.8 }}>
+                  <Typography variant="caption" fontWeight={900} sx={{ flex: 1 }}>セッションコンテキスト</Typography>
+                  <MaterialUI.Chip size="small" color={chatContextOptions.length ? "primary" : "default"} label={chatContextOptions.length ? `${chatContextOptions.length} 件` : "未使用"} sx={{ height: 20, fontSize: 10 }} />
+                </Box>
+                <Box sx={{ display: "flex", flexWrap: "wrap", gap: 0.5, minWidth: 0 }}>
+                  {SUPPORT_AI_CHAT_CONTEXT_OPTIONS.map(option => {
+                    const selected = chatSessionContextOptionIds.includes(option.id);
+                    return (
+                      <Tooltip key={option.id} title={option.detail} arrow>
+                        <MaterialUI.Chip
+                          clickable={!busy}
+                          disabled={busy}
+                          color={selected ? "primary" : "default"}
+                          variant={selected ? "filled" : "outlined"}
+                          label={option.label}
+                          onClick={() => toggleChatContextOption(option.id)}
+                          sx={{ maxWidth: "100%", "& .MuiChip-label": { overflow: "hidden", textOverflow: "ellipsis" } }}
+                        />
+                      </Tooltip>
+                    );
+                  })}
+                </Box>
+                <Grid container spacing={0.6} sx={{ mt: 0.75, minWidth: 0 }}>
+                  <Grid size={{ xs: 12 }}><Button size="small" variant="outlined" onClick={openContextPreview} sx={responsiveButtonSx}>コンテキストプレビュー</Button></Grid>
+                </Grid>
+                <Typography variant="caption" sx={{ display: "block", mt: 0.75, color: muted, lineHeight: 1.55 }}>未選択なら、セッション履歴や文書参照を追加せずにまず回答します。必要な時だけ文脈保持・文書取り込み・検討して回答をONにします。</Typography>
+              </Box>
+              <Box sx={{ p: 1, border: `1px solid ${border}`, borderRadius: 2, background: dark ? "rgba(255,255,255,0.035)" : "#f8fafc" }}>
+                <Box sx={{ display: "flex", alignItems: "center", gap: 0.75, flexWrap: "wrap", mb: 0.8 }}>
+                  <Typography variant="caption" fontWeight={900} sx={{ flex: 1 }}>セッションステップ</Typography>
+                  <MaterialUI.Chip size="small" color={chatWorkflowSteps.length ? "primary" : "default"} label={chatWorkflowSteps.length ? `${chatWorkflowSteps.length} step` : "通常回答"} sx={{ height: 20, fontSize: 10 }} />
+                </Box>
+                <Box sx={{ display: "flex", flexWrap: "wrap", gap: 0.5, minWidth: 0 }}>
+                  {SUPPORT_AI_CHAT_WORKFLOW_STEPS.map((step, index) => {
+                    const selected = chatSessionWorkflowStepIds.includes(step.id);
+                    return (
+                      <Tooltip key={step.id} title={step.detail} arrow>
+                        <MaterialUI.Chip
+                          clickable={!busy}
+                          disabled={busy}
+                          color={selected ? "primary" : "default"}
+                          variant={selected ? "filled" : "outlined"}
+                          label={`${index + 1}. ${step.label}`}
+                          onClick={() => toggleChatWorkflowStep(step.id)}
+                          sx={{ maxWidth: "100%", "& .MuiChip-label": { overflow: "hidden", textOverflow: "ellipsis" } }}
+                        />
+                      </Tooltip>
+                    );
+                  })}
+                </Box>
+                <Typography variant="caption" sx={{ display: "block", mt: 0.75, color: muted, lineHeight: 1.55 }}>無選択なら通常回答です。選択した場合は、参加Organization / Team / Agentの方針を使い、選択ステップを番号順に実施します。</Typography>
+              </Box>
+              <Box sx={{ p: 1, border: `1px solid ${border}`, borderRadius: 2, background: dark ? "rgba(255,255,255,0.035)" : "#f8fafc" }}>
+                <Box sx={{ display: "flex", alignItems: "center", gap: 0.75, flexWrap: "wrap", mb: 0.8 }}>
+                  <Typography variant="caption" fontWeight={900} sx={{ flex: 1 }}>セッション参加メンバー</Typography>
+                  <MaterialUI.Chip size="small" color={chatParticipantCount ? "primary" : "default"} label={`${chatParticipantCount} 件`} sx={{ height: 20, fontSize: 10 }} />
+                </Box>
+                <Stack spacing={0.75}>
+                  <Box>
+                    <Typography variant="caption" sx={{ display: "block", color: muted, fontWeight: 900, mb: 0.45 }}>Organization</Typography>
+                    <Box sx={{ display: "flex", flexWrap: "wrap", gap: 0.5, minWidth: 0 }}>
+                      {adminOrganizations.map(org => {
+                        const selected = chatSessionOrganizationIds.includes(org.id);
+                        return (
+                          <MaterialUI.Chip
+                            key={org.id}
+                            clickable={!busy}
+                            disabled={busy}
+                            color={selected ? "primary" : "default"}
+                            variant={selected ? "filled" : "outlined"}
+                            label={`${org.enabled === false ? "無効 " : ""}${org.label}`}
+                            onClick={() => toggleChatParticipantId("organizationIds", org.id)}
+                            sx={{ maxWidth: "100%", "& .MuiChip-label": { overflow: "hidden", textOverflow: "ellipsis" } }}
+                          />
+                        );
+                      })}
+                    </Box>
+                  </Box>
+                  <Box>
+                    <Typography variant="caption" sx={{ display: "block", color: muted, fontWeight: 900, mb: 0.45 }}>Team</Typography>
+                    <Box sx={{ display: "flex", flexWrap: "wrap", gap: 0.5, minWidth: 0 }}>
+                      {adminTeams.map(team => {
+                        const org = adminOrganizations.find(org => org.id === team.organizationId);
+                        const selected = chatSessionTeamIds.includes(team.id);
+                        return (
+                          <MaterialUI.Chip
+                            key={team.id}
+                            clickable={!busy}
+                            disabled={busy}
+                            color={selected ? "primary" : "default"}
+                            variant={selected ? "filled" : "outlined"}
+                            label={`${team.enabled === false ? "無効 " : ""}${team.label}${org ? ` / ${org.label}` : ""}`}
+                            onClick={() => toggleChatParticipantId("teamIds", team.id)}
+                            sx={{ maxWidth: "100%", "& .MuiChip-label": { overflow: "hidden", textOverflow: "ellipsis" } }}
+                          />
+                        );
+                      })}
+                    </Box>
+                  </Box>
+                  <Box>
+                    <Typography variant="caption" sx={{ display: "block", color: muted, fontWeight: 900, mb: 0.45 }}>Agent</Typography>
+                    <Box sx={{ display: "flex", flexWrap: "wrap", gap: 0.5, minWidth: 0 }}>
+                      {adminAgents.map(agent => {
+                        const selected = chatSessionAgentIds.includes(agent.id);
+                        return (
+                          <MaterialUI.Chip
+                            key={agent.id}
+                            clickable={!busy}
+                            disabled={busy}
+                            color={selected ? "primary" : "default"}
+                            variant={selected ? "filled" : "outlined"}
+                            label={`${agent.enabled === false ? "無効 " : ""}${agent.label}${agent.role ? ` / ${agent.role}` : ""}`}
+                            onClick={() => toggleChatParticipantId("agentIds", agent.id)}
+                            sx={{ maxWidth: "100%", "& .MuiChip-label": { overflow: "hidden", textOverflow: "ellipsis" } }}
+                          />
+                        );
+                      })}
+                    </Box>
+                  </Box>
+                  <Typography variant="caption" sx={{ color: muted, lineHeight: 1.55 }}>選択したメンバーのプロンプト、RAG、Knowledge方針をこのセッションの会話前提として使います。未選択なら通常のSupportAIとして応答します。</Typography>
+                </Stack>
+              </Box>
+              <Box sx={{ p: 1, border: `1px solid ${border}`, borderRadius: 2, background: dark ? "rgba(255,255,255,0.035)" : "#f8fafc" }}>
                 <Typography variant="caption" fontWeight={900}>会話モード</Typography>
                 <Typography variant="caption" sx={{ display: "block", color: muted, lineHeight: 1.6, mt: 0.5 }}>下のチャット欄に入力すると、現在の選択範囲または文書を必要に応じて参照しながら応答します。画像・音声・RAG・Knowledge・Agentもここから使えます。</Typography>
               </Box>
@@ -5547,9 +6461,10 @@ function SupportAIDialog({ open, onClose, appDarkMode, activeMode, editorApiRef,
                 <Grid size={{ xs: 12, sm: 6 }}><ActionButton variant="contained" onClick={chatSend} disabled={!textRunnable}>送信</ActionButton></Grid>
                 <Grid size={{ xs: 12, sm: 6 }}><Button size="small" variant="outlined" onClick={copyChatConversation} disabled={!chatMessages.some(supportAIIsModelConversationMessage)} sx={responsiveButtonSx}>会話コピー</Button></Grid>
                 <Grid size={{ xs: 12, sm: 6 }}><ActionButton onClick={ghostGenerateWithKnowledge} disabled={!textRunnable || (!aiConfig.enableRag && !aiConfig.enableKnowledge)}>RAG+Knowledge</ActionButton></Grid>
-                <Grid size={{ xs: 12, sm: 6 }}><ActionButton onClick={ghostRunAgent} disabled={!textRunnable || !aiConfig.enableAgents}>Agentで検討</ActionButton></Grid>
+                <Grid size={{ xs: 12, sm: 6 }}><ActionButton onClick={chatSend} disabled={!textRunnable || !aiConfig.enableAgents || !chatParticipantCount}>選択メンバーで相談</ActionButton></Grid>
                 <Grid size={{ xs: 12, sm: 6 }}><ActionButton onClick={() => imageInputRef.current?.click()} disabled={!visionRunnable}>画像を読む</ActionButton></Grid>
                 <Grid size={{ xs: 12, sm: 6 }}><ActionButton onClick={() => audioInputRef.current?.click()} disabled={!whisperRunnable}>音声→文字</ActionButton></Grid>
+                <Grid size={{ xs: 12, sm: 6 }}><ActionButton onClick={() => voiceAudioInputRef.current?.click()} disabled={!aiConfig.localAIEnabled || !aiConfig.enableTts}>音声会話 実験</ActionButton></Grid>
                 <Grid size={{ xs: 12, sm: 6 }}><ActionButton onClick={runLocalTTS} disabled={!ttsRunnable}>本文→音声</ActionButton></Grid>
               </Grid>
               <Stack direction={{ xs: "column", sm: "row" }} spacing={0.6} sx={{ minWidth: 0 }}>
@@ -5571,52 +6486,32 @@ function SupportAIDialog({ open, onClose, appDarkMode, activeMode, editorApiRef,
                   <StatusItem name="直近結果" value={result?.label || "なし"} color={result ? (result.ok ? "success" : "error") : "default"} />
                 </Stack>
               </Box>
-              <Box sx={{ p: 1, border: `1px solid ${border}`, borderRadius: 2, background: dark ? "#0f172a" : "#f8fafc", minWidth: 0 }}>
-                <Box sx={{ display: "flex", alignItems: "center", gap: 0.75, flexWrap: "wrap", mb: 0.8 }}>
-                  <Typography variant="caption" fontWeight={900} sx={{ flex: 1 }}>タスク登録</Typography>
-                  <Button size="small" variant="outlined" onClick={createScheduledTask}>新規</Button>
-                  <Button size="small" variant="contained" onClick={saveScheduledTask} disabled={!activeScheduledTask}>保存</Button>
-                  <Button size="small" variant="outlined" color="warning" onClick={deleteScheduledTask} disabled={!activeScheduledTask}>削除</Button>
-                </Box>
-                <Grid container spacing={0.75} alignItems="center">
-                  <Grid size={{ xs: 12 }}><MaterialUI.TextField fullWidth select SelectProps={{ native: true }} label="予定タスク" value={activeScheduledTask?.id || ""} onChange={e => setActiveScheduledTaskId(e.target.value)} size="small">
-                    <option value="">未選択</option>
-                    {scheduledTasks.map(task => <option key={task.id} value={task.id}>{task.label}</option>)}
-                  </MaterialUI.TextField></Grid>
-                  <Grid size={{ xs: 12 }}><MaterialUI.TextField fullWidth label="名前" value={scheduledTaskDraft.label} onChange={e => setScheduledTaskDraft(prev => ({ ...prev, label: e.target.value }))} size="small" /></Grid>
-                  <Grid size={{ xs: 12 }}><MaterialUI.TextField fullWidth select SelectProps={{ native: true }} label="実行タスク" value={scheduledTaskDraft.command} onChange={e => setScheduledTaskDraft(prev => ({ ...prev, command: e.target.value }))} size="small">
-                    {workTaskCards.map(task => <option key={task.id} value={task.id}>{task.title}</option>)}
-                  </MaterialUI.TextField></Grid>
-                  <Grid size={{ xs: 12 }}><MaterialUI.TextField fullWidth select SelectProps={{ native: true }} label="種別" value={scheduledTaskDraft.scheduleType} onChange={e => setScheduledTaskDraft(prev => ({ ...prev, scheduleType: e.target.value }))} size="small">
-                    <option value="once">単発</option>
-                    <option value="recurring">周期</option>
-                  </MaterialUI.TextField></Grid>
-                  <Grid size={{ xs: 12 }}><MaterialUI.TextField fullWidth type="datetime-local" label="次回" value={supportAIDatetimeLocalValue(scheduledTaskDraft.nextRunAt)} onChange={e => setScheduledTaskDraft(prev => ({ ...prev, nextRunAt: supportAIFromDatetimeLocal(e.target.value) }))} size="small" InputLabelProps={{ shrink: true }} /></Grid>
-                  <Grid size={{ xs: 6 }}><MaterialUI.TextField fullWidth label="周期" type="number" value={scheduledTaskDraft.intervalValue} onChange={e => setScheduledTaskDraft(prev => ({ ...prev, intervalValue: e.target.value }))} size="small" inputProps={{ min: 1 }} disabled={scheduledTaskDraft.scheduleType !== "recurring"} /></Grid>
-                  <Grid size={{ xs: 6 }}><MaterialUI.TextField fullWidth select SelectProps={{ native: true }} label="単位" value={scheduledTaskDraft.intervalUnit} onChange={e => setScheduledTaskDraft(prev => ({ ...prev, intervalUnit: e.target.value }))} size="small" disabled={scheduledTaskDraft.scheduleType !== "recurring"}>
-                    <option value="minutes">分</option>
-                    <option value="hours">時間</option>
-                    <option value="days">日</option>
-                    <option value="weeks">週</option>
-                  </MaterialUI.TextField></Grid>
-                  <Grid size={{ xs: 12 }}><Button size="small" variant="outlined" disabled={!activeScheduledTask || busy} onClick={() => runScheduledTask(activeScheduledTask)} sx={responsiveButtonSx}>このタスクを実行</Button></Grid>
-                </Grid>
-                <Grid container spacing={0.75} alignItems="center" sx={{ mt: 0.9 }}>
-                  <Grid size={{ xs: 12 }}>
-                    <MaterialUI.FormControlLabel
-                      control={<MaterialUI.Switch size="small" checked={Boolean(scheduledTaskState.autoRunEnabled)} onChange={e => updateSchedulerOptions({ autoRunEnabled: e.target.checked })} />}
-                      label={<Typography variant="caption">期限到来タスクを自動実行</Typography>}
-                      sx={{ m: 0 }}
-                    />
-                  </Grid>
-                  <Grid size={{ xs: 12 }}><MaterialUI.TextField fullWidth label="確認間隔 秒" type="number" value={scheduledTaskState.autoRunIntervalSec || 30} onChange={e => updateSchedulerOptions({ autoRunIntervalSec: e.target.value })} size="small" inputProps={{ min: 10, step: 5 }} /></Grid>
+              <Box sx={{ p: 1, border: `1px solid ${border}`, borderRadius: 2, background: dark ? "rgba(255,255,255,0.035)" : "#ffffff" }}>
+                <Typography variant="caption" fontWeight={900}>タスク操作</Typography>
+                <Grid container spacing={0.75} sx={{ mt: 0.8, minWidth: 0 }}>
+                  {workTaskCards.map(task => {
+                    const disabled = busy || (task.requiresAI && !textRunnable) || (task.requiresAgent && !aiConfig.enableAgents);
+                    return (
+                      <Grid key={task.id} size={{ xs: 12 }}>
+                        <Box sx={{ p: 1, border: `1px solid ${border}`, borderRadius: 2, background: dark ? "rgba(255,255,255,0.035)" : "#ffffff", display: "flex", flexDirection: "column", gap: 0.7 }}>
+                          <Box sx={{ display: "flex", alignItems: "center", gap: 0.75, minWidth: 0 }}>
+                            <MaterialUI.Chip size="small" label={task.group} sx={{ height: 20, fontSize: 10 }} />
+                            <Typography variant="caption" fontWeight={900} sx={{ flex: 1, minWidth: 0 }}>{task.title}</Typography>
+                            {task.requiresAI && <MaterialUI.Chip size="small" color={textRunnable ? "success" : "warning"} label={textRunnable ? "Ready" : "Need AI"} sx={{ height: 20, fontSize: 10 }} />}
+                          </Box>
+                          <Typography variant="caption" sx={{ color: muted, lineHeight: 1.55 }}>{task.desc}</Typography>
+                          <Button size="small" variant={task.primary ? "contained" : "outlined"} disabled={disabled} onClick={task.run} sx={responsiveButtonSx}>実行</Button>
+                        </Box>
+                      </Grid>
+                    );
+                  })}
                 </Grid>
               </Box>
               <Box sx={{ p: 1, border: `1px solid ${border}`, borderRadius: 2, background: dark ? "rgba(255,255,255,0.035)" : "#ffffff" }}>
-                <Typography variant="caption" fontWeight={900}>実行入力</Typography>
+                <Typography variant="caption" fontWeight={900}>タスク入力</Typography>
                 <Stack spacing={0.75} sx={{ mt: 0.8 }}>
-                  <MaterialUI.TextField label="AIへの指示" value={instruction} onChange={e => setInstruction(e.target.value)} size="small" multiline minRows={2} placeholder="例：選択範囲を自然で読みやすく直して" />
-                  <MaterialUI.TextField label="生成テーマ / Dev指示" value={themeText} onChange={e => setThemeText(e.target.value)} size="small" multiline minRows={2} placeholder="例：美しいTODOアプリを単一HTMLで作って" />
+                  <MaterialUI.TextField label="編集・分析タスクへの追加指示" value={instruction} onChange={e => setInstruction(e.target.value)} size="small" multiline minRows={2} placeholder="例：選択範囲を自然で読みやすく直して" />
+                  <MaterialUI.TextField label="生成タスクのテーマ" value={themeText} onChange={e => setThemeText(e.target.value)} size="small" multiline minRows={2} placeholder="例：美しいTODOアプリを単一HTMLで作って" />
                 </Stack>
               </Box>
               <Grid container spacing={0.75} sx={{ minWidth: 0 }}>
@@ -5657,29 +6552,29 @@ function SupportAIDialog({ open, onClose, appDarkMode, activeMode, editorApiRef,
             {tab === "settings" && <Box sx={{ display: "flex", flexDirection: "column", gap: 1 }}>
               <Box sx={{ p: 1, border: `1px solid ${border}`, borderRadius: 2, background: dark ? "rgba(255,255,255,0.035)" : "#f8fafc" }}>
                 <Typography variant="caption" fontWeight={900}>AI状態</Typography>
-                <Stack spacing={0.45} sx={{ mt: 0.8 }}>
-                  <StatusItem name="ローカルAI" value={aiConfig.localAIEnabled ? "有効" : "未有効"} color={aiConfig.localAIEnabled ? "success" : "default"} />
-                  <StatusItem name="Runtime" value={providerStatus.preparedStatus?.prepared?.runtime ? "読込済み" : "未読込"} color={providerStatus.preparedStatus?.prepared?.runtime ? "success" : "default"} />
-                  <StatusItem name="Text" value={providerStatus.preparedStatus?.prepared?.text ? "準備済み" : (aiConfig.enableText ? "未準備" : "無効")} color={providerStatus.preparedStatus?.prepared?.text ? "success" : "default"} />
-                  <StatusItem name="Vision" value={providerStatus.preparedStatus?.prepared?.vision ? "準備済み" : (aiConfig.enableVision ? "未準備" : "無効")} color={providerStatus.preparedStatus?.prepared?.vision ? "success" : "default"} />
-                  <StatusItem name="Whisper" value={providerStatus.preparedStatus?.prepared?.whisper ? "準備済み" : (aiConfig.enableWhisper ? "未準備" : "無効")} color={providerStatus.preparedStatus?.prepared?.whisper ? "success" : "default"} />
-                  <StatusItem name="TTS" value={providerStatus.preparedStatus?.prepared?.tts ? "準備済み" : (aiConfig.enableTts ? "未準備" : "無効")} color={providerStatus.preparedStatus?.prepared?.tts ? "success" : "default"} />
-                  <StatusItem name="Device" value={providerStatus.browserDevice === "webgpu" ? "WebGPU使用中" : "WASM使用中"} color={providerStatus.browserDevice === "webgpu" ? "primary" : "default"} />
-                  <StatusItem name="Model Cache" value={providerStatus.preparedStatus?.cache?.useBrowserCache ? "利用中" : (providerStatus.preparedStatus?.cache?.blocked ? "sandboxで無効" : "無効")} color={providerStatus.preparedStatus?.cache?.useBrowserCache ? "success" : "default"} />
-                </Stack>
+                <Grid container spacing={0.7} sx={{ mt: 0.8, minWidth: 0 }}>
+                  <Grid size={{ xs: 6 }}><SettingStatusCard label="ローカルAI" value={aiConfig.localAIEnabled ? "有効" : "未有効"} color={aiConfig.localAIEnabled ? "success" : "default"} /></Grid>
+                  <Grid size={{ xs: 6 }}><SettingStatusCard label="Runtime" value={providerStatus.preparedStatus?.prepared?.runtime ? "読込済み" : "未読込"} color={providerStatus.preparedStatus?.prepared?.runtime ? "success" : "default"} /></Grid>
+                  <Grid size={{ xs: 6 }}><SettingStatusCard label="Text" value={providerStatus.preparedStatus?.prepared?.text ? "準備済み" : (aiConfig.enableText ? "未準備" : "無効")} color={providerStatus.preparedStatus?.prepared?.text ? "success" : "default"} /></Grid>
+                  <Grid size={{ xs: 6 }}><SettingStatusCard label="Vision" value={providerStatus.preparedStatus?.prepared?.vision ? "準備済み" : (aiConfig.enableVision ? "未準備" : "無効")} color={providerStatus.preparedStatus?.prepared?.vision ? "success" : "default"} /></Grid>
+                  <Grid size={{ xs: 6 }}><SettingStatusCard label="Whisper" value={providerStatus.preparedStatus?.prepared?.whisper ? "準備済み" : (aiConfig.enableWhisper ? "未準備" : "無効")} color={providerStatus.preparedStatus?.prepared?.whisper ? "success" : "default"} /></Grid>
+                  <Grid size={{ xs: 6 }}><SettingStatusCard label="TTS" value={providerStatus.preparedStatus?.prepared?.tts ? "準備済み" : (aiConfig.enableTts ? "未準備" : "無効")} color={providerStatus.preparedStatus?.prepared?.tts ? "success" : "default"} /></Grid>
+                  <Grid size={{ xs: 6 }}><SettingStatusCard label="Device" value={providerStatus.browserDevice === "webgpu" ? "WebGPU" : "WASM"} color={providerStatus.browserDevice === "webgpu" ? "primary" : "default"} /></Grid>
+                  <Grid size={{ xs: 6 }}><SettingStatusCard label="Model Cache" value={providerStatus.preparedStatus?.cache?.useBrowserCache ? "利用中" : (providerStatus.preparedStatus?.cache?.blocked ? "無効" : "OFF")} color={providerStatus.preparedStatus?.cache?.useBrowserCache ? "success" : "default"} /></Grid>
+                </Grid>
               </Box>
 
               <Box sx={{ p: 1, border: `1px solid ${border}`, borderRadius: 2 }}>
                 <Typography variant="caption" fontWeight={900}>有効化する範囲</Typography>
-                <Grid container spacing={0.35} sx={{ mt: 0.5, minWidth: 0 }}>
-                  <Grid size={{ xs: 12 }}><FeatureSwitch label="ローカルAI全体" checked={aiConfig.localAIEnabled} disabled={settingDisabled} onChange={v => updateAIConfig({ localAIEnabled: v })} /></Grid>
-                  <Grid size={{ xs: 12 }}><FeatureSwitch label="Text LLM" checked={aiConfig.enableText} disabled={settingDisabled} onChange={v => updateAIConfig({ enableText: v })} /></Grid>
-                  <Grid size={{ xs: 12 }}><FeatureSwitch label="Vision画像理解" checked={aiConfig.enableVision} disabled={settingDisabled} onChange={v => updateAIConfig({ enableVision: v })} /></Grid>
-                  <Grid size={{ xs: 12 }}><FeatureSwitch label="Whisper ASR" checked={aiConfig.enableWhisper} disabled={settingDisabled} onChange={v => updateAIConfig({ enableWhisper: v })} /></Grid>
-                  <Grid size={{ xs: 12 }}><FeatureSwitch label="TTS / Interleaved" checked={aiConfig.enableTts} disabled={settingDisabled} onChange={v => updateAIConfig({ enableTts: v })} /></Grid>
-                  <Grid size={{ xs: 12 }}><FeatureSwitch label="Agent / Team" checked={aiConfig.enableAgents} disabled={settingDisabled} onChange={v => updateAIConfig({ enableAgents: v })} /></Grid>
-                  <Grid size={{ xs: 12 }}><FeatureSwitch label="RAG" checked={aiConfig.enableRag} disabled={settingDisabled} onChange={v => updateAIConfig({ enableRag: v })} /></Grid>
-                  <Grid size={{ xs: 12 }}><FeatureSwitch label="Knowledge" checked={aiConfig.enableKnowledge} disabled={settingDisabled} onChange={v => updateAIConfig({ enableKnowledge: v })} /></Grid>
+                <Grid container spacing={0.55} sx={{ mt: 0.75, minWidth: 0 }}>
+                  <Grid size={{ xs: 12 }}><SettingToggleChip label="ローカルAI全体" checked={aiConfig.localAIEnabled} disabled={settingDisabled} onChange={v => updateAIConfig({ localAIEnabled: v })} /></Grid>
+                  <Grid size={{ xs: 6 }}><SettingToggleChip label="Text LLM" checked={aiConfig.enableText} disabled={settingDisabled} onChange={v => updateAIConfig({ enableText: v })} /></Grid>
+                  <Grid size={{ xs: 6 }}><SettingToggleChip label="Vision" checked={aiConfig.enableVision} disabled={settingDisabled} onChange={v => updateAIConfig({ enableVision: v })} /></Grid>
+                  <Grid size={{ xs: 6 }}><SettingToggleChip label="Whisper" checked={aiConfig.enableWhisper} disabled={settingDisabled} onChange={v => updateAIConfig({ enableWhisper: v })} /></Grid>
+                  <Grid size={{ xs: 6 }}><SettingToggleChip label="TTS / Voice" checked={aiConfig.enableTts} disabled={settingDisabled} onChange={v => updateAIConfig({ enableTts: v })} /></Grid>
+                  <Grid size={{ xs: 6 }}><SettingToggleChip label="Agent / Team" checked={aiConfig.enableAgents} disabled={settingDisabled} onChange={v => updateAIConfig({ enableAgents: v })} /></Grid>
+                  <Grid size={{ xs: 6 }}><SettingToggleChip label="RAG" checked={aiConfig.enableRag} disabled={settingDisabled} onChange={v => updateAIConfig({ enableRag: v })} /></Grid>
+                  <Grid size={{ xs: 12 }}><SettingToggleChip label="Knowledge" checked={aiConfig.enableKnowledge} disabled={settingDisabled} onChange={v => updateAIConfig({ enableKnowledge: v })} /></Grid>
                 </Grid>
               </Box>
 
@@ -5711,10 +6606,16 @@ function SupportAIDialog({ open, onClose, appDarkMode, activeMode, editorApiRef,
                   <option value="__custom__">{supportAIModelPresetLabel("audio", aiConfig.browserWhisperModel)}</option>
                   {supportAIModelPresets("audio").map(p => <option key={`${p.kind}-${p.role}`} value={p.modelId}>{p.label} / {p.role}</option>)}
                 </MaterialUI.TextField></Grid>
+                <Grid size={{ xs: 12 }}><MaterialUI.TextField fullWidth select SelectProps={{ native: true }} label="Voice Conversation Preset" value={supportAIModelPresetFor("voice", aiConfig.browserLfmAudioModel)?.modelId || "__custom__"} onChange={e => applyModelPreset("voice", e.target.value)} size="small">
+                  <option value="__custom__">{supportAIModelPresetLabel("voice", aiConfig.browserLfmAudioModel)}</option>
+                  {supportAIModelPresets("voice").map(p => <option key={`${p.kind}-${p.role}`} value={p.modelId}>{p.label} / {p.role}</option>)}
+                </MaterialUI.TextField></Grid>
                 <Grid size={{ xs: 12 }}><MaterialUI.TextField fullWidth label="Text Model ID" value={aiConfig.browserTextModel} onChange={e => updateAIModelConfig({ browserTextModel: e.target.value }, ["text"])} size="small" /></Grid>
                 <Grid size={{ xs: 12 }}><MaterialUI.TextField fullWidth label="Vision Model ID" value={aiConfig.browserVisionModel} onChange={e => updateAIModelConfig({ browserVisionModel: e.target.value }, ["vision"])} size="small" /></Grid>
-                <Grid size={{ xs: 12 }}><MaterialUI.TextField fullWidth label="ASR Model ID" value={aiConfig.browserWhisperModel} onChange={e => updateAIModelConfig({ browserWhisperModel: e.target.value }, ["whisper"])} size="small" /></Grid>
+                <Grid size={{ xs: 12 }}><MaterialUI.TextField fullWidth label="Whisper ASR Model ID" value={aiConfig.browserWhisperModel} onChange={e => updateAIModelConfig({ browserWhisperModel: e.target.value, audioTranscribeProvider: "whisper" }, ["whisper"])} size="small" /></Grid>
+                <Grid size={{ xs: 12 }}><MaterialUI.TextField fullWidth label="LFM Audio Voice Model ID" value={aiConfig.browserLfmAudioModel} onChange={e => updateAIModelConfig({ browserLfmAudioModel: e.target.value, voiceConversationProvider: "lfm-audio" }, ["tts"])} size="small" /></Grid>
                 <Grid size={{ xs: 12 }}><MaterialUI.TextField fullWidth label="TTS Model ID" value={aiConfig.browserTtsModel} onChange={e => updateAIModelConfig({ browserTtsModel: e.target.value }, ["tts"])} size="small" /></Grid>
+                <Grid size={{ xs: 12 }}><MaterialUI.TextField fullWidth label="LFM Audio precision" value={aiConfig.browserLfmAudioPrecision} onChange={e => updateAIConfig({ browserLfmAudioPrecision: e.target.value })} size="small" /></Grid>
                 <Grid size={{ xs: 12 }}><MaterialUI.TextField fullWidth label="Text dtype" value={aiConfig.browserTextDtype} onChange={e => updateAIModelConfig({ browserTextDtype: e.target.value }, ["text"])} size="small" /></Grid>
                 <Grid size={{ xs: 12 }}><MaterialUI.TextField fullWidth label="Max new tokens" type="number" value={aiConfig.browserMaxNewTokens} onChange={e => updateAIConfig({ browserMaxNewTokens: e.target.value })} size="small" inputProps={{ step: 64, min: 16, max: 4096 }} /></Grid>
                 <Grid size={{ xs: 12 }}><MaterialUI.TextField fullWidth label="Timeout ms" type="number" value={aiConfig.timeoutMs} onChange={e => updateAIConfig({ timeoutMs: e.target.value })} size="small" inputProps={{ step: 1000, min: 5000 }} /></Grid>
@@ -5735,20 +6636,45 @@ function SupportAIDialog({ open, onClose, appDarkMode, activeMode, editorApiRef,
                 <Grid size={{ xs: 12 }}><Button size="small" variant="contained" disabled={busy || !aiConfig.localAIEnabled || !enabledModelFeatures().length} onClick={prepareSelectedModels} sx={responsiveButtonSx}>有効モデルを準備</Button></Grid>
                 <Grid size={{ xs: 12 }}><Button size="small" variant="outlined" disabled={busy || !textRunnable} onClick={testAIConnection} sx={responsiveButtonSx}>Text推論テスト</Button></Grid>
                 <Grid size={{ xs: 12 }}><Button size="small" variant="outlined" disabled={busy} onClick={showGhostStatus} sx={responsiveButtonSx}>Ghost Status</Button></Grid>
-                <Grid size={{ xs: 12 }}><Button size="small" variant="outlined" disabled={busy} onClick={addCurrentToRAG} sx={responsiveButtonSx}>文書をRAG登録</Button></Grid>
-                <Grid size={{ xs: 12 }}><Button size="small" variant="outlined" disabled={busy} onClick={addKnowledgeFact} sx={responsiveButtonSx}>Fact登録</Button></Grid>
                 <Grid size={{ xs: 12 }}><Button size="small" variant="outlined" color="warning" disabled={busy} onClick={clearModelCache} sx={responsiveButtonSx}>モデルCache削除</Button></Grid>
                 <Grid size={{ xs: 12 }}><Button size="small" variant="outlined" color="warning" disabled={busy} onClick={resetAIConfig} sx={responsiveButtonSx}>AI設定初期化</Button></Grid>
-              </Grid>
-              <Grid container spacing={0.75} sx={{ minWidth: 0, "& .MuiFormControl-root": { minWidth: 0 } }}>
-                <Grid size={{ xs: 12 }}><MaterialUI.TextField fullWidth label="Fact subject" value={knowledgeSubject} onChange={e => setKnowledgeSubject(e.target.value)} size="small" /></Grid>
-                <Grid size={{ xs: 12 }}><MaterialUI.TextField fullWidth label="Fact predicate" value={knowledgePredicate} onChange={e => setKnowledgePredicate(e.target.value)} size="small" /></Grid>
-                <Grid size={{ xs: 12 }}><MaterialUI.TextField fullWidth label="Fact object" value={knowledgeObject} onChange={e => setKnowledgeObject(e.target.value)} size="small" /></Grid>
               </Grid>
               <Typography variant="caption" sx={{ color: muted, lineHeight: 1.6 }}>基本方針は完全ローカル推論です。本文・画像・音声は外部LLMサービスへ送信されません。必要なモデルだけを有効化し、必要時に遅延ロードします。</Typography>
             </Box>}
 
+            {tab === "rag" && <Box sx={{ display: "flex", flexDirection: "column", gap: 1 }}>
+              <Box sx={{ p: 1, border: `1px solid ${border}`, borderRadius: 2, background: dark ? "rgba(255,255,255,0.035)" : "#f8fafc" }}>
+                <Typography variant="caption" fontWeight={900}>RAG状態</Typography>
+                <Stack spacing={0.45} sx={{ mt: 0.8 }}>
+                  <StatusItem name="RAG" value={aiConfig.enableRag ? "ON" : "OFF"} color={aiConfig.enableRag ? "success" : "default"} />
+                  <StatusItem name="登録文書" value={`${ragDocuments.length} 件`} color={ragDocuments.length ? "primary" : "default"} />
+                </Stack>
+              </Box>
+              <Grid container spacing={0.75} sx={{ minWidth: 0 }}>
+                <Grid size={{ xs: 12 }}><Button size="small" variant="contained" disabled={busy} onClick={addCurrentToRAG} sx={responsiveButtonSx}>現在の文書を登録</Button></Grid>
+                <Grid size={{ xs: 12 }}><Button size="small" variant="outlined" color="warning" disabled={busy || !ragDocuments.length} onClick={clearRAGDocuments} sx={responsiveButtonSx}>RAG文書クリア</Button></Grid>
+              </Grid>
+            </Box>}
+
+            {tab === "knowledge" && <Box sx={{ display: "flex", flexDirection: "column", gap: 1 }}>
+              <Box sx={{ p: 1, border: `1px solid ${border}`, borderRadius: 2, background: dark ? "rgba(255,255,255,0.035)" : "#f8fafc" }}>
+                <Typography variant="caption" fontWeight={900}>Knowledge状態</Typography>
+                <Stack spacing={0.45} sx={{ mt: 0.8 }}>
+                  <StatusItem name="Knowledge" value={aiConfig.enableKnowledge ? "ON" : "OFF"} color={aiConfig.enableKnowledge ? "success" : "default"} />
+                  <StatusItem name="Facts" value={`${knowledgeFacts.length} 件`} color={knowledgeFacts.length ? "primary" : "default"} />
+                </Stack>
+              </Box>
+              <Grid container spacing={0.75} sx={{ minWidth: 0, "& .MuiFormControl-root": { minWidth: 0 } }}>
+                <Grid size={{ xs: 12 }}><MaterialUI.TextField fullWidth label="Fact subject" value={knowledgeSubject} onChange={e => setKnowledgeSubject(e.target.value)} size="small" /></Grid>
+                <Grid size={{ xs: 12 }}><MaterialUI.TextField fullWidth label="Fact predicate" value={knowledgePredicate} onChange={e => setKnowledgePredicate(e.target.value)} size="small" /></Grid>
+                <Grid size={{ xs: 12 }}><MaterialUI.TextField fullWidth label="Fact object" value={knowledgeObject} onChange={e => setKnowledgeObject(e.target.value)} size="small" /></Grid>
+                <Grid size={{ xs: 12 }}><Button size="small" variant="contained" disabled={busy} onClick={addKnowledgeFact} sx={responsiveButtonSx}>Fact登録</Button></Grid>
+                <Grid size={{ xs: 12 }}><Button size="small" variant="outlined" color="warning" disabled={busy || !knowledgeFacts.length} onClick={clearKnowledgeFacts} sx={responsiveButtonSx}>Factsクリア</Button></Grid>
+              </Grid>
+            </Box>}
+
             <input ref={audioInputRef} type="file" accept="audio/*" style={{ display: "none" }} onChange={e => { handleAudioFile(e.target.files?.[0]); e.target.value = ""; }} />
+            <input ref={voiceAudioInputRef} type="file" accept="audio/*" style={{ display: "none" }} onChange={e => { handleVoiceConversationFile(e.target.files?.[0]); e.target.value = ""; }} />
             <input ref={imageInputRef} type="file" accept="image/*" style={{ display: "none" }} onChange={e => { handleImageFile(e.target.files?.[0]); e.target.value = ""; }} />
           </Box>}
 
@@ -5761,6 +6687,9 @@ function SupportAIDialog({ open, onClose, appDarkMode, activeMode, editorApiRef,
                 <Typography variant="caption" fontWeight={900} sx={{ flex: 1 }}>{rightPaneTitle}</Typography>
                 {busy && <MaterialUI.Chip size="small" color="primary" label="AI応答中" />}
                 <MaterialUI.Chip size="small" color={chatSessionTemporary ? "warning" : "default"} label={chatSessionTemporary ? "一時" : (activeChatSession?.title || "セッション")} />
+                <MaterialUI.Chip size="small" color={chatContextOptions.length ? "primary" : "default"} label={chatContextOptions.length ? `ctx ${chatContextOptions.length}` : "ctx OFF"} />
+                <MaterialUI.Chip size="small" color={chatParticipantCount ? "primary" : "default"} label={`参加 ${chatParticipantCount}`} />
+                <MaterialUI.Chip size="small" color={chatWorkflowSteps.length ? "primary" : "default"} label={chatWorkflowSteps.length ? `step ${chatWorkflowSteps.length}` : "通常"} />
                 <MaterialUI.Chip size="small" label={`${chatMessages.length} 件`} />
                 <Button size="small" variant="text" onClick={copyChatConversation} disabled={!chatMessages.some(supportAIIsModelConversationMessage)} sx={{ minHeight: 22, px: 0.7, fontSize: 11 }}>会話コピー</Button>
                 <PaneControls side="right" />
@@ -5863,6 +6792,49 @@ function SupportAIDialog({ open, onClose, appDarkMode, activeMode, editorApiRef,
                 <Grid container spacing={1} sx={{ minWidth: 0 }}>
                   <Grid size={{ xs: 12 }}>
                     <Box sx={{ p: 1, border: `1px solid ${border}`, borderRadius: 2, background: dark ? "#0f172a" : "#f8fafc", minWidth: 0 }}>
+                      <Box sx={{ display: "flex", alignItems: "center", gap: 0.75, flexWrap: "wrap", mb: 0.8 }}>
+                        <Typography variant="caption" fontWeight={900} sx={{ flex: 1 }}>新規タスク登録</Typography>
+                        <Button size="small" variant="outlined" onClick={createScheduledTask}>新規</Button>
+                        <Button size="small" variant="contained" onClick={saveScheduledTask} disabled={!activeScheduledTask}>保存</Button>
+                        <Button size="small" variant="outlined" color="warning" onClick={deleteScheduledTask} disabled={!activeScheduledTask}>削除</Button>
+                      </Box>
+                      <Grid container spacing={0.75} alignItems="center">
+                        <Grid size={{ xs: 12 }}><MaterialUI.TextField fullWidth select SelectProps={{ native: true }} label="予定タスク" value={activeScheduledTask?.id || ""} onChange={e => setActiveScheduledTaskId(e.target.value)} size="small">
+                          <option value="">未選択</option>
+                          {scheduledTasks.map(task => <option key={task.id} value={task.id}>{task.label}</option>)}
+                        </MaterialUI.TextField></Grid>
+                        <Grid size={{ xs: 12 }}><MaterialUI.TextField fullWidth label="名前" value={scheduledTaskDraft.label} onChange={e => setScheduledTaskDraft(prev => ({ ...prev, label: e.target.value }))} size="small" /></Grid>
+                        <Grid size={{ xs: 12 }}><MaterialUI.TextField fullWidth select SelectProps={{ native: true }} label="実行タスク" value={scheduledTaskDraft.command} onChange={e => setScheduledTaskDraft(prev => ({ ...prev, command: e.target.value }))} size="small">
+                          {workTaskCards.map(task => <option key={task.id} value={task.id}>{task.title}</option>)}
+                        </MaterialUI.TextField></Grid>
+                        <Grid size={{ xs: 12 }}><MaterialUI.TextField fullWidth select SelectProps={{ native: true }} label="種別" value={scheduledTaskDraft.scheduleType} onChange={e => setScheduledTaskDraft(prev => ({ ...prev, scheduleType: e.target.value }))} size="small">
+                          <option value="once">単発</option>
+                          <option value="recurring">周期</option>
+                        </MaterialUI.TextField></Grid>
+                        <Grid size={{ xs: 12 }}><MaterialUI.TextField fullWidth type="datetime-local" label="次回" value={supportAIDatetimeLocalValue(scheduledTaskDraft.nextRunAt)} onChange={e => setScheduledTaskDraft(prev => ({ ...prev, nextRunAt: supportAIFromDatetimeLocal(e.target.value) }))} size="small" InputLabelProps={{ shrink: true }} /></Grid>
+                        <Grid size={{ xs: 6 }}><MaterialUI.TextField fullWidth label="周期" type="number" value={scheduledTaskDraft.intervalValue} onChange={e => setScheduledTaskDraft(prev => ({ ...prev, intervalValue: e.target.value }))} size="small" inputProps={{ min: 1 }} disabled={scheduledTaskDraft.scheduleType !== "recurring"} /></Grid>
+                        <Grid size={{ xs: 6 }}><MaterialUI.TextField fullWidth select SelectProps={{ native: true }} label="単位" value={scheduledTaskDraft.intervalUnit} onChange={e => setScheduledTaskDraft(prev => ({ ...prev, intervalUnit: e.target.value }))} size="small" disabled={scheduledTaskDraft.scheduleType !== "recurring"}>
+                          <option value="minutes">分</option>
+                          <option value="hours">時間</option>
+                          <option value="days">日</option>
+                          <option value="weeks">週</option>
+                        </MaterialUI.TextField></Grid>
+                        <Grid size={{ xs: 12 }}><Button size="small" variant="outlined" disabled={!activeScheduledTask || busy} onClick={() => runScheduledTask(activeScheduledTask)} sx={responsiveButtonSx}>このタスクを実行</Button></Grid>
+                      </Grid>
+                      <Grid container spacing={0.75} alignItems="center" sx={{ mt: 0.9 }}>
+                        <Grid size={{ xs: 12 }}>
+                          <MaterialUI.FormControlLabel
+                            control={<MaterialUI.Switch size="small" checked={Boolean(scheduledTaskState.autoRunEnabled)} onChange={e => updateSchedulerOptions({ autoRunEnabled: e.target.checked })} />}
+                            label={<Typography variant="caption">期限到来タスクを自動実行</Typography>}
+                            sx={{ m: 0 }}
+                          />
+                        </Grid>
+                        <Grid size={{ xs: 12 }}><MaterialUI.TextField fullWidth label="確認間隔 秒" type="number" value={scheduledTaskState.autoRunIntervalSec || 30} onChange={e => updateSchedulerOptions({ autoRunIntervalSec: e.target.value })} size="small" inputProps={{ min: 10, step: 5 }} /></Grid>
+                      </Grid>
+                    </Box>
+                  </Grid>
+                  <Grid size={{ xs: 12 }}>
+                    <Box sx={{ p: 1, border: `1px solid ${border}`, borderRadius: 2, background: dark ? "#0f172a" : "#f8fafc", minWidth: 0 }}>
                       <Box sx={{ display: "flex", alignItems: "center", gap: 1, flexWrap: "wrap", mb: 0.8 }}>
                         <Typography variant="caption" fontWeight={900} sx={{ flex: 1 }}>スケジュール一覧</Typography>
                         <MaterialUI.Chip size="small" color={scheduledTaskState.autoRunEnabled ? "primary" : "default"} label={scheduledTaskState.autoRunEnabled ? "自動実行ON" : "自動実行OFF"} />
@@ -5935,22 +6907,6 @@ function SupportAIDialog({ open, onClose, appDarkMode, activeMode, editorApiRef,
                       </Box>
                     </Box>
                   </Grid>
-                  {workTaskCards.map(task => {
-                    const disabled = busy || (task.requiresAI && !textRunnable) || (task.requiresAgent && !aiConfig.enableAgents);
-                    return (
-                      <Grid key={task.id} size={{ xs: 12 }}>
-                        <Box sx={{ p: 1, border: `1px solid ${border}`, borderRadius: 2, background: dark ? "rgba(255,255,255,0.035)" : "#ffffff", minHeight: 132, display: "flex", flexDirection: "column", gap: 0.8 }}>
-                          <Box sx={{ display: "flex", alignItems: "center", gap: 0.75 }}>
-                            <MaterialUI.Chip size="small" label={task.group} sx={{ height: 20, fontSize: 10 }} />
-                            <Typography variant="caption" fontWeight={900} sx={{ flex: 1 }}>{task.title}</Typography>
-                            {task.requiresAI && <MaterialUI.Chip size="small" color={textRunnable ? "success" : "warning"} label={textRunnable ? "Ready" : "Need AI"} sx={{ height: 20, fontSize: 10 }} />}
-                          </Box>
-                          <Typography variant="caption" sx={{ color: muted, lineHeight: 1.55, flex: 1 }}>{task.desc}</Typography>
-                          <Button size="small" variant={task.primary ? "contained" : "outlined"} disabled={disabled} onClick={task.run} sx={responsiveButtonSx}>実行</Button>
-                        </Box>
-                      </Grid>
-                    );
-                  })}
                   <Grid size={{ xs: 12 }}>
                     <Box sx={{ p: 1, border: `1px solid ${border}`, borderRadius: 2, background: dark ? "#0f172a" : "#f8fafc", minWidth: 0 }}>
                       <Box sx={{ display: "flex", alignItems: "center", gap: 1, mb: 0.7 }}>
@@ -6001,13 +6957,8 @@ function SupportAIDialog({ open, onClose, appDarkMode, activeMode, editorApiRef,
                         <StatusItem name="Vision Model" value={aiConfig.browserVisionModel} color={visionRunnable ? "success" : "default"} />
                         <StatusItem name="ASR Model" value={aiConfig.browserWhisperModel} color={whisperRunnable ? "success" : "default"} />
                         <StatusItem name="TTS Model" value={aiConfig.browserTtsModel} color={ttsRunnable ? "success" : "default"} />
+                        <StatusItem name="LFM Audio Voice" value={aiConfig.browserLfmAudioModel} color={aiConfig.enableTts ? "warning" : "default"} />
                       </Stack>
-                    </Box>
-                  </Grid>
-                  <Grid size={{ xs: 12 }}>
-                    <Box sx={{ p: 1, border: `1px solid ${border}`, borderRadius: 2, background: dark ? "#0f172a" : "#f8fafc" }}>
-                      <Typography variant="caption" fontWeight={900}>Agent / Team実行指示</Typography>
-                      <MaterialUI.TextField fullWidth value={agentTaskText} onChange={e => setAgentTaskText(e.target.value)} size="small" multiline minRows={2} sx={{ mt: 0.8 }} />
                     </Box>
                   </Grid>
                   <Grid size={{ xs: 12 }}>
@@ -6094,7 +7045,6 @@ function SupportAIDialog({ open, onClose, appDarkMode, activeMode, editorApiRef,
                             </Box>
                           </Box>
                         </Box>
-                        <Button size="small" variant="outlined" disabled={busy || !textRunnable || !aiConfig.enableAgents || !activeAdminOrg?.enabled || !activeAdminAgent?.enabled} onClick={() => runManagedAgent(activeAdminAgent?.id)} sx={responsiveButtonSx}>このAgentを実行</Button>
                       </Stack>
                     </Box>
                   </Grid>
@@ -6146,22 +7096,71 @@ function SupportAIDialog({ open, onClose, appDarkMode, activeMode, editorApiRef,
                             </Box>
                           </Box>
                         </Box>
-                        <Button size="small" variant="contained" disabled={busy || !textRunnable || !aiConfig.enableAgents || !activeAdminOrg?.enabled || !activeAdminTeam?.enabled || !selectedTeamAgentIds.length} onClick={() => runManagedTeam(activeAdminTeam?.id)} sx={responsiveButtonSx}>このTeamを実行</Button>
                       </Stack>
                     </Box>
                   </Grid>
-                  <Grid size={{ xs: 12 }}>
-                    <Box sx={{ p: 1, border: `1px solid ${border}`, borderRadius: 2, background: dark ? "#0f172a" : "#f8fafc", minWidth: 0 }}>
-                      <Box sx={{ display: "flex", alignItems: "center", gap: 1, mb: 0.7 }}>
-                        <Typography variant="caption" fontWeight={900} sx={{ flex: 1 }}>Agent / Team結果</Typography>
-                        {result && <MaterialUI.Chip size="small" color={result.ok ? "success" : "error"} label={result.label || result.command || "result"} />}
-                      </Box>
-                      <Box component="pre" sx={{ m: 0, minHeight: 96, maxHeight: 220, overflow: "auto", whiteSpace: "pre-wrap", wordBreak: "break-word", fontFamily: EDITOR_FONT, fontSize: 12.5, lineHeight: 1.6, color: dark ? "#e5e7eb" : "#111827" }}>
-                        {resultText || result?.error || "AgentまたはTeamを実行すると、ここに結果が表示されます。"}
-                      </Box>
-                    </Box>
-                  </Grid>
                 </Grid>
+              </Box>
+            </Box>
+          ) : tab === "rag" ? (
+            <Box sx={{ display: "flex", flexDirection: "column", width: "100%", minHeight: 0, height: "100%", border: `1px solid ${border}`, borderRadius: 2, overflow: "hidden", background: dark ? "#020617" : "#fbfdff", minWidth: 0 }}>
+              <Box sx={{ px: 1.2, py: 0.8, display: "flex", alignItems: "center", gap: 1, borderBottom: `1px solid ${border}` }}>
+                <Typography variant="caption" fontWeight={900} sx={{ flex: 1 }}>{rightPaneTitle}</Typography>
+                <MaterialUI.Chip size="small" color={ragDocuments.length ? "primary" : "default"} label={`${ragDocuments.length} docs`} />
+                <PaneControls side="right" />
+              </Box>
+              <Box sx={{ flex: 1, minHeight: 0, overflow: "auto", p: { xs: 1, sm: 1.25 }, WebkitOverflowScrolling: "touch" }}>
+                <Box sx={{ overflow: "auto", border: `1px solid ${border}`, borderRadius: 1.5 }}>
+                  <Box component="table" sx={{ width: "100%", borderCollapse: "collapse", minWidth: 760 }}>
+                    <Box component="thead" sx={{ background: dark ? "rgba(255,255,255,0.04)" : "#f8fafc" }}><Box component="tr">
+                      {["ID", "タイトル", "タグ", "文字数", "作成日時"].map(head => <Box key={head} component="th" sx={{ p: 0.75, textAlign: "left", borderBottom: `1px solid ${border}`, color: muted, fontSize: 12 }}>{head}</Box>)}
+                    </Box></Box>
+                    <Box component="tbody">
+                      {ragDocuments.length ? ragDocuments.map(doc => (
+                        <Box key={doc.id} component="tr">
+                          <Box component="td" sx={{ p: 0.65, borderBottom: `1px solid ${border}`, fontSize: 12 }}>{doc.id}</Box>
+                          <Box component="td" sx={{ p: 0.65, borderBottom: `1px solid ${border}`, fontSize: 12, fontWeight: 800 }}>{doc.title}</Box>
+                          <Box component="td" sx={{ p: 0.65, borderBottom: `1px solid ${border}`, fontSize: 12 }}>{(doc.tags || []).join(", ") || "-"}</Box>
+                          <Box component="td" sx={{ p: 0.65, borderBottom: `1px solid ${border}`, fontSize: 12 }}>{String(doc.text || "").length}</Box>
+                          <Box component="td" sx={{ p: 0.65, borderBottom: `1px solid ${border}`, fontSize: 12, whiteSpace: "nowrap" }}>{doc.createdAt ? new Date(doc.createdAt).toLocaleString("ja-JP") : "-"}</Box>
+                        </Box>
+                      )) : (
+                        <Box component="tr"><Box component="td" colSpan={5} sx={{ p: 1, color: muted, fontSize: 12.5 }}>RAG文書はまだ登録されていません。</Box></Box>
+                      )}
+                    </Box>
+                  </Box>
+                </Box>
+              </Box>
+            </Box>
+          ) : tab === "knowledge" ? (
+            <Box sx={{ display: "flex", flexDirection: "column", width: "100%", minHeight: 0, height: "100%", border: `1px solid ${border}`, borderRadius: 2, overflow: "hidden", background: dark ? "#020617" : "#fbfdff", minWidth: 0 }}>
+              <Box sx={{ px: 1.2, py: 0.8, display: "flex", alignItems: "center", gap: 1, borderBottom: `1px solid ${border}` }}>
+                <Typography variant="caption" fontWeight={900} sx={{ flex: 1 }}>{rightPaneTitle}</Typography>
+                <MaterialUI.Chip size="small" color={knowledgeFacts.length ? "primary" : "default"} label={`${knowledgeFacts.length} facts`} />
+                <PaneControls side="right" />
+              </Box>
+              <Box sx={{ flex: 1, minHeight: 0, overflow: "auto", p: { xs: 1, sm: 1.25 }, WebkitOverflowScrolling: "touch" }}>
+                <Box sx={{ overflow: "auto", border: `1px solid ${border}`, borderRadius: 1.5 }}>
+                  <Box component="table" sx={{ width: "100%", borderCollapse: "collapse", minWidth: 760 }}>
+                    <Box component="thead" sx={{ background: dark ? "rgba(255,255,255,0.04)" : "#f8fafc" }}><Box component="tr">
+                      {["ID", "Subject", "Predicate", "Object", "タグ", "作成日時"].map(head => <Box key={head} component="th" sx={{ p: 0.75, textAlign: "left", borderBottom: `1px solid ${border}`, color: muted, fontSize: 12 }}>{head}</Box>)}
+                    </Box></Box>
+                    <Box component="tbody">
+                      {knowledgeFacts.length ? knowledgeFacts.map(fact => (
+                        <Box key={fact.id} component="tr">
+                          <Box component="td" sx={{ p: 0.65, borderBottom: `1px solid ${border}`, fontSize: 12 }}>{fact.id}</Box>
+                          <Box component="td" sx={{ p: 0.65, borderBottom: `1px solid ${border}`, fontSize: 12, fontWeight: 800 }}>{fact.subject}</Box>
+                          <Box component="td" sx={{ p: 0.65, borderBottom: `1px solid ${border}`, fontSize: 12 }}>{fact.predicate}</Box>
+                          <Box component="td" sx={{ p: 0.65, borderBottom: `1px solid ${border}`, fontSize: 12 }}>{fact.object}</Box>
+                          <Box component="td" sx={{ p: 0.65, borderBottom: `1px solid ${border}`, fontSize: 12 }}>{(fact.tags || []).join(", ") || "-"}</Box>
+                          <Box component="td" sx={{ p: 0.65, borderBottom: `1px solid ${border}`, fontSize: 12, whiteSpace: "nowrap" }}>{fact.createdAt ? new Date(fact.createdAt).toLocaleString("ja-JP") : "-"}</Box>
+                        </Box>
+                      )) : (
+                        <Box component="tr"><Box component="td" colSpan={6} sx={{ p: 1, color: muted, fontSize: 12.5 }}>Knowledge Factはまだ登録されていません。</Box></Box>
+                      )}
+                    </Box>
+                  </Box>
+                </Box>
               </Box>
             </Box>
           ) : tab === "monitor" ? (
@@ -6302,6 +7301,22 @@ function SupportAIDialog({ open, onClose, appDarkMode, activeMode, editorApiRef,
           <Button onClick={() => applySuggestion(result, false)} disabled={tab === "monitor" || !resultText || busy} variant="contained">結果を反映</Button>
         </Stack>
       </DialogActions>
+      <Dialog open={contextPreviewOpen} onClose={() => setContextPreviewOpen(false)} maxWidth="md" fullWidth>
+        <DialogTitle sx={{ display: "flex", alignItems: "center", gap: 1 }}>
+          <Icon name="preview" size={20} />
+          <Typography variant="subtitle1" fontWeight={900} sx={{ flex: 1 }}>コンテキストプレビュー</Typography>
+          <IconButton onClick={() => setContextPreviewOpen(false)}><Icon name="close" size={20} /></IconButton>
+        </DialogTitle>
+        <DialogContent dividers>
+          <Box component="pre" sx={{ m: 0, maxHeight: "62vh", overflow: "auto", whiteSpace: "pre-wrap", wordBreak: "break-word", fontFamily: EDITOR_FONT, fontSize: 12.5, lineHeight: 1.65, color: dark ? "#e5e7eb" : "#111827" }}>
+            {contextPreviewText || "プレビューするコンテキストはありません。"}
+          </Box>
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={() => supportAICopyText(contextPreviewText || "").then(() => onToast?.("コンテキストをコピーしました")).catch(() => onToast?.("コピーに失敗しました"))} disabled={!contextPreviewText}>コピー</Button>
+          <Button variant="contained" onClick={() => setContextPreviewOpen(false)}>閉じる</Button>
+        </DialogActions>
+      </Dialog>
       {!supportAIFullScreen && <>
         <SupportAIResizeHandle edge="right" handleProps={supportAIResize.handleProps} active={supportAIResize.draggingEdge === "right"} />
         <SupportAIResizeHandle edge="bottom" handleProps={supportAIResize.handleProps} active={supportAIResize.draggingEdge === "bottom"} />
@@ -6405,7 +7420,7 @@ function CommandDrawer({
             <Action icon="terminal" label="Console" secondary={`${consoleLogsCount || 0} 件のログ`} onClick={onConsole} />
             <Action icon="photo_camera" label="スナップショット保存" secondary={`${snapshotsCount || 0} 件保存中`} onClick={onTakeSnapshot} />
             <Action icon="history" label="スナップショット一覧" secondary="復元・削除" onClick={onSnapshots} />
-            <Action icon="security" label="Security & Storage" secondary="容量確認・完全初期化" onClick={onStorage} />
+            <Action icon="security" label="Security & Storage" secondary="容量確認・個別削除" onClick={onStorage} />
             <Action icon={appDarkMode ? 'light_mode' : 'dark_mode'} label={appDarkMode ? 'ライトテーマ' : 'ダークテーマ'} secondary="アプリ全体の見た目" onClick={onToggleTheme} />
             <Action icon="delete_outline" label="現在タブをクリア" secondary="確認ダイアログあり" onClick={onClear} />
           </List>
@@ -6666,7 +7681,7 @@ function App() {
   const applyPatchCode = (code) => { setHtml(code); toast("差分を適用しました"); };
   const clearEditor = () => { setHtml(""); setConfirmClear(false); toast("クリアしました"); };
   const resetProfile = () => { const tabs = [createEditorTab("index.html", DEFAULT_HTML, EDITOR_MODES.AUTO)]; setEditorTabs(tabs); setActiveEditorTabId(tabs[0].id); setHtmlState(DEFAULT_HTML); setSnapshots([]); setConsoleLogs([]); setConfirmReset(false); toast("初期設定に戻しました"); };
-  const fullReset = async () => { try { [STORAGE_KEY, STORAGE_PROFILES_KEY, STORAGE_ACTIVE_KEY].forEach(k => localStorage.removeItem(k)); await clearAllPlusCaches(); } catch {} const def = createProfile("デフォルト", { code: DEFAULT_HTML }); ProfileRepo.save([def]); ProfileRepo.saveActiveId(def.id); const tabs = normalizeEditorTabs(def.data); setProfiles([def]); setActiveProfileId(def.id); setEditorTabs(tabs); setActiveEditorTabId(tabs[0]?.id || null); setHtmlState(tabs[0]?.code || DEFAULT_HTML); setSnapshots([]); setConsoleLogs([]); setConfirmFullReset(false); setStorageOpen(false); toast("完全初期化しました"); };
+  const fullReset = async () => { try { [STORAGE_KEY, STORAGE_PROFILES_KEY, STORAGE_ACTIVE_KEY, SUPPORT_AI_CONFIG_KEY, SUPPORT_AI_ADMIN_STORAGE_KEY, SUPPORT_AI_SCHEDULED_TASKS_KEY, SUPPORT_AI_PANE_MODE_KEY, SUPPORT_AI_CHAT_SESSIONS_KEY, SUPPORT_AI_CHAT_ACTIVE_SESSION_KEY, OOS_GHOST_RUNTIME_STORAGE_KEY].forEach(k => localStorage.removeItem(k)); await clearAllPlusCaches(); } catch {} const def = createProfile("デフォルト", { code: DEFAULT_HTML }); ProfileRepo.save([def]); ProfileRepo.saveActiveId(def.id); const tabs = normalizeEditorTabs(def.data); setProfiles([def]); setActiveProfileId(def.id); setEditorTabs(tabs); setActiveEditorTabId(tabs[0]?.id || null); setHtmlState(tabs[0]?.code || DEFAULT_HTML); setSnapshots([]); setConsoleLogs([]); setConfirmFullReset(false); setStorageOpen(false); toast("完全初期化しました"); };
   const toggleFullscreen = (pane) => setFullscreen(v => v === pane ? "none" : pane);
   const showEditor = fullscreen !== "preview";
   const showPreview = fullscreen !== "editor";
@@ -6786,7 +7801,7 @@ function App() {
       />
       <ConfirmDialog open={confirmClear} title="入力内容をクリア" message="現在のタブの内容を削除します。" confirmLabel="クリア" onConfirm={clearEditor} onCancel={() => setConfirmClear(false)} />
       <ConfirmDialog open={confirmReset} title="初期設定に戻す" message="現在のプロファイルを初期状態に戻します。" confirmLabel="初期化" onConfirm={resetProfile} onCancel={() => setConfirmReset(false)} />
-      <ConfirmDialog open={confirmFullReset} title="完全初期化" message="localStorageのアプリデータとアプリ関連Cacheを削除します。必要なデータは先にExportしてください。" confirmLabel="完全初期化" onConfirm={fullReset} onCancel={() => setConfirmFullReset(false)} />
+      <ConfirmDialog open={confirmFullReset} title="完全初期化" message="localStorage、IndexedDB内のアプリデータ、アプリ関連Cacheを削除します。必要なデータは先にExportしてください。SafariのHTTPキャッシュはブラウザ設定側で管理されます。" confirmLabel="完全初期化" onConfirm={fullReset} onCancel={() => setConfirmFullReset(false)} />
       <Dialog open={Boolean(tabRename)} onClose={() => setTabRename(null)} maxWidth="xs" fullWidth PaperProps={{ sx: { borderRadius: 3 } }}><DialogTitle sx={{ fontWeight: 700, pb: 1 }}>コードタブ名を変更</DialogTitle><DialogContent><MaterialUI.TextField autoFocus fullWidth size="small" value={tabRename?.name || ""} onChange={e => setTabRename(v => v ? { ...v, name: e.target.value } : v)} onKeyDown={e => { if (e.key === "Enter") applyEditorTabRename(); }} /></DialogContent><DialogActions sx={{ px: 3, pb: 2, gap: 1 }}><Button onClick={() => setTabRename(null)} variant="outlined" fullWidth>キャンセル</Button><Button onClick={applyEditorTabRename} variant="contained" fullWidth>変更</Button></DialogActions></Dialog>
       <Dialog open={profileNewOpen} onClose={() => setProfileNewOpen(false)} maxWidth="xs" fullWidth PaperProps={{ sx: { borderRadius: 3 } }}><DialogTitle sx={{ fontWeight: 700, pb: 1 }}>新規プロファイル</DialogTitle><DialogContent><MaterialUI.TextField autoFocus fullWidth size="small" value={profileNewName} onChange={e => setProfileNewName(e.target.value)} onKeyDown={e => { if (e.key === "Enter") applyNewProfile(); }} /></DialogContent><DialogActions sx={{ px: 3, pb: 2, gap: 1 }}><Button onClick={() => setProfileNewOpen(false)} variant="outlined" fullWidth>キャンセル</Button><Button onClick={applyNewProfile} variant="contained" fullWidth>作成</Button></DialogActions></Dialog>
       <Dialog open={Boolean(previewDialog)} onClose={() => setPreviewDialog(null)} maxWidth="sm" fullWidth PaperProps={{ sx: { borderRadius: 3 } }}><DialogTitle sx={{ fontWeight: 700, pb: 1 }}>{previewDialog?.title || "Preview message"}</DialogTitle><DialogContent><DialogContentText sx={{ whiteSpace: "pre-wrap" }}>{previewDialog?.message || ""}</DialogContentText></DialogContent><DialogActions sx={{ px: 3, pb: 2 }}><Button onClick={() => setPreviewDialog(null)} variant="contained">OK</Button></DialogActions></Dialog>
