@@ -51,6 +51,29 @@ function bytesLabel(pos,total){
   return `${fmt(Math.round(pos / mb))}/${fmt(Math.round(total / mb))} MB`;
 }
 function fileKey(file){ return file ? `${file.name}|${file.size}|${file.lastModified || 0}` : ""; }
+
+function stableRulesKey(rules){
+  return JSON.stringify({
+    trim:!!rules.trim,
+    nfkc:!!rules.nfkc,
+    controls:!!rules.controls,
+    collapse:!!rules.collapse,
+    emptyNull:!!rules.emptyNull,
+    numericSymbols:!!rules.numericSymbols,
+    dedupSpaces:!!rules.dedupSpaces,
+    skipBadRows:!!rules.skipBadRows,
+    nullTokens:[...(rules.nullTokens || [])].map(String).sort(),
+    numericThreshold:Number(rules.numericThreshold ?? 0.9)
+  });
+}
+function schemaCacheKey(file, encoding, delimiter, rules){
+  return JSON.stringify({
+    file:fileKey(file),
+    encoding:String(encoding || "utf-8"),
+    delimiter:String(delimiter || ","),
+    rules:stableRulesKey(rules || {})
+  });
+}
 function postProgress(value, text, payload={}){
   const t = now();
   const v = Number.isFinite(Number(value)) ? Math.max(0, Math.min(100, Number(value))) : progressCurrentValue;
@@ -144,7 +167,40 @@ function numberCandidate(value, rules){
 async function* fileLines(file, encoding, start=0, progressLabel="", progressBase=0, progressSpan=100){
   const decoder = new TextDecoder(encoding);
   const chunkSize = 4 * 1024 * 1024;
-  let pos=start, carry="";
+  let pos=start;
+  let record="";
+  let inQuotes=false;
+  let pendingQuote=false;
+
+  function* consumeText(text){
+    for (let i=0;i<text.length;i++){
+      let ch=text[i];
+
+      if (pendingQuote){
+        if (inQuotes && ch === '"'){
+          record += '""';
+          pendingQuote = false;
+          continue;
+        }
+        record += '"';
+        inQuotes = !inQuotes;
+        pendingQuote = false;
+      }
+
+      if (ch === '"'){
+        pendingQuote = true;
+        continue;
+      }
+
+      if (ch === "\n" && !inQuotes){
+        yield record.replace(/\r$/,"");
+        record="";
+      } else {
+        record += ch;
+      }
+    }
+  }
+
   while(pos < file.size){
     if (state.cancelled) throw new Error("Cancelled");
     const end=Math.min(file.size,pos+chunkSize);
@@ -155,11 +211,16 @@ async function* fileLines(file, encoding, start=0, progressLabel="", progressBas
       const value = Math.min(99, Math.floor(progressBase + (pct / 100) * progressSpan));
       postProgress(value, `${progressLabel}: ${bytesLabel(pos,file.size)} (${pct}%)`, {loadedBytes:pos,totalBytes:file.size,stage:progressLabel});
     }
-    const parts=(carry+text).split("\n");
-    carry=parts.pop() ?? "";
-    for (const line of parts) yield line.replace(/\r$/,"");
+    yield* consumeText(text);
   }
-  if (carry.length) yield carry.replace(/\r$/,"");
+
+  const tail=decoder.decode();
+  if (tail) yield* consumeText(tail);
+  if (pendingQuote){
+    record += '"';
+    pendingQuote=false;
+  }
+  if (record.length) yield record.replace(/\r$/,"");
 }
 
 function opfsAvailable(){ return !!(self.navigator && navigator.storage && navigator.storage.getDirectory); }
@@ -187,6 +248,24 @@ async function writeBuffer(dir,name,buffer){ const h=await dir.getFileHandle(nam
 async function readBuffer(dir,name){ const h=await dir.getFileHandle(name); return await (await h.getFile()).arrayBuffer(); }
 function colFileName(index, type){ return `col_${String(index).padStart(4,"0")}.${type === "number" ? "f64" : "i32"}.bin`; }
 function dictFileName(index){ return `col_${String(index).padStart(4,"0")}.dict.json`; }
+
+function compactStringColumnForMemory(idsArr, dict){
+  const used=new Map();
+  const newDict=[];
+  const remapped=new Int32Array(idsArr.length);
+  for (let i=0;i<idsArr.length;i++){
+    const oldId=idsArr[i];
+    if (oldId < 0){ remapped[i] = -1; continue; }
+    let newId=used.get(oldId);
+    if (newId == null){
+      newId=newDict.length;
+      used.set(oldId,newId);
+      newDict.push(dict[oldId] ?? "");
+    }
+    remapped[i]=newId;
+  }
+  return {ids:remapped, dict:newDict};
+}
 
 async function analyzeSchema({file, encoding, delimiter, sampleRows, rules}){
   state.file=file; state.encoding=encoding; state.delimiter=delimiter;
@@ -228,7 +307,7 @@ async function analyzeSchema({file, encoding, delimiter, sampleRows, rules}){
   });
 
   state.schema={headers, columns, rules, sampleRows:sampled, malformedSampleRows:malformed, changedSampleCells:changed};
-  state.schemaFileKey=fileKey(file);
+  state.schemaFileKey=schemaCacheKey(file, encoding, delimiter, rules);
   postProgress(92, `Schema sample complete: ${fmt(sampled)} rows / ${fmt(headers.length)} columns`);
   return state.schema;
 }
@@ -364,87 +443,92 @@ async function analyzeFilesForMerge({files, encoding, delimiter, sampleRows, rul
 
 async function buildSingleColumnarCache(msg){
   const rules=makeRules(msg);
+  const cacheKey=schemaCacheKey(msg.file, msg.encoding, msg.delimiter, rules);
   let schema=state.schema;
-  if (!schema || !schema.columns || state.schemaFileKey !== fileKey(msg.file) || msg.forceAnalyze){
+  if (!schema || !schema.columns || state.schemaFileKey !== cacheKey || msg.forceAnalyze){
     schema=await analyzeSchema({file:msg.file, encoding:msg.encoding, delimiter:msg.delimiter, sampleRows:Number(msg.sampleRows||20000), rules});
   }
 
   state.file=msg.file; state.encoding=msg.encoding; state.delimiter=msg.delimiter;
   const root=await rootDir();
-  const stamp=new Date().toISOString().replace(/[-:.TZ]/g,"").slice(0,14);
-  const id=`${safeId(msg.datasetName || msg.file.name)}_${stamp}`;
+  const id=makeDatasetId(msg.datasetName || msg.file.name);
   const dir=await root.getDirectoryHandle(id,{create:true});
-
-  const columns=schema.columns;
-  const chunkSize=Math.max(1000,Number(msg.chunkSize||100000));
-  const iter=fileLines(msg.file, msg.encoding, 0, `Reading ${msg.file.name} for cache`, 8, 72);
-  await iter.next(); // header
-
-  let chunk=initChunk(columns);
-  let chunkIndex=0, totalRows=0, sourceRows=0, skippedRows=0, malformedRows=0;
-  const chunkMetas=[];
   const t0=now();
 
-  for await (const line of iter){
-    if (state.cancelled) throw new Error("Cancelled");
-    sourceRows++;
-    let cells=parseCSVLine(line, msg.delimiter);
-    if (cells.length !== columns.length) malformedRows++;
-    if (rules.skipBadRows && cells.length !== columns.length){ skippedRows++; continue; }
-    while(cells.length < columns.length) cells.push("");
-    if (cells.length > columns.length) cells=cells.slice(0, columns.length);
+  try{
+    const columns=schema.columns;
+    const chunkSize=Math.max(1000,Number(msg.chunkSize||100000));
+    const iter=fileLines(msg.file, msg.encoding, 0, `Reading ${msg.file.name} for cache`, 8, 72);
+    await iter.next(); // header
 
-    addRowToChunk(chunk,cells,columns,rules);
-    totalRows++;
+    let chunk=initChunk(columns);
+    let chunkIndex=0, totalRows=0, sourceRows=0, skippedRows=0, malformedRows=0;
+    const chunkMetas=[];
 
-    if (chunk.rows >= chunkSize){
+    for await (const line of iter){
+      if (state.cancelled) throw new Error("Cancelled");
+      sourceRows++;
+      let cells=parseCSVLine(line, msg.delimiter);
+      if (cells.length !== columns.length) malformedRows++;
+      if (rules.skipBadRows && cells.length !== columns.length){ skippedRows++; continue; }
+      while(cells.length < columns.length) cells.push("");
+      if (cells.length > columns.length) cells=cells.slice(0, columns.length);
+
+      addRowToChunk(chunk,cells,columns,rules);
+      totalRows++;
+
+      if (chunk.rows >= chunkSize){
+        const meta=await flushChunk(dir,chunkIndex,chunk,columns);
+        chunkMetas.push(meta);
+        chunkIndex++;
+        chunk=initChunk(columns);
+        postProgress(progressCurrentValue, `Writing chunk ${fmt(chunkIndex)}... rows ${fmt(totalRows)}`);
+      }
+      if (sourceRows % 50000 === 0){
+        postProgress(progressCurrentValue, `Building columnar... source rows ${fmt(sourceRows)} / output rows ${fmt(totalRows)} / chunks ${fmt(chunkIndex)}`);
+      }
+    }
+    if (chunk.rows > 0){
       const meta=await flushChunk(dir,chunkIndex,chunk,columns);
       chunkMetas.push(meta);
       chunkIndex++;
-      chunk=initChunk(columns);
-      postProgress(progressCurrentValue, `Writing chunk ${fmt(chunkIndex)}... rows ${fmt(totalRows)}`);
     }
-    if (sourceRows % 50000 === 0){
-      postProgress(progressCurrentValue, `Building columnar... source rows ${fmt(sourceRows)} / output rows ${fmt(totalRows)} / chunks ${fmt(chunkIndex)}`);
-    }
+
+    postProgress(88, `Finalizing columnar cache... ${fmt(totalRows)} rows / ${fmt(chunkIndex)} chunks`);
+
+    const cleanReport={
+      sourceRows,totalRows,skippedRows,malformedRows,
+      changedCells:chunkMetas.flatMap(c=>c.stats).reduce((a,s)=>a+(s.changedCells||0),0),
+      nullCells:chunkMetas.flatMap(c=>c.stats).reduce((a,s)=>a+(s.nulls||0),0),
+      invalidNumbers:chunkMetas.flatMap(c=>c.stats).reduce((a,s)=>a+(s.invalidNumbers||0),0)
+    };
+
+    const tableName=cleanMetaValue(msg.tableName || msg.datasetName || msg.file.name, msg.file.name);
+    const manifest={
+      id,
+      name:msg.datasetName || tableName,
+      storageWorkspace:cleanMetaValue(msg.storageWorkspace, "Default"),
+      storageCollection:cleanMetaValue(msg.storageCollection, "General"),
+      tableName,
+      storagePath:`${cleanMetaValue(msg.storageWorkspace, "Default")} / ${cleanMetaValue(msg.storageCollection, "General")} / ${tableName}`,
+      originalFileName:msg.file.name,
+      sourceFiles:[{name:msg.file.name,size:msg.file.size,sourceRows,totalRows,skippedRows,malformedRows}],
+      createdAt:new Date().toISOString(), mode:"columnar-clean",
+      encoding:msg.encoding, delimiter:msg.delimiter, fileSize:msg.file.size,
+      chunkSize,totalRows,sourceRows,chunks:chunkIndex,
+      columns, rules, cleanReport
+    };
+    postProgress(94, "Writing manifest and chunk metadata...");
+    await writeJson(dir,"manifest.json",manifest);
+    await writeJson(dir,"chunks.json",chunkMetas);
+
+    state.dataset={id,manifest,chunks:chunkMetas};
+    state.virtual=null; state.memory=null; state.manifest=manifest; state.dir=dir; state.searchMatches=[]; state.dataQueryMatches=null; state.dataQueryMeta=null; state.pivotTable=null; state.timeTable=null;
+    return {manifest,chunks:chunkMetas,ms:now()-t0};
+  }catch(err){
+    await cleanupDatasetDir(root,id);
+    throw err;
   }
-  if (chunk.rows > 0){
-    const meta=await flushChunk(dir,chunkIndex,chunk,columns);
-    chunkMetas.push(meta);
-    chunkIndex++;
-  }
-
-  postProgress(88, `Finalizing columnar cache... ${fmt(totalRows)} rows / ${fmt(chunkIndex)} chunks`);
-
-  const cleanReport={
-    sourceRows,totalRows,skippedRows,malformedRows,
-    changedCells:chunkMetas.flatMap(c=>c.stats).reduce((a,s)=>a+(s.changedCells||0),0),
-    nullCells:chunkMetas.flatMap(c=>c.stats).reduce((a,s)=>a+(s.nulls||0),0),
-    invalidNumbers:chunkMetas.flatMap(c=>c.stats).reduce((a,s)=>a+(s.invalidNumbers||0),0)
-  };
-
-  const tableName=cleanMetaValue(msg.tableName || msg.datasetName || msg.file.name, msg.file.name);
-  const manifest={
-    id,
-    name:msg.datasetName || tableName,
-    storageWorkspace:cleanMetaValue(msg.storageWorkspace, "Default"),
-    storageCollection:cleanMetaValue(msg.storageCollection, "General"),
-    tableName,
-    storagePath:`${cleanMetaValue(msg.storageWorkspace, "Default")} / ${cleanMetaValue(msg.storageCollection, "General")} / ${tableName}`,
-    originalFileName:msg.file.name,
-    sourceFiles:[{name:msg.file.name,size:msg.file.size,sourceRows,totalRows,skippedRows,malformedRows}],
-    createdAt:new Date().toISOString(), mode:"columnar-clean",
-    encoding:msg.encoding, delimiter:msg.delimiter, fileSize:msg.file.size,
-    chunkSize,totalRows,sourceRows,chunks:chunkIndex,
-    columns, rules, cleanReport
-  };
-  postProgress(94, "Writing manifest and chunk metadata...");
-  await writeJson(dir,"manifest.json",manifest);
-  await writeJson(dir,"chunks.json",chunkMetas);
-
-  state.dataset={id,manifest,chunks:chunkMetas};
-  state.manifest=manifest; state.dir=dir; state.searchMatches=[]; state.dataQueryMatches=null; state.dataQueryMeta=null; state.pivotTable=null;
-  return {manifest,chunks:chunkMetas,ms:now()-t0};
 }
 
 async function buildMergedColumnarCache(msg){
@@ -458,86 +542,90 @@ async function buildMergedColumnarCache(msg){
   state.file=files[0]; state.encoding=msg.encoding; state.delimiter=msg.delimiter;
 
   const root=await rootDir();
-  const stamp=new Date().toISOString().replace(/[-:.TZ]/g,"").slice(0,14);
-  const id=`${safeId(msg.datasetName || `merged_${files.length}_csv`)}_${stamp}`;
+  const id=makeDatasetId(msg.datasetName || `merged_${files.length}_csv`);
   const dir=await root.getDirectoryHandle(id,{create:true});
-  const chunkSize=Math.max(1000,Number(msg.chunkSize||100000));
-
-  let chunk=initChunk(columns);
-  let chunkIndex=0, totalRows=0, sourceRows=0, skippedRows=0, malformedRows=0;
-  const sourceFiles=[];
-  const chunkMetas=[];
   const t0=now();
 
-  for (let f=0; f<files.length; f++){
-    const file=files[f];
-    const iter=fileLines(file, msg.encoding, 0, `Reading CSV ${f+1}/${files.length} ${file.name}`, Math.floor((f/files.length)*80)+8, Math.max(1, Math.floor(80/files.length)));
-    await iter.next(); // header
-    let fileSourceRows=0, fileTotalRows=0, fileSkippedRows=0, fileMalformedRows=0;
-    postProgress(Math.floor((f/files.length)*80)+8, `Merging CSV ${f+1}/${files.length}: ${file.name}`);
+  try{
+    const chunkSize=Math.max(1000,Number(msg.chunkSize||100000));
+    let chunk=initChunk(columns);
+    let chunkIndex=0, totalRows=0, sourceRows=0, skippedRows=0, malformedRows=0;
+    const sourceFiles=[];
+    const chunkMetas=[];
 
-    for await (const line of iter){
-      if (state.cancelled) throw new Error("Cancelled");
-      fileSourceRows++; sourceRows++;
-      let cells=parseCSVLine(line, msg.delimiter);
-      if (cells.length !== columns.length){ malformedRows++; fileMalformedRows++; }
-      if (rules.skipBadRows && cells.length !== columns.length){ skippedRows++; fileSkippedRows++; continue; }
-      while(cells.length < columns.length) cells.push("");
-      if (cells.length > columns.length) cells=cells.slice(0, columns.length);
+    for (let f=0; f<files.length; f++){
+      const file=files[f];
+      const iter=fileLines(file, msg.encoding, 0, `Reading CSV ${f+1}/${files.length} ${file.name}`, Math.floor((f/files.length)*80)+8, Math.max(1, Math.floor(80/files.length)));
+      await iter.next(); // header
+      let fileSourceRows=0, fileTotalRows=0, fileSkippedRows=0, fileMalformedRows=0;
+      postProgress(Math.floor((f/files.length)*80)+8, `Merging CSV ${f+1}/${files.length}: ${file.name}`);
 
-      addRowToChunk(chunk,cells,columns,rules);
-      totalRows++; fileTotalRows++;
+      for await (const line of iter){
+        if (state.cancelled) throw new Error("Cancelled");
+        fileSourceRows++; sourceRows++;
+        let cells=parseCSVLine(line, msg.delimiter);
+        if (cells.length !== columns.length){ malformedRows++; fileMalformedRows++; }
+        if (rules.skipBadRows && cells.length !== columns.length){ skippedRows++; fileSkippedRows++; continue; }
+        while(cells.length < columns.length) cells.push("");
+        if (cells.length > columns.length) cells=cells.slice(0, columns.length);
 
-      if (chunk.rows >= chunkSize){
-        const meta=await flushChunk(dir,chunkIndex,chunk,columns);
-        chunkMetas.push(meta);
-        chunkIndex++;
-        chunk=initChunk(columns);
+        addRowToChunk(chunk,cells,columns,rules);
+        totalRows++; fileTotalRows++;
+
+        if (chunk.rows >= chunkSize){
+          const meta=await flushChunk(dir,chunkIndex,chunk,columns);
+          chunkMetas.push(meta);
+          chunkIndex++;
+          chunk=initChunk(columns);
+        }
+        if (sourceRows % 50000 === 0){
+          postProgress(progressCurrentValue, `Merging... source rows ${fmt(sourceRows)} / output rows ${fmt(totalRows)} / chunks ${fmt(chunkIndex)}`);
+        }
       }
-      if (sourceRows % 50000 === 0){
-        postProgress(progressCurrentValue, `Merging... source rows ${fmt(sourceRows)} / output rows ${fmt(totalRows)} / chunks ${fmt(chunkIndex)}`);
-      }
+      sourceFiles.push({name:file.name,size:file.size,sourceRows:fileSourceRows,totalRows:fileTotalRows,skippedRows:fileSkippedRows,malformedRows:fileMalformedRows});
     }
-    sourceFiles.push({name:file.name,size:file.size,sourceRows:fileSourceRows,totalRows:fileTotalRows,skippedRows:fileSkippedRows,malformedRows:fileMalformedRows});
+
+    if (chunk.rows > 0){
+      const meta=await flushChunk(dir,chunkIndex,chunk,columns);
+      chunkMetas.push(meta);
+      chunkIndex++;
+    }
+
+    postProgress(88, `Finalizing merged cache... ${fmt(totalRows)} rows / ${fmt(chunkIndex)} chunks`);
+
+    const cleanReport={
+      sourceRows,totalRows,skippedRows,malformedRows,
+      changedCells:chunkMetas.flatMap(c=>c.stats).reduce((a,s)=>a+(s.changedCells||0),0),
+      nullCells:chunkMetas.flatMap(c=>c.stats).reduce((a,s)=>a+(s.nulls||0),0),
+      invalidNumbers:chunkMetas.flatMap(c=>c.stats).reduce((a,s)=>a+(s.invalidNumbers||0),0),
+      typeWarnings:analyzed.typeWarnings
+    };
+
+    const tableName=cleanMetaValue(msg.tableName || msg.datasetName || `merged_${files.length}_csv`, `merged_${files.length}_csv`);
+    const manifest={
+      id,
+      name:msg.datasetName || tableName,
+      storageWorkspace:cleanMetaValue(msg.storageWorkspace, "Default"),
+      storageCollection:cleanMetaValue(msg.storageCollection, "General"),
+      tableName,
+      storagePath:`${cleanMetaValue(msg.storageWorkspace, "Default")} / ${cleanMetaValue(msg.storageCollection, "General")} / ${tableName}`,
+      originalFileName:files.map(f=>f.name).join(" + "),
+      sourceFiles,
+      createdAt:new Date().toISOString(), mode:"columnar-clean-merged-csv",
+      encoding:msg.encoding, delimiter:msg.delimiter, fileSize:files.reduce((a,f)=>a+(f.size||0),0),
+      chunkSize,totalRows,sourceRows,chunks:chunkIndex,
+      columns, rules, cleanReport
+    };
+    await writeJson(dir,"manifest.json",manifest);
+    await writeJson(dir,"chunks.json",chunkMetas);
+
+    state.dataset={id,manifest,chunks:chunkMetas};
+    state.virtual=null; state.memory=null; state.manifest=manifest; state.dir=dir; state.searchMatches=[]; state.dataQueryMatches=null; state.dataQueryMeta=null; state.pivotTable=null; state.timeTable=null;
+    return {manifest,chunks:chunkMetas,ms:now()-t0,typeWarnings:analyzed.typeWarnings};
+  }catch(err){
+    await cleanupDatasetDir(root,id);
+    throw err;
   }
-
-  if (chunk.rows > 0){
-    const meta=await flushChunk(dir,chunkIndex,chunk,columns);
-    chunkMetas.push(meta);
-    chunkIndex++;
-  }
-
-  postProgress(88, `Finalizing merged cache... ${fmt(totalRows)} rows / ${fmt(chunkIndex)} chunks`);
-
-  const cleanReport={
-    sourceRows,totalRows,skippedRows,malformedRows,
-    changedCells:chunkMetas.flatMap(c=>c.stats).reduce((a,s)=>a+(s.changedCells||0),0),
-    nullCells:chunkMetas.flatMap(c=>c.stats).reduce((a,s)=>a+(s.nulls||0),0),
-    invalidNumbers:chunkMetas.flatMap(c=>c.stats).reduce((a,s)=>a+(s.invalidNumbers||0),0),
-    typeWarnings:analyzed.typeWarnings
-  };
-
-  const tableName=cleanMetaValue(msg.tableName || msg.datasetName || `merged_${files.length}_csv`, `merged_${files.length}_csv`);
-  const manifest={
-    id,
-    name:msg.datasetName || tableName,
-    storageWorkspace:cleanMetaValue(msg.storageWorkspace, "Default"),
-    storageCollection:cleanMetaValue(msg.storageCollection, "General"),
-    tableName,
-    storagePath:`${cleanMetaValue(msg.storageWorkspace, "Default")} / ${cleanMetaValue(msg.storageCollection, "General")} / ${tableName}`,
-    originalFileName:files.map(f=>f.name).join(" + "),
-    sourceFiles,
-    createdAt:new Date().toISOString(), mode:"columnar-clean-merged-csv",
-    encoding:msg.encoding, delimiter:msg.delimiter, fileSize:files.reduce((a,f)=>a+(f.size||0),0),
-    chunkSize,totalRows,sourceRows,chunks:chunkIndex,
-    columns, rules, cleanReport
-  };
-  await writeJson(dir,"manifest.json",manifest);
-  await writeJson(dir,"chunks.json",chunkMetas);
-
-  state.dataset={id,manifest,chunks:chunkMetas};
-  state.virtual=null; state.virtual=null; state.memory=null; state.manifest=manifest; state.dir=dir; state.searchMatches=[]; state.dataQueryMatches=null; state.dataQueryMeta=null; state.pivotTable=null; state.timeTable=null;
-  return {manifest,chunks:chunkMetas,ms:now()-t0,typeWarnings:analyzed.typeWarnings};
 }
 
 async function buildColumnarCache(msg){
@@ -722,7 +810,12 @@ async function openMemoryDataset(ids, name, options={}){
           const buf=await readBuffer(chunkDir,colFileName(col.index,col.type));
           let idsArr=new Int32Array(buf);
           if (takeRows < idsArr.length) idsArr=idsArr.slice(0,takeRows);
-          const dict=await readJson(chunkDir,dictFileName(col.index));
+          let dict=await readJson(chunkDir,dictFileName(col.index));
+          if (takeRows < originalRowCount){
+            const compact=compactStringColumnForMemory(idsArr, dict);
+            idsArr=compact.ids;
+            dict=compact.dict;
+          }
           estimatedBytes += idsArr.byteLength + JSON.stringify(dict).length * 2;
           colMap.set(col.index,{type:"string", ids:idsArr, dict});
         }
@@ -778,8 +871,11 @@ function activeIsVirtual(){ return !!state.virtual && state.manifest?.mode === "
 function activeIsMemory(){ return !!state.memory && state.manifest?.mode === "memory-dataset"; }
 function chunkBaseRow(chunkIndex){
   if (activeIsMemory()) return Number(state.memory.chunks[chunkIndex]?.rowStart || 0);
-  if (!activeIsVirtual()) return chunkIndex * state.manifest.chunkSize;
-  return Number(state.virtual.globalChunks[chunkIndex]?.rowStart || 0);
+  if (activeIsVirtual()) return Number(state.virtual.globalChunks[chunkIndex]?.rowStart || 0);
+  const chunks=state.dataset?.chunks || [];
+  let start=0;
+  for (let i=0;i<chunkIndex;i++) start += Number(chunks[i]?.rowCount || 0);
+  return start;
 }
 
 async function deleteDataset(id){
@@ -805,71 +901,76 @@ async function mergeSavedDatasets(ids, datasetName, storageMeta={}){
     if (sig !== baseSig) throw new Error(`Merge blocked: saved dataset ${item.manifest.name || item.id} has a different column name/type layout`);
   }
 
-  const stamp=new Date().toISOString().replace(/[-:.TZ]/g,"").slice(0,14);
-  const id=`${safeId(datasetName || `merged_${list.length}_saved`)}_${stamp}`;
+  const id=makeDatasetId(datasetName || `merged_${list.length}_saved`);
   const targetDir=await root.getDirectoryHandle(id,{create:true});
-  const columns=base.columns;
-  const chunkMetas=[];
-  let chunkIndex=0;
 
-  for (let d=0; d<opened.length; d++){
-    const item=opened[d];
-    for (let c=0; c<item.chunks.length; c++){
-      if (state.cancelled) throw new Error("Cancelled");
-      post("PROGRESS",{value:Math.floor((d/opened.length)*100), text:`Merging saved dataset ${d+1}/${opened.length}: chunk ${c+1}/${item.chunks.length}`});
-      const sourceChunkDir=await item.dir.getDirectoryHandle(`chunk_${String(c).padStart(6,"0")}`);
-      const targetChunkDir=await targetDir.getDirectoryHandle(`chunk_${String(chunkIndex).padStart(6,"0")}`, {create:true});
-      for (const col of columns){
-        await writeBuffer(targetChunkDir, colFileName(col.index,col.type), await readBuffer(sourceChunkDir, colFileName(col.index,col.type)));
-        if (col.type === "string") await writeJson(targetChunkDir, dictFileName(col.index), await readJson(sourceChunkDir, dictFileName(col.index)));
+  try{
+    const columns=base.columns;
+    const chunkMetas=[];
+    let chunkIndex=0;
+
+    for (let d=0; d<opened.length; d++){
+      const item=opened[d];
+      for (let c=0; c<item.chunks.length; c++){
+        if (state.cancelled) throw new Error("Cancelled");
+        post("PROGRESS",{value:Math.floor((d/opened.length)*100), text:`Merging saved dataset ${d+1}/${opened.length}: chunk ${c+1}/${item.chunks.length}`});
+        const sourceChunkDir=await item.dir.getDirectoryHandle(`chunk_${String(c).padStart(6,"0")}`);
+        const targetChunkDir=await targetDir.getDirectoryHandle(`chunk_${String(chunkIndex).padStart(6,"0")}`, {create:true});
+        for (const col of columns){
+          await writeBuffer(targetChunkDir, colFileName(col.index,col.type), await readBuffer(sourceChunkDir, colFileName(col.index,col.type)));
+          if (col.type === "string") await writeJson(targetChunkDir, dictFileName(col.index), await readJson(sourceChunkDir, dictFileName(col.index)));
+        }
+        const meta=await readJson(sourceChunkDir,"meta.json");
+        const copiedMeta={...meta,chunkIndex};
+        await writeJson(targetChunkDir,"meta.json",copiedMeta);
+        chunkMetas.push(copiedMeta);
+        chunkIndex++;
       }
-      const meta=await readJson(sourceChunkDir,"meta.json");
-      const copiedMeta={...meta,chunkIndex};
-      await writeJson(targetChunkDir,"meta.json",copiedMeta);
-      chunkMetas.push(copiedMeta);
-      chunkIndex++;
     }
-  }
 
-  function sumReport(key){ return opened.reduce((a,x)=>a+Number(x.manifest.cleanReport?.[key]||0),0); }
-  const totalRows=opened.reduce((a,x)=>a+Number(x.manifest.totalRows||0),0);
-  const sourceRows=opened.reduce((a,x)=>a+Number(x.manifest.sourceRows||0),0);
-  const cleanReport={
-    sourceRows,totalRows,
-    skippedRows:sumReport("skippedRows"),
-    malformedRows:sumReport("malformedRows"),
-    changedCells:sumReport("changedCells"),
-    nullCells:sumReport("nullCells"),
-    invalidNumbers:sumReport("invalidNumbers")
-  };
-  const tableName=cleanMetaValue(storageMeta.tableName || datasetName || `merged_${list.length}_saved`, `merged_${list.length}_saved`);
-  const manifest={
-    id,
-    name:datasetName || tableName,
-    storageWorkspace:cleanMetaValue(storageMeta.storageWorkspace, manifestWorkspace(base)),
-    storageCollection:cleanMetaValue(storageMeta.storageCollection, manifestCollection(base)),
-    tableName,
-    storagePath:`${cleanMetaValue(storageMeta.storageWorkspace, manifestWorkspace(base))} / ${cleanMetaValue(storageMeta.storageCollection, manifestCollection(base))} / ${tableName}`,
-    originalFileName:opened.map(x=>x.manifest.name || x.id).join(" + "),
-    sourceDatasets:opened.map(x=>({id:x.id,name:x.manifest.name,rows:x.manifest.totalRows,chunks:x.manifest.chunks,createdAt:x.manifest.createdAt})),
-    createdAt:new Date().toISOString(),
-    mode:"columnar-clean-merged-opfs",
-    encoding:base.encoding,
-    delimiter:base.delimiter,
-    fileSize:opened.reduce((a,x)=>a+Number(x.manifest.fileSize||0),0),
-    chunkSize:base.chunkSize,
-    totalRows,
-    sourceRows,
-    chunks:chunkMetas.length,
-    columns,
-    rules:base.rules,
-    cleanReport
-  };
-  await writeJson(targetDir,"manifest.json",manifest);
-  await writeJson(targetDir,"chunks.json",chunkMetas);
-  state.dataset={id,manifest,chunks:chunkMetas};
-  state.virtual=null; state.memory=null; state.manifest=manifest; state.dir=targetDir; state.searchMatches=[]; state.dataQueryMatches=null; state.dataQueryMeta=null; state.pivotTable=null; state.timeTable=null;
-  return {manifest,chunks:chunkMetas};
+    function sumReport(key){ return opened.reduce((a,x)=>a+Number(x.manifest.cleanReport?.[key]||0),0); }
+    const totalRows=opened.reduce((a,x)=>a+Number(x.manifest.totalRows||0),0);
+    const sourceRows=opened.reduce((a,x)=>a+Number(x.manifest.sourceRows||0),0);
+    const cleanReport={
+      sourceRows,totalRows,
+      skippedRows:sumReport("skippedRows"),
+      malformedRows:sumReport("malformedRows"),
+      changedCells:sumReport("changedCells"),
+      nullCells:sumReport("nullCells"),
+      invalidNumbers:sumReport("invalidNumbers")
+    };
+    const tableName=cleanMetaValue(storageMeta.tableName || datasetName || `merged_${list.length}_saved`, `merged_${list.length}_saved`);
+    const manifest={
+      id,
+      name:datasetName || tableName,
+      storageWorkspace:cleanMetaValue(storageMeta.storageWorkspace, manifestWorkspace(base)),
+      storageCollection:cleanMetaValue(storageMeta.storageCollection, manifestCollection(base)),
+      tableName,
+      storagePath:`${cleanMetaValue(storageMeta.storageWorkspace, manifestWorkspace(base))} / ${cleanMetaValue(storageMeta.storageCollection, manifestCollection(base))} / ${tableName}`,
+      originalFileName:opened.map(x=>x.manifest.name || x.id).join(" + "),
+      sourceDatasets:opened.map(x=>({id:x.id,name:x.manifest.name,rows:x.manifest.totalRows,chunks:x.manifest.chunks,createdAt:x.manifest.createdAt})),
+      createdAt:new Date().toISOString(),
+      mode:"columnar-clean-merged-opfs",
+      encoding:base.encoding,
+      delimiter:base.delimiter,
+      fileSize:opened.reduce((a,x)=>a+Number(x.manifest.fileSize||0),0),
+      chunkSize:base.chunkSize,
+      totalRows,
+      sourceRows,
+      chunks:chunkMetas.length,
+      columns,
+      rules:base.rules,
+      cleanReport
+    };
+    await writeJson(targetDir,"manifest.json",manifest);
+    await writeJson(targetDir,"chunks.json",chunkMetas);
+    state.dataset={id,manifest,chunks:chunkMetas};
+    state.virtual=null; state.memory=null; state.manifest=manifest; state.dir=targetDir; state.searchMatches=[]; state.dataQueryMatches=null; state.dataQueryMeta=null; state.pivotTable=null; state.timeTable=null;
+    return {manifest,chunks:chunkMetas};
+  }catch(err){
+    await cleanupDatasetDir(root,id);
+    throw err;
+  }
 }
 
 async function purgeAllDatasets(){
@@ -958,26 +1059,33 @@ function valueFromColumn(colData, localRow){
 }
 
 function rowAddress(globalRow){
+  const target=Math.max(0, Number(globalRow || 0));
   if (activeIsMemory()){
-    const target=Number(globalRow || 0);
     for (let i=0; i<state.memory.chunks.length; i++){
       const ch=state.memory.chunks[i];
       if (target >= ch.rowStart && target < ch.rowEnd) return {chunkIndex:i, localRow:target - ch.rowStart};
     }
     const last=state.memory.chunks[state.memory.chunks.length-1];
-    return {chunkIndex:Math.max(0,state.memory.chunks.length-1), localRow:Math.max(0, (last?.rowEnd || 1) - (last?.rowStart || 0) - 1)};
+    return {chunkIndex:Math.max(0,state.memory.chunks.length-1), localRow:Math.max(0, Number(last?.rowCount || 1) - 1)};
   }
   if (activeIsVirtual()){
-    const target=Number(globalRow || 0);
     for (let i=0; i<state.virtual.globalChunks.length; i++){
       const ch=state.virtual.globalChunks[i];
       if (target >= ch.rowStart && target < ch.rowEnd) return {chunkIndex:i, localRow:target - ch.rowStart};
     }
     const last=state.virtual.globalChunks[state.virtual.globalChunks.length-1];
-    return {chunkIndex:Math.max(0,state.virtual.globalChunks.length-1), localRow:Math.max(0, (last?.rowEnd || 1) - (last?.rowStart || 0) - 1)};
+    return {chunkIndex:Math.max(0,state.virtual.globalChunks.length-1), localRow:Math.max(0, Number(last?.rowCount || 1) - 1)};
   }
-  const chunkSize=state.manifest.chunkSize;
-  return {chunkIndex:Math.floor(globalRow/chunkSize), localRow:globalRow%chunkSize};
+  const chunks=state.dataset?.chunks || [];
+  let start=0;
+  for (let i=0;i<chunks.length;i++){
+    const rowCount=Number(chunks[i]?.rowCount || 0);
+    const end=start + rowCount;
+    if (target >= start && target < end) return {chunkIndex:i, localRow:target - start};
+    start=end;
+  }
+  const last=chunks[chunks.length-1];
+  return {chunkIndex:Math.max(0,chunks.length-1), localRow:Math.max(0, Number(last?.rowCount || 1) - 1)};
 }
 
 function normalizeCols(cols){
@@ -1075,7 +1183,8 @@ async function runDataQuery({filters, sort, maxRows}){
   }
 
   const required = [...new Set([...normalizedFilters.map(f => f.columnIndex), ...(hasSort ? [sortColumn] : [])])];
-  const limit = Number(maxRows || 0) > 0 ? Number(maxRows) : Number.POSITIVE_INFINITY;
+  const requestedLimit = Number(maxRows || 0) > 0 ? Number(maxRows) : Number.POSITIVE_INFINITY;
+  const scanLimit = hasSort ? Number.POSITIVE_INFINITY : requestedLimit;
   const refs = [];
   const sortable = [];
   const t0 = now();
@@ -1094,7 +1203,8 @@ async function runDataQuery({filters, sort, maxRows}){
         const v = valueFromColumn(chunk.columns.get(f.columnIndex), r);
         if (!compareValue(v, f.op, f.value, col.type)) { ok = false; break; }
       }
-      if (!ok) { scanned++; continue; }
+      scanned++;
+      if (!ok) continue;
 
       const rowId = base + r;
       if (hasSort) {
@@ -1104,8 +1214,7 @@ async function runDataQuery({filters, sort, maxRows}){
         refs.push(rowId);
       }
 
-      if ((hasSort ? sortable.length : refs.length) >= limit) { capped = true; break; }
-      scanned++;
+      if (!hasSort && refs.length >= scanLimit) { capped = true; break; }
     }
     if (capped) break;
     if (c % 5 === 0) {
@@ -1126,13 +1235,14 @@ async function runDataQuery({filters, sort, maxRows}){
       }
       return String(a.value ?? "").localeCompare(String(b.value ?? ""), "ja", {numeric:true}) * dir || (a.rowId - b.rowId);
     });
-    state.dataQueryMatches = sortable.map(x=>x.rowId);
+    capped = Number.isFinite(requestedLimit) && sortable.length > requestedLimit;
+    state.dataQueryMatches = sortable.map(x=>x.rowId).slice(0, requestedLimit);
   } else {
     state.dataQueryMatches = refs;
   }
 
   state.dataQueryMeta = {filters:normalizedFilters, sort:hasSort ? {columnIndex:sortColumn,direction:sortDirection} : null, capped};
-  return {matches:state.dataQueryMatches.length, active:true, capped, ms:now()-t0};
+  return {matches:state.dataQueryMatches.length, active:true, capped, scanned, ms:now()-t0};
 }
 
 async function readDataQueryPage(page,pageSize,cols){
@@ -1175,8 +1285,8 @@ async function buildPivot({rowFields,columnFields,valueField,aggregation,maxRows
     if (state.cancelled) throw new Error("Cancelled");
     const chunk=await readChunkColumns(c,required);
     for (let r=0;r<chunk.rowCount;r++){
-      const rk=keyOf(rowIdx.map(i=>String(valueFromColumn(chunk.columns.get(i),r) || "(blank)")));
-      const ck=keyOf(colIdx.map(i=>String(valueFromColumn(chunk.columns.get(i),r) || "(blank)")));
+      const rk=keyOf(rowIdx.map(i=>keyCellValue(valueFromColumn(chunk.columns.get(i),r))));
+      const ck=keyOf(colIdx.map(i=>keyCellValue(valueFromColumn(chunk.columns.get(i),r))));
       if (!rowSet.has(rk)){ if (rowKeys.length>=maxRows){limitHit=true; scanned++; continue;} rowSet.add(rk); rowKeys.push(rk); }
       if (!colSet.has(ck)){ if (colKeys.length>=maxCols){limitHit=true; scanned++; continue;} colSet.add(ck); colKeys.push(ck); }
       const v=countMode ? "" : valueFromColumn(chunk.columns.get(valIdx),r);
@@ -1264,7 +1374,7 @@ async function buildTimeSeries({timeField, bucket, groupField, valueField, aggre
   if (!state.manifest.columns[timeIdx]) throw new Error("Time field is not selected");
 
   const states = new Map();
-  const bucketSet = new Set();
+  const timeBucketSet = new Set();
   const t0 = now();
   let scanned = 0, invalidTime = 0, limitHit = false;
 
@@ -1277,18 +1387,19 @@ async function buildTimeSeries({timeField, bucket, groupField, valueField, aggre
       const b = parseTimeBucket(rawTime, bucket);
       if (!b) { invalidTime++; scanned++; continue; }
 
-      const g = hasGroup ? String(valueFromColumn(chunk.columns.get(groupIdx), r) || "(blank)") : "(All)";
-      const key = `${b}\u001f${g}`;
-
-      if (!states.has(key)) {
-        if (bucketSet.size >= maxBuckets && !bucketSet.has(key)) {
+      if (!timeBucketSet.has(b)){
+        if (timeBucketSet.size >= maxBuckets){
           limitHit = true;
           scanned++;
           continue;
         }
-        states.set(key, makeAgg());
-        bucketSet.add(key);
+        timeBucketSet.add(b);
       }
+
+      const g = hasGroup ? keyCellValue(valueFromColumn(chunk.columns.get(groupIdx), r)) : "(All)";
+      const key = `${b}\u001f${g}`;
+
+      if (!states.has(key)) states.set(key, makeAgg());
 
       const v = countMode ? "" : valueFromColumn(chunk.columns.get(valIdx), r);
       addAgg(states.get(key), v, countMode);
@@ -1346,7 +1457,8 @@ self.onmessage=async(e)=>{
       const previewLimit=Number(msg.pageSize||200);
       postProgress(1, `Preparing preview: ${msg.file.name}`);
       let schema=state.schema;
-      if (msg.forceAnalyze || !schema || state.schemaFileKey !== fileKey(msg.file)) {
+      const cacheKey=schemaCacheKey(msg.file, msg.encoding, msg.delimiter, rules);
+      if (msg.forceAnalyze || !schema || state.schemaFileKey !== cacheKey) {
         const sampleForPreview = Math.max(200, Math.min(Number(msg.sampleRows||1000), Math.max(1000, previewLimit)));
         schema=await analyzeSchema({file:msg.file,encoding:msg.encoding,delimiter:msg.delimiter,sampleRows:sampleForPreview,rules});
       }
