@@ -348,7 +348,9 @@ function integrityFeatureFlags(base={}){
     quoteNewlineCSV:true,
     lruChunkCache:true,
     integrityCheck:true,
-    repairLayer:true
+    repairLayer:true,
+    queryPlan:true,
+    predicatePushdown:true
   };
 }
 
@@ -455,7 +457,7 @@ async function validateAndRepairDatasetDir(id,dir,options={}){
   let changedManifest=false, changedChunks=false;
   if (manifest.id !== id){ manifest.id=id; changedManifest=true; repairs.push("manifest.id normalized to directory id"); }
   manifest.features=integrityFeatureFlags(manifest.features);
-  if (Number(manifest.formatVersion || 0) < 4){ manifest.formatVersion=4; changedManifest=true; repairs.push("manifest.formatVersion upgraded to 4"); }
+  if (Number(manifest.formatVersion || 0) < 5){ manifest.formatVersion=5; changedManifest=true; repairs.push("manifest.formatVersion upgraded to 5"); }
 
   const repairedChunks=[];
   let totalRows=0;
@@ -727,6 +729,122 @@ function canSkipChunkForTime(chunkIndex, timeField){
   return !!stat && Number(stat.rowCount || meta?.rowCount || 0) > 0 && Number(stat.nullCount || 0) >= Number(stat.rowCount || meta?.rowCount || 0);
 }
 
+
+const QUERY_PLAN_VERSION = 1;
+
+function normalizeQueryOp(op, type){
+  const raw=String(op || "contains").toLowerCase().trim();
+  const aliases={
+    "=":"eq", "==":"eq", "===":"eq",
+    "!=" :"ne", "!==":"ne", "<>":"ne",
+    ">":"gt", ">=":"ge", "<":"lt", "<=":"le",
+    "is null":"isnull", "null":"isnull",
+    "is not null":"notnull", "not null":"notnull"
+  };
+  const x=aliases[raw] || raw;
+  if (["eq","ne","gt","ge","lt","le","contains","isnull","notnull"].includes(x)) return x;
+  return type === "number" ? "eq" : "contains";
+}
+
+function normalizeProjection(columns){
+  const set=new Set();
+  for (const raw of Array.isArray(columns) ? columns : []){
+    const idx=Number(raw);
+    if (Number.isFinite(idx) && idx >= 0 && state.manifest?.columns?.[idx]) set.add(idx);
+  }
+  return [...set].sort((a,b)=>a-b);
+}
+
+function normalizeQueryPredicate(raw){
+  const columnIndex=Number(raw?.columnIndex);
+  const col=state.manifest?.columns?.[columnIndex];
+  if (!Number.isFinite(columnIndex) || columnIndex < 0 || !col) return null;
+  const op=normalizeQueryOp(raw?.op, col.type);
+  return {
+    columnIndex,
+    columnName:col.name,
+    type:col.type,
+    op,
+    value:raw?.value ?? "",
+    source:raw?.source || "filter",
+    rowLevel:raw?.rowLevel !== false,
+    pushdown:raw?.pushdown !== false
+  };
+}
+
+function buildQueryPlan({name="query", predicates=[], projection=[], sort=null, limit=0, pushdown=true}={}){
+  const compiledPredicates=(Array.isArray(predicates) ? predicates : [])
+    .map(normalizeQueryPredicate)
+    .filter(Boolean);
+
+  let sortSpec=null;
+  const sortColumn = sort && sort.columnIndex !== "" && sort.columnIndex != null ? Number(sort.columnIndex) : -1;
+  const sortCol=state.manifest?.columns?.[sortColumn];
+  if (Number.isFinite(sortColumn) && sortColumn >= 0 && sortCol){
+    sortSpec={
+      columnIndex:sortColumn,
+      columnName:sortCol.name,
+      type:sortCol.type,
+      direction:sort?.direction === "desc" ? "desc" : "asc"
+    };
+  }
+
+  const required=new Set(normalizeProjection(projection));
+  for (const p of compiledPredicates) required.add(p.columnIndex);
+  if (sortSpec) required.add(sortSpec.columnIndex);
+
+  return {
+    version:QUERY_PLAN_VERSION,
+    name,
+    predicates:compiledPredicates,
+    projection:normalizeProjection(projection),
+    sort:sortSpec,
+    requiredColumns:[...required].sort((a,b)=>a-b),
+    limit:Number(limit || 0) > 0 ? Number(limit) : Number.POSITIVE_INFINITY,
+    pushdown:!!pushdown
+  };
+}
+
+function canSkipChunkByQueryPlan(chunkIndex, plan){
+  if (!plan?.pushdown || !Array.isArray(plan.predicates) || !plan.predicates.length) return false;
+  for (const p of plan.predicates){
+    if (!p.pushdown) continue;
+    const meta=chunkMetaForIndex(chunkIndex);
+    const stat=columnStatFromChunkMeta(meta, p.columnIndex);
+    if (canSkipByColumnStat(stat, p.op, p.value, p.type)) return true;
+  }
+  return false;
+}
+
+function rowMatchesQueryPlan(chunk, localRow, plan){
+  if (!Array.isArray(plan?.predicates) || !plan.predicates.length) return true;
+  for (const p of plan.predicates){
+    if (!p.rowLevel) continue;
+    const v=valueFromColumn(chunk.columns.get(p.columnIndex), localRow);
+    if (!compareValue(v, p.op, p.value, p.type)) return false;
+  }
+  return true;
+}
+
+function queryPlanSummary(plan){
+  return {
+    version:plan?.version || QUERY_PLAN_VERSION,
+    name:plan?.name || "query",
+    predicates:(plan?.predicates || []).map(p=>({
+      columnIndex:p.columnIndex,
+      columnName:p.columnName,
+      op:p.op,
+      type:p.type,
+      source:p.source,
+      rowLevel:p.rowLevel,
+      pushdown:p.pushdown
+    })),
+    sort:plan?.sort || null,
+    requiredColumns:plan?.requiredColumns || [],
+    predicatePushdown:!!plan?.pushdown
+  };
+}
+
 function compactStringColumnForMemory(idsArr, dict){
   const used=new Map();
   const newDict=[];
@@ -996,7 +1114,7 @@ async function buildSingleColumnarCache(msg){
       originalFileName:msg.file.name,
       sourceFiles:[{name:msg.file.name,size:msg.file.size,sourceRows,totalRows,skippedRows,malformedRows}],
       createdAt:new Date().toISOString(), mode:"columnar-clean",
-      formatVersion:4, features:integrityFeatureFlags({}),
+      formatVersion:5, features:integrityFeatureFlags({}),
       encoding:msg.encoding, delimiter:msg.delimiter, fileSize:msg.file.size,
       chunkSize,totalRows,sourceRows,chunks:chunkIndex,
       columns, rules, cleanReport
@@ -1096,7 +1214,7 @@ async function buildMergedColumnarCache(msg){
       originalFileName:files.map(f=>f.name).join(" + "),
       sourceFiles,
       createdAt:new Date().toISOString(), mode:"columnar-clean-merged-csv",
-      formatVersion:4, features:integrityFeatureFlags({}),
+      formatVersion:5, features:integrityFeatureFlags({}),
       encoding:msg.encoding, delimiter:msg.delimiter, fileSize:files.reduce((a,f)=>a+(f.size||0),0),
       chunkSize,totalRows,sourceRows,chunks:chunkIndex,
       columns, rules, cleanReport
@@ -1436,7 +1554,7 @@ async function mergeSavedDatasets(ids, datasetName, storageMeta={}){
       sourceDatasets:opened.map(x=>({id:x.id,name:x.manifest.name,rows:x.manifest.totalRows,chunks:x.manifest.chunks,createdAt:x.manifest.createdAt})),
       createdAt:new Date().toISOString(),
       mode:"columnar-clean-merged-opfs",
-      formatVersion:4, features:integrityFeatureFlags({}),
+      formatVersion:5, features:integrityFeatureFlags({}),
       encoding:base.encoding,
       delimiter:base.delimiter,
       fileSize:opened.reduce((a,x)=>a+Number(x.manifest.fileSize||0),0),
@@ -1669,53 +1787,68 @@ async function runSearch({columnIndex, op, value, maxMatches}){
   const idx=Number(columnIndex);
   const col=state.manifest.columns[idx];
   if (!col) throw new Error("Search column is not selected");
+  const cap=Number(maxMatches || 0) > 0 ? Number(maxMatches) : Number.POSITIVE_INFINITY;
+  const plan=buildQueryPlan({
+    name:"search",
+    predicates:[{columnIndex:idx, op, value, source:"search"}],
+    projection:[idx],
+    limit:cap,
+    pushdown:true
+  });
   const matches=[];
   const t0=now();
-  let skippedChunks=0;
+  let skippedChunks=0, scanned=0;
   for (let c=0;c<state.manifest.chunks;c++){
     if (state.cancelled) throw new Error("Cancelled");
-    if (canSkipChunkForSearch(c, idx, op, value)){
+    if (canSkipChunkByQueryPlan(c, plan)){
       skippedChunks++;
       if (c % 10 === 0) post("PROGRESS",{value:Math.floor((c+1)/state.manifest.chunks*100), text:`Searching chunks... ${c+1}/${state.manifest.chunks} / skipped ${fmt(skippedChunks)} / matches ${fmt(matches.length)}`});
       continue;
     }
-    const chunk=await readChunkColumns(c,[idx]);
-    const data=chunk.columns.get(idx);
+    const chunk=await readChunkColumns(c,plan.requiredColumns);
     const base=chunkBaseRow(c);
     for (let r=0;r<chunk.rowCount;r++){
-      const v=valueFromColumn(data,r);
-      if (compareValue(v,op,value,col.type)){
+      scanned++;
+      if (rowMatchesQueryPlan(chunk,r,plan)){
         matches.push(base+r);
-        if (matches.length >= maxMatches) break;
+        if (matches.length >= cap) break;
       }
     }
-    if (matches.length >= maxMatches) break;
+    if (matches.length >= cap) break;
     if (c % 5 === 0) post("PROGRESS",{value:Math.floor((c+1)/state.manifest.chunks*100), text:`Searching chunks... ${c+1}/${state.manifest.chunks} / skipped ${fmt(skippedChunks)} / matches ${fmt(matches.length)}`});
   }
   state.searchMatches=matches;
-  return {matches:matches.length,capped:matches.length>=maxMatches,skippedChunks,ms:now()-t0};
+  return {matches:matches.length,capped:matches.length>=cap,scanned,skippedChunks,queryPlan:queryPlanSummary(plan),ms:now()-t0};
 }
 
 function normalizeGlobalFilters(filters){
   return (Array.isArray(filters) ? filters : [])
-    .map(f => ({ columnIndex:Number(f.columnIndex), op:String(f.op || "contains"), value:f.value ?? "" }))
+    .map(f => {
+      const columnIndex=Number(f.columnIndex);
+      const col=state.manifest.columns[columnIndex];
+      return { columnIndex, op:normalizeQueryOp(f.op || "contains", col?.type), value:f.value ?? "", source:"globalFilter" };
+    })
     .filter(f => Number.isFinite(f.columnIndex) && f.columnIndex >= 0 && state.manifest.columns[f.columnIndex]);
 }
 
 async function runDataQuery({filters, sort, maxRows}){
   const normalizedFilters = normalizeGlobalFilters(filters);
-  const sortColumn = sort && sort.columnIndex !== "" && sort.columnIndex != null ? Number(sort.columnIndex) : -1;
-  const sortDirection = sort?.direction === "desc" ? "desc" : "asc";
-  const sortCol = state.manifest.columns[sortColumn];
-  const hasSort = Number.isFinite(sortColumn) && sortColumn >= 0 && !!sortCol;
-  if (!normalizedFilters.length && !hasSort) {
+  const requestedLimit = Number(maxRows || 0) > 0 ? Number(maxRows) : Number.POSITIVE_INFINITY;
+  const plan=buildQueryPlan({
+    name:"dataQuery",
+    predicates:normalizedFilters,
+    projection:[],
+    sort,
+    limit:requestedLimit,
+    pushdown:true
+  });
+  const hasSort=!!plan.sort;
+  if (!plan.predicates.length && !hasSort) {
     state.dataQueryMatches = null;
     state.dataQueryMeta = null;
-    return {matches:state.manifest.totalRows, active:false, capped:false, ms:0};
+    return {matches:state.manifest.totalRows, active:false, capped:false, ms:0, queryPlan:queryPlanSummary(plan)};
   }
 
-  const required = [...new Set([...normalizedFilters.map(f => f.columnIndex), ...(hasSort ? [sortColumn] : [])])];
-  const requestedLimit = Number(maxRows || 0) > 0 ? Number(maxRows) : Number.POSITIVE_INFINITY;
   const scanLimit = hasSort ? Number.POSITIVE_INFINITY : requestedLimit;
   const refs = [];
   const sortable = [];
@@ -1726,23 +1859,17 @@ async function runDataQuery({filters, sort, maxRows}){
 
   for (let c=0;c<state.manifest.chunks;c++){
     if (state.cancelled) throw new Error("Cancelled");
-    if (canSkipChunkByFilters(c, normalizedFilters)){ skippedChunks++; continue; }
-    const chunk = await readChunkColumns(c, required);
+    if (canSkipChunkByQueryPlan(c, plan)){ skippedChunks++; continue; }
+    const chunk = await readChunkColumns(c, plan.requiredColumns);
     const base = chunkBaseRow(c);
 
     for (let r=0;r<chunk.rowCount;r++){
-      let ok = true;
-      for (const f of normalizedFilters){
-        const col = state.manifest.columns[f.columnIndex];
-        const v = valueFromColumn(chunk.columns.get(f.columnIndex), r);
-        if (!compareValue(v, f.op, f.value, col.type)) { ok = false; break; }
-      }
       scanned++;
-      if (!ok) continue;
+      if (!rowMatchesQueryPlan(chunk, r, plan)) continue;
 
       const rowId = base + r;
       if (hasSort) {
-        const v = valueFromColumn(chunk.columns.get(sortColumn), r);
+        const v = valueFromColumn(chunk.columns.get(plan.sort.columnIndex), r);
         sortable.push({rowId, value:v});
       } else {
         refs.push(rowId);
@@ -1758,8 +1885,9 @@ async function runDataQuery({filters, sort, maxRows}){
   }
 
   if (hasSort) {
+    const sortDirection=plan.sort.direction;
     const dir = sortDirection === "desc" ? -1 : 1;
-    const type = sortCol.type;
+    const type = plan.sort.type;
     sortable.sort((a,b)=>{
       if (type === "number") {
         const an = Number(a.value), bn = Number(b.value);
@@ -1775,8 +1903,8 @@ async function runDataQuery({filters, sort, maxRows}){
     state.dataQueryMatches = refs;
   }
 
-  state.dataQueryMeta = {filters:normalizedFilters, sort:hasSort ? {columnIndex:sortColumn,direction:sortDirection} : null, capped};
-  return {matches:state.dataQueryMatches.length, active:true, capped, scanned, skippedChunks, ms:now()-t0};
+  state.dataQueryMeta = {filters:normalizedFilters, sort:plan.sort ? {columnIndex:plan.sort.columnIndex,direction:plan.sort.direction} : null, capped, queryPlan:queryPlanSummary(plan)};
+  return {matches:state.dataQueryMatches.length, active:true, capped, scanned, skippedChunks, queryPlan:queryPlanSummary(plan), ms:now()-t0};
 }
 
 async function readDataQueryPage(page,pageSize,cols){
@@ -1826,12 +1954,13 @@ async function buildPivot({rowFields,columnFields,valueField,aggregation,maxRows
   const countMode = !Number.isFinite(valIdx) || valIdx < 0;
   const mode=countMode?"Count":aggregation;
   const required=[...new Set([...rowIdx,...colIdx,...(countMode?[]:[valIdx])])];
+  const plan=buildQueryPlan({name:"pivot", projection:required, pushdown:true});
   const rowKeys=[], colKeys=[], rowSet=new Set(), colSet=new Set(), cells=new Map(), rowTotals=new Map(), colTotals=new Map(), grand=makeAgg();
   const t0=now(); let scanned=0, limitHit=false;
 
   for (let c=0;c<state.manifest.chunks;c++){
     if (state.cancelled) throw new Error("Cancelled");
-    const chunk=await readChunkColumns(c,required);
+    const chunk=await readChunkColumns(c,plan.requiredColumns);
     for (let r=0;r<chunk.rowCount;r++){
       const rk=keyOf(rowIdx.map(i=>keyCellValue(valueFromColumn(chunk.columns.get(i),r))));
       const ck=keyOf(colIdx.map(i=>keyCellValue(valueFromColumn(chunk.columns.get(i),r))));
@@ -1865,7 +1994,7 @@ async function buildPivot({rowFields,columnFields,valueField,aggregation,maxRows
   gr[header.length-1]=aggValue(grand,mode);
   rows.push(gr);
   state.pivotTable={header,rows};
-  return {header,rows,scanned,limitHit,ms:now()-t0};
+  return {header,rows,scanned,limitHit,queryPlan:queryPlanSummary(plan),ms:now()-t0};
 }
 
 
@@ -1920,6 +2049,12 @@ async function buildTimeSeries({timeField, bucket, groupField, valueField, aggre
   const required = [...new Set([timeIdx, ...(hasGroup ? [groupIdx] : []), ...(countMode ? [] : [valIdx])])];
 
   if (!state.manifest.columns[timeIdx]) throw new Error("Time field is not selected");
+  const plan=buildQueryPlan({
+    name:"timeSeries",
+    predicates:[{columnIndex:timeIdx, op:"notnull", value:"", rowLevel:false, source:"timeField"}],
+    projection:required,
+    pushdown:true
+  });
 
   const states = new Map();
   const timeBucketSet = new Set();
@@ -1928,8 +2063,8 @@ async function buildTimeSeries({timeField, bucket, groupField, valueField, aggre
 
   for (let c=0;c<state.manifest.chunks;c++){
     if (state.cancelled) throw new Error("Cancelled");
-    if (canSkipChunkForTime(c, timeIdx)){ skippedChunks++; continue; }
-    const chunk = await readChunkColumns(c, required);
+    if (canSkipChunkByQueryPlan(c, plan)){ skippedChunks++; continue; }
+    const chunk = await readChunkColumns(c, plan.requiredColumns);
 
     for (let r=0;r<chunk.rowCount;r++){
       const rawTime = valueFromColumn(chunk.columns.get(timeIdx), r);
@@ -1966,7 +2101,7 @@ async function buildTimeSeries({timeField, bucket, groupField, valueField, aggre
   });
 
   state.timeTable = {header, rows};
-  return {header, rows, scanned, invalidTime, limitHit, skippedChunks, ms:now()-t0};
+  return {header, rows, scanned, invalidTime, limitHit, skippedChunks, queryPlan:queryPlanSummary(plan), ms:now()-t0};
 }
 
 
