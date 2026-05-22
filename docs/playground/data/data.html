@@ -22,6 +22,7 @@
   <!-- Heavy CSV/OPFS processing stays as a Worker. No JSX is needed inside the Worker. -->
   <script id="worker-code" type="text/plain">
 
+
 let state = {
   file:null,
   encoding:"utf-8",
@@ -329,6 +330,237 @@ async function writeJson(dir,name,obj){ await writeText(dir,name,JSON.stringify(
 async function readJson(dir,name){ return JSON.parse(await readText(dir,name)); }
 async function writeBuffer(dir,name,buffer){ const h=await dir.getFileHandle(name,{create:true}); const w=await h.createWritable(); await w.write(buffer); await w.close(); }
 async function readBuffer(dir,name){ const h=await dir.getFileHandle(name); return await (await h.getFile()).arrayBuffer(); }
+
+async function fileByteLength(dir,name){
+  const h=await dir.getFileHandle(name);
+  return Number((await h.getFile()).size || 0);
+}
+
+async function cleanupDatasetDir(root,id){
+  try{ await root.removeEntry(id,{recursive:true}); }catch{}
+}
+
+function integrityFeatureFlags(base={}){
+  return {
+    ...(base || {}),
+    columnStats:true,
+    rowCountAddressing:true,
+    quoteNewlineCSV:true,
+    lruChunkCache:true,
+    integrityCheck:true,
+    repairLayer:true
+  };
+}
+
+function integritySummary(ok, issues=[], warnings=[], repairs=[]){
+  return {
+    ok:!!ok,
+    checkedAt:new Date().toISOString(),
+    issueCount:issues.length,
+    warningCount:warnings.length,
+    repairCount:repairs.length,
+    issues:issues.slice(0,50),
+    warnings:warnings.slice(0,50),
+    repairs:repairs.slice(0,50)
+  };
+}
+
+function issueText(e){ return e && e.message ? e.message : String(e || "Unknown error"); }
+function expectedColumnBytes(rowCount,type){ return Number(rowCount || 0) * (type === "number" ? 8 : 4); }
+function rowCountFromBytes(byteLength,type){
+  const width = type === "number" ? 8 : 4;
+  const n = Number(byteLength || 0);
+  if (!Number.isFinite(n) || n < 0 || n % width !== 0) return null;
+  return n / width;
+}
+
+async function readDictArray(chunkDir,col){
+  const dict=await readJson(chunkDir,dictFileName(col.index));
+  if (!Array.isArray(dict)) throw new Error(`Dictionary is not an array: ${dictFileName(col.index)}`);
+  return dict;
+}
+
+async function rebuildColumnStatFromFiles(chunkDir,col,rowCount){
+  const rc=Number(rowCount || 0);
+  if (col.type === "number"){
+    const buf=await readBuffer(chunkDir,colFileName(col.index,col.type));
+    const arr=new Float64Array(buf);
+    if (arr.length !== rc) throw new Error(`Number column row count mismatch for ${col.name || col.index}: ${arr.length} !== ${rc}`);
+    let nulls=0, min=null, max=null;
+    for (let i=0;i<arr.length;i++){
+      const v=arr[i];
+      if (!Number.isFinite(v)){ nulls++; continue; }
+      min = min == null ? v : Math.min(min,v);
+      max = max == null ? v : Math.max(max,v);
+    }
+    return makeColumnStatForMeta({type:"number", nulls, invalidNumbers:0, min, max}, rc);
+  }
+
+  const buf=await readBuffer(chunkDir,colFileName(col.index,col.type));
+  const ids=new Int32Array(buf);
+  if (ids.length !== rc) throw new Error(`String column row count mismatch for ${col.name || col.index}: ${ids.length} !== ${rc}`);
+  const dict=await readDictArray(chunkDir,col);
+  let nulls=0;
+  for (let i=0;i<ids.length;i++){
+    const id=ids[i];
+    if (id < 0){ nulls++; continue; }
+    if (id >= dict.length) throw new Error(`String dictionary id out of range in ${col.name || col.index}: ${id} >= ${dict.length}`);
+  }
+  return makeColumnStatForMeta({type:"string", nulls, distinct:dict.length}, rc, dict);
+}
+
+function isColumnStatUsable(stat,col,rowCount){
+  if (!stat) return false;
+  if ((stat.type || col.type) !== col.type) return false;
+  if (Number(stat.rowCount ?? rowCount) !== Number(rowCount || 0)) return false;
+  if (!Number.isFinite(Number(stat.nullCount ?? stat.nulls ?? 0))) return false;
+  if (col.type === "number"){
+    const nullCount=Number(stat.nullCount ?? stat.nulls ?? 0);
+    if (nullCount < Number(rowCount || 0)){
+      if (stat.min == null || stat.max == null) return false;
+      if (!Number.isFinite(Number(stat.min)) || !Number.isFinite(Number(stat.max))) return false;
+    }
+  }
+  return true;
+}
+
+async function validateAndRepairDatasetDir(id,dir,options={}){
+  const repair = options.repair !== false;
+  const rebuildStats = !!options.rebuildStats;
+  const issues=[], warnings=[], repairs=[];
+  let manifest, chunks;
+
+  async function persistIntegrity(ok){
+    const summary=integritySummary(ok,issues,warnings,repairs);
+    if (repair){ try{ await writeJson(dir,"_integrity.json",summary); }catch{} }
+    return summary;
+  }
+
+  try{ manifest=await readJson(dir,"manifest.json"); }
+  catch(e){ issues.push(`manifest.json unreadable: ${issueText(e)}`); return {ok:false,issues,warnings,repairs,integrity:await persistIntegrity(false)}; }
+
+  try{ chunks=await readJson(dir,"chunks.json"); }
+  catch(e){ issues.push(`chunks.json unreadable: ${issueText(e)}`); return {ok:false,manifest,issues,warnings,repairs,integrity:await persistIntegrity(false)}; }
+
+  if (!manifest || typeof manifest !== "object") issues.push("manifest.json is not an object");
+  if (!Array.isArray(chunks)) issues.push("chunks.json is not an array");
+  const columns=Array.isArray(manifest?.columns) ? manifest.columns : [];
+  if (!columns.length) issues.push("manifest.columns is empty or missing");
+  for (const col of columns){
+    if (!Number.isFinite(Number(col.index))) issues.push(`column has invalid index: ${JSON.stringify(col)}`);
+    if (col.type !== "number" && col.type !== "string") issues.push(`column has unsupported type: ${col.name || col.index}`);
+  }
+  if (issues.length) return {ok:false,manifest,chunks:Array.isArray(chunks)?chunks:[],issues,warnings,repairs,integrity:await persistIntegrity(false)};
+
+  let changedManifest=false, changedChunks=false;
+  if (manifest.id !== id){ manifest.id=id; changedManifest=true; repairs.push("manifest.id normalized to directory id"); }
+  manifest.features=integrityFeatureFlags(manifest.features);
+  if (Number(manifest.formatVersion || 0) < 4){ manifest.formatVersion=4; changedManifest=true; repairs.push("manifest.formatVersion upgraded to 4"); }
+
+  const repairedChunks=[];
+  let totalRows=0;
+
+  for (let i=0;i<chunks.length;i++){
+    let chunkDir;
+    try{ chunkDir=await dir.getDirectoryHandle(`chunk_${String(i).padStart(6,"0")}`); }
+    catch(e){ issues.push(`missing chunk directory chunk_${String(i).padStart(6,"0")}: ${issueText(e)}`); continue; }
+
+    let diskMeta=null;
+    try{ diskMeta=await readJson(chunkDir,"meta.json"); }
+    catch(e){ warnings.push(`chunk ${i} meta.json unreadable; reconstructing from chunks.json/files: ${issueText(e)}`); }
+
+    const originalMeta={...(chunks[i] || {}), ...(diskMeta || {})};
+    const meta={...originalMeta};
+    const inferred=[];
+    const dictCache=new Map();
+
+    for (const col of columns){
+      try{
+        const bytes=await fileByteLength(chunkDir,colFileName(col.index,col.type));
+        const rc=rowCountFromBytes(bytes,col.type);
+        if (rc == null){ issues.push(`chunk ${i} ${col.name || col.index} has invalid byte length ${bytes}`); continue; }
+        inferred.push(rc);
+        if (col.type === "string"){
+          const dict=await readDictArray(chunkDir,col);
+          dictCache.set(col.index,dict);
+        }
+      }catch(e){
+        issues.push(`chunk ${i} column ${col.name || col.index} unreadable: ${issueText(e)}`);
+      }
+    }
+    if (issues.length) continue;
+
+    const uniqueCounts=[...new Set(inferred.map(Number))];
+    if (uniqueCounts.length !== 1){
+      issues.push(`chunk ${i} column row counts disagree: ${uniqueCounts.join(", ")}`);
+      continue;
+    }
+    const rowCount=uniqueCounts[0];
+
+    if (Number(meta.chunkIndex) !== i){ meta.chunkIndex=i; repairs.push(`chunk ${i} meta.chunkIndex repaired`); }
+    if (Number(meta.rowCount || 0) !== rowCount){ meta.rowCount=rowCount; repairs.push(`chunk ${i} rowCount repaired to ${rowCount}`); }
+
+    if (!Array.isArray(meta.stats)) meta.stats=[];
+    if (!meta.columnStats || typeof meta.columnStats !== "object" || Array.isArray(meta.columnStats)) meta.columnStats={};
+
+    for (const col of columns){
+      const key=String(col.index);
+      let raw=meta.columnStats[key] || meta.stats[col.index] || null;
+      let stat=normalizeColumnStat(raw,rowCount);
+      let mustRebuild=!isColumnStatUsable(stat,col,rowCount);
+      if (col.type === "string" && rebuildStats && stat && !stat.lowerHashComplete && (dictCache.get(col.index)?.length || 0) <= 8192) mustRebuild=true;
+
+      if (mustRebuild && rebuildStats){
+        stat=await rebuildColumnStatFromFiles(chunkDir,col,rowCount);
+        repairs.push(`chunk ${i} column ${col.name || col.index} statistics rebuilt`);
+      }
+
+      if (stat && isColumnStatUsable(stat,col,rowCount)){
+        meta.columnStats[key]=stat;
+      } else if (mustRebuild && !rebuildStats){
+        warnings.push(`chunk ${i} column ${col.name || col.index} statistics need rebuild on open`);
+      }
+    }
+
+    totalRows += rowCount;
+    repairedChunks.push(meta);
+
+    const metaChanged = JSON.stringify(meta) !== JSON.stringify(originalMeta);
+    if (repair && metaChanged){
+      await writeJson(chunkDir,"meta.json",meta);
+      changedChunks=true;
+    }
+  }
+
+  if (issues.length) return {ok:false,manifest,chunks:repairedChunks,issues,warnings,repairs,integrity:await persistIntegrity(false)};
+
+  if (Number(manifest.chunks || 0) !== repairedChunks.length){ manifest.chunks=repairedChunks.length; changedManifest=true; repairs.push(`manifest.chunks repaired to ${repairedChunks.length}`); }
+  if (Number(manifest.totalRows || 0) !== totalRows){ manifest.totalRows=totalRows; changedManifest=true; repairs.push(`manifest.totalRows repaired to ${totalRows}`); }
+  if (!Number.isFinite(Number(manifest.sourceRows || 0)) || Number(manifest.sourceRows || 0) < totalRows){ manifest.sourceRows=Math.max(totalRows,Number(manifest.sourceRows || 0)); changedManifest=true; repairs.push("manifest.sourceRows normalized"); }
+
+  const summary=integritySummary(true,issues,warnings,repairs);
+  manifest.integrity=summary;
+  changedManifest=true;
+
+  if (repair){
+    if (changedChunks || JSON.stringify(chunks) !== JSON.stringify(repairedChunks)) await writeJson(dir,"chunks.json",repairedChunks);
+    if (changedManifest) await writeJson(dir,"manifest.json",manifest);
+    await writeJson(dir,"_integrity.json",summary);
+  }
+  return {ok:true,manifest,chunks:repairedChunks,issues,warnings,repairs,integrity:summary};
+}
+
+async function loadValidatedDataset(id,options={}){
+  const root=await rootDir();
+  const dir=await root.getDirectoryHandle(id);
+  const checked=await validateAndRepairDatasetDir(id,dir,{repair:true,rebuildStats:!!options.rebuildStats});
+  if (!checked.ok){
+    const msg=(checked.issues || []).slice(0,3).join(" / ") || "unknown integrity error";
+    throw new Error(`Dataset integrity check failed for ${id}: ${msg}`);
+  }
+  return {id,dir,manifest:checked.manifest,chunks:checked.chunks,integrity:checked.integrity};
+}
+
 function colFileName(index, type){ return `col_${String(index).padStart(4,"0")}.${type === "number" ? "f64" : "i32"}.bin`; }
 function dictFileName(index){ return `col_${String(index).padStart(4,"0")}.dict.json`; }
 
@@ -764,7 +996,7 @@ async function buildSingleColumnarCache(msg){
       originalFileName:msg.file.name,
       sourceFiles:[{name:msg.file.name,size:msg.file.size,sourceRows,totalRows,skippedRows,malformedRows}],
       createdAt:new Date().toISOString(), mode:"columnar-clean",
-      formatVersion:3, features:{columnStats:true, rowCountAddressing:true, quoteNewlineCSV:true},
+      formatVersion:4, features:integrityFeatureFlags({}),
       encoding:msg.encoding, delimiter:msg.delimiter, fileSize:msg.file.size,
       chunkSize,totalRows,sourceRows,chunks:chunkIndex,
       columns, rules, cleanReport
@@ -864,7 +1096,7 @@ async function buildMergedColumnarCache(msg){
       originalFileName:files.map(f=>f.name).join(" + "),
       sourceFiles,
       createdAt:new Date().toISOString(), mode:"columnar-clean-merged-csv",
-      formatVersion:3, features:{columnStats:true, rowCountAddressing:true, quoteNewlineCSV:true},
+      formatVersion:4, features:integrityFeatureFlags({}),
       encoding:msg.encoding, delimiter:msg.delimiter, fileSize:files.reduce((a,f)=>a+(f.size||0),0),
       chunkSize,totalRows,sourceRows,chunks:chunkIndex,
       columns, rules, cleanReport
@@ -892,7 +1124,9 @@ async function listDatasets(){
   for await (const [id,h] of root.entries()){
     if (h.kind !== "directory") continue;
     try{
-      const m=await readJson(h,"manifest.json");
+      const checked=await validateAndRepairDatasetDir(id,h,{repair:true,rebuildStats:false});
+      if (!checked.ok) continue;
+      const m=checked.manifest;
       rows.push({
         id,
         workspace:manifestWorkspace(m),
@@ -907,7 +1141,8 @@ async function listDatasets(){
         columns:(m.columns||[]).length,
         chunks:m.chunks||0,
         fileSize:m.fileSize||0,
-        mode:m.mode||""
+        mode:m.mode||"",
+        integrity:m.integrity || checked.integrity
       });
     }catch{}
   }
@@ -917,13 +1152,11 @@ async function listDatasets(){
 
 async function openDataset(id){
   clearChunkCache();
-  const root=await rootDir();
-  const dir=await root.getDirectoryHandle(id);
-  const manifest=await readJson(dir,"manifest.json");
-  const chunks=await readJson(dir,"chunks.json");
+  const loaded=await loadValidatedDataset(id,{rebuildStats:true});
+  const {dir,manifest,chunks}=loaded;
   state.virtual=null; state.memory=null; state.dir=dir; state.manifest=manifest; state.dataset={id,manifest,chunks};
   state.searchMatches=[]; state.dataQueryMatches=null; state.dataQueryMeta=null; state.pivotTable=null; state.timeTable=null;
-  return {manifest,chunks};
+  return {manifest,chunks,integrity:loaded.integrity};
 }
 
 
@@ -931,13 +1164,9 @@ async function openVirtualDataset(ids, name){
   clearChunkCache();
   const list=(Array.isArray(ids) ? ids : []).filter(Boolean);
   if (list.length < 2) throw new Error("Virtual Dataset requires at least two saved tables");
-  const root=await rootDir();
   const sources=[];
   for (const id of list){
-    const dir=await root.getDirectoryHandle(id);
-    const manifest=await readJson(dir,"manifest.json");
-    const chunks=await readJson(dir,"chunks.json");
-    sources.push({id,dir,manifest,chunks});
+    sources.push(await loadValidatedDataset(id,{rebuildStats:true}));
   }
   const base=sources[0].manifest;
   const baseSig=schemaFullSignatureFromColumns(base.columns);
@@ -1015,13 +1244,9 @@ async function openMemoryDataset(ids, name, options={}){
   if (list.length < 1) throw new Error("Select at least one saved table to load into memory");
   const maxRows=Number(options.maxRows || 0);
   const maxBytes=Number(options.maxMemoryMB || 512) * 1024 * 1024;
-  const root=await rootDir();
   const opened=[];
   for (const id of list){
-    const dir=await root.getDirectoryHandle(id);
-    const manifest=await readJson(dir,"manifest.json");
-    const chunks=await readJson(dir,"chunks.json");
-    opened.push({id,dir,manifest,chunks});
+    opened.push(await loadValidatedDataset(id,{rebuildStats:true}));
   }
   const base=opened[0].manifest;
   const baseSig=schemaFullSignatureFromColumns(base.columns);
@@ -1152,10 +1377,7 @@ async function mergeSavedDatasets(ids, datasetName, storageMeta={}){
   const root=await rootDir();
   const opened=[];
   for (const id of list){
-    const dir=await root.getDirectoryHandle(id);
-    const manifest=await readJson(dir,"manifest.json");
-    const chunks=await readJson(dir,"chunks.json");
-    opened.push({id,dir,manifest,chunks});
+    opened.push(await loadValidatedDataset(id,{rebuildStats:true}));
   }
   const base=opened[0].manifest;
   const baseSig=schemaFullSignatureFromColumns(base.columns);
@@ -1214,7 +1436,7 @@ async function mergeSavedDatasets(ids, datasetName, storageMeta={}){
       sourceDatasets:opened.map(x=>({id:x.id,name:x.manifest.name,rows:x.manifest.totalRows,chunks:x.manifest.chunks,createdAt:x.manifest.createdAt})),
       createdAt:new Date().toISOString(),
       mode:"columnar-clean-merged-opfs",
-      formatVersion:3, features:{columnStats:true, rowCountAddressing:true, quoteNewlineCSV:true},
+      formatVersion:4, features:integrityFeatureFlags({}),
       encoding:base.encoding,
       delimiter:base.delimiter,
       fileSize:opened.reduce((a,x)=>a+Number(x.manifest.fileSize||0),0),
@@ -1974,6 +2196,7 @@ self.onmessage=async(e)=>{
     postProgress(0,"Error");
   }
 };
+
 </script>
 
   <!-- JSX application source. It is transformed by Babel in the module below. -->
