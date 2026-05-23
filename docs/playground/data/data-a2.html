@@ -6122,7 +6122,7 @@ function QueryGraphEdge(props) {
   );
 }
 
-function GraphQueryEditor({ columns, datasets=[], manifest=null, nodes, setNodes, edges, setEdges, onApply, onReadPage=()=>{}, onClearResult=()=>{}, disabled, dataQueryActive, dataQueryCount, resultTable, resultStatus, resultTime, resultPage, resultPageMax, sqlText="", setSqlText=()=>{}, sqlMode=false, setSqlMode=()=>{} }) {
+function GraphQueryEditor({ columns, datasets=[], manifest=null, nodes, setNodes, edges, setEdges, onApply, onReadPage=()=>{}, onClearResult=()=>{}, onExportCsv=()=>{}, disabled, dataQueryActive, dataQueryCount, resultTable, resultStatus, resultTime, resultPage, resultPageMax, resultViewMode="tile", setResultViewMode=()=>{}, sqlText="", setSqlText=()=>{}, sqlMode=false, setSqlMode=()=>{} }) {
   const [selectedId, setSelectedId] = useState(nodes?.[0]?.id || "source");
   const [sqlErrors, setSqlErrors] = useState([]);
   const selectedNode = useMemo(() => nodes.find((n) => n.id === selectedId) || null, [nodes, selectedId]);
@@ -6435,9 +6435,13 @@ function GraphQueryEditor({ columns, datasets=[], manifest=null, nodes, setNodes
         <Stack direction="row" useFlexGap flexWrap="wrap" spacing={1} alignItems="center" sx={{ mb: 0.75 }}>
           <Typography variant="subtitle2" sx={{ fontWeight: 900 }}>Graph Query Result / 実行結果</Typography>
           <Button size="small" color="warning" variant="outlined" onClick={onClearResult}>結果クリア</Button>
-          <Button size="small" onClick={() => onReadPage(Math.max(1, Number(resultPage || 1) - 1))}>Prev</Button>
-          <Typography variant="caption">Page {Number(resultPage || 1).toLocaleString()} / {Number(resultPageMax || 0).toLocaleString()}</Typography>
-          <Button size="small" onClick={() => onReadPage(Math.min(Number(resultPageMax || 1), Number(resultPage || 1) + 1))}>Next</Button>
+          <Button size="small" variant="contained" startIcon={<Download />} onClick={onExportCsv} disabled={!Number(dataQueryCount || 0)}>CSV全件出力</Button>
+          <Button size="small" variant={resultViewMode === "tile" ? "contained" : "outlined"} onClick={() => setResultViewMode("tile")}>タイル表示</Button>
+          <Button size="small" variant={resultViewMode === "page" ? "contained" : "outlined"} onClick={() => setResultViewMode("page")}>ページ表示</Button>
+          {resultViewMode === "page" && <Button size="small" onClick={() => onReadPage(Math.max(1, Number(resultPage || 1) - 1))}>Prev</Button>}
+          {resultViewMode === "page" && <Typography variant="caption">Page {Number(resultPage || 1).toLocaleString()} / {Number(resultPageMax || 0).toLocaleString()}</Typography>}
+          {resultViewMode === "page" && <Button size="small" onClick={() => onReadPage(Math.min(Number(resultPageMax || 1), Number(resultPage || 1) + 1))}>Next</Button>}
+          {resultViewMode === "tile" && <Chip size="small" color="primary" label={`Tile rows ${Number(resultTable?.rows?.length || 0).toLocaleString()} / total ${Number(dataQueryCount || 0).toLocaleString()}`} />}
           <Chip size="small" label={`${Number(dataQueryCount || 0).toLocaleString()} rows`} />
         </Stack>
         <DataTable table={resultTable} tableId="graphQueryResult" height={360} />
@@ -6540,6 +6544,7 @@ function App() {
   const [graphResultPage, setGraphResultPage] = useState(1);
   const [graphResultStatus, setGraphResultStatus] = useState("Graph Queryを実行してください。");
   const [graphResultTime, setGraphResultTime] = useState("");
+  const [graphResultViewMode, setGraphResultViewMode] = useState("tile");
 
   const [searchColumn, setSearchColumn] = useState("0");
   const [searchOp, setSearchOp] = useState("contains");
@@ -7171,6 +7176,14 @@ function App() {
 
       if (msg.type === "TIME_CSV") {
         downloadText("time_view.csv", msg.csv || "");
+        return;
+      }
+
+      if (msg.type === "GRAPH_QUERY_CSV") {
+        downloadText("graph_query_result.csv", msg.csv || "");
+        setGraphResultStatus(`Graph Query CSVを全件出力しました: ${fmt(msg.rows || 0)} / ${fmt(msg.totalRows || msg.rows || 0)} rows`);
+        setGraphResultTime(ms(msg.ms));
+        return;
       }
     };
 
@@ -7392,6 +7405,23 @@ function App() {
     } else {
       post({ type: "READ_DATA_QUERY_PAGE", origin: "graph", page: safe, pageSize: pageSizeRef.current, columns: selectedColumnsForPost() });
     }
+  }
+
+  function exportGraphQueryCsvAll() {
+    if (!graphResultCount) {
+      setGraphResultStatus("CSV出力対象のGraph Query結果がありません。先にグラフ実行してください。");
+      return;
+    }
+    const ctx = graphExecutionRef.current || {};
+    setGraphResultStatus(`Graph Query CSVを全件出力中... ${fmt(graphResultCount)} rows`);
+    post({
+      type: "EXPORT_GRAPH_QUERY_CSV",
+      mode: graphResultMode === "join" ? "join" : "data",
+      columns: selectedColumnsForPost(),
+      derivedColumns: ctx.derivedColumns || [],
+      maxRows: 0,
+      chunkRows: 5000,
+    });
   }
 
   function runDataQuery() {
@@ -8175,10 +8205,12 @@ function App() {
                   dataQueryActive={graphResultCount > 0}
                   dataQueryCount={graphResultCount}
                   resultTable={graphResultTable}
-                  resultStatus={graphResultMode === "join" ? graphResultStatus : dataStatus}
-                  resultTime={graphResultMode === "join" ? graphResultTime : dataTime}
-                  resultPage={graphResultMode === "join" ? graphResultPage : page}
+                  resultStatus={graphResultStatus}
+                  resultTime={graphResultTime}
+                  resultPage={graphResultMode === "join" ? graphResultPage : graphResultPage}
                   resultPageMax={Math.max(1, Math.ceil((graphResultCount || 0) / Number(pageSize || 500)))}
+                  resultViewMode={graphResultViewMode}
+                  setResultViewMode={setGraphResultViewMode}
                   sqlText={graphSqlText}
                   setSqlText={setGraphSqlText}
                   sqlMode={graphSqlMode}
