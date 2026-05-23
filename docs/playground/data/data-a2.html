@@ -6,6 +6,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Roboto:wght@300;400;600;700&display=swap" />
   <link rel="stylesheet" href="https://fonts.googleapis.com/icon?family=Material+Icons" />
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@xyflow/react@12.8.4/dist/style.css" />
 
   <style>
     html, body, #root { min-height: 100%; }
@@ -3640,7 +3641,7 @@ self.onmessage=async(e)=>{
   <script id="app-code" type="text/plain">
 
 
-const { useEffect, useMemo, useRef, useState } = React;
+const { useCallback, useEffect, useMemo, useRef, useState } = React;
 
 const {
   ThemeProvider,
@@ -3695,6 +3696,17 @@ const {
   Schema,
   Article,
 } = MaterialIcons;
+
+const {
+  ReactFlow: ReactFlowCanvas,
+  Background: RFBackground,
+  Controls: RFControls,
+  MiniMap: RFMiniMap,
+  addEdge: rfAddEdge,
+  applyNodeChanges: rfApplyNodeChanges,
+  applyEdgeChanges: rfApplyEdgeChanges,
+  MarkerType: RFMarkerType,
+} = ReactFlowLib || {};
 
 function createAppTheme(mode) {
   const isDark = mode === "dark";
@@ -5094,6 +5106,191 @@ function PivotTileGrid({ meta, view, onRequest, height = 640 }) {
   );
 }
 
+
+function normalizeGraphNodeLabel(node, columns) {
+  if (!node) return "Node";
+  const data = node.data || {};
+  const col = columns.find((c) => Number(c.index) === Number(data.columnIndex));
+  if (data.kind === "source") return "Active Dataset";
+  if (data.kind === "filter") return `Filter: ${col?.name || "column"} ${data.op || "contains"}`;
+  if (data.kind === "sort") return `Sort: ${col?.name || "column"} ${(data.direction || "asc").toUpperCase()}`;
+  if (data.kind === "limit") return `Limit: ${Number(data.maxRows || 0) || "all"}`;
+  if (data.kind === "output") return "Output: Data Table";
+  return data.label || "Node";
+}
+
+function makeGraphNode(id, kind, position, columns) {
+  const firstCol = columns[0]?.index ?? 0;
+  const base = { id, type: "default", position, data: { kind, label: kind } };
+  if (kind === "source") return { ...base, data: { kind, label: "Active Dataset" }, style: { borderWidth: 2 } };
+  if (kind === "filter") return { ...base, data: { kind, label: "Filter", columnIndex: firstCol, op: "contains", value: "" } };
+  if (kind === "sort") return { ...base, data: { kind, label: "Sort", columnIndex: firstCol, direction: "asc" } };
+  if (kind === "limit") return { ...base, data: { kind, label: "Limit", maxRows: "0" } };
+  return { ...base, data: { kind: "output", label: "Output: Data Table" }, style: { borderWidth: 2 } };
+}
+
+function compileGraphQuery(nodes) {
+  const filters = [];
+  let sort = null;
+  let maxRows = 0;
+  for (const n of nodes || []) {
+    const d = n.data || {};
+    if (d.disabled) continue;
+    if (d.kind === "filter") {
+      filters.push({
+        id: n.id,
+        columnIndex: Number(d.columnIndex),
+        op: d.op || "contains",
+        value: d.value ?? "",
+      });
+    }
+    if (d.kind === "sort") {
+      sort = { columnIndex: Number(d.columnIndex), direction: d.direction === "desc" ? "desc" : "asc" };
+    }
+    if (d.kind === "limit") {
+      maxRows = Math.max(0, Number(d.maxRows || 0));
+    }
+  }
+  return { filters, sort, maxRows };
+}
+
+function GraphQueryEditor({ columns, nodes, setNodes, edges, setEdges, onApply, disabled, dataQueryActive, dataQueryCount }) {
+  const [selectedId, setSelectedId] = useState(nodes?.[0]?.id || "source");
+  const selectedNode = useMemo(() => nodes.find((n) => n.id === selectedId) || null, [nodes, selectedId]);
+  const plan = useMemo(() => compileGraphQuery(nodes), [nodes]);
+  const graphReady = !!ReactFlowCanvas;
+
+  const updateNodeData = (id, patch) => {
+    setNodes((prev) => prev.map((n) => {
+      if (n.id !== id) return n;
+      const next = { ...n, data: { ...(n.data || {}), ...patch } };
+      next.data.label = normalizeGraphNodeLabel(next, columns);
+      return next;
+    }));
+  };
+
+  const addNode = (kind) => {
+    const id = `${kind}-${Date.now().toString(36)}`;
+    const x = 180 + Math.max(0, nodes.length - 2) * 170;
+    const y = kind === "filter" ? 120 : kind === "sort" ? 245 : 360;
+    const node = makeGraphNode(id, kind, { x, y }, columns);
+    node.data.label = normalizeGraphNodeLabel(node, columns);
+    setNodes((prev) => [...prev, node]);
+    setEdges((prev) => [...prev, {
+      id: `e-${prev.length}-${Date.now().toString(36)}`,
+      source: prev[prev.length - 1]?.target === "output" ? "source" : "source",
+      target: id,
+      animated: true,
+      markerEnd: RFMarkerType ? { type: RFMarkerType.ArrowClosed } : undefined,
+    }]);
+    setSelectedId(id);
+  };
+
+  const resetGraph = () => {
+    const baseNodes = [
+      makeGraphNode("source", "source", { x: 20, y: 140 }, columns),
+      makeGraphNode("filter-1", "filter", { x: 240, y: 70 }, columns),
+      makeGraphNode("sort-1", "sort", { x: 460, y: 170 }, columns),
+      makeGraphNode("output", "output", { x: 700, y: 140 }, columns),
+    ].map((n) => ({ ...n, data: { ...n.data, label: normalizeGraphNodeLabel(n, columns) } }));
+    setNodes(baseNodes);
+    setEdges([
+      { id: "source-filter", source: "source", target: "filter-1", animated: true, markerEnd: RFMarkerType ? { type: RFMarkerType.ArrowClosed } : undefined },
+      { id: "filter-sort", source: "filter-1", target: "sort-1", animated: true, markerEnd: RFMarkerType ? { type: RFMarkerType.ArrowClosed } : undefined },
+      { id: "sort-output", source: "sort-1", target: "output", animated: true, markerEnd: RFMarkerType ? { type: RFMarkerType.ArrowClosed } : undefined },
+    ]);
+    setSelectedId("filter-1");
+  };
+
+  const removeSelected = () => {
+    if (!selectedNode || ["source", "output"].includes(selectedNode.id)) return;
+    setNodes((prev) => prev.filter((n) => n.id !== selectedNode.id));
+    setEdges((prev) => prev.filter((e) => e.source !== selectedNode.id && e.target !== selectedNode.id));
+    setSelectedId("source");
+  };
+
+  return (
+    <Box sx={{ display: "grid", gridTemplateColumns: { xs: "1fr", lg: "minmax(0, 1fr) 360px" }, gap: 1, minWidth: 0 }}>
+      <Paper elevation={0} sx={{ p: 1, bgcolor: "background.default", borderRadius: 2, minWidth: 0 }}>
+        <Stack direction="row" useFlexGap flexWrap="wrap" spacing={0.75} alignItems="center" sx={{ mb: 1 }}>
+          <Typography variant="subtitle2" sx={{ fontWeight: 900 }}>Graph Query</Typography>
+          <Button size="small" variant="outlined" onClick={() => addNode("filter")} disabled={!columns.length}>+ Filter</Button>
+          <Button size="small" variant="outlined" onClick={() => addNode("sort")} disabled={!columns.length}>+ Sort</Button>
+          <Button size="small" variant="outlined" onClick={() => addNode("limit")}>+ Limit</Button>
+          <Button size="small" onClick={resetGraph}>Reset</Button>
+          <Button size="small" color="error" variant="outlined" onClick={removeSelected} disabled={!selectedNode || ["source", "output"].includes(selectedNode.id)}>Remove</Button>
+          <Button size="small" variant="contained" onClick={() => onApply(plan)} disabled={disabled || !columns.length}>Run graph query</Button>
+          {dataQueryActive && <Chip color="success" size="small" label={`Active ${Number(dataQueryCount || 0).toLocaleString()} rows`} />}
+        </Stack>
+        {!graphReady ? (
+          <Alert severity="warning">React Flow CDNを読み込めませんでした。ネットワークまたはCDN制限を確認してください。</Alert>
+        ) : (
+          <Box sx={{ height: 520, border: "1px solid", borderColor: "divider", borderRadius: 2, overflow: "hidden", bgcolor: "background.paper" }}>
+            <ReactFlowCanvas
+              nodes={nodes}
+              edges={edges}
+              onNodesChange={(changes) => setNodes((nds) => rfApplyNodeChanges ? rfApplyNodeChanges(changes, nds) : nds)}
+              onEdgesChange={(changes) => setEdges((eds) => rfApplyEdgeChanges ? rfApplyEdgeChanges(changes, eds) : eds)}
+              onConnect={(params) => setEdges((eds) => rfAddEdge ? rfAddEdge({ ...params, animated: true, markerEnd: RFMarkerType ? { type: RFMarkerType.ArrowClosed } : undefined }, eds) : eds)}
+              onNodeClick={(e, node) => setSelectedId(node.id)}
+              fitView
+            >
+              {RFMiniMap && <RFMiniMap pannable zoomable />}
+              {RFControls && <RFControls />}
+              {RFBackground && <RFBackground gap={18} />}
+            </ReactFlowCanvas>
+          </Box>
+        )}
+        <Typography variant="caption" color="text.secondary" sx={{ display: "block", mt: 0.75 }}>
+          このGraphはDataタブのGlobal filter/sortへコンパイルされます。線は処理順の可視化で、実行条件は右ペインのノード設定が正です。
+        </Typography>
+      </Paper>
+
+      <Paper elevation={0} sx={{ p: 1, bgcolor: "background.default", borderRadius: 2 }}>
+        <Typography variant="subtitle2" sx={{ fontWeight: 900, mb: 1 }}>Selected Node</Typography>
+        {!selectedNode ? (
+          <Typography variant="body2" color="text.secondary">ノードを選択してください。</Typography>
+        ) : (
+          <Stack spacing={1}>
+            <Chip label={`${selectedNode.id} / ${selectedNode.data?.kind || "node"}`} />
+            {selectedNode.data?.kind === "filter" && (
+              <>
+                <TextField select label="Column" size="small" value={String(selectedNode.data.columnIndex ?? columns[0]?.index ?? 0)} onChange={(e) => updateNodeData(selectedNode.id, { columnIndex: Number(e.target.value) })} fullWidth>
+                  {columns.map((c) => <MenuItem key={c.index} value={String(c.index)}>{c.name} ({c.type})</MenuItem>)}
+                </TextField>
+                <TextField select label="Operator" size="small" value={selectedNode.data.op || "contains"} onChange={(e) => updateNodeData(selectedNode.id, { op: e.target.value })} fullWidth>
+                  {["contains", "eq", "ne", "gt", "ge", "lt", "le", "isnull", "notnull"].map((x) => <MenuItem key={x} value={x}>{x}</MenuItem>)}
+                </TextField>
+                <TextField label="Value" size="small" value={selectedNode.data.value || ""} onChange={(e) => updateNodeData(selectedNode.id, { value: e.target.value })} fullWidth />
+              </>
+            )}
+            {selectedNode.data?.kind === "sort" && (
+              <>
+                <TextField select label="Sort column" size="small" value={String(selectedNode.data.columnIndex ?? columns[0]?.index ?? 0)} onChange={(e) => updateNodeData(selectedNode.id, { columnIndex: Number(e.target.value) })} fullWidth>
+                  {columns.map((c) => <MenuItem key={c.index} value={String(c.index)}>{c.name} ({c.type})</MenuItem>)}
+                </TextField>
+                <TextField select label="Direction" size="small" value={selectedNode.data.direction || "asc"} onChange={(e) => updateNodeData(selectedNode.id, { direction: e.target.value })} fullWidth>
+                  <MenuItem value="asc">ASC</MenuItem>
+                  <MenuItem value="desc">DESC</MenuItem>
+                </TextField>
+              </>
+            )}
+            {selectedNode.data?.kind === "limit" && (
+              <SmallNumberField label="Max rows 0=all" value={String(selectedNode.data.maxRows ?? "0")} onChange={(v) => updateNodeData(selectedNode.id, { maxRows: v })} min="0" step="100000" fullWidth />
+            )}
+            {["source", "output"].includes(selectedNode.data?.kind) && (
+              <Alert severity="info">このノードは固定です。Filter / Sort / Limitノードを追加して条件を作成します。</Alert>
+            )}
+            <Divider />
+            <Typography variant="subtitle2" sx={{ fontWeight: 900 }}>Compiled Plan</Typography>
+            <Typography component="pre" variant="caption" sx={{ p: 1, bgcolor: "background.paper", borderRadius: 1, overflow: "auto", maxHeight: 180 }}>{JSON.stringify(plan, null, 2)}</Typography>
+          </Stack>
+        )}
+      </Paper>
+    </Box>
+  );
+}
+
 function App() {
   const workerRef = useRef(null);
   const pageSizeRef = useRef(500);
@@ -5164,6 +5361,18 @@ function App() {
   const [dataSortColumn, setDataSortColumn] = useState("-1");
   const [dataSortDirection, setDataSortDirection] = useState("asc");
   const [dataQueryMaxRows, setDataQueryMaxRows] = useState("0");
+  const [dataSubTab, setDataSubTab] = useState(initialSettings.dataSubTab || "table");
+  const [graphNodes, setGraphNodes] = useState(() => [
+    makeGraphNode("source", "source", { x: 20, y: 140 }, []),
+    makeGraphNode("filter-1", "filter", { x: 240, y: 70 }, []),
+    makeGraphNode("sort-1", "sort", { x: 460, y: 170 }, []),
+    makeGraphNode("output", "output", { x: 700, y: 140 }, []),
+  ].map((n) => ({ ...n, data: { ...n.data, label: normalizeGraphNodeLabel(n, []) } })));
+  const [graphEdges, setGraphEdges] = useState(() => [
+    { id: "source-filter", source: "source", target: "filter-1", animated: true, markerEnd: RFMarkerType ? { type: RFMarkerType.ArrowClosed } : undefined },
+    { id: "filter-sort", source: "filter-1", target: "sort-1", animated: true, markerEnd: RFMarkerType ? { type: RFMarkerType.ArrowClosed } : undefined },
+    { id: "sort-output", source: "sort-1", target: "output", animated: true, markerEnd: RFMarkerType ? { type: RFMarkerType.ArrowClosed } : undefined },
+  ]);
 
   const [searchColumn, setSearchColumn] = useState("0");
   const [searchOp, setSearchOp] = useState("contains");
@@ -5877,6 +6086,36 @@ function App() {
     setDataQueryFilters((prev) => prev.filter((f) => f.id !== id));
   }
 
+  useEffect(() => {
+    if (!columns.length) return;
+    setGraphNodes((prev) => prev.map((n) => {
+      const data = { ...(n.data || {}) };
+      if (["filter", "sort"].includes(data.kind) && !columns.some((c) => Number(c.index) === Number(data.columnIndex))) {
+        data.columnIndex = columns[0]?.index ?? 0;
+      }
+      const next = { ...n, data };
+      next.data.label = normalizeGraphNodeLabel(next, columns);
+      return next;
+    }));
+  }, [columns.map((c) => `${c.index}:${c.name}:${c.type}`).join("|")]);
+
+  function runGraphQueryPlan(plan) {
+    if (!manifest) return;
+    const filters = (plan?.filters || []).map((f) => ({ ...f, id: f.id || `${Date.now()}-${Math.random()}` }));
+    const sort = plan?.sort || null;
+    const maxRows = Number(plan?.maxRows || 0);
+    setDataQueryFilters(filters);
+    setDataSortColumn(sort ? String(sort.columnIndex) : "-1");
+    setDataSortDirection(sort?.direction === "desc" ? "desc" : "asc");
+    setDataQueryMaxRows(String(maxRows || 0));
+    post({
+      type: "RUN_DATA_QUERY",
+      filters,
+      sort,
+      maxRows,
+    });
+  }
+
   function runDataQuery() {
     if (!manifest) return;
     post({
@@ -6585,6 +6824,12 @@ function App() {
 
           {tab === "data" && (
             <Section title="Data" icon={<Article />} hint="左のWorkspace Treeで選んだActive Datasetを表示します。">
+              <Tabs value={dataSubTab} onChange={(e, v) => setDataSubTab(v)} variant="scrollable" scrollButtons="auto" sx={{ mb: 1 }}>
+                <Tab value="table" label="Table" />
+                <Tab value="graph" label="Graph Query" />
+              </Tabs>
+              {dataSubTab === "table" && (
+                <>
               <Stack direction="row" useFlexGap flexWrap="wrap" spacing={1} alignItems="center" sx={{ mb: 0.75 }}>
                 <Button onClick={() => readPage(1)}>First</Button>
                 <Button onClick={() => readPage(page - 1)}>Prev</Button>
@@ -6634,6 +6879,21 @@ function App() {
                 <Typography variant="caption" color="text.secondary">{dataStatus}</Typography>
                 <Typography variant="caption" color="text.secondary">{dataTime}</Typography>
               </Stack>
+                </>
+              )}
+              {dataSubTab === "graph" && (
+                <GraphQueryEditor
+                  columns={columns}
+                  nodes={graphNodes}
+                  setNodes={setGraphNodes}
+                  edges={graphEdges}
+                  setEdges={setGraphEdges}
+                  onApply={runGraphQueryPlan}
+                  disabled={!manifest || busy}
+                  dataQueryActive={dataQueryActive}
+                  dataQueryCount={dataQueryCount}
+                />
+              )}
             </Section>
           )}
 
@@ -6991,6 +7251,7 @@ root.render(
     import Send from "https://esm.sh/@mui/icons-material@7.3.5/Send?deps=react@19.2.0,react-dom@19.2.0";
     import Schema from "https://esm.sh/@mui/icons-material@7.3.5/Schema?deps=react@19.2.0,react-dom@19.2.0";
     import Article from "https://esm.sh/@mui/icons-material@7.3.5/Article?deps=react@19.2.0,react-dom@19.2.0";
+    import * as ReactFlowLib from "https://esm.sh/@xyflow/react@12.8.4?deps=react@19.2.0,react-dom@19.2.0";
 
     const MaterialIcons = {
       UploadFile,
@@ -7028,10 +7289,11 @@ root.render(
       "createRoot",
       "MaterialUI",
       "MaterialIcons",
+      "ReactFlowLib",
       code
     );
 
-    runApp(React, createRoot, MaterialUI, MaterialIcons);
+    runApp(React, createRoot, MaterialUI, MaterialIcons, ReactFlowLib);
   </script>
 </body>
 </html>
