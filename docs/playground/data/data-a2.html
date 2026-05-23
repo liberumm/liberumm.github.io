@@ -40,6 +40,7 @@ let state = {
   timeTable:null,
   virtual:null,
   memory:null,
+  remoteExecution:{enabled:false,endpoint:"",token:"",mode:"local-first",timeoutMs:120000,lastProbe:null},
   cancelled:false
 };
 
@@ -353,7 +354,9 @@ function integrityFeatureFlags(base={}){
     queryPlan:true,
     predicatePushdown:true,
     chunkExecutionEngine:true,
-    chunkWorkerPool:true
+    chunkWorkerPool:true,
+    distributedAggregateReduce:true,
+    remoteExecutionAdapter:true
   };
 }
 
@@ -904,10 +907,17 @@ function queryPlanSummary(plan){
       pushdown:p.pushdown
     })),
     sort:plan?.sort || null,
+    aggregate:plan?.aggregate ? {
+      type:plan.aggregate.type,
+      mode:plan.aggregate.mode || null,
+      countMode:!!plan.aggregate.countMode,
+      distributedReduce:true
+    } : null,
     requiredColumns:plan?.requiredColumns || [],
     predicatePushdown:!!plan?.pushdown,
     executionEngine:"chunk-v1",
-    workerPoolReady:true
+    workerPoolReady:true,
+    distributedAggregateReduce:!!plan?.aggregate
   };
 }
 
@@ -956,12 +966,203 @@ function sortPlanRows(sortable, sortSpec){
   });
 }
 
+
+const CHUNK_DISTRIBUTED_AGG_VERSION = 1;
+
+function cloneAgg(a){
+  return {
+    count:Number(a?.count || 0),
+    n:Number(a?.n || 0),
+    sum:Number(a?.sum || 0),
+    min:a?.min == null ? null : Number(a.min),
+    max:a?.max == null ? null : Number(a.max)
+  };
+}
+
+function mergeAggInto(target, source){
+  if (!source) return target;
+  target.count += Number(source.count || 0);
+  target.n += Number(source.n || 0);
+  target.sum += Number(source.sum || 0);
+  const smin = source.min == null ? null : Number(source.min);
+  const smax = source.max == null ? null : Number(source.max);
+  if (Number.isFinite(smin)) target.min = target.min == null ? smin : Math.min(target.min, smin);
+  if (Number.isFinite(smax)) target.max = target.max == null ? smax : Math.max(target.max, smax);
+  return target;
+}
+
+function valuesFromSetLike(value){
+  if (!value) return [];
+  if (value instanceof Set) return [...value];
+  if (Array.isArray(value)) return value;
+  if (typeof value.values === "function") return [...value.values()];
+  return [];
+}
+
+function entriesFromMapLike(value){
+  if (!value) return [];
+  if (value instanceof Map) return [...value.entries()];
+  if (Array.isArray(value)) return value;
+  if (typeof value.entries === "function") return [...value.entries()];
+  if (typeof value === "object") return Object.entries(value);
+  return [];
+}
+
+function ensureAggInMap(map, key){
+  let a = map.get(key);
+  if (!a){ a = makeAgg(); map.set(key, a); }
+  return a;
+}
+
+function createChunkAggregateMetrics(aggregate){
+  if (!aggregate) return {};
+  if (aggregate.type === "pivot"){
+    return {
+      aggregateType:"pivot",
+      rowKeys:new Set(),
+      colKeys:new Set(),
+      cells:new Map(),
+      rowTotals:new Map(),
+      colTotals:new Map(),
+      grand:makeAgg(),
+      limitHit:false
+    };
+  }
+  if (aggregate.type === "timeSeries"){
+    return {
+      aggregateType:"timeSeries",
+      states:new Map(),
+      timeBucketSet:new Set(),
+      invalidTime:0,
+      limitHit:false
+    };
+  }
+  return {aggregateType:String(aggregate.type || "unknown")};
+}
+
+function applyPivotAggregateRow(metrics, chunk, localRow, aggregate){
+  const rowIdx = Array.isArray(aggregate.rowIdx) ? aggregate.rowIdx : [];
+  const colIdx = Array.isArray(aggregate.colIdx) ? aggregate.colIdx : [];
+  const valIdx = Number(aggregate.valIdx);
+  const countMode = !!aggregate.countMode;
+  const rk = keyOf(rowIdx.map(i => keyCellValue(valueFromColumn(chunk.columns.get(i), localRow))));
+  const ck = keyOf(colIdx.map(i => keyCellValue(valueFromColumn(chunk.columns.get(i), localRow))));
+  metrics.rowKeys.add(rk);
+  metrics.colKeys.add(ck);
+  const v = countMode ? "" : valueFromColumn(chunk.columns.get(valIdx), localRow);
+  let rm = metrics.cells.get(rk);
+  if (!rm){ rm = new Map(); metrics.cells.set(rk, rm); }
+  addAgg(ensureAggInMap(rm, ck), v, countMode);
+  addAgg(ensureAggInMap(metrics.rowTotals, rk), v, countMode);
+  addAgg(ensureAggInMap(metrics.colTotals, ck), v, countMode);
+  addAgg(metrics.grand, v, countMode);
+}
+
+function applyTimeSeriesAggregateRow(metrics, chunk, localRow, aggregate){
+  const timeIdx = Number(aggregate.timeIdx);
+  const groupIdx = Number(aggregate.groupIdx);
+  const valIdx = Number(aggregate.valIdx);
+  const hasGroup = !!aggregate.hasGroup;
+  const countMode = !!aggregate.countMode;
+  const bucketLimit = Math.max(1, Number(aggregate.bucketLimit || 5000));
+  const rawTime = valueFromColumn(chunk.columns.get(timeIdx), localRow);
+  const bucketKey = parseTimeBucket(rawTime, aggregate.bucket || "month");
+  if (!bucketKey){ metrics.invalidTime++; return; }
+  if (!metrics.timeBucketSet.has(bucketKey)){
+    if (metrics.timeBucketSet.size >= bucketLimit){ metrics.limitHit = true; return; }
+    metrics.timeBucketSet.add(bucketKey);
+  }
+  const groupKey = hasGroup ? keyCellValue(valueFromColumn(chunk.columns.get(groupIdx), localRow)) : "(All)";
+  const key = JSON.stringify([bucketKey, groupKey]);
+  const v = countMode ? "" : valueFromColumn(chunk.columns.get(valIdx), localRow);
+  addAgg(ensureAggInMap(metrics.states, key), v, countMode);
+}
+
+function applyAggregateRowToPartial(partial, chunk, localRow, aggregate){
+  if (!aggregate || !partial?.metrics) return;
+  if (aggregate.type === "pivot") applyPivotAggregateRow(partial.metrics, chunk, localRow, aggregate);
+  else if (aggregate.type === "timeSeries") applyTimeSeriesAggregateRow(partial.metrics, chunk, localRow, aggregate);
+}
+
+function mergePivotAggregatePartials(partials, {rowLimit, colLimit}={}){
+  const rowKeys=[], colKeys=[], rowSet=new Set(), colSet=new Set();
+  const cells=new Map(), rowTotals=new Map(), colTotals=new Map(), grand=makeAgg();
+  let limitHit=false;
+  const safeRowLimit=Math.max(1, Number(rowLimit || 1000000));
+  const safeColLimit=Math.max(1, Number(colLimit || 10000));
+
+  function includeRow(key){
+    if (rowSet.has(key)) return true;
+    if (rowKeys.length >= safeRowLimit){ limitHit=true; return false; }
+    rowSet.add(key); rowKeys.push(key); return true;
+  }
+  function includeCol(key){
+    if (colSet.has(key)) return true;
+    if (colKeys.length >= safeColLimit){ limitHit=true; return false; }
+    colSet.add(key); colKeys.push(key); return true;
+  }
+
+  for (const partial of Array.isArray(partials) ? partials : []){
+    const m=partial?.metrics || {};
+    if (m.limitHit) limitHit=true;
+    const cellEntries=entriesFromMapLike(m.cells);
+    if (cellEntries.length){
+      for (const [rk, rawCols] of cellEntries){
+        if (!includeRow(String(rk))) continue;
+        for (const [ck, rawAgg] of entriesFromMapLike(rawCols)){
+          if (!includeCol(String(ck))) continue;
+          const agg=cloneAgg(rawAgg);
+          let rm=cells.get(String(rk));
+          if (!rm){ rm=new Map(); cells.set(String(rk),rm); }
+          mergeAggInto(ensureAggInMap(rm, String(ck)), agg);
+          mergeAggInto(ensureAggInMap(rowTotals, String(rk)), agg);
+          mergeAggInto(ensureAggInMap(colTotals, String(ck)), agg);
+          mergeAggInto(grand, agg);
+        }
+      }
+    } else {
+      // Backward-compatible fallback for partials that only contain totals.
+      for (const rk of valuesFromSetLike(m.rowKeys)) includeRow(String(rk));
+      for (const ck of valuesFromSetLike(m.colKeys)) includeCol(String(ck));
+    }
+  }
+
+  rowKeys.sort();
+  colKeys.sort();
+  return {rowKeys, colKeys, cells, rowTotals, colTotals, grand, limitHit};
+}
+
+function mergeTimeSeriesAggregatePartials(partials, {bucketLimit}={}){
+  const states=new Map();
+  const timeBucketSet=new Set();
+  const safeBucketLimit=Math.max(1, Number(bucketLimit || 5000));
+  let invalidTime=0, limitHit=false;
+
+  for (const partial of Array.isArray(partials) ? partials : []){
+    const m=partial?.metrics || {};
+    invalidTime += Number(m.invalidTime || 0);
+    if (m.limitHit) limitHit=true;
+    for (const [key, rawAgg] of entriesFromMapLike(m.states)){
+      let bucketKey="", groupKey="";
+      try { [bucketKey, groupKey] = JSON.parse(key); } catch { [bucketKey, groupKey] = String(key).split("\u001f"); }
+      if (!timeBucketSet.has(bucketKey)){
+        if (timeBucketSet.size >= safeBucketLimit){ limitHit=true; continue; }
+        timeBucketSet.add(bucketKey);
+      }
+      mergeAggInto(ensureAggInMap(states, String(key)), cloneAgg(rawAgg));
+    }
+  }
+
+  return {states, timeBucketSet, invalidTime, limitHit};
+}
+
 async function executeChunkExecutionPlan(plan, options={}){
   const taskId = options.taskId || executionTaskId(plan?.name || "query");
   const chunks = selectChunksForPlan(plan);
   const collectRows = !!options.collectRows;
   const collectSort = !!options.collectSort && !!plan?.sort;
-  const collectPartials = !!options.collectPartials;
+  const collectAggregate = !!plan?.aggregate;
+  const collectPartials = !!options.collectPartials || collectAggregate;
   const limit = normalizePlanLimit(options.limit ?? plan?.limit);
   const progressLabel = options.progressLabel || plan?.name || "Executing chunks";
   const progressEvery = Math.max(1, Number(options.progressEvery || 5));
@@ -1002,7 +1203,7 @@ async function executeChunkExecutionPlan(plan, options={}){
 
     const chunk = await readChunkColumns(chunkIndex, plan?.requiredColumns || []);
     const base = chunkBaseRow(chunkIndex);
-    const partial = {taskId, chunkIndex, rowStart:base, rowCount:chunk.rowCount, scanned:0, matched:0, refs:[], sortable:[], metrics:{}};
+    const partial = {taskId, chunkIndex, rowStart:base, rowCount:chunk.rowCount, scanned:0, matched:0, refs:[], sortable:[], metrics:createChunkAggregateMetrics(plan?.aggregate)};
 
     if (typeof options.onChunkStart === "function") await options.onChunkStart({...ctxBase(), chunk, base, partial});
 
@@ -1023,6 +1224,8 @@ async function executeChunkExecutionPlan(plan, options={}){
         refs.push(rowId);
         partial.refs.push(rowId);
       }
+
+      if (collectAggregate) applyAggregateRowToPartial(partial, chunk, localRow, plan.aggregate);
 
       if (typeof options.onMatch === "function"){
         const signal = await options.onMatch({...ctxBase(), chunk, base, localRow, rowId, partial});
@@ -1064,6 +1267,142 @@ async function executeChunkExecutionPlan(plan, options={}){
     ms:now()-t0,
     queryPlan:queryPlanSummary(plan)
   };
+}
+
+
+const REMOTE_EXECUTION_ADAPTER_VERSION = 1;
+
+function normalizeRemoteExecutionConfig(config={}){
+  const endpoint=String(config.endpoint || "").trim();
+  const mode=["off","local-first","remote-first","remote-only"].includes(config.mode) ? config.mode : (config.enabled ? "remote-first" : "off");
+  return {
+    enabled:!!config.enabled && !!endpoint && mode !== "off",
+    endpoint,
+    token:String(config.token || ""),
+    mode,
+    timeoutMs:Math.max(5000, Math.min(15 * 60 * 1000, Number(config.timeoutMs || 120000))),
+    lastProbe:config.lastProbe || null
+  };
+}
+
+function configureRemoteExecution(config={}){
+  state.remoteExecution=normalizeRemoteExecutionConfig(config);
+  return remoteExecutionStatus();
+}
+
+function remoteExecutionStatus(extra={}){
+  const cfg=state.remoteExecution || {};
+  return {
+    remoteExecutionAdapterVersion:REMOTE_EXECUTION_ADAPTER_VERSION,
+    enabled:!!cfg.enabled,
+    endpoint:cfg.endpoint || "",
+    mode:cfg.mode || "off",
+    timeoutMs:Number(cfg.timeoutMs || 120000),
+    lastProbe:cfg.lastProbe || null,
+    ...extra
+  };
+}
+
+function canUseRemoteExecution(plan, options={}, chunks=[]){
+  const cfg=state.remoteExecution || {};
+  if (!cfg.enabled || !cfg.endpoint || cfg.mode === "off") return false;
+  if (options.remote === false) return false;
+  if (activeIsMemory()) return false;
+  if (!Array.isArray(chunks) || !chunks.length) return false;
+  if (typeof fetch !== "function" || typeof AbortController === "undefined") return false;
+  if (!(options.collectRows || options.collectSort || options.collectPartials || plan?.aggregate)) return false;
+  const context=chunkExecutionContextSnapshot();
+  // OPFS-backed storage cannot be read by an arbitrary server. The remote endpoint must either
+  // understand this context or return {fallback:true}. This adapter keeps the local path intact.
+  if (context.mode !== "storage" && context.mode !== "virtual") return false;
+  return true;
+}
+
+function serializableRemoteExecutionRequest(plan, options={}, chunks=[]){
+  return {
+    protocol:"quantum-csv-grid.remote-execution.v1",
+    adapterVersion:REMOTE_EXECUTION_ADAPTER_VERSION,
+    requestId:options.taskId || executionTaskId(`${plan?.name || "query"}_remote`),
+    createdAt:new Date().toISOString(),
+    context:chunkExecutionContextSnapshot(),
+    plan:{...plan,chunks,limit:Number.isFinite(Number(plan?.limit)) ? Number(plan.limit) : null},
+    options:{
+      collectRows:!!options.collectRows,
+      collectSort:!!options.collectSort,
+      collectPartials:!!options.collectPartials || !!plan?.aggregate,
+      limit:Number.isFinite(Number(options.limit ?? plan?.limit)) ? Number(options.limit ?? plan?.limit) : null,
+      progress:false
+    }
+  };
+}
+
+async function fetchJsonWithTimeout(url, payload, {token="", timeoutMs=120000}={}){
+  const controller=new AbortController();
+  const timer=setTimeout(()=>controller.abort(new Error("Remote execution timeout")), timeoutMs);
+  try{
+    const res=await fetch(url,{
+      method:"POST",
+      headers:{
+        "content-type":"application/json",
+        ...(token ? {"authorization":`Bearer ${token}`} : {})
+      },
+      body:JSON.stringify(payload),
+      signal:controller.signal
+    });
+    const text=await res.text();
+    let data=null;
+    try{ data=text ? JSON.parse(text) : null; }catch{ data={raw:text}; }
+    if (!res.ok) throw new Error(data?.message || data?.error || `Remote execution HTTP ${res.status}`);
+    return data;
+  }finally{
+    clearTimeout(timer);
+  }
+}
+
+function normalizeRemoteExecutionResult(plan, options, chunks, response, t0){
+  if (!response || response.fallback) throw new Error(response?.message || "Remote executor requested local fallback");
+  const result=response.result || response;
+  const refs=Array.isArray(result.refs) ? result.refs : [];
+  const sortable=Array.isArray(result.sortable) ? result.sortable : [];
+  const partials=Array.isArray(result.partials) ? result.partials : [];
+  return {
+    taskId:result.taskId || response.requestId || options.taskId || executionTaskId(`${plan?.name || "query"}_remote`),
+    engineVersion:CHUNK_EXECUTION_ENGINE_VERSION,
+    remoteExecutionAdapterVersion:REMOTE_EXECUTION_ADAPTER_VERSION,
+    executionMode:"remote-execution",
+    remoteEndpoint:state.remoteExecution?.endpoint || "",
+    chunks:Array.isArray(result.chunks) ? result.chunks : chunks,
+    refs,
+    sortable,
+    partials,
+    scanned:Number(result.scanned || 0),
+    matched:Number(result.matched || refs.length || sortable.length || 0),
+    skippedChunks:Number(result.skippedChunks || 0),
+    capped:!!result.capped,
+    ms:Number(result.ms || (now()-t0)),
+    queryPlan:{...queryPlanSummary(plan), executionEngine:"remote-v1", remoteExecution:{version:REMOTE_EXECUTION_ADAPTER_VERSION, endpoint:state.remoteExecution?.endpoint || ""}}
+  };
+}
+
+async function probeRemoteExecution(config={}){
+  const merged=normalizeRemoteExecutionConfig({...state.remoteExecution,...config,enabled:true});
+  if (!merged.endpoint) throw new Error("Remote execution endpoint is empty");
+  const t0=now();
+  const response=await fetchJsonWithTimeout(merged.endpoint,{protocol:"quantum-csv-grid.remote-execution.v1",type:"PING",createdAt:new Date().toISOString()},{token:merged.token,timeoutMs:Math.min(merged.timeoutMs,15000)});
+  state.remoteExecution={...merged,lastProbe:{ok:true,checkedAt:new Date().toISOString(),ms:Math.round(now()-t0),response}};
+  return remoteExecutionStatus({probe:response});
+}
+
+async function executeChunkExecutionPlanRemote(plan, options={}, chunks=null){
+  const selected=chunks || selectChunksForPlan(plan);
+  const cfg=state.remoteExecution || {};
+  const t0=now();
+  const request=serializableRemoteExecutionRequest(plan, options, selected);
+  post("PROGRESS",{value:1,text:`${options.progressLabel || plan?.name || "Executing chunks"} with Remote Execution... chunks ${fmt(selected.length)}`});
+  const response=await fetchJsonWithTimeout(cfg.endpoint,request,{token:cfg.token,timeoutMs:cfg.timeoutMs});
+  const result=normalizeRemoteExecutionResult(plan,{...options,taskId:request.requestId},selected,response,t0);
+  post("PROGRESS",{value:100,text:`Remote Execution complete... chunks ${fmt(selected.length)} / rows ${fmt(result.scanned)} / matches ${fmt(result.matched)}`});
+  return result;
 }
 
 
@@ -1109,7 +1448,7 @@ function defaultChunkWorkerCount(chunkCount){
 function canUseChunkWorkerPool(plan, options, chunks){
   if (options?.parallel === false) return false;
   if (options?.onMatch || options?.onChunkStart || options?.onChunkEnd) return false;
-  if (!(options?.collectRows || options?.collectSort)) return false;
+  if (!(options?.collectRows || options?.collectSort || options?.collectPartials || plan?.aggregate)) return false;
   if (!Array.isArray(chunks) || chunks.length < 2) return false;
   if (activeIsMemory()) return false;
   if (typeof Worker === "undefined") return false;
@@ -1211,11 +1550,11 @@ function reduceChunkWorkerResults(plan, options, chunks, batches, results, t0){
     skippedChunks,
     capped,
     ms:now()-t0,
-    queryPlan:{...queryPlanSummary(plan), executionEngine:"chunk-pool-v1", workerPool:{version:CHUNK_WORKER_POOL_VERSION, workers:batches.length}}
+    queryPlan:{...queryPlanSummary(plan), executionEngine:"chunk-pool-v1", workerPool:{version:CHUNK_WORKER_POOL_VERSION, workers:batches.length}, distributedReduce:!!plan?.aggregate}
   };
 }
 
-async function executeChunkExecutionPlanMaybeParallel(plan, options={}){
+async function executeChunkExecutionPlanLocalMaybeParallel(plan, options={}){
   const chunks=selectChunksForPlan(plan);
   if (!canUseChunkWorkerPool(plan, options, chunks)){
     const exec=await executeChunkExecutionPlan(plan, options);
@@ -1251,6 +1590,29 @@ async function executeChunkExecutionPlanMaybeParallel(plan, options={}){
     exec.workerPoolError=err?.message || String(err);
     return exec;
   }
+}
+
+
+async function executeChunkExecutionPlanMaybeParallel(plan, options={}){
+  const chunks=selectChunksForPlan(plan);
+  const cfg=state.remoteExecution || {};
+  const remoteEligible=canUseRemoteExecution(plan, options, chunks);
+
+  if (remoteEligible && (cfg.mode === "remote-first" || cfg.mode === "remote-only")){
+    try{
+      return await executeChunkExecutionPlanRemote(plan, options, chunks);
+    }catch(err){
+      if (cfg.mode === "remote-only") throw err;
+      post("PROGRESS",{value:0,text:`Remote Execution fallback: ${err?.message || err}`});
+    }
+  }
+
+  const local=await executeChunkExecutionPlanLocalMaybeParallel(plan, options);
+  if (remoteEligible && cfg.mode === "local-first"){
+    local.remoteExecutionAvailable=true;
+    local.queryPlan={...(local.queryPlan || queryPlanSummary(plan)), remoteExecution:{version:REMOTE_EXECUTION_ADAPTER_VERSION, available:true, mode:cfg.mode}};
+  }
+  return local;
 }
 
 function compactStringColumnForMemory(idsArr, dict){
@@ -2357,54 +2719,65 @@ async function buildPivot({rowFields,columnFields,valueField,aggregation,maxRows
   const rowLimit=Math.max(1, Number(maxRows || 1000000));
   const colLimit=Math.max(1, Number(maxCols || 10000));
   const required=[...new Set([...rowIdx,...colIdx,...(countMode?[]:[valIdx])])];
-  const plan=buildQueryPlan({name:"pivotTile", projection:required, pushdown:true});
-  const rowKeys=[], colKeys=[], rowSet=new Set(), colSet=new Set();
-  const cells=new Map(), rowTotals=new Map(), colTotals=new Map(), grand=makeAgg();
-  let limitHit=false;
+  const plan=buildQueryPlan({
+    name:"pivotTile",
+    projection:required,
+    pushdown:true
+  });
+  plan.aggregate={
+    type:"pivot",
+    rowIdx,
+    colIdx,
+    valIdx:countMode ? -1 : valIdx,
+    countMode,
+    mode,
+    rowLimit,
+    colLimit
+  };
 
   state.pivotTable=null;
   state.pivotTileIndex=null;
 
-  const exec=await executeChunkExecutionPlan(plan,{
-    progressLabel:"Pivot tile index",
+  const exec=await executeChunkExecutionPlanMaybeParallel(plan,{
+    collectPartials:true,
+    progressLabel:"Pivot distributed reduce",
     progressEvery:1,
-    progressText:(ctx)=>`Pivot tile index... ${ctx.position+1}/${ctx.totalChunks} / rows ${fmt(ctx.scanned)} / row groups ${fmt(rowKeys.length)} / col groups ${fmt(colKeys.length)}`,
-    onMatch:({chunk, localRow})=>{
-      const rk=keyOf(rowIdx.map(i=>keyCellValue(valueFromColumn(chunk.columns.get(i),localRow))));
-      const ck=keyOf(colIdx.map(i=>keyCellValue(valueFromColumn(chunk.columns.get(i),localRow))));
-
-      if (!rowSet.has(rk)){
-        if (rowKeys.length>=rowLimit){ limitHit=true; return; }
-        rowSet.add(rk); rowKeys.push(rk);
-      }
-      if (!colSet.has(ck)){
-        if (colKeys.length>=colLimit){ limitHit=true; return; }
-        colSet.add(ck); colKeys.push(ck);
-      }
-
-      const v=countMode ? "" : valueFromColumn(chunk.columns.get(valIdx),localRow);
-      let rm=cells.get(rk); if(!rm){rm=new Map(); cells.set(rk,rm);}
-      let a=rm.get(ck); if(!a){a=makeAgg(); rm.set(ck,a);}
-      addAgg(a,v,countMode);
-      let rt=rowTotals.get(rk); if(!rt){rt=makeAgg(); rowTotals.set(rk,rt);} addAgg(rt,v,countMode);
-      let ct=colTotals.get(ck); if(!ct){ct=makeAgg(); colTotals.set(ck,ct);} addAgg(ct,v,countMode);
-      addAgg(grand,v,countMode);
-    }
+    progressText:(ctx)=>`Pivot distributed reduce... ${ctx.position+1}/${ctx.totalChunks} / rows ${fmt(ctx.scanned)} / partials ${fmt(ctx.partials.length)}`
   });
 
-  rowKeys.sort();
-  colKeys.sort();
-
+  const reduced=mergePivotAggregatePartials(exec.partials,{rowLimit,colLimit});
   const rowHeaderNames = rowIdx.length ? rowIdx.map(i=>state.manifest.columns[i].name) : ["Rows"];
   const colHeaderNames = colIdx.length ? colIdx.map(i=>state.manifest.columns[i].name) : ["Columns"];
 
   state.pivotTileIndex={
-    rowKeys, colKeys, cells, rowTotals, colTotals, grand, mode, countMode,
-    rowIdx, colIdx, valueField:countMode ? -1 : valIdx,
-    rowHeaderNames, colHeaderNames,
-    tileRows:PIVOT_TILE_ROWS, tileCols:PIVOT_TILE_COLS,
-    scanned:exec.scanned, limitHit, queryPlan:exec.queryPlan, ms:exec.ms,
-    executionEngine:{version:exec.engineVersion,taskId:exec.taskId,chunks:exec.chunks.length},
+    rowKeys:reduced.rowKeys,
+    colKeys:reduced.colKeys,
+    cells:reduced.cells,
+    rowTotals:reduced.rowTotals,
+    colTotals:reduced.colTotals,
+    grand:reduced.grand,
+    mode,
+    countMode,
+    rowIdx,
+    colIdx,
+    valueField:countMode ? -1 : valIdx,
+    rowHeaderNames,
+    colHeaderNames,
+    tileRows:PIVOT_TILE_ROWS,
+    tileCols:PIVOT_TILE_COLS,
+    scanned:exec.scanned,
+    limitHit:reduced.limitHit || exec.capped,
+    queryPlan:exec.queryPlan,
+    ms:exec.ms,
+    executionEngine:{
+      version:exec.engineVersion,
+      mode:exec.executionMode || "single-worker",
+      workerPoolVersion:exec.workerPoolVersion || null,
+      workers:exec.workerCount || 1,
+      distributedAggregateReduceVersion:CHUNK_DISTRIBUTED_AGG_VERSION,
+      taskId:exec.taskId,
+      chunks:exec.chunks.length
+    },
     builtAt:new Date().toISOString()
   };
 
@@ -2573,53 +2946,41 @@ async function buildTimeSeries({timeField, bucket, groupField, valueField, aggre
   const timeIdx = Number(timeField);
   const groupIdx = Number(groupField);
   const valIdx = Number(valueField);
-  const hasGroup = Number.isFinite(groupIdx) && groupIdx >= 0;
-  const countMode = !Number.isFinite(valIdx) || valIdx < 0;
+  const hasGroup = Number.isFinite(groupIdx) && groupIdx >= 0 && !!state.manifest.columns[groupIdx];
+  const countMode = !Number.isFinite(valIdx) || valIdx < 0 || !state.manifest.columns[valIdx];
   const mode = countMode ? "Count" : aggregation;
   const required = [...new Set([timeIdx, ...(hasGroup ? [groupIdx] : []), ...(countMode ? [] : [valIdx])])];
 
   if (!state.manifest.columns[timeIdx]) throw new Error("Time field is not selected");
+  const bucketLimit = Math.max(1, Number(maxBuckets || 5000));
   const plan=buildQueryPlan({
     name:"timeSeries",
     predicates:[{columnIndex:timeIdx, op:"notnull", value:"", rowLevel:false, source:"timeField"}],
     projection:required,
     pushdown:true
   });
+  plan.aggregate={
+    type:"timeSeries",
+    timeIdx,
+    bucket:bucket || "month",
+    groupIdx:hasGroup ? groupIdx : -1,
+    valIdx:countMode ? -1 : valIdx,
+    hasGroup,
+    countMode,
+    mode,
+    bucketLimit
+  };
 
-  const states = new Map();
-  const timeBucketSet = new Set();
-  let invalidTime = 0, limitHit = false;
-  const bucketLimit = Math.max(1, Number(maxBuckets || 5000));
-
-  const exec=await executeChunkExecutionPlan(plan,{
-    progressLabel:"Time view chunks",
+  const exec=await executeChunkExecutionPlanMaybeParallel(plan,{
+    collectPartials:true,
+    progressLabel:"Time distributed reduce",
     progressEvery:1,
-    progressText:(ctx)=>`Time view chunks... ${ctx.position+1}/${ctx.totalChunks} / skipped ${fmt(ctx.skippedChunks)} / rows ${fmt(ctx.scanned)}`,
-    onMatch:({chunk, localRow})=>{
-      const rawTime = valueFromColumn(chunk.columns.get(timeIdx), localRow);
-      const b = parseTimeBucket(rawTime, bucket);
-      if (!b) { invalidTime++; return; }
-
-      if (!timeBucketSet.has(b)){
-        if (timeBucketSet.size >= bucketLimit){
-          limitHit = true;
-          return;
-        }
-        timeBucketSet.add(b);
-      }
-
-      const g = hasGroup ? keyCellValue(valueFromColumn(chunk.columns.get(groupIdx), localRow)) : "(All)";
-      const key = JSON.stringify([b, g]);
-
-      if (!states.has(key)) states.set(key, makeAgg());
-
-      const v = countMode ? "" : valueFromColumn(chunk.columns.get(valIdx), localRow);
-      addAgg(states.get(key), v, countMode);
-    }
+    progressText:(ctx)=>`Time distributed reduce... ${ctx.position+1}/${ctx.totalChunks} / skipped ${fmt(ctx.skippedChunks)} / rows ${fmt(ctx.scanned)} / partials ${fmt(ctx.partials.length)}`
   });
 
+  const reduced=mergeTimeSeriesAggregatePartials(exec.partials,{bucketLimit});
   const header = hasGroup ? ["Time", "Group", mode] : ["Time", mode];
-  const rows = [...states.entries()].sort((a,b)=>a[0].localeCompare(b[0])).map(([key, agg])=>{
+  const rows = [...reduced.states.entries()].sort((a,b)=>a[0].localeCompare(b[0])).map(([key, agg])=>{
     let b = "", g = "";
     try { [b, g] = JSON.parse(key); } catch { [b, g] = String(key).split("\u001f"); }
     return hasGroup ? [b, g, aggValue(agg, mode)] : [b, aggValue(agg, mode)];
@@ -2627,13 +2988,22 @@ async function buildTimeSeries({timeField, bucket, groupField, valueField, aggre
 
   state.timeTable = {header, rows};
   return {
-    header, rows,
+    header,
+    rows,
     scanned:exec.scanned,
-    invalidTime,
-    limitHit,
+    invalidTime:reduced.invalidTime,
+    limitHit:reduced.limitHit || exec.capped,
     skippedChunks:exec.skippedChunks,
     queryPlan:exec.queryPlan,
-    executionEngine:{version:exec.engineVersion,taskId:exec.taskId,chunks:exec.chunks.length},
+    executionEngine:{
+      version:exec.engineVersion,
+      mode:exec.executionMode || "single-worker",
+      workerPoolVersion:exec.workerPoolVersion || null,
+      workers:exec.workerCount || 1,
+      distributedAggregateReduceVersion:CHUNK_DISTRIBUTED_AGG_VERSION,
+      taskId:exec.taskId,
+      chunks:exec.chunks.length
+    },
     ms:exec.ms
   };
 }
@@ -2653,6 +3023,21 @@ self.onmessage=async(e)=>{
       await hydrateChunkExecutionContext(msg.context);
       const result=await executeChunkExecutionPlan(msg.plan,{...(msg.options || {}),progress:false,parallel:false});
       post("CHUNK_BATCH_DONE",{requestId:msg.requestId,batchIndex:msg.batchIndex,result});
+      return;
+    }
+
+    if (msg.type==="REMOTE_EXECUTION_CONFIG"){
+      post("REMOTE_EXECUTION_STATUS", configureRemoteExecution(msg.config || msg));
+      return;
+    }
+
+    if (msg.type==="REMOTE_EXECUTION_STATUS"){
+      post("REMOTE_EXECUTION_STATUS", remoteExecutionStatus());
+      return;
+    }
+
+    if (msg.type==="REMOTE_EXECUTION_PING"){
+      post("REMOTE_EXECUTION_STATUS", await probeRemoteExecution(msg.config || {}));
       return;
     }
 
