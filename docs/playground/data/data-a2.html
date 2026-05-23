@@ -41,6 +41,8 @@ let state = {
   virtual:null,
   memory:null,
   remoteExecution:{enabled:false,endpoint:"",token:"",mode:"local-first",timeoutMs:120000,lastProbe:null},
+  externalStorage:{enabled:false,provider:"custom-http",endpoint:"",authMode:"none",apiKey:"",prefix:"quantum_csv_grid_columnar",timeoutMs:120000,lastProbe:null},
+  externalDataset:null,
   cancelled:false
 };
 
@@ -356,7 +358,8 @@ function integrityFeatureFlags(base={}){
     chunkExecutionEngine:true,
     chunkWorkerPool:true,
     distributedAggregateReduce:true,
-    remoteExecutionAdapter:true
+    remoteExecutionAdapter:true,
+    browserExternalStorageAdapter:true
   };
 }
 
@@ -705,6 +708,7 @@ function normalizeColumnStat(raw, rowCount){
 
 function chunkMetaForIndex(chunkIndex){
   if (activeIsMemory()) return state.dataset?.chunks?.[chunkIndex] || state.memory?.chunks?.[chunkIndex] || null;
+  if (activeIsExternalStorage()) return state.externalDataset?.chunks?.[chunkIndex] || state.dataset?.chunks?.[chunkIndex] || null;
   if (activeIsVirtual()){
     const vc=state.virtual?.globalChunks?.[chunkIndex];
     const src=vc ? state.virtual.sources[vc.sourceIndex] : null;
@@ -1308,6 +1312,7 @@ function canUseRemoteExecution(plan, options={}, chunks=[]){
   if (!cfg.enabled || !cfg.endpoint || cfg.mode === "off") return false;
   if (options.remote === false) return false;
   if (activeIsMemory()) return false;
+  if (activeIsExternalStorage()) return false;
   if (!Array.isArray(chunks) || !chunks.length) return false;
   if (typeof fetch !== "function" || typeof AbortController === "undefined") return false;
   if (!(options.collectRows || options.collectSort || options.collectPartials || plan?.aggregate)) return false;
@@ -1406,10 +1411,226 @@ async function executeChunkExecutionPlanRemote(plan, options={}, chunks=null){
 }
 
 
+const BROWSER_EXTERNAL_STORAGE_ADAPTER_VERSION = 1;
+
+function normalizeExternalStoragePrefix(prefix){
+  return String(prefix || "quantum_csv_grid_columnar").trim().replace(/^\/+|\/+$/g, "") || "quantum_csv_grid_columnar";
+}
+
+function normalizeExternalStorageConfig(config={}){
+  const endpoint=String(config.endpoint || "").trim().replace(/\/+$/g, "");
+  const authMode=["none","bearer","api-key"].includes(config.authMode) ? config.authMode : "none";
+  return {
+    enabled:!!config.enabled && !!endpoint,
+    provider:"custom-http",
+    endpoint,
+    authMode,
+    apiKey:String(config.apiKey || ""),
+    prefix:normalizeExternalStoragePrefix(config.prefix),
+    timeoutMs:Math.max(5000, Math.min(15 * 60 * 1000, Number(config.timeoutMs || 120000))),
+    lastProbe:config.lastProbe || null
+  };
+}
+
+function configureExternalStorage(config={}){
+  state.externalStorage=normalizeExternalStorageConfig(config);
+  return externalStorageStatus();
+}
+
+function externalStorageStatus(extra={}){
+  const cfg=state.externalStorage || {};
+  return {
+    browserExternalStorageAdapterVersion:BROWSER_EXTERNAL_STORAGE_ADAPTER_VERSION,
+    enabled:!!cfg.enabled,
+    provider:cfg.provider || "custom-http",
+    endpoint:cfg.endpoint || "",
+    authMode:cfg.authMode || "none",
+    prefix:cfg.prefix || "quantum_csv_grid_columnar",
+    timeoutMs:Number(cfg.timeoutMs || 120000),
+    lastProbe:cfg.lastProbe || null,
+    hasApiKey:!!cfg.apiKey,
+    ...extra
+  };
+}
+
+function externalStorageHeaders(contentType=""){
+  const cfg=state.externalStorage || {};
+  const headers={};
+  if (contentType) headers["content-type"]=contentType;
+  if (cfg.authMode === "bearer" && cfg.apiKey) headers["authorization"]=`Bearer ${cfg.apiKey}`;
+  if (cfg.authMode === "api-key" && cfg.apiKey) headers["x-api-key"]=cfg.apiKey;
+  return headers;
+}
+
+function encodeExternalPath(path){
+  return String(path || "").split("/").filter(Boolean).map(encodeURIComponent).join("/");
+}
+
+function externalDatasetBasePath(id){
+  return `${normalizeExternalStoragePrefix(state.externalStorage?.prefix)}/datasets/${safeId(id)}`;
+}
+
+function externalUrlForFile(path){
+  const endpoint=String(state.externalStorage?.endpoint || "").replace(/\/+$/g, "");
+  if (!endpoint) throw new Error("External Storage endpoint is empty");
+  return `${endpoint}/files/${encodeExternalPath(path)}`;
+}
+
+function externalUrlForList(prefix){
+  const endpoint=String(state.externalStorage?.endpoint || "").replace(/\/+$/g, "");
+  if (!endpoint) throw new Error("External Storage endpoint is empty");
+  return `${endpoint}/list?prefix=${encodeURIComponent(String(prefix || ""))}`;
+}
+
+async function externalFetch(url, init={}, timeoutMs){
+  if (!state.externalStorage?.enabled) throw new Error("External Storage is not connected");
+  const controller=new AbortController();
+  const timer=setTimeout(()=>controller.abort(new Error("External Storage request timeout")), Number(timeoutMs || state.externalStorage.timeoutMs || 120000));
+  try{
+    const res=await fetch(url,{...init, signal:controller.signal});
+    if (!res.ok){
+      let message=`External Storage HTTP ${res.status}`;
+      try{ const text=await res.text(); if (text) message += `: ${text.slice(0,300)}`; }catch{}
+      throw new Error(message);
+    }
+    return res;
+  }finally{
+    clearTimeout(timer);
+  }
+}
+
+async function externalReadText(path){
+  const res=await externalFetch(externalUrlForFile(path),{method:"GET",headers:externalStorageHeaders()}, state.externalStorage?.timeoutMs);
+  return await res.text();
+}
+async function externalReadJson(path){ return JSON.parse(await externalReadText(path)); }
+async function externalReadBuffer(path){
+  const res=await externalFetch(externalUrlForFile(path),{method:"GET",headers:externalStorageHeaders()}, state.externalStorage?.timeoutMs);
+  return await res.arrayBuffer();
+}
+async function externalWriteText(path, text){
+  await externalFetch(externalUrlForFile(path),{method:"PUT",headers:externalStorageHeaders("application/json; charset=utf-8"),body:String(text ?? "")}, state.externalStorage?.timeoutMs);
+}
+async function externalWriteJson(path, obj){ await externalWriteText(path, JSON.stringify(obj)); }
+async function externalWriteBuffer(path, buffer){
+  await externalFetch(externalUrlForFile(path),{method:"PUT",headers:externalStorageHeaders("application/octet-stream"),body:buffer}, state.externalStorage?.timeoutMs);
+}
+
+function parseExternalListPayload(payload){
+  const raw=Array.isArray(payload) ? payload : (payload?.paths || payload?.items || payload?.objects || payload?.keys || []);
+  return raw.map((item)=> typeof item === "string" ? item : (item?.path || item?.key || item?.name || item?.url || "")).map(String).filter(Boolean);
+}
+
+async function externalListPaths(prefix){
+  const res=await externalFetch(externalUrlForList(prefix),{method:"GET",headers:externalStorageHeaders()}, state.externalStorage?.timeoutMs);
+  const text=await res.text();
+  if (!text) return [];
+  let payload;
+  try{ payload=JSON.parse(text); }catch{ return text.split(/\r?\n/).map(x=>x.trim()).filter(Boolean); }
+  return parseExternalListPayload(payload);
+}
+
+function externalDatasetIdFromManifestPath(path){
+  const prefix=`${normalizeExternalStoragePrefix(state.externalStorage?.prefix)}/datasets/`;
+  const s=String(path || "");
+  if (!s.startsWith(prefix) || !s.endsWith("/manifest.json")) return "";
+  return s.slice(prefix.length, -"/manifest.json".length).split("/")[0] || "";
+}
+
+async function testExternalStorage(config={}){
+  configureExternalStorage({...state.externalStorage,...config,enabled:true});
+  const t0=now();
+  const prefix=`${normalizeExternalStoragePrefix(state.externalStorage.prefix)}/datasets/`;
+  try{
+    const paths=await externalListPaths(prefix);
+    state.externalStorage.lastProbe={ok:true,checkedAt:new Date().toISOString(),ms:Math.round(now()-t0),count:paths.length};
+    return externalStorageStatus({ok:true,count:paths.length});
+  }catch(e){
+    state.externalStorage.lastProbe={ok:false,checkedAt:new Date().toISOString(),ms:Math.round(now()-t0),message:issueText(e)};
+    return externalStorageStatus({ok:false,message:`Connected config saved, but list failed: ${issueText(e)}`});
+  }
+}
+
+async function listExternalDatasets(){
+  const prefix=`${normalizeExternalStoragePrefix(state.externalStorage?.prefix)}/datasets/`;
+  const paths=await externalListPaths(prefix);
+  const ids=[...new Set(paths.map(externalDatasetIdFromManifestPath).filter(Boolean))].sort();
+  const rows=[];
+  for (const id of ids){
+    try{
+      const base=externalDatasetBasePath(id);
+      const m=await externalReadJson(`${base}/manifest.json`);
+      rows.push({id,workspace:manifestWorkspace(m),collection:manifestCollection(m),tableName:manifestTableName(m),path:manifestPath(m),name:m.name||id,originalFileName:m.originalFileName||"",createdAt:m.createdAt||"",rows:m.totalRows||0,sourceRows:m.sourceRows||0,columns:(m.columns||[]).length,chunks:m.chunks||0,fileSize:m.fileSize||0,mode:m.mode||"",external:true});
+    }catch(e){
+      rows.push({id,name:id,workspace:"External",collection:"Unreadable",tableName:id,path:`External / Unreadable / ${id}`,rows:0,columns:0,chunks:0,mode:`error: ${issueText(e)}`,external:true});
+    }
+  }
+  rows.sort((a,b)=>String(b.createdAt).localeCompare(String(a.createdAt)));
+  return rows;
+}
+
+async function syncDatasetToExternal(datasetId){
+  if (!state.externalStorage?.enabled) throw new Error("External Storage is not connected");
+  const id=datasetId || state.dataset?.id || state.manifest?.id;
+  if (!id || String(id).startsWith("virtual:") || String(id).startsWith("memory:") || state.manifest?.openedFromExternalStorage) throw new Error("Sync requires one physical OPFS dataset");
+  const loaded=await loadValidatedDataset(id,{rebuildStats:true});
+  const {dir,manifest,chunks}=loaded;
+  const base=externalDatasetBasePath(id);
+  const columns=manifest.columns || [];
+  const t0=now();
+  let filesWritten=0, bytesWritten=0;
+  postProgress(1, `External sync start: ${manifest.name || id}`);
+  await externalWriteJson(`${base}/manifest.json`, {...manifest, externalStorageSyncedAt:new Date().toISOString()}); filesWritten++;
+  await externalWriteJson(`${base}/chunks.json`, chunks); filesWritten++;
+  for (let c=0; c<chunks.length; c++){
+    if (state.cancelled) throw new Error("Cancelled");
+    const chunkName=`chunk_${String(c).padStart(6,"0")}`;
+    const chunkDir=await dir.getDirectoryHandle(chunkName);
+    try{ await externalWriteText(`${base}/${chunkName}/meta.json`, await readText(chunkDir,"meta.json")); filesWritten++; }catch{}
+    for (const col of columns){
+      const colName=colFileName(col.index,col.type);
+      const buf=await readBuffer(chunkDir,colName);
+      await externalWriteBuffer(`${base}/${chunkName}/${colName}`, buf);
+      filesWritten++; bytesWritten += Number(buf.byteLength || 0);
+      if (col.type === "string"){
+        const dictName=dictFileName(col.index);
+        const dictText=await readText(chunkDir,dictName);
+        await externalWriteText(`${base}/${chunkName}/${dictName}`, dictText);
+        filesWritten++; bytesWritten += dictText.length * 2;
+      }
+    }
+    postProgress(Math.min(99, Math.floor(((c+1)/Math.max(1,chunks.length))*100)), `External sync... chunks ${fmt(c+1)}/${fmt(chunks.length)} / files ${fmt(filesWritten)}`);
+  }
+  return {id,manifest,filesWritten,bytesWritten,ms:now()-t0,base};
+}
+
+async function openExternalDataset(id){
+  if (!state.externalStorage?.enabled) throw new Error("External Storage is not connected");
+  const datasetId=safeId(id);
+  if (!datasetId) throw new Error("External dataset id is empty");
+  clearChunkCache();
+  const base=externalDatasetBasePath(datasetId);
+  const manifest=await externalReadJson(`${base}/manifest.json`);
+  const chunks=await externalReadJson(`${base}/chunks.json`);
+  if (!manifest || !Array.isArray(manifest.columns)) throw new Error("External manifest is invalid");
+  if (!Array.isArray(chunks)) throw new Error("External chunks.json is invalid");
+  const openedManifest={...manifest,id:manifest.id || datasetId,openedFromExternalStorage:true,externalStoragePath:base};
+  state.virtual=null; state.memory=null; state.dir=null;
+  state.externalDataset={id:datasetId,base,manifest:openedManifest,chunks};
+  state.manifest=openedManifest;
+  state.dataset={id:datasetId,manifest:openedManifest,chunks};
+  state.searchMatches=[]; state.dataQueryMatches=null; state.dataQueryMeta=null; state.pivotTable=null; state.pivotTileIndex=null; state.timeTable=null;
+  return {manifest:openedManifest,chunks};
+}
+
+function activeIsExternalStorage(){ return !!state.externalDataset && !!state.manifest?.openedFromExternalStorage; }
+
+
 const CHUNK_WORKER_POOL_VERSION = 1;
 
 function chunkExecutionContextSnapshot(){
   if (activeIsMemory()) return {mode:"memory", reason:"In-memory chunks cannot be shared across nested workers yet"};
+  if (activeIsExternalStorage()) return {mode:"external", reason:"External Storage credentials stay in the main worker memory only"};
   if (activeIsVirtual()){
     return {
       mode:"virtual",
@@ -1451,6 +1672,7 @@ function canUseChunkWorkerPool(plan, options, chunks){
   if (!(options?.collectRows || options?.collectSort || options?.collectPartials || plan?.aggregate)) return false;
   if (!Array.isArray(chunks) || chunks.length < 2) return false;
   if (activeIsMemory()) return false;
+  if (activeIsExternalStorage()) return false;
   if (typeof Worker === "undefined") return false;
   if (!self.location || !self.location.href) return false;
   const context=chunkExecutionContextSnapshot();
@@ -2042,7 +2264,7 @@ async function openDataset(id){
   clearChunkCache();
   const loaded=await loadValidatedDataset(id,{rebuildStats:true});
   const {dir,manifest,chunks}=loaded;
-  state.virtual=null; state.memory=null; state.dir=dir; state.manifest=manifest; state.dataset={id,manifest,chunks};
+  state.virtual=null; state.memory=null; state.externalDataset=null; state.dir=dir; state.manifest=manifest; state.dataset={id,manifest,chunks};
   state.searchMatches=[]; state.dataQueryMatches=null; state.dataQueryMeta=null; state.pivotTable=null; state.pivotTileIndex=null; state.timeTable=null;
   return {manifest,chunks,integrity:loaded.integrity};
 }
@@ -2119,6 +2341,7 @@ async function openVirtualDataset(ids, name){
     }
   };
   state.virtual={sources:virtualSources, globalChunks};
+  state.externalDataset=null;
   state.dir=null; state.manifest=manifest; state.dataset={id:manifest.id,manifest,chunks:globalChunks};
   state.searchMatches=[]; state.dataQueryMatches=null; state.dataQueryMeta=null; state.pivotTable=null; state.pivotTileIndex=null; state.timeTable=null;
   return {manifest,chunks:globalChunks};
@@ -2236,13 +2459,14 @@ async function openMemoryDataset(ids, name, options={}){
     return {chunkIndex:i,rowCount:ch.rowCount,sourceIndex:ch.sourceIndex,sourceChunkIndex:ch.sourceChunkIndex,rowStart:ch.rowStart,rowEnd:ch.rowEnd,...(fullChunk && srcMeta ? {stats:srcMeta.stats,columnStats:srcMeta.columnStats,indexVersion:srcMeta.indexVersion} : {})};
   });
   state.memory={sources:memorySources,chunks:memoryChunks,estimatedBytes,maxBytes};
-  state.virtual=null; state.dir=null; state.manifest=manifest; state.dataset={id:manifest.id,manifest,chunks:chunkMetas};
+  state.virtual=null; state.externalDataset=null; state.dir=null; state.manifest=manifest; state.dataset={id:manifest.id,manifest,chunks:chunkMetas};
   state.searchMatches=[]; state.dataQueryMatches=null; state.dataQueryMeta=null; state.pivotTable=null; state.pivotTileIndex=null; state.timeTable=null;
   return {manifest,chunks:chunkMetas};
 }
 
 function activeIsVirtual(){ return !!state.virtual && state.manifest?.mode === "virtual-dataset"; }
 function activeIsMemory(){ return !!state.memory && state.manifest?.mode === "memory-dataset"; }
+// activeIsExternalStorage is defined by the Browser External Storage Adapter block above.
 function chunkBaseRow(chunkIndex){
   if (activeIsMemory()) return Number(state.memory.chunks[chunkIndex]?.rowStart || 0);
   if (activeIsVirtual()) return Number(state.virtual.globalChunks[chunkIndex]?.rowStart || 0);
@@ -2402,6 +2626,11 @@ async function resolveChunkReadTarget(chunkIndex){
     physicalChunkIndex=Number(vc.sourceChunkIndex);
     catalogMeta=vc;
     chunkDir=await src.dir.getDirectoryHandle(`chunk_${String(physicalChunkIndex).padStart(6,"0")}`);
+  } else if (activeIsExternalStorage()){
+    catalogMeta=state.externalDataset?.chunks?.[chunkIndex] || state.dataset?.chunks?.[chunkIndex] || null;
+    datasetId=state.externalDataset?.id || state.dataset?.id || state.manifest?.id || "external";
+    sourceManifest=state.externalDataset?.manifest || state.manifest;
+    physicalChunkIndex=Number(chunkIndex);
   } else {
     catalogMeta=state.dataset?.chunks?.[chunkIndex] || null;
     chunkDir=await state.dir.getDirectoryHandle(`chunk_${String(chunkIndex).padStart(6,"0")}`);
@@ -2410,11 +2639,12 @@ async function resolveChunkReadTarget(chunkIndex){
   let rowCount=Number(catalogMeta?.rowCount || 0);
   let meta=catalogMeta;
   if (!rowCount){
-    meta=await readJson(chunkDir,"meta.json");
+    if (activeIsExternalStorage()) meta=await externalReadJson(`${state.externalDataset.base}/chunk_${String(physicalChunkIndex).padStart(6,"0")}/meta.json`);
+    else meta=await readJson(chunkDir,"meta.json");
     rowCount=Number(meta.rowCount || 0);
   }
 
-  return {chunkDir, sourceManifest, datasetId, physicalChunkIndex, rowCount, meta};
+  return {chunkDir, sourceManifest, datasetId, physicalChunkIndex, rowCount, meta, external:activeIsExternalStorage(), externalBase:state.externalDataset?.base || ""};
 }
 
 async function readCachedColumn(target, col){
@@ -2427,12 +2657,13 @@ async function readCachedColumn(target, col){
 
   chunkColumnCache.misses++;
   let value;
+  const chunkPath=`${target.externalBase}/chunk_${String(target.physicalChunkIndex).padStart(6,"0")}`;
   if (col.type === "number"){
-    const buf=await readBuffer(target.chunkDir,colFileName(col.index,col.type));
+    const buf=target.external ? await externalReadBuffer(`${chunkPath}/${colFileName(col.index,col.type)}`) : await readBuffer(target.chunkDir,colFileName(col.index,col.type));
     value={type:"number", data:new Float64Array(buf)};
   } else {
-    const buf=await readBuffer(target.chunkDir,colFileName(col.index,col.type));
-    const dict=await readJson(target.chunkDir,dictFileName(col.index));
+    const buf=target.external ? await externalReadBuffer(`${chunkPath}/${colFileName(col.index,col.type)}`) : await readBuffer(target.chunkDir,colFileName(col.index,col.type));
+    const dict=target.external ? await externalReadJson(`${chunkPath}/${dictFileName(col.index)}`) : await readJson(target.chunkDir,dictFileName(col.index));
     value={type:"string", ids:new Int32Array(buf), dict};
   }
   return putChunkCacheEntry(key, value, estimateColumnDataBytes(value));
@@ -3038,6 +3269,37 @@ self.onmessage=async(e)=>{
 
     if (msg.type==="REMOTE_EXECUTION_PING"){
       post("REMOTE_EXECUTION_STATUS", await probeRemoteExecution(msg.config || {}));
+      return;
+    }
+
+    if (msg.type==="EXTERNAL_STORAGE_CONFIG"){
+      post("EXTERNAL_STORAGE_STATUS", configureExternalStorage(msg.config || msg));
+      return;
+    }
+
+    if (msg.type==="EXTERNAL_STORAGE_TEST"){
+      post("EXTERNAL_STORAGE_STATUS", await testExternalStorage(msg.config || {}));
+      return;
+    }
+
+    if (msg.type==="EXTERNAL_STORAGE_LIST"){
+      const datasets=await listExternalDatasets();
+      post("EXTERNAL_STORAGE_LIST_DONE", {datasets, status:externalStorageStatus()});
+      return;
+    }
+
+    if (msg.type==="EXTERNAL_STORAGE_SYNC"){
+      state.cancelled=false;
+      const result=await syncDatasetToExternal(msg.datasetId || state.dataset?.id || state.manifest?.id);
+      const datasets=await listExternalDatasets().catch(()=>[]);
+      post("EXTERNAL_STORAGE_SYNC_DONE", {...result,datasets});
+      return;
+    }
+
+    if (msg.type==="EXTERNAL_STORAGE_OPEN"){
+      state.cancelled=false;
+      const opened=await openExternalDataset(msg.id || msg.datasetId);
+      post("EXTERNAL_STORAGE_OPENED", opened);
       return;
     }
 
@@ -4845,6 +5107,14 @@ function App() {
   const [tableName, setTableName] = useState("");
   const [browseWorkspace, setBrowseWorkspace] = useState("All");
   const [browseCollection, setBrowseCollection] = useState("All");
+  const [externalEndpoint, setExternalEndpoint] = useState(initialSettings.externalEndpoint || "");
+  const [externalPrefix, setExternalPrefix] = useState(initialSettings.externalPrefix || "quantum_csv_grid_columnar");
+  const [externalAuthMode, setExternalAuthMode] = useState(initialSettings.externalAuthMode || "none");
+  const [externalApiKey, setExternalApiKey] = useState("");
+  const [externalDatasets, setExternalDatasets] = useState([]);
+  const [externalSelectedDataset, setExternalSelectedDataset] = useState("");
+  const [externalManualDatasetId, setExternalManualDatasetId] = useState("");
+  const [externalStatus, setExternalStatus] = useState("未接続。APIキーは保存されず、このページのメモリ上だけで使います。");
 
   const columns = useMemo(() => manifest?.columns || schema?.columns || [], [manifest, schema]);
   const normalPageMax = manifest?.totalRows ? Math.ceil(manifest.totalRows / Number(pageSize || 500)) : 0;
@@ -4875,6 +5145,9 @@ function App() {
       storageCollection,
       memoryMaxMB,
       memoryMaxRows,
+      externalEndpoint,
+      externalPrefix,
+      externalAuthMode,
       mainPanel,
       tab,
       rules,
@@ -5107,6 +5380,48 @@ function App() {
         return;
       }
 
+      if (msg.type === "EXTERNAL_STORAGE_STATUS") {
+        const ok = msg.ok === true || msg.enabled;
+        const probe = msg.lastProbe || msg.probe || null;
+        const detail = msg.message || (probe?.message ? probe.message : "");
+        setExternalStatus(`${ok ? "External Storage ready" : "External Storage configured"}: ${msg.provider || "custom-http"} / ${msg.endpoint || ""} / prefix ${msg.prefix || ""}${detail ? ` / ${detail}` : ""}`);
+        appendLog(`External Storage: ${ok ? "ready" : "status"} ${msg.endpoint || ""}`);
+        return;
+      }
+
+      if (msg.type === "EXTERNAL_STORAGE_LIST_DONE") {
+        const list = msg.datasets || [];
+        setExternalDatasets(list);
+        setExternalSelectedDataset((current) => current || list?.[0]?.id || "");
+        setExternalStatus(list.length ? `External datasets: ${fmt(list.length)}` : "External StorageにDatasetはありません。Sync後に表示されます。");
+        return;
+      }
+
+      if (msg.type === "EXTERNAL_STORAGE_SYNC_DONE") {
+        setExternalDatasets(msg.datasets || []);
+        setExternalSelectedDataset(msg.id || "");
+        setExternalStatus(`External sync完了: ${msg.manifest?.name || msg.id} / files ${fmt(msg.filesWritten)} / ${fmt(Math.round((msg.bytesWritten || 0) / 1024 / 1024))} MB`);
+        appendLog(`External sync done: ${msg.id}`);
+        return;
+      }
+
+      if (msg.type === "EXTERNAL_STORAGE_OPENED") {
+        setFiles([]);
+        setActiveFileIndex(0);
+        setCleanTable(null);
+        setManifest(msg.manifest);
+        setSchema({ columns: msg.manifest.columns });
+        resetColumnState(msg.manifest.columns || []);
+        setPage(1);
+        setDataQueryActive(false);
+        setDataQueryCount(0);
+        setStatus(`External Storageから開きました: ${msg.manifest.name || msg.manifest.id} / ${fmt(msg.manifest.totalRows)} rows`);
+        setExternalStatus(`Active external dataset: ${msg.manifest.externalStoragePath || msg.manifest.id}`);
+        appendLog(`External opened: ${msg.manifest.id}`);
+        worker.postMessage({ type: "READ_PAGE", page: 1, pageSize: pageSizeRef.current, columns: [] });
+        return;
+      }
+
       if (msg.type === "OPFS_LOADED") {
         setFiles([]);
         setActiveFileIndex(0);
@@ -5324,6 +5639,10 @@ function App() {
       RUN_SEARCH: "検索",
       BUILD_PIVOT: "Pivot集計",
       BUILD_TIME: "時間軸集計",
+      EXTERNAL_STORAGE_TEST: "External Storage接続確認",
+      EXTERNAL_STORAGE_LIST: "External Storage一覧取得",
+      EXTERNAL_STORAGE_SYNC: "External Storage同期",
+      EXTERNAL_STORAGE_OPEN: "External Storage Dataset読込",
     };
     if (labels[msg.type]) {
       setBusy(true);
@@ -5543,6 +5862,37 @@ function App() {
     post({ type: "OPFS_DELETE", id: selectedDataset });
   }
 
+  function externalStorageConfigPayload() {
+    return { enabled: true, provider: "custom-http", endpoint: externalEndpoint, prefix: externalPrefix || "quantum_csv_grid_columnar", authMode: externalAuthMode, apiKey: externalApiKey, timeoutMs: 120000 };
+  }
+
+  function connectExternalStorage() {
+    if (!externalEndpoint.trim()) { setExternalStatus("Endpoint URLを入力してください。"); return; }
+    post({ type: "EXTERNAL_STORAGE_TEST", config: externalStorageConfigPayload() });
+  }
+
+  function refreshExternalDatasets() {
+    if (!externalEndpoint.trim()) { setExternalStatus("Endpoint URLを入力してください。"); return; }
+    post({ type: "EXTERNAL_STORAGE_CONFIG", config: externalStorageConfigPayload() });
+    post({ type: "EXTERNAL_STORAGE_LIST" });
+  }
+
+  function syncActiveDatasetToExternal() {
+    if (!manifest?.id || manifest.openedFromExternalStorage || String(manifest.id || "").startsWith("virtual:") || String(manifest.id || "").startsWith("memory:")) {
+      setExternalStatus("同期できるActive OPFS物理Datasetを開いてください。Virtual / Memory / Externalは同期対象外です。");
+      return;
+    }
+    post({ type: "EXTERNAL_STORAGE_CONFIG", config: externalStorageConfigPayload() });
+    post({ type: "EXTERNAL_STORAGE_SYNC", datasetId: manifest.id });
+  }
+
+  function openExternalDatasetFromSelection() {
+    const id = externalSelectedDataset || externalManualDatasetId.trim();
+    if (!id) { setExternalStatus("External Datasetを選択するか、Dataset IDを入力してください。"); return; }
+    post({ type: "EXTERNAL_STORAGE_CONFIG", config: externalStorageConfigPayload() });
+    post({ type: "EXTERNAL_STORAGE_OPEN", id });
+  }
+
   function mergeSelectedDatasets() {
     if (mergeDatasetIds.length < 2) {
       setOpfsStatus("マージする保存済みデータセットを2件以上選択してください。");
@@ -5684,6 +6034,11 @@ function App() {
       d.mode,
       d.id,
     ]),
+  };
+
+  const externalDatasetTable = {
+    header: ["Workspace", "Collection", "Table", "Rows", "Columns", "Chunks", "Mode", "ID"],
+    rows: externalDatasets.map((d) => [d.workspace || "External", d.collection || "General", d.tableName || d.name || d.id, fmt(d.rows), fmt(d.columns), fmt(d.chunks), d.mode || "external", d.id]),
   };
 
   const workNavigator = ({ toggleLeftCollapsed } = {}) => (
@@ -6042,6 +6397,7 @@ function App() {
               <Tab value="search" icon={<Search />} iconPosition="start" label="Search" />
               <Tab value="pivot" icon={<TableChart />} iconPosition="start" label="Pivot" />
               <Tab value="time" icon={<Timeline />} iconPosition="start" label="Time" />
+              <Tab value="storage" icon={<Storage />} iconPosition="start" label="Storage" />
               <Tab value="schema" icon={<Schema />} iconPosition="start" label="Schema" />
               <Tab value="log" icon={<Article />} iconPosition="start" label="Log" />
             </Tabs>
@@ -6327,6 +6683,32 @@ function App() {
                   Mergeは新しい物理TableをStorageに作ります。Storage-backed Viewは物理コピーせず、選択Tableを横断ビューとして開き、必要な列・チャンクだけを読みます。どちらも列名と型が完全一致する場合のみ実行します。
                 </Alert>
                 <Divider sx={{ my: 2 }} />
+                <Typography variant="subtitle2" sx={{ fontWeight: 900, mb: 0.75 }}>Browser External Storage Adapter</Typography>
+                <Alert severity="info" sx={{ mb: 0.75 }}>Custom HTTP Storageにブラウザから直接APIリクエストします。APIキーは保存せず、現在のページメモリ上だけで利用します。</Alert>
+                <TextField label="Endpoint URL" placeholder="https://storage.example.com" size="small" fullWidth value={externalEndpoint} onChange={(e) => setExternalEndpoint(e.target.value)} />
+                <Stack direction="row" spacing={0.75} useFlexGap flexWrap="wrap" sx={{ mt: 0.75 }}>
+                  <TextField label="Root prefix" size="small" value={externalPrefix} onChange={(e) => setExternalPrefix(e.target.value)} sx={{ minWidth: 230 }} />
+                  <TextField select label="Auth" size="small" value={externalAuthMode} onChange={(e) => setExternalAuthMode(e.target.value)} sx={{ width: 145 }}>
+                    <MenuItem value="none">None</MenuItem>
+                    <MenuItem value="bearer">Bearer</MenuItem>
+                    <MenuItem value="api-key">X-API-Key</MenuItem>
+                  </TextField>
+                </Stack>
+                <TextField label="API key / token（保存しない）" type="password" size="small" fullWidth value={externalApiKey} onChange={(e) => setExternalApiKey(e.target.value)} sx={{ mt: 0.75 }} />
+                <Stack direction="row" spacing={0.75} useFlexGap flexWrap="wrap" sx={{ mt: 0.75 }}>
+                  <Button variant="contained" onClick={connectExternalStorage}>Connect/Test</Button>
+                  <Button variant="outlined" onClick={refreshExternalDatasets}>List Remote</Button>
+                  <Button variant="outlined" color="success" onClick={syncActiveDatasetToExternal}>Sync Active OPFS Dataset</Button>
+                </Stack>
+                <TextField select label="Remote Dataset" size="small" fullWidth value={externalSelectedDataset} onChange={(e) => setExternalSelectedDataset(e.target.value)} sx={{ mt: 0.75 }}>
+                  {externalDatasets.map((d) => <MenuItem key={d.id} value={d.id}>{d.workspace || "External"} / {d.collection || "General"} / {d.tableName || d.name || d.id} / {fmt(d.rows)} rows</MenuItem>)}
+                </TextField>
+                <TextField label="Manual Dataset ID（list不可の場合）" size="small" fullWidth value={externalManualDatasetId} onChange={(e) => setExternalManualDatasetId(e.target.value)} sx={{ mt: 0.75 }} />
+                <Stack direction="row" spacing={0.75} useFlexGap flexWrap="wrap" sx={{ mt: 0.75 }}>
+                  <Button variant="contained" color="secondary" onClick={openExternalDatasetFromSelection}>Open Remote Dataset</Button>
+                </Stack>
+                <Alert severity="success" sx={{ mt: 0.75 }}>{externalStatus}</Alert>
+                <Divider sx={{ my: 2 }} />
                 <Alert severity="warning">
                   OPFS内の列指向キャッシュを論理削除します。ブラウザ・OS・SSD都合の物理上書き消去は保証できません。
                 </Alert>
@@ -6344,7 +6726,9 @@ function App() {
                 <Typography variant="subtitle2" sx={{ fontWeight: 900, mb: 1 }}>Workspace / Collection summary</Typography>
                 <DataTable table={storageHierarchyTable} tableId="storageHierarchy" height={220} minColumnWidth={170} />
                 <Typography variant="subtitle2" sx={{ fontWeight: 900, mt: 2, mb: 1 }}>Tables in selected scope</Typography>
-                <DataTable table={datasetTable} tableId="storageTables" height={420} minColumnWidth={170} />
+                <DataTable table={datasetTable} tableId="storageTables" height={300} minColumnWidth={170} />
+                <Typography variant="subtitle2" sx={{ fontWeight: 900, mt: 2, mb: 1 }}>External Storage datasets</Typography>
+                <DataTable table={externalDatasetTable} tableId="externalStorageTables" height={260} minColumnWidth={170} />
                 <Typography variant="caption" color="text.secondary">{opfsTime}</Typography>
               </Section>
               )}
