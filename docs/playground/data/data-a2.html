@@ -41,7 +41,7 @@ let state = {
   virtual:null,
   memory:null,
   remoteExecution:{enabled:false,endpoint:"",token:"",mode:"local-first",timeoutMs:120000,lastProbe:null},
-  externalStorage:{enabled:false,provider:"custom-http",endpoint:"",authMode:"none",apiKey:"",prefix:"quantum_csv_grid_columnar",timeoutMs:120000,lastProbe:null},
+  externalStorage:{enabled:false,provider:"custom-http",endpoint:"",authMode:"none",apiKey:"",prefix:"quantum_csv_grid_columnar",timeoutMs:120000,lastProbe:null,region:"auto",bucket:"",accessKeyId:"",secretAccessKey:"",sessionToken:""},
   externalDataset:null,
   cancelled:false
 };
@@ -1411,23 +1411,33 @@ async function executeChunkExecutionPlanRemote(plan, options={}, chunks=null){
 }
 
 
-const BROWSER_EXTERNAL_STORAGE_ADAPTER_VERSION = 1;
+const BROWSER_EXTERNAL_STORAGE_ADAPTER_VERSION = 2;
 
 function normalizeExternalStoragePrefix(prefix){
   return String(prefix || "quantum_csv_grid_columnar").trim().replace(/^\/+|\/+$/g, "") || "quantum_csv_grid_columnar";
 }
 
 function normalizeExternalStorageConfig(config={}){
+  const provider=["custom-http","s3-compatible"].includes(config.provider) ? config.provider : "custom-http";
   const endpoint=String(config.endpoint || "").trim().replace(/\/+$/g, "");
   const authMode=["none","bearer","api-key"].includes(config.authMode) ? config.authMode : "none";
+  const bucket=String(config.bucket || "").trim().replace(/^\/+|\/+$/g, "");
+  const accessKeyId=String(config.accessKeyId || config.apiKey || "");
+  const secretAccessKey=String(config.secretAccessKey || "");
   return {
-    enabled:!!config.enabled && !!endpoint,
-    provider:"custom-http",
+    enabled:!!config.enabled && !!endpoint && (provider !== "s3-compatible" || (!!bucket && !!accessKeyId && !!secretAccessKey)),
+    provider,
     endpoint,
     authMode,
     apiKey:String(config.apiKey || ""),
     prefix:normalizeExternalStoragePrefix(config.prefix),
     timeoutMs:Math.max(5000, Math.min(15 * 60 * 1000, Number(config.timeoutMs || 120000))),
+    region:String(config.region || "auto").trim() || "auto",
+    bucket,
+    accessKeyId,
+    secretAccessKey,
+    sessionToken:String(config.sessionToken || ""),
+    forcePathStyle:config.forcePathStyle !== false,
     lastProbe:config.lastProbe || null
   };
 }
@@ -1447,8 +1457,13 @@ function externalStorageStatus(extra={}){
     authMode:cfg.authMode || "none",
     prefix:cfg.prefix || "quantum_csv_grid_columnar",
     timeoutMs:Number(cfg.timeoutMs || 120000),
+    region:cfg.region || "auto",
+    bucket:cfg.bucket || "",
     lastProbe:cfg.lastProbe || null,
     hasApiKey:!!cfg.apiKey,
+    hasAccessKeyId:!!cfg.accessKeyId,
+    hasSecretAccessKey:!!cfg.secretAccessKey,
+    hasSessionToken:!!cfg.sessionToken,
     ...extra
   };
 }
@@ -1499,20 +1514,91 @@ async function externalFetch(url, init={}, timeoutMs){
   }
 }
 
+function utf8Bytes(text){ return new TextEncoder().encode(String(text)); }
+function bytesToHex(bytes){ return Array.from(new Uint8Array(bytes)).map(b=>b.toString(16).padStart(2,"0")).join(""); }
+async function sha256Bytes(data){ return await crypto.subtle.digest("SHA-256", data instanceof ArrayBuffer ? data : (ArrayBuffer.isView(data) ? data.buffer.slice(data.byteOffset,data.byteOffset+data.byteLength) : utf8Bytes(data))); }
+async function sha256Hex(data){ return bytesToHex(await sha256Bytes(data)); }
+async function hmacBytes(key, data){
+  const cryptoKey=await crypto.subtle.importKey("raw", key instanceof ArrayBuffer ? key : utf8Bytes(key), {name:"HMAC",hash:"SHA-256"}, false, ["sign"]);
+  return await crypto.subtle.sign("HMAC", cryptoKey, data instanceof ArrayBuffer ? data : utf8Bytes(data));
+}
+function s3Timestamp(date=new Date()){
+  const iso=date.toISOString().replace(/[:-]|\.\d{3}/g, "");
+  return {amz:iso, short:iso.slice(0,8)};
+}
+function s3EncodePath(path){ return String(path || "").split("/").filter(Boolean).map(x=>encodeURIComponent(x).replace(/[!'()*]/g,c=>`%${c.charCodeAt(0).toString(16).toUpperCase()}`)).join("/"); }
+function s3ObjectUrl(path){
+  const cfg=state.externalStorage || {};
+  const endpoint=String(cfg.endpoint || "").replace(/\/+$/g, "");
+  if (!endpoint) throw new Error("S3 endpoint is empty");
+  if (!cfg.bucket) throw new Error("S3 bucket is empty");
+  return `${endpoint}/${encodeURIComponent(cfg.bucket)}/${s3EncodePath(path)}`;
+}
+async function s3SigningKey(secret, date, region, service="s3"){
+  let k=await hmacBytes(`AWS4${secret}`, date);
+  k=await hmacBytes(k, region);
+  k=await hmacBytes(k, service);
+  return await hmacBytes(k, "aws4_request");
+}
+async function s3SignedFetch(method, path, {body=null, contentType="", query=""}={}){
+  const cfg=state.externalStorage || {};
+  if (!cfg.enabled) throw new Error("External Storage is not connected");
+  if (!cfg.accessKeyId || !cfg.secretAccessKey) throw new Error("S3 Access Key / Secret Key is required");
+  const urlBase=s3ObjectUrl(path);
+  const url=new URL(query ? `${urlBase}?${query}` : urlBase);
+  const ts=s3Timestamp();
+  const payload=body == null ? new Uint8Array() : (typeof body === "string" ? utf8Bytes(body) : body);
+  const payloadHash=await sha256Hex(payload);
+  const headers={
+    "host":url.host,
+    "x-amz-content-sha256":payloadHash,
+    "x-amz-date":ts.amz
+  };
+  if (contentType) headers["content-type"]=contentType;
+  if (cfg.sessionToken) headers["x-amz-security-token"]=cfg.sessionToken;
+  const signedHeaderNames=Object.keys(headers).map(k=>k.toLowerCase()).sort();
+  const canonicalHeaders=signedHeaderNames.map(k=>`${k}:${String(headers[k]).trim().replace(/\s+/g," ")}\n`).join("");
+  const canonicalQuery=[...url.searchParams.entries()].sort(([a,av],[b,bv])=> a===b ? av.localeCompare(bv) : a.localeCompare(b)).map(([k,v])=>`${encodeURIComponent(k)}=${encodeURIComponent(v)}`).join("&");
+  const canonicalRequest=[method.toUpperCase(), url.pathname, canonicalQuery, canonicalHeaders, signedHeaderNames.join(";"), payloadHash].join("\n");
+  const region=cfg.region || "auto";
+  const scope=`${ts.short}/${region}/s3/aws4_request`;
+  const stringToSign=["AWS4-HMAC-SHA256", ts.amz, scope, await sha256Hex(canonicalRequest)].join("\n");
+  const signingKey=await s3SigningKey(cfg.secretAccessKey, ts.short, region, "s3");
+  const signature=bytesToHex(await hmacBytes(signingKey, stringToSign));
+  const auth=`AWS4-HMAC-SHA256 Credential=${cfg.accessKeyId}/${scope}, SignedHeaders=${signedHeaderNames.join(";")}, Signature=${signature}`;
+  const fetchHeaders={...headers, authorization:auth};
+  delete fetchHeaders.host;
+  const controller=new AbortController();
+  const timer=setTimeout(()=>controller.abort(new Error("S3 request timeout")), Number(cfg.timeoutMs || 120000));
+  try{
+    const res=await fetch(url.toString(),{method:method.toUpperCase(),headers:fetchHeaders,body:method.toUpperCase()==="GET" ? undefined : payload,signal:controller.signal});
+    if (!res.ok){
+      let message=`S3 HTTP ${res.status}`;
+      try{ const text=await res.text(); if (text) message += `: ${text.slice(0,500)}`; }catch{}
+      throw new Error(message);
+    }
+    return res;
+  }finally{ clearTimeout(timer); }
+}
+
 async function externalReadText(path){
+  if (state.externalStorage?.provider === "s3-compatible") return await (await s3SignedFetch("GET", path)).text();
   const res=await externalFetch(externalUrlForFile(path),{method:"GET",headers:externalStorageHeaders()}, state.externalStorage?.timeoutMs);
   return await res.text();
 }
 async function externalReadJson(path){ return JSON.parse(await externalReadText(path)); }
 async function externalReadBuffer(path){
+  if (state.externalStorage?.provider === "s3-compatible") return await (await s3SignedFetch("GET", path)).arrayBuffer();
   const res=await externalFetch(externalUrlForFile(path),{method:"GET",headers:externalStorageHeaders()}, state.externalStorage?.timeoutMs);
   return await res.arrayBuffer();
 }
 async function externalWriteText(path, text){
+  if (state.externalStorage?.provider === "s3-compatible") { await s3SignedFetch("PUT", path, {body:String(text ?? ""), contentType:"application/json; charset=utf-8"}); return; }
   await externalFetch(externalUrlForFile(path),{method:"PUT",headers:externalStorageHeaders("application/json; charset=utf-8"),body:String(text ?? "")}, state.externalStorage?.timeoutMs);
 }
 async function externalWriteJson(path, obj){ await externalWriteText(path, JSON.stringify(obj)); }
 async function externalWriteBuffer(path, buffer){
+  if (state.externalStorage?.provider === "s3-compatible") { await s3SignedFetch("PUT", path, {body:buffer, contentType:"application/octet-stream"}); return; }
   await externalFetch(externalUrlForFile(path),{method:"PUT",headers:externalStorageHeaders("application/octet-stream"),body:buffer}, state.externalStorage?.timeoutMs);
 }
 
@@ -1520,8 +1606,30 @@ function parseExternalListPayload(payload){
   const raw=Array.isArray(payload) ? payload : (payload?.paths || payload?.items || payload?.objects || payload?.keys || []);
   return raw.map((item)=> typeof item === "string" ? item : (item?.path || item?.key || item?.name || item?.url || "")).map(String).filter(Boolean);
 }
-
+function decodeXmlEntities(s){ return String(s || "").replace(/&lt;/g,"<").replace(/&gt;/g,">").replace(/&amp;/g,"&").replace(/&quot;/g,'"').replace(/&#39;/g,"'"); }
+function parseS3ListXml(xml){
+  const out=[];
+  const re=/<Key>([\s\S]*?)<\/Key>/g;
+  let m;
+  while((m=re.exec(String(xml || "")))) out.push(decodeXmlEntities(m[1]));
+  return out;
+}
 async function externalListPaths(prefix){
+  if (state.externalStorage?.provider === "s3-compatible"){
+    const paths=[];
+    let token="";
+    for (let guard=0; guard<100; guard++){
+      const params=new URLSearchParams({"list-type":"2",prefix:String(prefix || ""),"max-keys":"1000"});
+      if (token) params.set("continuation-token", token);
+      const res=await s3SignedFetch("GET", "", {query:params.toString()});
+      const xml=await res.text();
+      paths.push(...parseS3ListXml(xml));
+      const next=xml.match(/<NextContinuationToken>([\s\S]*?)<\/NextContinuationToken>/)?.[1];
+      if (!next) break;
+      token=decodeXmlEntities(next);
+    }
+    return paths;
+  }
   const res=await externalFetch(externalUrlForList(prefix),{method:"GET",headers:externalStorageHeaders()}, state.externalStorage?.timeoutMs);
   const text=await res.text();
   if (!text) return [];
@@ -3525,6 +3633,7 @@ self.onmessage=async(e)=>{
   }
 };
 
+
 </script>
 
   <!-- JSX application source. It is transformed by Babel in the module below. -->
@@ -5107,13 +5216,18 @@ function App() {
   const [tableName, setTableName] = useState("");
   const [browseWorkspace, setBrowseWorkspace] = useState("All");
   const [browseCollection, setBrowseCollection] = useState("All");
+  const [externalProvider, setExternalProvider] = useState(initialSettings.externalProvider || "custom-http");
   const [externalEndpoint, setExternalEndpoint] = useState(initialSettings.externalEndpoint || "");
   const [externalPrefix, setExternalPrefix] = useState(initialSettings.externalPrefix || "quantum_csv_grid_columnar");
   const [externalAuthMode, setExternalAuthMode] = useState(initialSettings.externalAuthMode || "none");
   const [externalApiKey, setExternalApiKey] = useState("");
+  const [s3Region, setS3Region] = useState(initialSettings.s3Region || "auto");
+  const [s3Bucket, setS3Bucket] = useState(initialSettings.s3Bucket || "");
+  const [s3AccessKeyId, setS3AccessKeyId] = useState("");
+  const [s3SecretAccessKey, setS3SecretAccessKey] = useState("");
+  const [s3SessionToken, setS3SessionToken] = useState("");
   const [externalDatasets, setExternalDatasets] = useState([]);
   const [externalSelectedDataset, setExternalSelectedDataset] = useState("");
-  const [externalManualDatasetId, setExternalManualDatasetId] = useState("");
   const [externalStatus, setExternalStatus] = useState("未接続。APIキーは保存されず、このページのメモリ上だけで使います。");
 
   const columns = useMemo(() => manifest?.columns || schema?.columns || [], [manifest, schema]);
@@ -5145,14 +5259,17 @@ function App() {
       storageCollection,
       memoryMaxMB,
       memoryMaxRows,
+      externalProvider,
       externalEndpoint,
       externalPrefix,
       externalAuthMode,
+      s3Region,
+      s3Bucket,
       mainPanel,
       tab,
       rules,
     });
-  }, [themeMode, tableDensity, previewRows, encoding, delimiter, chunkSize, sampleRows, pageSize, storageWorkspace, storageCollection, memoryMaxMB, memoryMaxRows, mainPanel, tab, rules]);
+  }, [themeMode, tableDensity, previewRows, encoding, delimiter, chunkSize, sampleRows, pageSize, storageWorkspace, storageCollection, memoryMaxMB, memoryMaxRows, externalProvider, externalEndpoint, externalPrefix, externalAuthMode, s3Region, s3Bucket, mainPanel, tab, rules]);
 
   function appendLog(text) {
     const line = `[${new Date().toLocaleTimeString()}] ${text}`;
@@ -5863,16 +5980,31 @@ function App() {
   }
 
   function externalStorageConfigPayload() {
-    return { enabled: true, provider: "custom-http", endpoint: externalEndpoint, prefix: externalPrefix || "quantum_csv_grid_columnar", authMode: externalAuthMode, apiKey: externalApiKey, timeoutMs: 120000 };
+    return {
+      enabled: true,
+      provider: externalProvider,
+      endpoint: externalEndpoint,
+      prefix: externalPrefix || "quantum_csv_grid_columnar",
+      authMode: externalAuthMode,
+      apiKey: externalApiKey,
+      region: s3Region || "auto",
+      bucket: s3Bucket,
+      accessKeyId: s3AccessKeyId,
+      secretAccessKey: s3SecretAccessKey,
+      sessionToken: s3SessionToken,
+      timeoutMs: 120000
+    };
   }
 
   function connectExternalStorage() {
     if (!externalEndpoint.trim()) { setExternalStatus("Endpoint URLを入力してください。"); return; }
+    if (externalProvider === "s3-compatible" && (!s3Bucket.trim() || !s3AccessKeyId || !s3SecretAccessKey)) { setExternalStatus("S3/R2はBucket、Access Key、Secret Keyを入力してください。"); return; }
     post({ type: "EXTERNAL_STORAGE_TEST", config: externalStorageConfigPayload() });
   }
 
   function refreshExternalDatasets() {
     if (!externalEndpoint.trim()) { setExternalStatus("Endpoint URLを入力してください。"); return; }
+    if (externalProvider === "s3-compatible" && (!s3Bucket.trim() || !s3AccessKeyId || !s3SecretAccessKey)) { setExternalStatus("S3/R2はBucket、Access Key、Secret Keyを入力してください。"); return; }
     post({ type: "EXTERNAL_STORAGE_CONFIG", config: externalStorageConfigPayload() });
     post({ type: "EXTERNAL_STORAGE_LIST" });
   }
@@ -5887,10 +6019,9 @@ function App() {
   }
 
   function openExternalDatasetFromSelection() {
-    const id = externalSelectedDataset || externalManualDatasetId.trim();
-    if (!id) { setExternalStatus("External Datasetを選択するか、Dataset IDを入力してください。"); return; }
+    if (!externalSelectedDataset) { setExternalStatus("External Datasetを選択してください。"); return; }
     post({ type: "EXTERNAL_STORAGE_CONFIG", config: externalStorageConfigPayload() });
-    post({ type: "EXTERNAL_STORAGE_OPEN", id });
+    post({ type: "EXTERNAL_STORAGE_OPEN", id: externalSelectedDataset });
   }
 
   function mergeSelectedDatasets() {
@@ -6684,17 +6815,35 @@ function App() {
                 </Alert>
                 <Divider sx={{ my: 2 }} />
                 <Typography variant="subtitle2" sx={{ fontWeight: 900, mb: 0.75 }}>Browser External Storage Adapter</Typography>
-                <Alert severity="info" sx={{ mb: 0.75 }}>Custom HTTP Storageにブラウザから直接APIリクエストします。APIキーは保存せず、現在のページメモリ上だけで利用します。</Alert>
-                <TextField label="Endpoint URL" placeholder="https://storage.example.com" size="small" fullWidth value={externalEndpoint} onChange={(e) => setExternalEndpoint(e.target.value)} />
+                <Alert severity="info" sx={{ mb: 0.75 }}>Custom HTTP / S3互換（AWS S3・Cloudflare R2等）へブラウザから直接APIリクエストします。APIキーは保存せず、現在のページメモリ上だけで利用します。</Alert>
+                <Stack direction="row" spacing={0.75} useFlexGap flexWrap="wrap">
+                  <TextField select label="Provider" size="small" value={externalProvider} onChange={(e) => setExternalProvider(e.target.value)} sx={{ minWidth: 190 }}>
+                    <MenuItem value="custom-http">Custom HTTP</MenuItem>
+                    <MenuItem value="s3-compatible">S3 / R2 compatible</MenuItem>
+                  </TextField>
+                  <TextField label="Endpoint URL" placeholder={externalProvider === "s3-compatible" ? "https://s3.amazonaws.com / https://<account>.r2.cloudflarestorage.com" : "https://storage.example.com"} size="small" value={externalEndpoint} onChange={(e) => setExternalEndpoint(e.target.value)} sx={{ flex: 1, minWidth: 280 }} />
+                </Stack>
                 <Stack direction="row" spacing={0.75} useFlexGap flexWrap="wrap" sx={{ mt: 0.75 }}>
                   <TextField label="Root prefix" size="small" value={externalPrefix} onChange={(e) => setExternalPrefix(e.target.value)} sx={{ minWidth: 230 }} />
-                  <TextField select label="Auth" size="small" value={externalAuthMode} onChange={(e) => setExternalAuthMode(e.target.value)} sx={{ width: 145 }}>
-                    <MenuItem value="none">None</MenuItem>
-                    <MenuItem value="bearer">Bearer</MenuItem>
-                    <MenuItem value="api-key">X-API-Key</MenuItem>
-                  </TextField>
+                  {externalProvider === "custom-http" && (
+                    <TextField select label="Auth" size="small" value={externalAuthMode} onChange={(e) => setExternalAuthMode(e.target.value)} sx={{ width: 145 }}>
+                      <MenuItem value="none">None</MenuItem>
+                      <MenuItem value="bearer">Bearer</MenuItem>
+                      <MenuItem value="api-key">X-API-Key</MenuItem>
+                    </TextField>
+                  )}
+                  {externalProvider === "s3-compatible" && <TextField label="Bucket" size="small" value={s3Bucket} onChange={(e) => setS3Bucket(e.target.value)} sx={{ minWidth: 180 }} />}
+                  {externalProvider === "s3-compatible" && <TextField label="Region" size="small" value={s3Region} onChange={(e) => setS3Region(e.target.value)} sx={{ width: 120 }} />}
                 </Stack>
-                <TextField label="API key / token（保存しない）" type="password" size="small" fullWidth value={externalApiKey} onChange={(e) => setExternalApiKey(e.target.value)} sx={{ mt: 0.75 }} />
+                {externalProvider === "custom-http" && <TextField label="API key / token（保存しない）" type="password" size="small" fullWidth value={externalApiKey} onChange={(e) => setExternalApiKey(e.target.value)} sx={{ mt: 0.75 }} />}
+                {externalProvider === "s3-compatible" && (
+                  <Stack spacing={0.75} sx={{ mt: 0.75 }}>
+                    <TextField label="Access Key ID（保存しない）" type="password" size="small" fullWidth value={s3AccessKeyId} onChange={(e) => setS3AccessKeyId(e.target.value)} />
+                    <TextField label="Secret Access Key（保存しない）" type="password" size="small" fullWidth value={s3SecretAccessKey} onChange={(e) => setS3SecretAccessKey(e.target.value)} />
+                    <TextField label="Session Token optional（保存しない）" type="password" size="small" fullWidth value={s3SessionToken} onChange={(e) => setS3SessionToken(e.target.value)} />
+                    <Alert severity="warning">S3/R2のCORSで GET / PUT、Authorization、x-amz-date、x-amz-content-sha256、x-amz-security-token、content-type を許可してください。キーは最小権限の専用キーを使ってください。</Alert>
+                  </Stack>
+                )}
                 <Stack direction="row" spacing={0.75} useFlexGap flexWrap="wrap" sx={{ mt: 0.75 }}>
                   <Button variant="contained" onClick={connectExternalStorage}>Connect/Test</Button>
                   <Button variant="outlined" onClick={refreshExternalDatasets}>List Remote</Button>
@@ -6703,7 +6852,6 @@ function App() {
                 <TextField select label="Remote Dataset" size="small" fullWidth value={externalSelectedDataset} onChange={(e) => setExternalSelectedDataset(e.target.value)} sx={{ mt: 0.75 }}>
                   {externalDatasets.map((d) => <MenuItem key={d.id} value={d.id}>{d.workspace || "External"} / {d.collection || "General"} / {d.tableName || d.name || d.id} / {fmt(d.rows)} rows</MenuItem>)}
                 </TextField>
-                <TextField label="Manual Dataset ID（list不可の場合）" size="small" fullWidth value={externalManualDatasetId} onChange={(e) => setExternalManualDatasetId(e.target.value)} sx={{ mt: 0.75 }} />
                 <Stack direction="row" spacing={0.75} useFlexGap flexWrap="wrap" sx={{ mt: 0.75 }}>
                   <Button variant="contained" color="secondary" onClick={openExternalDatasetFromSelection}>Open Remote Dataset</Button>
                 </Stack>
@@ -6820,6 +6968,7 @@ root.render(
   </React.StrictMode>
 );
 
+  
   
   </script>
 
