@@ -3833,23 +3833,53 @@ function evaluateGraphDerivedColumnForWorker(d, rowMap){
   }
 }
 
-function appendRowsToCsvLines(lines, header, rows, derivedColumns){
+function graphExportHeader(header, derivedColumns, outputColumnNames=null){
   const derived = normalizeGraphDerivedColumnsForWorker(derivedColumns);
+  const full = [...(header || []), ...derived.map((d) => d.newColumnName)];
+  const desired = Array.isArray(outputColumnNames) && outputColumnNames.length
+    ? [...outputColumnNames.map(String), ...derived.map((d) => d.newColumnName)]
+    : null;
+  if (!desired) return full;
+  const used = new Set();
+  const out = [];
+  for (const name of desired){
+    const idx = full.findIndex((h, i) => !used.has(i) && String(h) === String(name));
+    if (idx >= 0){ used.add(idx); out.push(full[idx]); }
+  }
+  return out.length ? out : full;
+}
+
+function graphExportIndexesForHeader(header, derivedColumns, outputColumnNames=null){
+  const full = graphExportHeader(header, derivedColumns, null);
+  const outHeader = graphExportHeader(header, derivedColumns, outputColumnNames);
+  const used = new Set();
+  return outHeader.map((name) => {
+    const idx = full.findIndex((h, i) => !used.has(i) && String(h) === String(name));
+    if (idx >= 0) used.add(idx);
+    return idx;
+  }).filter((idx) => idx >= 0);
+}
+
+function appendRowsToCsvLines(lines, header, rows, derivedColumns, outputColumnNames=null){
+  const derived = normalizeGraphDerivedColumnsForWorker(derivedColumns);
+  const indexes = graphExportIndexesForHeader(header, derivedColumns, outputColumnNames);
+  const useProjection = Array.isArray(outputColumnNames) && outputColumnNames.length && indexes.length;
   if (!derived.length){
-    for (const row of rows || []) lines.push((row || []).map(csvEscape).join(","));
+    for (const row of rows || []){
+      const fullRow = row || [];
+      const outRow = useProjection ? indexes.map((idx) => fullRow?.[idx] ?? "") : fullRow;
+      lines.push(outRow.map(csvEscape).join(","));
+    }
     return;
   }
   for (const row of rows || []){
     const rowMap = {};
     header.forEach((h, i) => { rowMap[h] = row?.[i]; });
     const extra = derived.map((d) => evaluateGraphDerivedColumnForWorker(d, rowMap));
-    lines.push([...(row || []), ...extra].map(csvEscape).join(","));
+    const fullRow = [...(row || []), ...extra];
+    const outRow = useProjection ? indexes.map((idx) => fullRow?.[idx] ?? "") : fullRow;
+    lines.push(outRow.map(csvEscape).join(","));
   }
-}
-
-function graphExportHeader(header, derivedColumns){
-  const derived = normalizeGraphDerivedColumnsForWorker(derivedColumns);
-  return [...(header || []), ...derived.map((d) => d.newColumnName)];
 }
 
 function normalizeExportLimit(value){
@@ -3860,6 +3890,7 @@ function normalizeExportLimit(value){
 async function exportGraphQueryCsv(msg={}){
   const mode = String(msg.mode || "data");
   const derivedColumns = normalizeGraphDerivedColumnsForWorker(msg.derivedColumns || []);
+  const outputColumnNames = Array.isArray(msg.outputColumnNames) ? msg.outputColumnNames.map(String).filter(Boolean) : null;
   const maxRows = normalizeExportLimit(msg.maxRows);
   const chunkRows = Math.max(100, Math.min(10000, Number(msg.chunkRows || 3000)));
   const lines = [];
@@ -3869,12 +3900,12 @@ async function exportGraphQueryCsv(msg={}){
   if (mode === "join"){
     if (!state.graphJoinResult) throw new Error("Graph JOIN result is not active");
     const header = state.graphJoinResult.header || [];
-    lines.push(graphExportHeader(header, derivedColumns).map(csvEscape).join(","));
+    lines.push(graphExportHeader(header, derivedColumns, outputColumnNames).map(csvEscape).join(","));
     const rows = state.graphJoinResult.rows || [];
     const total = Math.min(rows.length, maxRows);
     for (let start=0; start<total; start+=chunkRows){
       if (state.cancelled) throw new Error("Cancelled");
-      appendRowsToCsvLines(lines, header, rows.slice(start, Math.min(total, start + chunkRows)), derivedColumns);
+      appendRowsToCsvLines(lines, header, rows.slice(start, Math.min(total, start + chunkRows)), derivedColumns, outputColumnNames);
       exportedRows = Math.min(total, start + chunkRows);
       post("PROGRESS", {value:Math.min(99, Math.floor((exportedRows / Math.max(1,total)) * 100)), text:`Exporting Graph JOIN CSV... ${fmt(exportedRows)}/${fmt(total)} rows`});
     }
@@ -3883,7 +3914,7 @@ async function exportGraphQueryCsv(msg={}){
 
   const selected = normalizeCols(Array.isArray(msg.columns) && msg.columns.length ? msg.columns : (state.dataQueryMeta?.projection || []));
   const header = selected.map(i => state.manifest.columns[i].name);
-  lines.push(graphExportHeader(header, derivedColumns).map(csvEscape).join(","));
+  lines.push(graphExportHeader(header, derivedColumns, outputColumnNames).map(csvEscape).join(","));
 
   if (Array.isArray(state.dataQueryMatches)){
     const total = Math.min(state.dataQueryMatches.length, maxRows);
@@ -3891,7 +3922,7 @@ async function exportGraphQueryCsv(msg={}){
       if (state.cancelled) throw new Error("Cancelled");
       const ids = state.dataQueryMatches.slice(start, Math.min(total, start + chunkRows));
       const table = await readRowsByGlobal(ids, selected);
-      appendRowsToCsvLines(lines, table.header, table.rows, derivedColumns);
+      appendRowsToCsvLines(lines, table.header, table.rows, derivedColumns, outputColumnNames);
       exportedRows = Math.min(total, start + chunkRows);
       post("PROGRESS", {value:Math.min(99, Math.floor((exportedRows / Math.max(1,total)) * 100)), text:`Exporting Graph Query CSV... ${fmt(exportedRows)}/${fmt(total)} rows`});
     }
@@ -3903,7 +3934,7 @@ async function exportGraphQueryCsv(msg={}){
     if (state.cancelled) throw new Error("Cancelled");
     const page = Math.floor(start / chunkRows) + 1;
     const table = await readPage(page, Math.min(chunkRows, totalRows - start), selected);
-    appendRowsToCsvLines(lines, table.header, table.rows, derivedColumns);
+    appendRowsToCsvLines(lines, table.header, table.rows, derivedColumns, outputColumnNames);
     exportedRows = Math.min(totalRows, start + chunkRows);
     post("PROGRESS", {value:Math.min(99, Math.floor((exportedRows / Math.max(1,totalRows)) * 100)), text:`Exporting Graph Query CSV... ${fmt(exportedRows)}/${fmt(totalRows)} rows`});
   }
@@ -8238,10 +8269,12 @@ function App() {
     }
     const ctx = graphExecutionRef.current || {};
     setGraphResultStatus(`Graph Query CSVを全件出力中... ${fmt(graphResultCount)} rows`);
+    appendLog(`Graph Query CSV export requested: ${JSON.stringify({ mode: graphResultMode, rows: graphResultCount, readColumns: ctx.readColumns?.length || "all", outputColumns: ctx.outputColumnNames?.length || "all", derivedColumns: (ctx.derivedColumns || []).map(d => d.newColumnName) })}`);
     post({
       type: "EXPORT_GRAPH_QUERY_CSV",
       mode: graphResultMode === "join" ? "join" : "data",
       columns: ctx.readColumns || selectedColumnsForPost(),
+      outputColumnNames: ctx.outputColumnNames || null,
       derivedColumns: ctx.derivedColumns || [],
       maxRows: 0,
       chunkRows: 5000,
@@ -9025,6 +9058,7 @@ function App() {
                   onApply={runGraphQueryPlan}
                   onReadPage={readGraphQueryPage}
                   onClearResult={clearGraphQueryResult}
+                  onExportCsv={exportGraphQueryCsvAll}
                   disabled={(!manifest && !hierarchicalDatasets.length) || busy}
                   dataQueryActive={graphResultCount > 0}
                   dataQueryCount={graphResultCount}
