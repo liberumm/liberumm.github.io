@@ -3606,6 +3606,7 @@ function csvEscape(v){
 
 
 const GRAPH_DERIVED_FORBIDDEN_WORKER = /\b(?:window|document|self|globalThis|Function|eval|fetch|XMLHttpRequest|WebSocket|Worker|importScripts|postMessage|navigator|localStorage|indexedDB|crypto|process|require)\b/;
+const GRAPH_DERIVED_FN_CACHE_WORKER = new Map();
 
 function normalizeGraphDerivedColumnsForWorker(items){
   return (Array.isArray(items) ? items : [])
@@ -3708,12 +3709,17 @@ function evaluateGraphDerivedColumnForWorker(d, rowMap){
         return m ? (m[Number(group)||0] ?? "") : "";
       }catch{ return ""; }
     };
-    const fn = new Function(
-      "col", "num", "str", "concat", "coalesce", "lower", "upper", "round", "abs", "min", "max", "row",
-      "split", "part", "pathParts", "pathPart", "basename", "filename", "dirname", "ext", "extname", "stem",
-      "before", "after", "between", "sliceText", "left", "right", "replaceText", "regexExtract",
-      `"use strict"; return (${expr});`
-    );
+    let fn = GRAPH_DERIVED_FN_CACHE_WORKER.get(expr);
+    if (!fn) {
+      fn = new Function(
+        "col", "num", "str", "concat", "coalesce", "lower", "upper", "round", "abs", "min", "max", "row",
+        "split", "part", "pathParts", "pathPart", "basename", "filename", "dirname", "ext", "extname", "stem",
+        "before", "after", "between", "sliceText", "left", "right", "replaceText", "regexExtract",
+        `"use strict"; return (${expr});`
+      );
+      if (GRAPH_DERIVED_FN_CACHE_WORKER.size > 100) GRAPH_DERIVED_FN_CACHE_WORKER.clear();
+      GRAPH_DERIVED_FN_CACHE_WORKER.set(expr, fn);
+    }
     const value = fn(
       col, num, str, concat, coalesce, lower, upper, round, Math.abs, Math.min, Math.max, rowMap,
       splitText, pathPart, pathParts, pathPart, basename, filename, dirname, ext, extname, stem,
@@ -4189,6 +4195,7 @@ const {
   applyEdgeChanges: rfApplyEdgeChanges,
   MarkerType: RFMarkerType,
 } = ReactFlowLib || {};
+const { toPng: htmlToImageToPng } = HtmlToImage || {};
 
 function createAppTheme(mode) {
   const isDark = mode === "dark";
@@ -5867,6 +5874,7 @@ function graphDerivedSqlExpression(d) {
 }
 
 const GRAPH_DERIVED_FORBIDDEN = /\b(window|document|fetch|XMLHttpRequest|localStorage|sessionStorage|indexedDB|Function|eval|import|constructor|prototype|globalThis|self|postMessage)\b/i;
+const GRAPH_DERIVED_FN_CACHE = new Map();
 
 function valueByFlexibleName(rowMap, name) {
   const key = String(name || "");
@@ -5957,12 +5965,17 @@ function evaluateGraphDerivedColumn(d, rowMap) {
         return m ? (m[Number(group)||0] ?? "") : "";
       }catch{ return ""; }
     };
-    const fn = new Function(
-      "col", "num", "str", "concat", "coalesce", "lower", "upper", "round", "abs", "min", "max", "row",
-      "split", "part", "pathParts", "pathPart", "basename", "filename", "dirname", "ext", "extname", "stem",
-      "before", "after", "between", "sliceText", "left", "right", "replaceText", "regexExtract",
-      `"use strict"; return (${expr});`
-    );
+    let fn = GRAPH_DERIVED_FN_CACHE.get(expr);
+    if (!fn) {
+      fn = new Function(
+        "col", "num", "str", "concat", "coalesce", "lower", "upper", "round", "abs", "min", "max", "row",
+        "split", "part", "pathParts", "pathPart", "basename", "filename", "dirname", "ext", "extname", "stem",
+        "before", "after", "between", "sliceText", "left", "right", "replaceText", "regexExtract",
+        `"use strict"; return (${expr});`
+      );
+      if (GRAPH_DERIVED_FN_CACHE.size > 100) GRAPH_DERIVED_FN_CACHE.clear();
+      GRAPH_DERIVED_FN_CACHE.set(expr, fn);
+    }
     const value = fn(
       col, num, str, concat, coalesce, lower, upper, round, Math.abs, Math.min, Math.max, rowMap,
       splitText, pathPart, pathParts, pathPart, basename, filename, dirname, ext, extname, stem,
@@ -5978,12 +5991,42 @@ function applyGraphDerivedColumnsToTable(table, derivedColumns=[]) {
   const normalized = normalizeGraphDerivedColumns(derivedColumns);
   if (!table || !Array.isArray(table.header) || !normalized.length) return table;
   const header = [...table.header, ...normalized.map((d) => d.newColumnName)];
+  const evaluators = normalized.map((d) => (rowMap) => evaluateGraphDerivedColumn(d, rowMap));
   const rows = (table.rows || []).map((row) => {
     const rowMap = {};
     table.header.forEach((h, i) => { rowMap[h] = row[i]; });
-    const extra = normalized.map((d) => evaluateGraphDerivedColumn(d, rowMap));
+    const extra = evaluators.map((fn) => fn(rowMap));
     return [...row, ...extra];
   });
+  return { ...table, header, rows };
+}
+
+function graphYieldFrame(){
+  return new Promise((resolve) => {
+    if (typeof requestAnimationFrame === "function") requestAnimationFrame(() => resolve());
+    else setTimeout(resolve, 0);
+  });
+}
+
+async function applyGraphDerivedColumnsToTableAsync(table, derivedColumns=[], options={}) {
+  const normalized = normalizeGraphDerivedColumns(derivedColumns);
+  if (!table || !Array.isArray(table.header) || !normalized.length) return table;
+  const header = [...table.header, ...normalized.map((d) => d.newColumnName)];
+  const rows = [];
+  const sourceRows = table.rows || [];
+  const evaluators = normalized.map((d) => (rowMap) => evaluateGraphDerivedColumn(d, rowMap));
+  const chunkSize = Math.max(50, Number(options.chunkSize || 200));
+  for (let start=0; start<sourceRows.length; start += chunkSize) {
+    const end = Math.min(sourceRows.length, start + chunkSize);
+    for (let r=start; r<end; r++) {
+      const row = sourceRows[r] || [];
+      const rowMap = {};
+      table.header.forEach((h, i) => { rowMap[h] = row[i]; });
+      const extra = evaluators.map((fn) => fn(rowMap));
+      rows.push([...row, ...extra]);
+    }
+    if (end < sourceRows.length) await graphYieldFrame();
+  }
   return { ...table, header, rows };
 }
 
@@ -6172,6 +6215,37 @@ function parseSqlToGraphPlan(sql, columns) {
   return { filters, sort, maxRows: Number(limitPart || 0), projection, errors };
 }
 
+
+function graphNodeById(nodes, id){ return (nodes || []).find((n) => String(n.id) === String(id)) || null; }
+function graphEdgeColor(edge, nodes){
+  const sourceKind = graphNodeById(nodes, edge?.source)?.data?.kind || "node";
+  const targetKind = graphNodeById(nodes, edge?.target)?.data?.kind || "node";
+  const sourceMeta = graphKindMeta(sourceKind);
+  const targetMeta = graphKindMeta(targetKind);
+  return targetMeta?.accent || sourceMeta?.accent || "#64748b";
+}
+function autoArrangeGraphNodesNoOverlap(nodes){
+  const widths = { subquery: 480, source: 220, join: 230, select: 220, filter: 220, sort: 220, limit: 190, derived: 240, aggregate: 230, output: 210 };
+  const heights = { subquery: 340, source: 100, join: 115, select: 105, filter: 120, sort: 105, limit: 95, derived: 130, aggregate: 115, output: 95 };
+  const gapX = 48, gapY = 34;
+  const placed = [];
+  const intersects = (a, b) => !(a.x + a.w + gapX < b.x || b.x + b.w + gapX < a.x || a.y + a.h + gapY < b.y || b.y + b.h + gapY < a.y);
+  return (nodes || []).map((n, idx) => {
+    const kind = n.data?.kind || "node";
+    let x = Number(n.position?.x ?? (idx * 220));
+    let y = Number(n.position?.y ?? 80);
+    const box = { x, y, w: widths[kind] || 220, h: heights[kind] || 105 };
+    let guard = 0;
+    while (placed.some((p) => intersects(box, p)) && guard < 300) {
+      box.x += 36;
+      box.y += box.x > 1180 ? 145 : 0;
+      if (box.x > 1180) box.x = 40;
+      guard++;
+    }
+    placed.push({ ...box });
+    return { ...n, position: { x: box.x, y: box.y } };
+  });
+}
 function QueryGraphNode({ id, data, selected }) {
   const kind = data?.kind || "node";
   const meta = graphKindMeta(kind);
@@ -6189,11 +6263,11 @@ function QueryGraphNode({ id, data, selected }) {
       position:"relative",
       bgcolor: meta.bg,
       color: meta.text,
-      border: "2px solid",
+      border: "1px solid",
       borderColor: selected ? meta.accent : meta.border,
-      borderLeft: `8px solid ${meta.accent}`,
-      borderRadius: 2,
-      boxShadow: selected ? `0 0 0 3px ${meta.border}, 0 16px 36px rgba(15,23,42,0.18)` : "0 10px 28px rgba(15,23,42,0.10)",
+      borderLeft: `5px solid ${meta.accent}`,
+      borderRadius: 1.5,
+      boxShadow: selected ? `0 0 0 2px ${meta.border}, 0 10px 22px rgba(15,23,42,0.14)` : "0 4px 12px rgba(15,23,42,0.08)",
     }}>
       {toolbarReady && (
         <RFNodeToolbar isVisible={selected} position="top">
@@ -6234,9 +6308,10 @@ function QueryGraphEdge(props) {
   const { id, sourceX, sourceY, targetX, targetY, sourcePosition, targetPosition, markerEnd, data, selected } = props;
   if (!RFBaseEdge || !rfGetBezierPath || !RFEdgeLabelRenderer) return null;
   const [edgePath, labelX, labelY] = rfGetBezierPath({ sourceX, sourceY, sourcePosition, targetX, targetY, targetPosition });
+  const edgeColor = data?.color || "#64748b";
   return (
     <>
-      <RFBaseEdge id={id} path={edgePath} markerEnd={markerEnd} style={{ strokeWidth: selected ? 2.4 : 1.5, stroke: selected ? "#2563eb" : "#64748b" }} />
+      <RFBaseEdge id={id} path={edgePath} markerEnd={markerEnd} style={{ strokeWidth: selected ? 2.6 : 1.6, stroke: selected ? edgeColor : edgeColor, opacity: selected ? 1 : 0.78 }} />
       <RFEdgeLabelRenderer>
         <Box sx={{
           position: "absolute",
@@ -6244,7 +6319,7 @@ function QueryGraphEdge(props) {
           pointerEvents: "all",
           bgcolor: selected ? "rgba(255,255,255,0.98)" : "rgba(255,255,255,0.84)",
           border: "1px solid",
-          borderColor: selected ? "primary.main" : "divider",
+          borderColor: selected ? edgeColor : "divider",
           borderRadius: 999,
           px: 0.12,
           py: 0.05,
@@ -6281,7 +6356,15 @@ const GRAPH_FORMULA_RECIPES = [
   { group:"整形", label:"空なら代替", expr:'coalesce(col("memo"), "なし")', desc:"NULL/空文字を置き換える" },
 ];
 
-function FormulaRecipePanel({ onPick }) {
+function formulaColumnExpression(field){
+  const name = String(field?.name || "").replace(/\/g, "\\").replace(/"/g, '\"');
+  const alias = String(field?.alias || "").trim();
+  const qualified = alias && alias !== "t1" ? `${alias}.${name}` : name;
+  return `col("${qualified}")`;
+}
+
+function FormulaRecipePanel({ onPick, fieldOptions=[] }) {
+  const [filterText, setFilterText] = useState("");
   const groups = useMemo(() => {
     const map = new Map();
     for (const recipe of GRAPH_FORMULA_RECIPES) {
@@ -6290,13 +6373,31 @@ function FormulaRecipePanel({ onPick }) {
     }
     return [...map.entries()];
   }, []);
+  const filteredFields = useMemo(() => {
+    const q = String(filterText || "").trim().toLowerCase();
+    const list = Array.isArray(fieldOptions) ? fieldOptions : [];
+    return (q ? list.filter((f) => `${f.alias}.${f.name} ${f.type}`.toLowerCase().includes(q)) : list).slice(0, 80);
+  }, [fieldOptions, filterText]);
   return (
     <Paper variant="outlined" sx={{ p: 1, bgcolor: "rgba(255,255,255,0.72)", borderRadius: 1.5 }}>
       <Stack spacing={0.8}>
-        <Typography variant="subtitle2" sx={{ fontWeight: 900 }}>数式ヘルプ / クリックで挿入</Typography>
+        <Typography variant="subtitle2" sx={{ fontWeight: 900 }}>数式ヘルプ / 入力支援</Typography>
         <Alert severity="info" sx={{ py: 0.25 }}>
-          例の <b>full_path</b> や <b>name</b> は、実データの列名に置き換えてください。col("列名") は「同じ行のその列の値」を参照します。
+          列名チップを押すと col("列名") を挿入します。JOIN結果では alias.column 形式も使えます。
         </Alert>
+        <TextField size="small" label="カラム検索" value={filterText} onChange={(e) => setFilterText(e.target.value)} placeholder="path, amount, t1.name など" />
+        {!!filteredFields.length && (
+          <Box>
+            <Typography variant="caption" sx={{ fontWeight: 900, color: "text.secondary" }}>接続データソースのカラム / クリックで col(...) 挿入</Typography>
+            <Stack direction="row" useFlexGap flexWrap="wrap" spacing={0.5} sx={{ mt: 0.35, maxHeight: 120, overflow: "auto" }}>
+              {filteredFields.map((f) => (
+                <Tooltip key={`${f.value}-${f.alias}-${f.name}`} title={`${formulaColumnExpression(f)} / ${f.type || ""}`}>
+                  <Chip size="small" clickable label={`${f.alias}.${f.name}`} onClick={() => onPick?.(formulaColumnExpression(f))} sx={{ fontWeight: 700 }} />
+                </Tooltip>
+              ))}
+            </Stack>
+          </Box>
+        )}
         {groups.map(([group, recipes]) => (
           <Box key={group}>
             <Typography variant="caption" sx={{ fontWeight: 900, color: "text.secondary" }}>{group}</Typography>
@@ -6379,6 +6480,8 @@ function GraphQueryVirtualTable({ table, totalRows=0, page=1, pageSize=1000, onR
 function GraphQueryEditor({ columns, datasets=[], manifest=null, nodes, setNodes, edges, setEdges, onApply, onReadPage=()=>{}, onClearResult=()=>{}, onExportCsv=()=>{}, disabled, dataQueryActive, dataQueryCount, resultTable, resultStatus, resultTime, resultPage, resultPageMax, resultViewMode="tile", setResultViewMode=()=>{}, resultRowsPerTile="1000", setResultRowsPerTile=()=>{}, sqlText="", setSqlText=()=>{}, sqlMode=false, setSqlMode=()=>{} }) {
   const [selectedId, setSelectedId] = useState(nodes?.[0]?.id || "source");
   const [sqlErrors, setSqlErrors] = useState([]);
+  const [showMiniMap, setShowMiniMap] = useState(false);
+  const flowPanelRef = useRef(null);
   const selectedNode = useMemo(() => nodes.find((n) => n.id === selectedId) || null, [nodes, selectedId]);
   const plan = useMemo(() => compileGraphQuery(nodes, edges, columns, datasets), [nodes, edges, columns, datasets]);
   const graphReady = !!ReactFlowCanvas;
@@ -6430,6 +6533,26 @@ function GraphQueryEditor({ columns, datasets=[], manifest=null, nodes, setNodes
     ]);
     setSelectedId("filter-1");
     safeSetSqlMode(false);
+  };
+
+
+  const autoArrangeGraph = () => {
+    setNodes((prev) => autoArrangeGraphNodesNoOverlap(prev));
+  };
+
+  const downloadFlowImage = async () => {
+    try {
+      if (!htmlToImageToPng) { alert("画像出力ライブラリを読み込めませんでした。"); return; }
+      const target = flowPanelRef.current?.querySelector?.(".react-flow__viewport") || flowPanelRef.current;
+      if (!target) { alert("フローキャンバスが見つかりません。"); return; }
+      const dataUrl = await htmlToImageToPng(target, { cacheBust: true, backgroundColor: "#ffffff", pixelRatio: 2 });
+      const a = document.createElement("a");
+      a.download = `graph_query_flow_${new Date().toISOString().replace(/[:.]/g,"-")}.png`;
+      a.href = dataUrl;
+      a.click();
+    } catch (e) {
+      alert(`画像出力に失敗しました: ${e?.message || e}`);
+    }
   };
 
   const firstSubqueryId = () => nodes.find((n) => n.data?.kind === "subquery")?.id || null;
@@ -6501,7 +6624,7 @@ function GraphQueryEditor({ columns, datasets=[], manifest=null, nodes, setNodes
     data: { ...(n.data || {}), onNodeAction: handleNodeAction },
     style: { ...(n.style || graphNodeStyle(n.data?.kind)), ...(selectedId === n.id ? { boxShadow: "0 0 0 2px #2563eb" } : {}) },
   })), [nodes, selectedId, columns]);
-  const renderedEdges = useMemo(() => edges.map((e) => ({ ...e, type: "queryEdge", data: { ...(e.data || {}), onEdgeAction: handleEdgeAction } })), [edges, nodes, columns]);
+  const renderedEdges = useMemo(() => edges.map((e) => ({ ...e, type: "queryEdge", data: { ...(e.data || {}), color: graphEdgeColor(e, nodes), onEdgeAction: handleEdgeAction } })), [edges, nodes, columns]);
 
   const runFromSql = () => {
     const parsed = parseSqlToGraphPlan(sqlText, columns);
@@ -6539,13 +6662,16 @@ function GraphQueryEditor({ columns, datasets=[], manifest=null, nodes, setNodes
             <Tooltip title="集計ノードを追加。実集計接続は次段階で有効化"><span><Button size="small" variant="outlined" onClick={() => addNode("aggregate")} disabled={!columns.length}>+ 集計</Button></span></Tooltip>
             <Tooltip title="サブクエリ用のグループを追加"><Button size="small" variant="outlined" onClick={() => addNode("subquery")}>+ サブクエリ</Button></Tooltip>
             <Tooltip title="初期ノード構成へ戻します"><Button size="small" onClick={resetGraph}>リセット</Button></Tooltip>
+            <Tooltip title="ノードが重なりにくい位置へ整列します"><Button size="small" onClick={autoArrangeGraph}>重なり回避</Button></Tooltip>
+            <Tooltip title="ミニマップの表示/非表示を切り替えます"><Button size="small" variant={showMiniMap ? "contained" : "outlined"} onClick={() => setShowMiniMap((v) => !v)}>{showMiniMap ? "ミニマップ非表示" : "ミニマップ表示"}</Button></Tooltip>
+            <Tooltip title="現在のフロー図をPNG画像として保存します"><Button size="small" variant="outlined" onClick={downloadFlowImage}>画像保存</Button></Tooltip>
             <Tooltip title="グラフからQueryPlanを生成して実行"><span><Button size="small" variant="contained" onClick={runFromGraph} disabled={disabled || (!columns.length && !datasets.length)}>グラフ実行</Button></span></Tooltip>
             {dataQueryActive && <Chip color="success" size="small" label={`実行中 ${Number(dataQueryCount || 0).toLocaleString()} 行`} />}
           </Stack>
           {!graphReady ? (
             <Alert severity="warning">React Flow CDNを読み込めませんでした。ネットワークまたはCDN制限を確認してください。</Alert>
           ) : (
-            <Box sx={{ height: 560, border: "1px solid", borderColor: "divider", borderRadius: 2, overflow: "hidden", bgcolor: "background.paper" }}>
+            <Box ref={flowPanelRef} className="graph-query-flow-panel" sx={{ height: 560, border: "1px solid", borderColor: "divider", borderRadius: 2, overflow: "hidden", bgcolor: "background.paper" }}>
               <ReactFlowCanvas
                 nodes={renderedNodes}
                 edges={renderedEdges}
@@ -6557,16 +6683,18 @@ function GraphQueryEditor({ columns, datasets=[], manifest=null, nodes, setNodes
                 onReconnect={handleReconnect}
                 edgesReconnectable={true}
                 onNodeClick={(e, node) => setSelectedId(node.id)}
+                onlyRenderVisibleElements={true}
+                elevateEdgesOnSelect={true}
                 fitView
               >
-                {RFMiniMap && <RFMiniMap pannable zoomable nodeColor={(node) => graphKindMeta(node?.data?.kind).accent} />}
+                {showMiniMap && RFMiniMap && <RFMiniMap pannable zoomable nodeColor={(node) => graphKindMeta(node?.data?.kind).accent} />}
                 {RFControls && <RFControls />}
                 {RFBackground && <RFBackground gap={18} />}
               </ReactFlowCanvas>
             </Box>
           )}
           <Typography variant="caption" color="text.secondary" sx={{ display: "block", mt: 0.75 }}>
-            ノードは種類ごとに色分けしています。上下左右の接続ポイントを使えます。ノード/エッジの小型ツールバーから複製・無効化・削除・条件挿入ができます。計算列は結果テーブルに追加されます。サブクエリはWITH句としてSQLプレビューに出力します。
+            ノードは種類ごとに色分け、エッジは接続元/先に応じた色で表示します。ミニマップは必要時だけ表示、画像保存、重なり回避配置に対応しています。計算列は非同期チャンク処理で結果テーブルに追加されます。
           </Typography>
         </Paper>
 
@@ -6660,7 +6788,7 @@ function GraphQueryEditor({ columns, datasets=[], manifest=null, nodes, setNodes
                     <TextField label="数式 / Formula" size="small" multiline minRows={3} value={selectedNode.data.formulaExpression || ""} onChange={(e) => updateNodeData(selectedNode.id, { formulaExpression: e.target.value })} fullWidth placeholder={'例: num(col("amount")) * 1.1\n例: basename(col("full_path"))\n例: dirname(col("full_path"))\n例: pathPart(col("full_path"), -2)\n例: regexExtract(col("full_path"), "([^/]+)\\.csv$", 1)'} />
                   )}
                   {(selectedNode.data.valueMode || "constant") === "formula" && (
-                    <FormulaRecipePanel onPick={(expr) => updateNodeData(selectedNode.id, { formulaExpression: expr })} />
+                    <FormulaRecipePanel fieldOptions={allFieldOptions} onPick={(expr) => updateNodeData(selectedNode.id, { formulaExpression: selectedNode.data.formulaExpression ? `${selectedNode.data.formulaExpression}${selectedNode.data.formulaExpression.endsWith(" ") ? "" : " "}${expr}` : expr })} />
                   )}
                   <Alert severity="info" sx={{ py: 0.25 }}>数式では col("列名") で同じ行の列値を参照します。num/str/concat/coalesce/lower/upper/round のほか、basename, dirname, ext, stem, pathPart, before/after/between, sliceText, left/right, replaceText, regexExtract でパスや文字列を切り出せます。計算列は保存済みDatasetを破壊せず、Graph Query結果テーブルに追加されます。</Alert>
                 </>
@@ -6725,6 +6853,7 @@ function App() {
   const searchPageRef = useRef(1);
   const pageRef = useRef(1);
   const graphExecutionRef = useRef({ active:false, mode:"data", readMode:"dataQuery", derivedColumns:[] });
+  const graphDerivedApplySeqRef = useRef(0);
   const initialSettingsRef = useRef(loadSettings());
   const initialSettings = initialSettingsRef.current;
 
@@ -7294,7 +7423,7 @@ function App() {
         const table = { header: msg.header, rows: msg.rows };
         if (msg.origin === "graph") {
           const derived = graphExecutionRef.current?.derivedColumns || [];
-          setGraphResultTable(applyGraphDerivedColumnsToTable(table, derived));
+          setGraphResultTableWithDerived(table, derived);
           setGraphResultMode("data");
           setGraphResultPage(msg.page || 1);
           setGraphResultCount(manifestRef.current?.totalRows || msg.totalMatches || 0);
@@ -7352,7 +7481,7 @@ function App() {
         if (msg.origin === "graph") {
           const derived = graphExecutionRef.current?.derivedColumns || [];
           setGraphResultMode("data");
-          setGraphResultTable(applyGraphDerivedColumnsToTable(table, derived));
+          setGraphResultTableWithDerived(table, derived);
           setGraphResultCount(msg.totalMatches || 0);
           setGraphResultPage(msg.page || 1);
           setGraphResultStatus(`Graph rows ${fmt(msg.startRow + 1)} - ${fmt(msg.startRow + msg.rows.length)} / ${fmt(msg.totalMatches)} / page ${fmt(msg.page)}${derived.length ? ` / 計算列 ${fmt(derived.length)}列` : ""}`);
@@ -7370,7 +7499,7 @@ function App() {
       if (msg.type === "GRAPH_JOIN_DONE") {
         const derived = graphExecutionRef.current?.derivedColumns || [];
         setGraphResultMode("join");
-        setGraphResultTable(applyGraphDerivedColumnsToTable({ header: msg.header, rows: msg.rows }, derived));
+        setGraphResultTableWithDerived({ header: msg.header, rows: msg.rows }, derived);
         setGraphResultCount(msg.totalMatches || msg.matches || 0);
         setGraphResultPage(1);
         setGraphResultStatus(`JOIN result: ${fmt(msg.totalMatches || msg.matches || 0)} rows / scanned ${fmt(msg.scanned || 0)} / right indexed ${fmt(msg.rightIndexed || 0)}${derived.length ? ` / 計算列 ${fmt(derived.length)}列` : ""}${msg.capped ? " / limitで打ち切り" : ""}`);
@@ -7380,7 +7509,7 @@ function App() {
 
       if (msg.type === "GRAPH_JOIN_PAGE_RESULT") {
         const derived = graphExecutionRef.current?.derivedColumns || [];
-        setGraphResultTable(applyGraphDerivedColumnsToTable({ header: msg.header, rows: msg.rows }, derived));
+        setGraphResultTableWithDerived({ header: msg.header, rows: msg.rows }, derived);
         setGraphResultCount(msg.totalMatches || 0);
         setGraphResultPage(msg.page || 1);
         setGraphResultStatus(`JOIN rows ${fmt(msg.startRow + 1)} - ${fmt(msg.startRow + msg.rows.length)} / ${fmt(msg.totalMatches)} / page ${fmt(msg.page)}${derived.length ? ` / 計算列 ${fmt(derived.length)}列` : ""}`);
@@ -8843,6 +8972,7 @@ root.render(
     import Schema from "https://esm.sh/@mui/icons-material@7.3.5/Schema?deps=react@19.2.0,react-dom@19.2.0";
     import Article from "https://esm.sh/@mui/icons-material@7.3.5/Article?deps=react@19.2.0,react-dom@19.2.0";
     import * as ReactFlowLib from "https://esm.sh/@xyflow/react@12.8.4?deps=react@19.2.0,react-dom@19.2.0";
+    import * as HtmlToImage from "https://esm.sh/html-to-image@1.11.11";
 
     const MaterialIcons = {
       UploadFile,
@@ -8881,10 +9011,11 @@ root.render(
       "MaterialUI",
       "MaterialIcons",
       "ReactFlowLib",
+      "HtmlToImage",
       code
     );
 
-    runApp(React, createRoot, MaterialUI, MaterialIcons, ReactFlowLib);
+    runApp(React, createRoot, MaterialUI, MaterialIcons, ReactFlowLib, HtmlToImage);
   </script>
 </body>
 </html>
