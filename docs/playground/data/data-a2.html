@@ -351,7 +351,8 @@ function integrityFeatureFlags(base={}){
     integrityCheck:true,
     repairLayer:true,
     queryPlan:true,
-    predicatePushdown:true
+    predicatePushdown:true,
+    chunkExecutionEngine:true
   };
 }
 
@@ -842,7 +843,163 @@ function queryPlanSummary(plan){
     })),
     sort:plan?.sort || null,
     requiredColumns:plan?.requiredColumns || [],
-    predicatePushdown:!!plan?.pushdown
+    predicatePushdown:!!plan?.pushdown,
+    executionEngine:"chunk-v1"
+  };
+}
+
+const CHUNK_EXECUTION_ENGINE_VERSION = 1;
+
+function executionTaskId(prefix="task"){
+  const rand = crypto.getRandomValues(new Uint32Array(1))[0].toString(36);
+  return `${prefix}_${Date.now().toString(36)}_${rand}`;
+}
+
+function activeChunkCount(){
+  return Number(state.manifest?.chunks || state.dataset?.chunks?.length || 0);
+}
+
+function normalizePlanLimit(value){
+  const n = Number(value);
+  return Number.isFinite(n) && n > 0 ? n : Number.POSITIVE_INFINITY;
+}
+
+function selectChunksForPlan(plan){
+  const total = activeChunkCount();
+  const explicit = Array.isArray(plan?.chunks) ? plan.chunks : null;
+  if (explicit && explicit.length){
+    return [...new Set(explicit.map(Number).filter(i => Number.isFinite(i) && i >= 0 && i < total))].sort((a,b)=>a-b);
+  }
+  return Array.from({length:total}, (_,i)=>i);
+}
+
+function executionProgressText(label, ctx){
+  return `${label}... ${ctx.position + 1}/${ctx.totalChunks} / skipped ${fmt(ctx.skippedChunks)} / rows ${fmt(ctx.scanned)} / matches ${fmt(ctx.matched)}`;
+}
+
+function sortPlanRows(sortable, sortSpec){
+  if (!Array.isArray(sortable) || !sortSpec) return [];
+  const sortDirection = sortSpec.direction === "desc" ? "desc" : "asc";
+  const dir = sortDirection === "desc" ? -1 : 1;
+  const type = sortSpec.type;
+  return sortable.sort((a,b)=>{
+    if (type === "number") {
+      const an = Number(a.value), bn = Number(b.value);
+      const av = Number.isFinite(an) ? an : (sortDirection === "desc" ? -Infinity : Infinity);
+      const bv = Number.isFinite(bn) ? bn : (sortDirection === "desc" ? -Infinity : Infinity);
+      return (av - bv) * dir || (a.rowId - b.rowId);
+    }
+    return String(a.value ?? "").localeCompare(String(b.value ?? ""), "ja", {numeric:true}) * dir || (a.rowId - b.rowId);
+  });
+}
+
+async function executeChunkExecutionPlan(plan, options={}){
+  const taskId = options.taskId || executionTaskId(plan?.name || "query");
+  const chunks = selectChunksForPlan(plan);
+  const collectRows = !!options.collectRows;
+  const collectSort = !!options.collectSort && !!plan?.sort;
+  const collectPartials = !!options.collectPartials;
+  const limit = normalizePlanLimit(options.limit ?? plan?.limit);
+  const progressLabel = options.progressLabel || plan?.name || "Executing chunks";
+  const progressEvery = Math.max(1, Number(options.progressEvery || 5));
+  const progress = options.progress !== false;
+  const refs = [];
+  const sortable = [];
+  const partials = [];
+  const t0 = now();
+  let skippedChunks = 0, scanned = 0, matched = 0, stoppedByLimit = false;
+
+  const totalChunks = chunks.length;
+  if (!totalChunks){
+    return {
+      taskId, engineVersion:CHUNK_EXECUTION_ENGINE_VERSION, chunks, refs, sortable, partials,
+      scanned, matched, skippedChunks, capped:false, ms:now()-t0, queryPlan:queryPlanSummary(plan)
+    };
+  }
+
+  outer:
+  for (let position=0; position<chunks.length; position++){
+    if (state.cancelled) throw new Error("Cancelled");
+    const chunkIndex = chunks[position];
+    const ctxBase = () => ({
+      taskId, plan, chunkIndex, position, totalChunks, scanned, matched, skippedChunks, refs, sortable, partials
+    });
+
+    if (canSkipChunkByQueryPlan(chunkIndex, plan)){
+      skippedChunks++;
+      if (progress && (position % progressEvery === 0 || position === chunks.length - 1)){
+        const ctx=ctxBase();
+        post("PROGRESS",{
+          value:Math.floor(((position + 1) / totalChunks) * 100),
+          text:typeof options.progressText === "function" ? options.progressText(ctx) : executionProgressText(progressLabel, ctx)
+        });
+      }
+      continue;
+    }
+
+    const chunk = await readChunkColumns(chunkIndex, plan?.requiredColumns || []);
+    const base = chunkBaseRow(chunkIndex);
+    const partial = {taskId, chunkIndex, rowStart:base, rowCount:chunk.rowCount, scanned:0, matched:0, refs:[], sortable:[], metrics:{}};
+
+    if (typeof options.onChunkStart === "function") await options.onChunkStart({...ctxBase(), chunk, base, partial});
+
+    for (let localRow=0; localRow<chunk.rowCount; localRow++){
+      scanned++;
+      partial.scanned++;
+      if (!rowMatchesQueryPlan(chunk, localRow, plan)) continue;
+      matched++;
+      partial.matched++;
+      const rowId = base + localRow;
+
+      if (collectSort){
+        const value = valueFromColumn(chunk.columns.get(plan.sort.columnIndex), localRow);
+        const item = {rowId, value};
+        sortable.push(item);
+        partial.sortable.push(item);
+      } else if (collectRows){
+        refs.push(rowId);
+        partial.refs.push(rowId);
+      }
+
+      if (typeof options.onMatch === "function"){
+        const signal = await options.onMatch({...ctxBase(), chunk, base, localRow, rowId, partial});
+        if (signal === "stop"){
+          stoppedByLimit = true;
+          break outer;
+        }
+      }
+
+      if (!collectSort && collectRows && refs.length >= limit){
+        stoppedByLimit = true;
+        break outer;
+      }
+    }
+
+    if (typeof options.onChunkEnd === "function") await options.onChunkEnd({...ctxBase(), chunk, base, partial});
+    if (collectPartials) partials.push(partial);
+
+    if (progress && (position % progressEvery === 0 || position === chunks.length - 1)){
+      const ctx=ctxBase();
+      post("PROGRESS",{
+        value:Math.floor(((position + 1) / totalChunks) * 100),
+        text:typeof options.progressText === "function" ? options.progressText(ctx) : executionProgressText(progressLabel, ctx)
+      });
+    }
+  }
+
+  return {
+    taskId,
+    engineVersion:CHUNK_EXECUTION_ENGINE_VERSION,
+    chunks,
+    refs,
+    sortable,
+    partials,
+    scanned,
+    matched,
+    skippedChunks,
+    capped:stoppedByLimit,
+    ms:now()-t0,
+    queryPlan:queryPlanSummary(plan)
   };
 }
 
@@ -1790,7 +1947,7 @@ async function runSearch({columnIndex, op, value, maxMatches}){
   const idx=Number(columnIndex);
   const col=state.manifest.columns[idx];
   if (!col) throw new Error("Search column is not selected");
-  const cap=Number(maxMatches || 0) > 0 ? Number(maxMatches) : Number.POSITIVE_INFINITY;
+  const cap=normalizePlanLimit(maxMatches);
   const plan=buildQueryPlan({
     name:"search",
     predicates:[{columnIndex:idx, op, value, source:"search"}],
@@ -1798,30 +1955,25 @@ async function runSearch({columnIndex, op, value, maxMatches}){
     limit:cap,
     pushdown:true
   });
-  const matches=[];
-  const t0=now();
-  let skippedChunks=0, scanned=0;
-  for (let c=0;c<state.manifest.chunks;c++){
-    if (state.cancelled) throw new Error("Cancelled");
-    if (canSkipChunkByQueryPlan(c, plan)){
-      skippedChunks++;
-      if (c % 10 === 0) post("PROGRESS",{value:Math.floor((c+1)/state.manifest.chunks*100), text:`Searching chunks... ${c+1}/${state.manifest.chunks} / skipped ${fmt(skippedChunks)} / matches ${fmt(matches.length)}`});
-      continue;
-    }
-    const chunk=await readChunkColumns(c,plan.requiredColumns);
-    const base=chunkBaseRow(c);
-    for (let r=0;r<chunk.rowCount;r++){
-      scanned++;
-      if (rowMatchesQueryPlan(chunk,r,plan)){
-        matches.push(base+r);
-        if (matches.length >= cap) break;
-      }
-    }
-    if (matches.length >= cap) break;
-    if (c % 5 === 0) post("PROGRESS",{value:Math.floor((c+1)/state.manifest.chunks*100), text:`Searching chunks... ${c+1}/${state.manifest.chunks} / skipped ${fmt(skippedChunks)} / matches ${fmt(matches.length)}`});
-  }
-  state.searchMatches=matches;
-  return {matches:matches.length,capped:matches.length>=cap,scanned,skippedChunks,queryPlan:queryPlanSummary(plan),ms:now()-t0};
+
+  const exec=await executeChunkExecutionPlan(plan,{
+    collectRows:true,
+    limit:cap,
+    progressLabel:"Searching chunks",
+    progressEvery:5,
+    progressText:(ctx)=>`Searching chunks... ${ctx.position+1}/${ctx.totalChunks} / skipped ${fmt(ctx.skippedChunks)} / matches ${fmt(ctx.refs.length)}`
+  });
+
+  state.searchMatches=exec.refs;
+  return {
+    matches:exec.refs.length,
+    capped:exec.capped,
+    scanned:exec.scanned,
+    skippedChunks:exec.skippedChunks,
+    queryPlan:exec.queryPlan,
+    executionEngine:{version:exec.engineVersion,taskId:exec.taskId,chunks:exec.chunks.length},
+    ms:exec.ms
+  };
 }
 
 function normalizeGlobalFilters(filters){
@@ -1836,7 +1988,7 @@ function normalizeGlobalFilters(filters){
 
 async function runDataQuery({filters, sort, maxRows}){
   const normalizedFilters = normalizeGlobalFilters(filters);
-  const requestedLimit = Number(maxRows || 0) > 0 ? Number(maxRows) : Number.POSITIVE_INFINITY;
+  const requestedLimit = normalizePlanLimit(maxRows);
   const plan=buildQueryPlan({
     name:"dataQuery",
     predicates:normalizedFilters,
@@ -1853,61 +2005,44 @@ async function runDataQuery({filters, sort, maxRows}){
   }
 
   const scanLimit = hasSort ? Number.POSITIVE_INFINITY : requestedLimit;
-  const refs = [];
-  const sortable = [];
-  const t0 = now();
-  let scanned = 0;
-  let capped = false;
-  let skippedChunks = 0;
-
-  for (let c=0;c<state.manifest.chunks;c++){
-    if (state.cancelled) throw new Error("Cancelled");
-    if (canSkipChunkByQueryPlan(c, plan)){ skippedChunks++; continue; }
-    const chunk = await readChunkColumns(c, plan.requiredColumns);
-    const base = chunkBaseRow(c);
-
-    for (let r=0;r<chunk.rowCount;r++){
-      scanned++;
-      if (!rowMatchesQueryPlan(chunk, r, plan)) continue;
-
-      const rowId = base + r;
-      if (hasSort) {
-        const v = valueFromColumn(chunk.columns.get(plan.sort.columnIndex), r);
-        sortable.push({rowId, value:v});
-      } else {
-        refs.push(rowId);
-      }
-
-      if (!hasSort && refs.length >= scanLimit) { capped = true; break; }
+  const exec=await executeChunkExecutionPlan(plan,{
+    collectRows:!hasSort,
+    collectSort:hasSort,
+    limit:scanLimit,
+    progressLabel:"Global filter/sort chunks",
+    progressEvery:5,
+    progressText:(ctx)=>{
+      const found = hasSort ? ctx.sortable.length : ctx.refs.length;
+      return `Global filter/sort chunks... ${ctx.position+1}/${ctx.totalChunks} / skipped ${fmt(ctx.skippedChunks)} / matches ${fmt(found)}`;
     }
-    if (capped) break;
-    if (c % 5 === 0) {
-      const found = hasSort ? sortable.length : refs.length;
-      post("PROGRESS",{value:Math.floor((c+1)/state.manifest.chunks*100), text:`Global filter/sort chunks... ${c+1}/${state.manifest.chunks} / skipped ${fmt(skippedChunks)} / matches ${fmt(found)}`});
-    }
-  }
+  });
 
+  let capped = exec.capped;
   if (hasSort) {
-    const sortDirection=plan.sort.direction;
-    const dir = sortDirection === "desc" ? -1 : 1;
-    const type = plan.sort.type;
-    sortable.sort((a,b)=>{
-      if (type === "number") {
-        const an = Number(a.value), bn = Number(b.value);
-        const av = Number.isFinite(an) ? an : (sortDirection === "desc" ? -Infinity : Infinity);
-        const bv = Number.isFinite(bn) ? bn : (sortDirection === "desc" ? -Infinity : Infinity);
-        return (av - bv) * dir || (a.rowId - b.rowId);
-      }
-      return String(a.value ?? "").localeCompare(String(b.value ?? ""), "ja", {numeric:true}) * dir || (a.rowId - b.rowId);
-    });
-    capped = Number.isFinite(requestedLimit) && sortable.length > requestedLimit;
-    state.dataQueryMatches = sortable.map(x=>x.rowId).slice(0, requestedLimit);
+    const sorted = sortPlanRows(exec.sortable, plan.sort);
+    capped = Number.isFinite(requestedLimit) && sorted.length > requestedLimit;
+    state.dataQueryMatches = Number.isFinite(requestedLimit) ? sorted.slice(0, requestedLimit).map(x=>x.rowId) : sorted.map(x=>x.rowId);
   } else {
-    state.dataQueryMatches = refs;
+    state.dataQueryMatches = exec.refs;
   }
 
-  state.dataQueryMeta = {filters:normalizedFilters, sort:plan.sort ? {columnIndex:plan.sort.columnIndex,direction:plan.sort.direction} : null, capped, queryPlan:queryPlanSummary(plan)};
-  return {matches:state.dataQueryMatches.length, active:true, capped, scanned, skippedChunks, queryPlan:queryPlanSummary(plan), ms:now()-t0};
+  state.dataQueryMeta = {
+    filters:normalizedFilters,
+    sort:plan.sort ? {columnIndex:plan.sort.columnIndex,direction:plan.sort.direction} : null,
+    capped,
+    queryPlan:exec.queryPlan,
+    executionEngine:{version:exec.engineVersion,taskId:exec.taskId,chunks:exec.chunks.length}
+  };
+  return {
+    matches:state.dataQueryMatches.length,
+    active:true,
+    capped,
+    scanned:exec.scanned,
+    skippedChunks:exec.skippedChunks,
+    queryPlan:exec.queryPlan,
+    executionEngine:{version:exec.engineVersion,taskId:exec.taskId,chunks:exec.chunks.length},
+    ms:exec.ms
+  };
 }
 
 async function readDataQueryPage(page,pageSize,cols){
@@ -1975,52 +2110,51 @@ async function buildPivot({rowFields,columnFields,valueField,aggregation,maxRows
   const plan=buildQueryPlan({name:"pivotTile", projection:required, pushdown:true});
   const rowKeys=[], colKeys=[], rowSet=new Set(), colSet=new Set();
   const cells=new Map(), rowTotals=new Map(), colTotals=new Map(), grand=makeAgg();
-  const t0=now(); let scanned=0, limitHit=false;
+  let limitHit=false;
 
   state.pivotTable=null;
   state.pivotTileIndex=null;
 
-  for (let c=0;c<state.manifest.chunks;c++){
-    if (state.cancelled) throw new Error("Cancelled");
-    const chunk=await readChunkColumns(c,plan.requiredColumns);
-    for (let r=0;r<chunk.rowCount;r++){
-      const rk=keyOf(rowIdx.map(i=>keyCellValue(valueFromColumn(chunk.columns.get(i),r))));
-      const ck=keyOf(colIdx.map(i=>keyCellValue(valueFromColumn(chunk.columns.get(i),r))));
+  const exec=await executeChunkExecutionPlan(plan,{
+    progressLabel:"Pivot tile index",
+    progressEvery:1,
+    progressText:(ctx)=>`Pivot tile index... ${ctx.position+1}/${ctx.totalChunks} / rows ${fmt(ctx.scanned)} / row groups ${fmt(rowKeys.length)} / col groups ${fmt(colKeys.length)}`,
+    onMatch:({chunk, localRow})=>{
+      const rk=keyOf(rowIdx.map(i=>keyCellValue(valueFromColumn(chunk.columns.get(i),localRow))));
+      const ck=keyOf(colIdx.map(i=>keyCellValue(valueFromColumn(chunk.columns.get(i),localRow))));
 
       if (!rowSet.has(rk)){
-        if (rowKeys.length>=rowLimit){ limitHit=true; scanned++; continue; }
+        if (rowKeys.length>=rowLimit){ limitHit=true; return; }
         rowSet.add(rk); rowKeys.push(rk);
       }
       if (!colSet.has(ck)){
-        if (colKeys.length>=colLimit){ limitHit=true; scanned++; continue; }
+        if (colKeys.length>=colLimit){ limitHit=true; return; }
         colSet.add(ck); colKeys.push(ck);
       }
 
-      const v=countMode ? "" : valueFromColumn(chunk.columns.get(valIdx),r);
+      const v=countMode ? "" : valueFromColumn(chunk.columns.get(valIdx),localRow);
       let rm=cells.get(rk); if(!rm){rm=new Map(); cells.set(rk,rm);}
       let a=rm.get(ck); if(!a){a=makeAgg(); rm.set(ck,a);}
       addAgg(a,v,countMode);
       let rt=rowTotals.get(rk); if(!rt){rt=makeAgg(); rowTotals.set(rk,rt);} addAgg(rt,v,countMode);
       let ct=colTotals.get(ck); if(!ct){ct=makeAgg(); colTotals.set(ck,ct);} addAgg(ct,v,countMode);
       addAgg(grand,v,countMode);
-      scanned++;
     }
-    post("PROGRESS",{value:Math.floor((c+1)/state.manifest.chunks*100), text:`Pivot tile index... ${c+1}/${state.manifest.chunks} / rows ${fmt(scanned)} / row groups ${fmt(rowKeys.length)} / col groups ${fmt(colKeys.length)}`});
-  }
+  });
 
   rowKeys.sort();
   colKeys.sort();
 
   const rowHeaderNames = rowIdx.length ? rowIdx.map(i=>state.manifest.columns[i].name) : ["Rows"];
   const colHeaderNames = colIdx.length ? colIdx.map(i=>state.manifest.columns[i].name) : ["Columns"];
-  const msValue=now()-t0;
 
   state.pivotTileIndex={
     rowKeys, colKeys, cells, rowTotals, colTotals, grand, mode, countMode,
     rowIdx, colIdx, valueField:countMode ? -1 : valIdx,
     rowHeaderNames, colHeaderNames,
     tileRows:PIVOT_TILE_ROWS, tileCols:PIVOT_TILE_COLS,
-    scanned, limitHit, queryPlan:queryPlanSummary(plan), ms:msValue,
+    scanned:exec.scanned, limitHit, queryPlan:exec.queryPlan, ms:exec.ms,
+    executionEngine:{version:exec.engineVersion,taskId:exec.taskId,chunks:exec.chunks.length},
     builtAt:new Date().toISOString()
   };
 
@@ -2043,6 +2177,7 @@ function pivotTileMeta(){
     scanned:p.scanned,
     limitHit:p.limitHit,
     queryPlan:p.queryPlan,
+    executionEngine:p.executionEngine || null,
     ms:p.ms,
     builtAt:p.builtAt
   };
@@ -2203,40 +2338,35 @@ async function buildTimeSeries({timeField, bucket, groupField, valueField, aggre
 
   const states = new Map();
   const timeBucketSet = new Set();
-  const t0 = now();
-  let scanned = 0, invalidTime = 0, limitHit = false, skippedChunks = 0;
+  let invalidTime = 0, limitHit = false;
+  const bucketLimit = Math.max(1, Number(maxBuckets || 5000));
 
-  for (let c=0;c<state.manifest.chunks;c++){
-    if (state.cancelled) throw new Error("Cancelled");
-    if (canSkipChunkByQueryPlan(c, plan)){ skippedChunks++; continue; }
-    const chunk = await readChunkColumns(c, plan.requiredColumns);
-
-    for (let r=0;r<chunk.rowCount;r++){
-      const rawTime = valueFromColumn(chunk.columns.get(timeIdx), r);
+  const exec=await executeChunkExecutionPlan(plan,{
+    progressLabel:"Time view chunks",
+    progressEvery:1,
+    progressText:(ctx)=>`Time view chunks... ${ctx.position+1}/${ctx.totalChunks} / skipped ${fmt(ctx.skippedChunks)} / rows ${fmt(ctx.scanned)}`,
+    onMatch:({chunk, localRow})=>{
+      const rawTime = valueFromColumn(chunk.columns.get(timeIdx), localRow);
       const b = parseTimeBucket(rawTime, bucket);
-      if (!b) { invalidTime++; scanned++; continue; }
+      if (!b) { invalidTime++; return; }
 
       if (!timeBucketSet.has(b)){
-        if (timeBucketSet.size >= maxBuckets){
+        if (timeBucketSet.size >= bucketLimit){
           limitHit = true;
-          scanned++;
-          continue;
+          return;
         }
         timeBucketSet.add(b);
       }
 
-      const g = hasGroup ? keyCellValue(valueFromColumn(chunk.columns.get(groupIdx), r)) : "(All)";
+      const g = hasGroup ? keyCellValue(valueFromColumn(chunk.columns.get(groupIdx), localRow)) : "(All)";
       const key = JSON.stringify([b, g]);
 
       if (!states.has(key)) states.set(key, makeAgg());
 
-      const v = countMode ? "" : valueFromColumn(chunk.columns.get(valIdx), r);
+      const v = countMode ? "" : valueFromColumn(chunk.columns.get(valIdx), localRow);
       addAgg(states.get(key), v, countMode);
-      scanned++;
     }
-
-    post("PROGRESS", {value:Math.floor((c+1)/state.manifest.chunks*100), text:`Time view chunks... ${c+1}/${state.manifest.chunks} / skipped ${fmt(skippedChunks)} / rows ${fmt(scanned)}`});
-  }
+  });
 
   const header = hasGroup ? ["Time", "Group", mode] : ["Time", mode];
   const rows = [...states.entries()].sort((a,b)=>a[0].localeCompare(b[0])).map(([key, agg])=>{
@@ -2246,7 +2376,16 @@ async function buildTimeSeries({timeField, bucket, groupField, valueField, aggre
   });
 
   state.timeTable = {header, rows};
-  return {header, rows, scanned, invalidTime, limitHit, skippedChunks, queryPlan:queryPlanSummary(plan), ms:now()-t0};
+  return {
+    header, rows,
+    scanned:exec.scanned,
+    invalidTime,
+    limitHit,
+    skippedChunks:exec.skippedChunks,
+    queryPlan:exec.queryPlan,
+    executionEngine:{version:exec.engineVersion,taskId:exec.taskId,chunks:exec.chunks.length},
+    ms:exec.ms
+  };
 }
 
 
