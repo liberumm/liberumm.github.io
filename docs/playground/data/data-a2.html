@@ -352,7 +352,8 @@ function integrityFeatureFlags(base={}){
     repairLayer:true,
     queryPlan:true,
     predicatePushdown:true,
-    chunkExecutionEngine:true
+    chunkExecutionEngine:true,
+    chunkWorkerPool:true
   };
 }
 
@@ -563,6 +564,67 @@ async function loadValidatedDataset(id,options={}){
     throw new Error(`Dataset integrity check failed for ${id}: ${msg}`);
   }
   return {id,dir,manifest:checked.manifest,chunks:checked.chunks,integrity:checked.integrity};
+}
+
+async function loadDatasetForWorkerReadOnly(id){
+  const root=await rootDir();
+  const dir=await root.getDirectoryHandle(id);
+  const checked=await validateAndRepairDatasetDir(id,dir,{repair:false,rebuildStats:false});
+  if (!checked.ok){
+    const msg=(checked.issues || []).slice(0,3).join(" / ") || "unknown integrity error";
+    throw new Error(`Worker Pool read-only integrity check failed for ${id}: ${msg}`);
+  }
+  return {id,dir,manifest:checked.manifest,chunks:checked.chunks,integrity:checked.integrity};
+}
+
+async function openVirtualDatasetForWorkerReadOnly(ids, name){
+  clearChunkCache();
+  const list=(Array.isArray(ids) ? ids : []).filter(Boolean);
+  if (list.length < 2) throw new Error("Virtual worker pool requires at least two saved tables");
+  const sources=[];
+  for (const id of list) sources.push(await loadDatasetForWorkerReadOnly(id));
+  const base=sources[0].manifest;
+  const baseSig=schemaFullSignatureFromColumns(base.columns);
+  for (const item of sources.slice(1)){
+    const sig=schemaFullSignatureFromColumns(item.manifest.columns);
+    if (sig !== baseSig) throw new Error(`Virtual worker pool blocked: ${item.manifest.name || item.id} has a different column name/type layout`);
+  }
+
+  let rowOffset=0;
+  const globalChunks=[];
+  const virtualSources=sources.map((item, sourceIndex)=>{
+    const src={id:item.id,dir:item.dir,manifest:item.manifest,chunks:item.chunks,rowOffset,rows:Number(item.manifest.totalRows || 0)};
+    for (let c=0; c<item.chunks.length; c++){
+      const rowCount=Number(item.chunks[c]?.rowCount || 0);
+      globalChunks.push({sourceIndex, sourceChunkIndex:c, rowStart:rowOffset, rowEnd:rowOffset + rowCount, rowCount, stats:item.chunks[c]?.stats, columnStats:item.chunks[c]?.columnStats, indexVersion:item.chunks[c]?.indexVersion});
+      rowOffset += rowCount;
+    }
+    return src;
+  });
+
+  const tableName=cleanMetaValue(name || `virtual_${list.length}_tables`, `virtual_${list.length}_tables`);
+  const manifest={
+    ...base,
+    id:`virtual:${list.join("+")}`,
+    name:tableName,
+    storageWorkspace:"Virtual",
+    storageCollection:"Cross Workspace",
+    tableName,
+    storagePath:`Virtual / Cross Workspace / ${tableName}`,
+    originalFileName:sources.map(x=>x.manifest.name || x.id).join(" + "),
+    sourceDatasets:sources.map(x=>({id:x.id,workspace:manifestWorkspace(x.manifest),collection:manifestCollection(x.manifest),tableName:manifestTableName(x.manifest),name:x.manifest.name,rows:x.manifest.totalRows,chunks:x.manifest.chunks,createdAt:x.manifest.createdAt})),
+    createdAt:new Date().toISOString(),
+    mode:"virtual-dataset",
+    totalRows:rowOffset,
+    sourceRows:sources.reduce((a,x)=>a+Number(x.manifest.sourceRows || x.manifest.totalRows || 0),0),
+    chunks:globalChunks.length,
+    fileSize:sources.reduce((a,x)=>a+Number(x.manifest.fileSize || 0),0)
+  };
+  state.virtual={sources:virtualSources, globalChunks};
+  state.memory=null;
+  state.dir=null;
+  state.manifest=manifest;
+  state.dataset={id:manifest.id,manifest,chunks:globalChunks};
 }
 
 function colFileName(index, type){ return `col_${String(index).padStart(4,"0")}.${type === "number" ? "f64" : "i32"}.bin`; }
@@ -844,7 +906,8 @@ function queryPlanSummary(plan){
     sort:plan?.sort || null,
     requiredColumns:plan?.requiredColumns || [],
     predicatePushdown:!!plan?.pushdown,
-    executionEngine:"chunk-v1"
+    executionEngine:"chunk-v1",
+    workerPoolReady:true
   };
 }
 
@@ -1001,6 +1064,193 @@ async function executeChunkExecutionPlan(plan, options={}){
     ms:now()-t0,
     queryPlan:queryPlanSummary(plan)
   };
+}
+
+
+const CHUNK_WORKER_POOL_VERSION = 1;
+
+function chunkExecutionContextSnapshot(){
+  if (activeIsMemory()) return {mode:"memory", reason:"In-memory chunks cannot be shared across nested workers yet"};
+  if (activeIsVirtual()){
+    return {
+      mode:"virtual",
+      sourceIds:(state.virtual?.sources || []).map(s => s.id).filter(Boolean),
+      name:state.manifest?.name || "virtual_worker_pool"
+    };
+  }
+  const id=state.dataset?.id || state.manifest?.id;
+  return id ? {mode:"storage", datasetId:id} : {mode:"none", reason:"No active storage-backed dataset"};
+}
+
+async function hydrateChunkExecutionContext(context){
+  if (!context || context.mode === "none") throw new Error(context?.reason || "Chunk worker context is empty");
+  if (context.mode === "memory") throw new Error(context.reason || "Memory dataset is not supported by worker pool");
+  if (context.mode === "storage"){
+    const loaded=await loadDatasetForWorkerReadOnly(context.datasetId);
+    state.virtual=null;
+    state.memory=null;
+    state.dir=loaded.dir;
+    state.manifest=loaded.manifest;
+    state.dataset={id:loaded.id,manifest:loaded.manifest,chunks:loaded.chunks};
+    return;
+  }
+  if (context.mode === "virtual"){
+    await openVirtualDatasetForWorkerReadOnly(context.sourceIds || [], context.name || "virtual_worker_pool");
+    return;
+  }
+  throw new Error(`Unsupported chunk worker context: ${context.mode}`);
+}
+
+function defaultChunkWorkerCount(chunkCount){
+  const cores=Number(navigator?.hardwareConcurrency || 4);
+  return Math.max(1, Math.min(Number(chunkCount || 1), Math.max(1, cores - 1), 6));
+}
+
+function canUseChunkWorkerPool(plan, options, chunks){
+  if (options?.parallel === false) return false;
+  if (options?.onMatch || options?.onChunkStart || options?.onChunkEnd) return false;
+  if (!(options?.collectRows || options?.collectSort)) return false;
+  if (!Array.isArray(chunks) || chunks.length < 2) return false;
+  if (activeIsMemory()) return false;
+  if (typeof Worker === "undefined") return false;
+  if (!self.location || !self.location.href) return false;
+  const context=chunkExecutionContextSnapshot();
+  if (context.mode !== "storage" && context.mode !== "virtual") return false;
+  return !!plan;
+}
+
+function shardChunksContiguously(chunks, workerCount){
+  const n=Math.max(1, Math.min(Number(workerCount || 1), chunks.length));
+  const out=[];
+  const size=Math.ceil(chunks.length / n);
+  for (let i=0;i<n;i++){
+    const batch=chunks.slice(i*size, (i+1)*size);
+    if (batch.length) out.push(batch);
+  }
+  return out;
+}
+
+function serializableExecutionOptions(options={}){
+  return {
+    collectRows:!!options.collectRows,
+    collectSort:!!options.collectSort,
+    collectPartials:!!options.collectPartials,
+    limit:Number.POSITIVE_INFINITY,
+    progress:false,
+    parallel:false
+  };
+}
+
+function runChunkExecutorWorker({requestId, batchIndex, context, plan, options}){
+  return new Promise((resolve,reject)=>{
+    let worker;
+    try{ worker=new Worker(self.location.href); }
+    catch(err){ reject(err); return; }
+    let settled=false;
+    const cleanup=()=>{ try{ worker.terminate(); }catch{} };
+    worker.onmessage=(e)=>{
+      const msg=e.data || {};
+      if (msg.type === "CHUNK_BATCH_DONE" && msg.requestId === requestId){
+        if (settled) return;
+        settled=true;
+        cleanup();
+        resolve({...msg.result,batchIndex});
+      } else if (msg.type === "ERROR"){
+        if (settled) return;
+        settled=true;
+        cleanup();
+        reject(new Error(msg.message || "Chunk executor failed"));
+      }
+    };
+    worker.onerror=(err)=>{
+      if (settled) return;
+      settled=true;
+      cleanup();
+      reject(new Error(err?.message || "Chunk executor worker error"));
+    };
+    worker.postMessage({type:"EXECUTE_CHUNK_BATCH", requestId, batchIndex, context, plan, options});
+  });
+}
+
+function reduceChunkWorkerResults(plan, options, chunks, batches, results, t0){
+  const ordered=[...results].sort((a,b)=>Number(a.batchIndex||0)-Number(b.batchIndex||0));
+  let refs=[], sortable=[], partials=[];
+  let scanned=0, matched=0, skippedChunks=0;
+  for (const r of ordered){
+    scanned += Number(r.scanned || 0);
+    matched += Number(r.matched || 0);
+    skippedChunks += Number(r.skippedChunks || 0);
+    if (Array.isArray(r.refs)) refs.push(...r.refs);
+    if (Array.isArray(r.sortable)) sortable.push(...r.sortable);
+    if (Array.isArray(r.partials)) partials.push(...r.partials);
+  }
+
+  const limit=normalizePlanLimit(options.limit ?? plan?.limit);
+  let capped=false;
+  if (options.collectRows && Number.isFinite(limit) && refs.length > limit){
+    refs=refs.slice(0, limit);
+    capped=true;
+  }
+  if (options.collectSort && Number.isFinite(limit) && sortable.length > limit){
+    // Keep the full sortable list for correct final ordering. The caller sorts and slices.
+    capped=true;
+  }
+
+  return {
+    taskId:options.taskId || executionTaskId(plan?.name || "query"),
+    engineVersion:CHUNK_EXECUTION_ENGINE_VERSION,
+    workerPoolVersion:CHUNK_WORKER_POOL_VERSION,
+    executionMode:"worker-pool",
+    workerCount:batches.length,
+    chunks,
+    refs,
+    sortable,
+    partials,
+    scanned,
+    matched,
+    skippedChunks,
+    capped,
+    ms:now()-t0,
+    queryPlan:{...queryPlanSummary(plan), executionEngine:"chunk-pool-v1", workerPool:{version:CHUNK_WORKER_POOL_VERSION, workers:batches.length}}
+  };
+}
+
+async function executeChunkExecutionPlanMaybeParallel(plan, options={}){
+  const chunks=selectChunksForPlan(plan);
+  if (!canUseChunkWorkerPool(plan, options, chunks)){
+    const exec=await executeChunkExecutionPlan(plan, options);
+    exec.executionMode=exec.executionMode || "single-worker";
+    return exec;
+  }
+
+  const t0=now();
+  const context=chunkExecutionContextSnapshot();
+  const workerCount=defaultChunkWorkerCount(chunks.length);
+  const batches=shardChunksContiguously(chunks, workerCount);
+  const taskId=options.taskId || executionTaskId(`${plan?.name || "query"}_pool`);
+  const progressLabel=options.progressLabel || plan?.name || "Executing chunks";
+  post("PROGRESS",{value:1,text:`${progressLabel} with Worker Pool... workers ${batches.length} / chunks ${fmt(chunks.length)}`});
+
+  try{
+    let completed=0;
+    const results=await Promise.all(batches.map((batch,batchIndex)=>{
+      const batchPlan={...plan,chunks:batch,limit:Number.POSITIVE_INFINITY};
+      const batchOptions=serializableExecutionOptions(options);
+      return runChunkExecutorWorker({requestId:`${taskId}_${batchIndex}`, batchIndex, context, plan:batchPlan, options:batchOptions})
+        .then(result=>{
+          completed++;
+          post("PROGRESS",{value:Math.min(99,Math.floor((completed / batches.length) * 100)),text:`${progressLabel} with Worker Pool... batches ${completed}/${batches.length}`});
+          return result;
+        });
+    }));
+    return reduceChunkWorkerResults(plan,{...options,taskId},chunks,batches,results,t0);
+  }catch(err){
+    post("PROGRESS",{value:0,text:`Worker Pool fallback: ${err?.message || err}`});
+    const exec=await executeChunkExecutionPlan(plan,{...options,parallel:false});
+    exec.executionMode="single-worker-fallback";
+    exec.workerPoolError=err?.message || String(err);
+    return exec;
+  }
 }
 
 function compactStringColumnForMemory(idsArr, dict){
@@ -1956,7 +2206,7 @@ async function runSearch({columnIndex, op, value, maxMatches}){
     pushdown:true
   });
 
-  const exec=await executeChunkExecutionPlan(plan,{
+  const exec=await executeChunkExecutionPlanMaybeParallel(plan,{
     collectRows:true,
     limit:cap,
     progressLabel:"Searching chunks",
@@ -1971,7 +2221,7 @@ async function runSearch({columnIndex, op, value, maxMatches}){
     scanned:exec.scanned,
     skippedChunks:exec.skippedChunks,
     queryPlan:exec.queryPlan,
-    executionEngine:{version:exec.engineVersion,taskId:exec.taskId,chunks:exec.chunks.length},
+    executionEngine:{version:exec.engineVersion,mode:exec.executionMode || "single-worker",workerPoolVersion:exec.workerPoolVersion || null,workers:exec.workerCount || 1,taskId:exec.taskId,chunks:exec.chunks.length},
     ms:exec.ms
   };
 }
@@ -2005,7 +2255,7 @@ async function runDataQuery({filters, sort, maxRows}){
   }
 
   const scanLimit = hasSort ? Number.POSITIVE_INFINITY : requestedLimit;
-  const exec=await executeChunkExecutionPlan(plan,{
+  const exec=await executeChunkExecutionPlanMaybeParallel(plan,{
     collectRows:!hasSort,
     collectSort:hasSort,
     limit:scanLimit,
@@ -2031,7 +2281,7 @@ async function runDataQuery({filters, sort, maxRows}){
     sort:plan.sort ? {columnIndex:plan.sort.columnIndex,direction:plan.sort.direction} : null,
     capped,
     queryPlan:exec.queryPlan,
-    executionEngine:{version:exec.engineVersion,taskId:exec.taskId,chunks:exec.chunks.length}
+    executionEngine:{version:exec.engineVersion,mode:exec.executionMode || "single-worker",workerPoolVersion:exec.workerPoolVersion || null,workers:exec.workerCount || 1,taskId:exec.taskId,chunks:exec.chunks.length}
   };
   return {
     matches:state.dataQueryMatches.length,
@@ -2040,7 +2290,7 @@ async function runDataQuery({filters, sort, maxRows}){
     scanned:exec.scanned,
     skippedChunks:exec.skippedChunks,
     queryPlan:exec.queryPlan,
-    executionEngine:{version:exec.engineVersion,taskId:exec.taskId,chunks:exec.chunks.length},
+    executionEngine:{version:exec.engineVersion,mode:exec.executionMode || "single-worker",workerPoolVersion:exec.workerPoolVersion || null,workers:exec.workerCount || 1,taskId:exec.taskId,chunks:exec.chunks.length},
     ms:exec.ms
   };
 }
@@ -2398,6 +2648,14 @@ function csvEscape(v){
 self.onmessage=async(e)=>{
   const msg=e.data||{};
   try{
+    if (msg.type==="EXECUTE_CHUNK_BATCH"){
+      state.cancelled=false;
+      await hydrateChunkExecutionContext(msg.context);
+      const result=await executeChunkExecutionPlan(msg.plan,{...(msg.options || {}),progress:false,parallel:false});
+      post("CHUNK_BATCH_DONE",{requestId:msg.requestId,batchIndex:msg.batchIndex,result});
+      return;
+    }
+
     if (msg.type==="CANCEL"){state.cancelled=true; return;}
 
     if (msg.type==="ANALYZE"){
@@ -4587,7 +4845,8 @@ function App() {
         setDataQueryActive(true);
         setDataQueryCount(msg.matches || 0);
         setPage(1);
-        setDataStatus(`Global filter/sort: ${fmt(msg.matches)} rows${msg.capped ? " / max rowsで打ち切り" : ""}`);
+        const engine = msg.executionEngine?.mode === "worker-pool" ? ` / Worker Pool x${fmt(msg.executionEngine?.workers || 1)}` : "";
+        setDataStatus(`Global filter/sort: ${fmt(msg.matches)} rows${msg.capped ? " / max rowsで打ち切り" : ""}${engine}`);
         setDataTime(ms(msg.ms));
         worker.postMessage({ type: "READ_DATA_QUERY_PAGE", page: 1, pageSize: pageSizeRef.current, columns: selectedColumnsForPost() });
         return;
@@ -4613,7 +4872,8 @@ function App() {
       if (msg.type === "SEARCH_DONE") {
         setSearchCount(msg.matches || 0);
         setSearchPage(1);
-        setSearchStatus(`Matches: ${fmt(msg.matches)}${msg.capped ? " / maxに到達" : ""}`);
+        const engine = msg.executionEngine?.mode === "worker-pool" ? ` / Worker Pool x${fmt(msg.executionEngine?.workers || 1)}` : "";
+        setSearchStatus(`Matches: ${fmt(msg.matches)}${msg.capped ? " / maxに到達" : ""}${engine}`);
         setSearchTime(ms(msg.ms));
         worker.postMessage({ type: "READ_SEARCH_PAGE", page: 1, pageSize: pageSizeRef.current, columns: selectedColumnsForPost() });
         return;
