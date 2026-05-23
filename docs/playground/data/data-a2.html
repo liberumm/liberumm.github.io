@@ -6262,7 +6262,121 @@ function QueryGraphEdge(props) {
   );
 }
 
-function GraphQueryEditor({ columns, datasets=[], manifest=null, nodes, setNodes, edges, setEdges, onApply, onReadPage=()=>{}, onClearResult=()=>{}, onExportCsv=()=>{}, disabled, dataQueryActive, dataQueryCount, resultTable, resultStatus, resultTime, resultPage, resultPageMax, resultViewMode="tile", setResultViewMode=()=>{}, sqlText="", setSqlText=()=>{}, sqlMode=false, setSqlMode=()=>{} }) {
+
+
+const GRAPH_FORMULA_RECIPES = [
+  { group:"パス分解", label:"ファイル名", expr:'basename(col("full_path"))', desc:"/a/b/report.csv → report.csv" },
+  { group:"パス分解", label:"親フォルダ", expr:'dirname(col("full_path"))', desc:"/a/b/report.csv → /a/b" },
+  { group:"パス分解", label:"拡張子なし", expr:'stem(col("full_path"))', desc:"report.csv → report" },
+  { group:"パス分解", label:"拡張子", expr:'ext(col("full_path"))', desc:"report.csv → csv" },
+  { group:"パス分解", label:"最後の1つ前", expr:'pathPart(col("full_path"), -2)', desc:"/a/b/report.csv → b" },
+  { group:"文字列抽出", label:"前を取り出す", expr:'before(col("name"), "_")', desc:"ABC_001 → ABC" },
+  { group:"文字列抽出", label:"後を取り出す", expr:'after(col("name"), "_")', desc:"ABC_001 → 001" },
+  { group:"文字列抽出", label:"間を取り出す", expr:'between(col("text"), "[", "]")', desc:"abc[Tokyo]def → Tokyo" },
+  { group:"文字列抽出", label:"左からn文字", expr:'left(col("code"), 3)', desc:"ABCDE → ABC" },
+  { group:"文字列抽出", label:"右からn文字", expr:'right(col("code"), 4)', desc:"ABCDE1234 → 1234" },
+  { group:"正規表現", label:"正規表現抽出", expr:'regexExtract(col("full_path"), "([^/\\\\]+)\\\\.csv$", 1)', desc:"最後のCSVファイル名部分を抽出" },
+  { group:"整形", label:"置換", expr:'replaceText(col("path"), "\\\\", "/")', desc:"Windows区切りを/へ置換" },
+  { group:"整形", label:"連結", expr:'concat(col("dir"), "/", col("file"))', desc:"複数列をつなぐ" },
+  { group:"整形", label:"空なら代替", expr:'coalesce(col("memo"), "なし")', desc:"NULL/空文字を置き換える" },
+];
+
+function FormulaRecipePanel({ onPick }) {
+  const groups = useMemo(() => {
+    const map = new Map();
+    for (const recipe of GRAPH_FORMULA_RECIPES) {
+      if (!map.has(recipe.group)) map.set(recipe.group, []);
+      map.get(recipe.group).push(recipe);
+    }
+    return [...map.entries()];
+  }, []);
+  return (
+    <Paper variant="outlined" sx={{ p: 1, bgcolor: "rgba(255,255,255,0.72)", borderRadius: 1.5 }}>
+      <Stack spacing={0.8}>
+        <Typography variant="subtitle2" sx={{ fontWeight: 900 }}>数式ヘルプ / クリックで挿入</Typography>
+        <Alert severity="info" sx={{ py: 0.25 }}>
+          例の <b>full_path</b> や <b>name</b> は、実データの列名に置き換えてください。col("列名") は「同じ行のその列の値」を参照します。
+        </Alert>
+        {groups.map(([group, recipes]) => (
+          <Box key={group}>
+            <Typography variant="caption" sx={{ fontWeight: 900, color: "text.secondary" }}>{group}</Typography>
+            <Stack direction="row" useFlexGap flexWrap="wrap" spacing={0.5} sx={{ mt: 0.35 }}>
+              {recipes.map((recipe) => (
+                <Tooltip key={`${group}-${recipe.label}`} title={`${recipe.expr} / ${recipe.desc}`}>
+                  <Button size="small" variant="outlined" onClick={() => onPick?.(recipe.expr)} sx={{ textTransform:"none" }}>
+                    {recipe.label}
+                  </Button>
+                </Tooltip>
+              ))}
+            </Stack>
+          </Box>
+        ))}
+      </Stack>
+    </Paper>
+  );
+}
+
+function GraphQueryVirtualTable({ table, totalRows=0, page=1, pageSize=1000, onReadPage=()=>{}, height=420 }) {
+  const header = table?.header || [];
+  const rows = table?.rows || [];
+  const rowHeight = 34;
+  const headerHeight = 42;
+  const safePageSize = Math.max(1, Number(pageSize || 1000));
+  const safeTotal = Math.max(Number(totalRows || 0), rows.length);
+  const safePage = Math.max(1, Number(page || 1));
+  const startIndex = (safePage - 1) * safePageSize;
+  const contentHeight = Math.max(safeTotal * rowHeight, Math.max(0, height - headerHeight));
+  const lastRequestedRef = useRef({ page:safePage, at:0 });
+
+  useEffect(() => {
+    lastRequestedRef.current.page = safePage;
+  }, [safePage]);
+
+  const onScroll = (event) => {
+    if (!safeTotal) return;
+    const top = event.currentTarget.scrollTop || 0;
+    const nextPage = Math.min(Math.max(1, Math.floor(top / (rowHeight * safePageSize)) + 1), Math.max(1, Math.ceil(safeTotal / safePageSize)));
+    const t = performance.now();
+    if (nextPage !== lastRequestedRef.current.page && t - lastRequestedRef.current.at > 180) {
+      lastRequestedRef.current = { page:nextPage, at:t };
+      onReadPage(nextPage);
+    }
+  };
+
+  if (!header.length) {
+    return (
+      <Box sx={{ height, display:"grid", placeItems:"center", color:"text.secondary", border:"1px dashed", borderColor:"divider", borderRadius:1.5 }}>
+        Graph Queryを実行すると、ここに結果パネルが表示されます。
+      </Box>
+    );
+  }
+
+  return (
+    <Box sx={{ border:"1px solid", borderColor:"divider", borderRadius:1.5, overflow:"hidden", bgcolor:"background.paper" }}>
+      <Box sx={{ px:1, py:0.6, bgcolor:"action.hover", borderBottom:"1px solid", borderColor:"divider" }}>
+        <Typography variant="caption" sx={{ fontWeight:900 }}>
+          全{fmt(safeTotal)}行を論理表示中 / 読込中タイル: {fmt(startIndex + 1)} - {fmt(Math.min(startIndex + rows.length, safeTotal))} / タイル行数 {fmt(safePageSize)}
+        </Typography>
+      </Box>
+      <Box onScroll={onScroll} sx={{ height, overflow:"auto", position:"relative" }}>
+        <Box sx={{ position:"sticky", top:0, zIndex:4, display:"grid", gridTemplateColumns:`repeat(${header.length}, minmax(160px, 1fr))`, minWidth:Math.max(720, header.length * 160), bgcolor:"background.paper", borderBottom:"1px solid", borderColor:"divider" }}>
+          {header.map((h, i) => <Box key={i} sx={{ px:1, py:0.8, fontWeight:900, whiteSpace:"nowrap", overflow:"hidden", textOverflow:"ellipsis", borderRight:"1px solid", borderColor:"divider" }}>{h}</Box>)}
+        </Box>
+        <Box sx={{ height:contentHeight, position:"relative", minWidth:Math.max(720, header.length * 160) }}>
+          <Box sx={{ position:"absolute", left:0, right:0, top:startIndex * rowHeight }}>
+            {rows.map((row, ri) => (
+              <Box key={`${startIndex}-${ri}`} sx={{ display:"grid", gridTemplateColumns:`repeat(${header.length}, minmax(160px, 1fr))`, height:rowHeight, borderBottom:"1px solid", borderColor:"divider", '&:hover':{ bgcolor:"action.hover" } }}>
+                {header.map((_, ci) => <Box key={ci} title={String(row?.[ci] ?? "")} sx={{ px:1, py:0.65, whiteSpace:"nowrap", overflow:"hidden", textOverflow:"ellipsis", borderRight:"1px solid", borderColor:"divider" }}>{String(row?.[ci] ?? "")}</Box>)}
+              </Box>
+            ))}
+          </Box>
+        </Box>
+      </Box>
+    </Box>
+  );
+}
+
+function GraphQueryEditor({ columns, datasets=[], manifest=null, nodes, setNodes, edges, setEdges, onApply, onReadPage=()=>{}, onClearResult=()=>{}, onExportCsv=()=>{}, disabled, dataQueryActive, dataQueryCount, resultTable, resultStatus, resultTime, resultPage, resultPageMax, resultViewMode="tile", setResultViewMode=()=>{}, resultRowsPerTile="1000", setResultRowsPerTile=()=>{}, sqlText="", setSqlText=()=>{}, sqlMode=false, setSqlMode=()=>{} }) {
   const [selectedId, setSelectedId] = useState(nodes?.[0]?.id || "source");
   const [sqlErrors, setSqlErrors] = useState([]);
   const selectedNode = useMemo(() => nodes.find((n) => n.id === selectedId) || null, [nodes, selectedId]);
@@ -6545,7 +6659,10 @@ function GraphQueryEditor({ columns, datasets=[], manifest=null, nodes, setNodes
                   ) : (
                     <TextField label="数式 / Formula" size="small" multiline minRows={3} value={selectedNode.data.formulaExpression || ""} onChange={(e) => updateNodeData(selectedNode.id, { formulaExpression: e.target.value })} fullWidth placeholder={'例: num(col("amount")) * 1.1\n例: basename(col("full_path"))\n例: dirname(col("full_path"))\n例: pathPart(col("full_path"), -2)\n例: regexExtract(col("full_path"), "([^/]+)\\.csv$", 1)'} />
                   )}
-                  <Alert severity="info" sx={{ py: 0.25 }}>数式では col("列名"), num(x), str(x), concat(...), coalesce(...), lower/upper, round のほか、basename, dirname, ext, stem, pathPart, before/after/between, sliceText, left/right, replaceText, regexExtract でパスや文字列を切り出せます。計算列は保存済みDatasetを破壊せず、Graph Query結果テーブルに追加されます。</Alert>
+                  {(selectedNode.data.valueMode || "constant") === "formula" && (
+                    <FormulaRecipePanel onPick={(expr) => updateNodeData(selectedNode.id, { formulaExpression: expr })} />
+                  )}
+                  <Alert severity="info" sx={{ py: 0.25 }}>数式では col("列名") で同じ行の列値を参照します。num/str/concat/coalesce/lower/upper/round のほか、basename, dirname, ext, stem, pathPart, before/after/between, sliceText, left/right, replaceText, regexExtract でパスや文字列を切り出せます。計算列は保存済みDatasetを破壊せず、Graph Query結果テーブルに追加されます。</Alert>
                 </>
               )}
               {selectedNode.data?.kind === "aggregate" && <Alert severity="info">集計ノードはSQLプレビューへ表現を追加するための予約ノードです。実集計はPivot/Time基盤へ接続する次段階で有効化します。</Alert>}
@@ -6578,13 +6695,18 @@ function GraphQueryEditor({ columns, datasets=[], manifest=null, nodes, setNodes
           <Button size="small" variant="contained" startIcon={<Download />} onClick={onExportCsv} disabled={!Number(dataQueryCount || 0)}>CSV全件出力</Button>
           <Button size="small" variant={resultViewMode === "tile" ? "contained" : "outlined"} onClick={() => setResultViewMode("tile")}>タイル表示</Button>
           <Button size="small" variant={resultViewMode === "page" ? "contained" : "outlined"} onClick={() => setResultViewMode("page")}>ページ表示</Button>
+          <SmallNumberField label="タイル/ページ行数" value={String(resultRowsPerTile || "1000")} onChange={(v) => { setResultRowsPerTile(v); setTimeout(() => onReadPage(1), 0); }} min="50" step="50" sx={{ width: 150 }} />
           {resultViewMode === "page" && <Button size="small" onClick={() => onReadPage(Math.max(1, Number(resultPage || 1) - 1))}>Prev</Button>}
           {resultViewMode === "page" && <Typography variant="caption">Page {Number(resultPage || 1).toLocaleString()} / {Number(resultPageMax || 0).toLocaleString()}</Typography>}
           {resultViewMode === "page" && <Button size="small" onClick={() => onReadPage(Math.min(Number(resultPageMax || 1), Number(resultPage || 1) + 1))}>Next</Button>}
           {resultViewMode === "tile" && <Chip size="small" color="primary" label={`Tile rows ${Number(resultTable?.rows?.length || 0).toLocaleString()} / total ${Number(dataQueryCount || 0).toLocaleString()}`} />}
           <Chip size="small" label={`${Number(dataQueryCount || 0).toLocaleString()} rows`} />
         </Stack>
-        <DataTable table={resultTable} tableId="graphQueryResult" height={360} />
+        {resultViewMode === "tile" ? (
+          <GraphQueryVirtualTable table={resultTable} totalRows={Number(dataQueryCount || 0)} page={Number(resultPage || 1)} pageSize={Number(resultRowsPerTile || 1000)} onReadPage={onReadPage} height={420} />
+        ) : (
+          <DataTable table={resultTable} tableId="graphQueryResult" height={360} />
+        )}
         <Stack direction="row" justifyContent="space-between" sx={{ mt: 0.6 }}>
           <Typography variant="caption" color="text.secondary">{resultStatus || "Run graph query to show results here."}</Typography>
           <Typography variant="caption" color="text.secondary">{resultTime || ""}</Typography>
@@ -6597,6 +6719,7 @@ function GraphQueryEditor({ columns, datasets=[], manifest=null, nodes, setNodes
 function App() {
   const workerRef = useRef(null);
   const pageSizeRef = useRef(500);
+  const graphResultPageSizeRef = useRef(1000);
   const visibleColsRef = useRef([]);
   const manifestRef = useRef(null);
   const searchPageRef = useRef(1);
@@ -6685,6 +6808,7 @@ function App() {
   const [graphResultStatus, setGraphResultStatus] = useState("Graph Queryを実行してください。");
   const [graphResultTime, setGraphResultTime] = useState("");
   const [graphResultViewMode, setGraphResultViewMode] = useState("tile");
+  const [graphResultPageSize, setGraphResultPageSize] = useState(initialSettings.graphResultPageSize || "1000");
 
   const [searchColumn, setSearchColumn] = useState("0");
   const [searchOp, setSearchOp] = useState("contains");
@@ -6758,6 +6882,7 @@ function App() {
   const searchPageMax = searchCount ? Math.ceil(searchCount / Number(pageSize || 500)) : 0;
 
   useEffect(() => { pageSizeRef.current = Number(pageSize || 500); }, [pageSize]);
+  useEffect(() => { graphResultPageSizeRef.current = Number(graphResultPageSize || 1000); }, [graphResultPageSize]);
   useEffect(() => { visibleColsRef.current = visibleCols; }, [visibleCols]);
   useEffect(() => { manifestRef.current = manifest; }, [manifest]);
   useEffect(() => { searchPageRef.current = searchPage; }, [searchPage]);
@@ -6776,6 +6901,7 @@ function App() {
       chunkSize,
       sampleRows,
       pageSize,
+      graphResultPageSize,
       storageWorkspace,
       storageCollection,
       memoryMaxMB,
@@ -6790,7 +6916,7 @@ function App() {
       tab,
       rules,
     });
-  }, [themeMode, tableDensity, previewRows, encoding, delimiter, chunkSize, sampleRows, pageSize, storageWorkspace, storageCollection, memoryMaxMB, memoryMaxRows, externalProvider, externalEndpoint, externalPrefix, externalAuthMode, s3Region, s3Bucket, mainPanel, tab, rules]);
+  }, [themeMode, tableDensity, previewRows, encoding, delimiter, chunkSize, sampleRows, pageSize, graphResultPageSize, storageWorkspace, storageCollection, memoryMaxMB, memoryMaxRows, externalProvider, externalEndpoint, externalPrefix, externalAuthMode, s3Region, s3Bucket, mainPanel, tab, rules]);
 
   function appendLog(text) {
     const line = `[${new Date().toLocaleTimeString()}] ${text}`;
@@ -7193,9 +7319,9 @@ function App() {
           setGraphResultTime(ms(msg.ms));
           graphExecutionRef.current.readMode = msg.active ? "dataQuery" : "page";
           if (!msg.active) {
-            worker.postMessage({ type: "READ_PAGE", origin: "graph", page: 1, pageSize: pageSizeRef.current, columns: projection || selectedColumnsForPost() });
+            worker.postMessage({ type: "READ_PAGE", origin: "graph", page: 1, pageSize: graphResultPageSizeRef.current, columns: projection || selectedColumnsForPost() });
           } else {
-            worker.postMessage({ type: "READ_DATA_QUERY_PAGE", origin: "graph", page: 1, pageSize: pageSizeRef.current, columns: Array.isArray(msg.projection) && msg.projection.length ? msg.projection : selectedColumnsForPost() });
+            worker.postMessage({ type: "READ_DATA_QUERY_PAGE", origin: "graph", page: 1, pageSize: graphResultPageSizeRef.current, columns: Array.isArray(msg.projection) && msg.projection.length ? msg.projection : selectedColumnsForPost() });
           }
           return;
         }
@@ -7503,7 +7629,7 @@ function App() {
       setGraphResultPage(1);
       setGraphResultStatus(`Graph JOINを実行中... 旧結果をクリアしました。${derivedColumns.length ? ` / 計算列 ${fmt(derivedColumns.length)}列` : ""}`);
       setGraphResultTime("");
-      post({ type: "RUN_GRAPH_JOIN_QUERY", plan, pageSize: pageSizeRef.current });
+      post({ type: "RUN_GRAPH_JOIN_QUERY", plan, pageSize: graphResultPageSizeRef.current });
       return;
     }
     setGraphResultMode("data");
@@ -7535,15 +7661,15 @@ function App() {
     const safe = Math.max(1, Number(next || 1));
     if (graphResultMode === "join") {
       setGraphResultPage(safe);
-      post({ type: "READ_GRAPH_JOIN_PAGE", page: safe, pageSize: pageSizeRef.current });
+      post({ type: "READ_GRAPH_JOIN_PAGE", page: safe, pageSize: graphResultPageSizeRef.current });
       return;
     }
     setGraphResultPage(safe);
     const readMode = graphExecutionRef.current?.readMode || "dataQuery";
     if (readMode === "page") {
-      post({ type: "READ_PAGE", origin: "graph", page: safe, pageSize: pageSizeRef.current, columns: selectedColumnsForPost() });
+      post({ type: "READ_PAGE", origin: "graph", page: safe, pageSize: graphResultPageSizeRef.current, columns: selectedColumnsForPost() });
     } else {
-      post({ type: "READ_DATA_QUERY_PAGE", origin: "graph", page: safe, pageSize: pageSizeRef.current, columns: selectedColumnsForPost() });
+      post({ type: "READ_DATA_QUERY_PAGE", origin: "graph", page: safe, pageSize: graphResultPageSizeRef.current, columns: selectedColumnsForPost() });
     }
   }
 
@@ -8348,9 +8474,11 @@ function App() {
                   resultStatus={graphResultStatus}
                   resultTime={graphResultTime}
                   resultPage={graphResultMode === "join" ? graphResultPage : graphResultPage}
-                  resultPageMax={Math.max(1, Math.ceil((graphResultCount || 0) / Number(pageSize || 500)))}
+                  resultPageMax={Math.max(1, Math.ceil((graphResultCount || 0) / Number(graphResultPageSize || 1000)))}
                   resultViewMode={graphResultViewMode}
                   setResultViewMode={setGraphResultViewMode}
+                  resultRowsPerTile={graphResultPageSize}
+                  setResultRowsPerTile={setGraphResultPageSize}
                   sqlText={graphSqlText}
                   setSqlText={setGraphSqlText}
                   sqlMode={graphSqlMode}
