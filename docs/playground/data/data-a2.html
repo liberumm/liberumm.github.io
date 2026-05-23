@@ -6565,6 +6565,11 @@ function GraphQueryVirtualTable({ table, totalRows=0, page=1, pageSize=1000, onR
   const [selectedAbsRow, setSelectedAbsRow] = useState(-1);
   const [columnWidths, setColumnWidths] = useState({});
   const headerKey = header.join("\u001f");
+  const tablePage = Math.max(1, Number(table?.page || safePage || 1));
+  const tablePageSize = Math.max(1, Number(table?.pageSize || safePageSize || 1000));
+  const tableStartRow = Number.isFinite(Number(table?.startRow))
+    ? Math.max(0, Number(table.startRow || 0))
+    : (tablePage - 1) * tablePageSize;
 
   useEffect(() => {
     lastRequestedRef.current.page = safePage;
@@ -6586,6 +6591,14 @@ function GraphQueryVirtualTable({ table, totalRows=0, page=1, pageSize=1000, onR
       resizeRef.current = null;
     }
   }, []);
+  useEffect(() => {
+    if (!header.length || !safeTotal || rows.length) return;
+    const t = performance.now();
+    if (t - lastRequestedRef.current.at < 120) return;
+    lastRequestedRef.current = { page:safePage, at:t };
+    onReadPage(safePage);
+  }, [headerKey, safeTotal, rows.length, safePage]);
+
 
   const clientXOf = (event) => event.touches?.[0]?.clientX ?? event.clientX ?? 0;
   const getColumnWidth = (index) => {
@@ -6668,22 +6681,25 @@ function GraphQueryVirtualTable({ table, totalRows=0, page=1, pageSize=1000, onR
   const overscan = 12;
   const visibleAbsStart = Math.max(0, virtualRowFromScroll(scrollTop) - overscan);
   const visibleAbsEnd = Math.min(safeTotal, visibleAbsStart + viewportRows + overscan * 2);
-  const loadedAbsStart = startIndex;
-  const loadedAbsEnd = startIndex + rows.length;
-  const localStart = Math.max(0, visibleAbsStart - loadedAbsStart);
-  const localEnd = Math.min(rows.length, Math.max(localStart, visibleAbsEnd - loadedAbsStart));
+  const loadedAbsStart = tableStartRow;
+  const loadedAbsEnd = loadedAbsStart + rows.length;
+  const visibleMissesLoadedTile = rows.length > 0 && (visibleAbsEnd <= loadedAbsStart || visibleAbsStart >= loadedAbsEnd);
+  const renderAbsStart = visibleMissesLoadedTile ? loadedAbsStart : visibleAbsStart;
+  const renderAbsEnd = visibleMissesLoadedTile ? Math.min(loadedAbsEnd, loadedAbsStart + viewportRows + overscan * 2) : visibleAbsEnd;
+  const localStart = Math.max(0, renderAbsStart - loadedAbsStart);
+  const localEnd = Math.min(rows.length, Math.max(localStart, renderAbsEnd - loadedAbsStart));
   const visibleRows = rows.slice(localStart, localEnd);
   const visibleTop = isCompressedScroll
     ? Math.max(0, Math.min(contentHeight - (visibleRows.length * rowHeight), scrollFromVirtualRow(loadedAbsStart + localStart)))
-    : (startIndex + localStart) * rowHeight;
-  const loadedRangeText = rows.length ? `${fmt(startIndex + 1)} - ${fmt(Math.min(startIndex + rows.length, safeTotal))}` : "未読込";
+    : (loadedAbsStart + localStart) * rowHeight;
+  const loadedRangeText = rows.length ? `${fmt(loadedAbsStart + 1)} - ${fmt(Math.min(loadedAbsStart + rows.length, safeTotal))}` : "未読込";
   const virtualRangeText = safeTotal ? `${fmt(visibleAbsStart + 1)} - ${fmt(Math.min(visibleAbsEnd, safeTotal))}` : "0";
 
   return (
     <Box sx={{ border:"1px solid", borderColor:"divider", borderRadius:1.5, overflow:"hidden", bgcolor:"background.paper" }}>
       <Box sx={{ px:1, py:0.6, bgcolor:"action.hover", borderBottom:"1px solid", borderColor:"divider", display:"flex", gap:1, alignItems:"center", flexWrap:"wrap" }}>
         <Typography variant="caption" sx={{ fontWeight:900 }}>
-          全{fmt(safeTotal)}行をlazy全件パネル表示 / 表示位置: {virtualRangeText} / 読込タイル: {loadedRangeText} / 描画中: {fmt(visibleRows.length)}行
+          全{fmt(safeTotal)}行をlazy全件パネル表示 / 表示位置: {visibleMissesLoadedTile ? `${fmt(loadedAbsStart + 1)} - ${fmt(Math.min(loadedAbsEnd, safeTotal))}` : virtualRangeText} / 読込タイル: {loadedRangeText} / 描画中: {fmt(visibleRows.length)}行
         </Typography>
         {isCompressedScroll && <Chip size="small" color="warning" variant="outlined" label="リミットレス圧縮スクロール" />}
         {selectedAbsRow >= 0 && <Chip size="small" color="primary" label={`選択行: ${fmt(selectedAbsRow + 1)}`} />}
@@ -6718,10 +6734,10 @@ function GraphQueryVirtualTable({ table, totalRows=0, page=1, pageSize=1000, onR
         <Box sx={{ height:contentHeight, position:"relative", minWidth }}>
           <Box sx={{ position:"absolute", left:0, right:0, top:visibleTop }}>
             {visibleRows.map((row, ri) => {
-              const absRow = startIndex + localStart + ri;
+              const absRow = loadedAbsStart + localStart + ri;
               return (
                 <Box
-                  key={`${startIndex + localStart}-${ri}`}
+                  key={`${loadedAbsStart + localStart}-${ri}`}
                   onClick={() => setSelectedAbsRow(absRow)}
                   sx={{ display:"grid", gridTemplateColumns, height:rowHeight, borderBottom:"1px solid", borderColor:"divider", cursor:"pointer", bgcolor:selectedAbsRow === absRow ? "action.selected" : "background.paper", '&:hover':{ bgcolor:"action.hover" } }}
                 >
@@ -7823,7 +7839,7 @@ function App() {
       }
 
       if (msg.type === "PAGE_RESULT") {
-        const table = { header: msg.header, rows: msg.rows };
+        const table = { header: msg.header, rows: msg.rows, page: msg.page || 1, pageSize: msg.pageSize || graphResultPageSizeRef.current, startRow: Number(msg.startRow || 0), totalMatches: msg.totalMatches || manifestRef.current?.totalRows || 0 };
         if (msg.origin === "graph") {
           const derived = graphExecutionRef.current?.derivedColumns || [];
           setGraphResultTableWithDerived(table, derived);
@@ -7882,7 +7898,7 @@ function App() {
       }
 
       if (msg.type === "DATA_QUERY_PAGE_RESULT") {
-        const table = { header: msg.header, rows: msg.rows };
+        const table = { header: msg.header, rows: msg.rows, page: msg.page || 1, pageSize: msg.pageSize || graphResultPageSizeRef.current, startRow: Number(msg.startRow || 0), totalMatches: msg.totalMatches || 0 };
         if (msg.origin === "graph") {
           const derived = graphExecutionRef.current?.derivedColumns || [];
           setGraphResultMode("data");
@@ -7904,7 +7920,7 @@ function App() {
       if (msg.type === "GRAPH_JOIN_DONE") {
         const derived = graphExecutionRef.current?.derivedColumns || [];
         setGraphResultMode("join");
-        setGraphResultTableWithDerived({ header: msg.header, rows: msg.rows }, derived);
+        setGraphResultTableWithDerived({ header: msg.header, rows: msg.rows, page: 1, pageSize: graphResultPageSizeRef.current, startRow: 0, totalMatches: msg.totalMatches || msg.matches || 0 }, derived);
         setGraphResultCount(msg.totalMatches || msg.matches || 0);
         setGraphResultPage(1);
         setGraphResultStatus(`JOIN result: ${fmt(msg.totalMatches || msg.matches || 0)} rows / scanned ${fmt(msg.scanned || 0)} / right indexed ${fmt(msg.rightIndexed || 0)}${derived.length ? ` / 計算列 ${fmt(derived.length)}列` : ""}${msg.capped ? " / limitで打ち切り" : ""}`);
@@ -7914,7 +7930,7 @@ function App() {
 
       if (msg.type === "GRAPH_JOIN_PAGE_RESULT") {
         const derived = graphExecutionRef.current?.derivedColumns || [];
-        setGraphResultTableWithDerived({ header: msg.header, rows: msg.rows }, derived);
+        setGraphResultTableWithDerived({ header: msg.header, rows: msg.rows, page: msg.page || 1, pageSize: msg.pageSize || graphResultPageSizeRef.current, startRow: Number(msg.startRow || 0), totalMatches: msg.totalMatches || 0 }, derived);
         setGraphResultCount(msg.totalMatches || 0);
         setGraphResultPage(msg.page || 1);
         setGraphResultStatus(`JOIN rows ${fmt(msg.startRow + 1)} - ${fmt(msg.startRow + msg.rows.length)} / ${fmt(msg.totalMatches)} / page ${fmt(msg.page)}${derived.length ? ` / 計算列 ${fmt(derived.length)}列` : ""}`);
