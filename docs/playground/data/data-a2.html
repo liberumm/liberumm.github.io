@@ -6357,12 +6357,11 @@ const GRAPH_FORMULA_RECIPES = [
 ];
 
 function formulaColumnExpression(field){
-  const name = String(field?.name || "").replace(/\/g, "\\").replace(/"/g, '\"');
-  const alias = String(field?.alias || "").trim();
+  const name = String(field?.name ?? "");
+  const alias = String(field?.alias ?? "").trim();
   const qualified = alias && alias !== "t1" ? `${alias}.${name}` : name;
-  return `col("${qualified}")`;
+  return `col(${JSON.stringify(qualified)})`;
 }
-
 function FormulaRecipePanel({ onPick, fieldOptions=[] }) {
   const [filterText, setFilterText] = useState("");
   const groups = useMemo(() => {
@@ -6426,19 +6425,29 @@ function GraphQueryVirtualTable({ table, totalRows=0, page=1, pageSize=1000, onR
   const safeTotal = Math.max(Number(totalRows || 0), rows.length);
   const safePage = Math.max(1, Number(page || 1));
   const startIndex = (safePage - 1) * safePageSize;
+  const totalPages = Math.max(1, Math.ceil(safeTotal / safePageSize));
   const contentHeight = Math.max(safeTotal * rowHeight, Math.max(0, height - headerHeight));
   const lastRequestedRef = useRef({ page:safePage, at:0 });
+  const rafRef = useRef(0);
+  const [scrollTop, setScrollTop] = useState(0);
 
   useEffect(() => {
     lastRequestedRef.current.page = safePage;
   }, [safePage]);
 
+  useEffect(() => () => {
+    if (rafRef.current) cancelAnimationFrame(rafRef.current);
+  }, []);
+
   const onScroll = (event) => {
     if (!safeTotal) return;
     const top = event.currentTarget.scrollTop || 0;
-    const nextPage = Math.min(Math.max(1, Math.floor(top / (rowHeight * safePageSize)) + 1), Math.max(1, Math.ceil(safeTotal / safePageSize)));
+    if (rafRef.current) cancelAnimationFrame(rafRef.current);
+    rafRef.current = requestAnimationFrame(() => setScrollTop(top));
+
+    const nextPage = Math.min(Math.max(1, Math.floor(top / (rowHeight * safePageSize)) + 1), totalPages);
     const t = performance.now();
-    if (nextPage !== lastRequestedRef.current.page && t - lastRequestedRef.current.at > 180) {
+    if (nextPage !== lastRequestedRef.current.page && t - lastRequestedRef.current.at > 260) {
       lastRequestedRef.current = { page:nextPage, at:t };
       onReadPage(nextPage);
     }
@@ -6452,21 +6461,32 @@ function GraphQueryVirtualTable({ table, totalRows=0, page=1, pageSize=1000, onR
     );
   }
 
+  const minWidth = Math.max(720, header.length * 160);
+  const overscan = 12;
+  const visibleAbsStart = Math.max(0, Math.floor(scrollTop / rowHeight) - overscan);
+  const visibleAbsEnd = Math.min(safeTotal, Math.ceil((scrollTop + height) / rowHeight) + overscan);
+  const loadedAbsStart = startIndex;
+  const loadedAbsEnd = startIndex + rows.length;
+  const localStart = Math.max(0, visibleAbsStart - loadedAbsStart);
+  const localEnd = Math.min(rows.length, Math.max(localStart, visibleAbsEnd - loadedAbsStart));
+  const visibleRows = rows.slice(localStart, localEnd);
+  const visibleTop = (startIndex + localStart) * rowHeight;
+
   return (
     <Box sx={{ border:"1px solid", borderColor:"divider", borderRadius:1.5, overflow:"hidden", bgcolor:"background.paper" }}>
       <Box sx={{ px:1, py:0.6, bgcolor:"action.hover", borderBottom:"1px solid", borderColor:"divider" }}>
         <Typography variant="caption" sx={{ fontWeight:900 }}>
-          全{fmt(safeTotal)}行を論理表示中 / 読込中タイル: {fmt(startIndex + 1)} - {fmt(Math.min(startIndex + rows.length, safeTotal))} / タイル行数 {fmt(safePageSize)}
+          全{fmt(safeTotal)}行を論理表示中 / 読込中タイル: {rows.length ? `${fmt(startIndex + 1)} - ${fmt(Math.min(startIndex + rows.length, safeTotal))}` : "未読込"} / 描画中: {fmt(visibleRows.length)}行 / タイル行数 {fmt(safePageSize)}
         </Typography>
       </Box>
       <Box onScroll={onScroll} sx={{ height, overflow:"auto", position:"relative" }}>
-        <Box sx={{ position:"sticky", top:0, zIndex:4, display:"grid", gridTemplateColumns:`repeat(${header.length}, minmax(160px, 1fr))`, minWidth:Math.max(720, header.length * 160), bgcolor:"background.paper", borderBottom:"1px solid", borderColor:"divider" }}>
+        <Box sx={{ position:"sticky", top:0, zIndex:4, display:"grid", gridTemplateColumns:`repeat(${header.length}, minmax(160px, 1fr))`, minWidth, bgcolor:"background.paper", borderBottom:"1px solid", borderColor:"divider" }}>
           {header.map((h, i) => <Box key={i} sx={{ px:1, py:0.8, fontWeight:900, whiteSpace:"nowrap", overflow:"hidden", textOverflow:"ellipsis", borderRight:"1px solid", borderColor:"divider" }}>{h}</Box>)}
         </Box>
-        <Box sx={{ height:contentHeight, position:"relative", minWidth:Math.max(720, header.length * 160) }}>
-          <Box sx={{ position:"absolute", left:0, right:0, top:startIndex * rowHeight }}>
-            {rows.map((row, ri) => (
-              <Box key={`${startIndex}-${ri}`} sx={{ display:"grid", gridTemplateColumns:`repeat(${header.length}, minmax(160px, 1fr))`, height:rowHeight, borderBottom:"1px solid", borderColor:"divider", '&:hover':{ bgcolor:"action.hover" } }}>
+        <Box sx={{ height:contentHeight, position:"relative", minWidth }}>
+          <Box sx={{ position:"absolute", left:0, right:0, top:visibleTop }}>
+            {visibleRows.map((row, ri) => (
+              <Box key={`${startIndex + localStart}-${ri}`} sx={{ display:"grid", gridTemplateColumns:`repeat(${header.length}, minmax(160px, 1fr))`, height:rowHeight, borderBottom:"1px solid", borderColor:"divider", '&:hover':{ bgcolor:"action.hover" } }}>
                 {header.map((_, ci) => <Box key={ci} title={String(row?.[ci] ?? "")} sx={{ px:1, py:0.65, whiteSpace:"nowrap", overflow:"hidden", textOverflow:"ellipsis", borderRight:"1px solid", borderColor:"divider" }}>{String(row?.[ci] ?? "")}</Box>)}
               </Box>
             ))}
@@ -6476,17 +6496,27 @@ function GraphQueryVirtualTable({ table, totalRows=0, page=1, pageSize=1000, onR
     </Box>
   );
 }
-
 function GraphQueryEditor({ columns, datasets=[], manifest=null, nodes, setNodes, edges, setEdges, onApply, onReadPage=()=>{}, onClearResult=()=>{}, onExportCsv=()=>{}, disabled, dataQueryActive, dataQueryCount, resultTable, resultStatus, resultTime, resultPage, resultPageMax, resultViewMode="tile", setResultViewMode=()=>{}, resultRowsPerTile="1000", setResultRowsPerTile=()=>{}, sqlText="", setSqlText=()=>{}, sqlMode=false, setSqlMode=()=>{} }) {
   const [selectedId, setSelectedId] = useState(nodes?.[0]?.id || "source");
   const [sqlErrors, setSqlErrors] = useState([]);
   const [showMiniMap, setShowMiniMap] = useState(false);
+  const [resultRowsDraft, setResultRowsDraft] = useState(String(resultRowsPerTile || "1000"));
   const flowPanelRef = useRef(null);
   const selectedNode = useMemo(() => nodes.find((n) => n.id === selectedId) || null, [nodes, selectedId]);
   const plan = useMemo(() => compileGraphQuery(nodes, edges, columns, datasets), [nodes, edges, columns, datasets]);
   const graphReady = !!ReactFlowCanvas;
   const safeSetSqlText = typeof setSqlText === "function" ? setSqlText : () => {};
   const safeSetSqlMode = typeof setSqlMode === "function" ? setSqlMode : () => {};
+
+  useEffect(() => {
+    setResultRowsDraft(String(resultRowsPerTile || "1000"));
+  }, [resultRowsPerTile]);
+
+  const applyResultRowsPerTile = () => {
+    const next = String(Math.max(50, Math.floor(Number(resultRowsDraft || resultRowsPerTile || 1000) || 1000)));
+    setResultRowsPerTile(next);
+    setTimeout(() => onReadPage(1), 0);
+  };
 
   useEffect(() => {
     if (!sqlMode) safeSetSqlText(plan.sql || "");
@@ -6823,7 +6853,8 @@ function GraphQueryEditor({ columns, datasets=[], manifest=null, nodes, setNodes
           <Button size="small" variant="contained" startIcon={<Download />} onClick={onExportCsv} disabled={!Number(dataQueryCount || 0)}>CSV全件出力</Button>
           <Button size="small" variant={resultViewMode === "tile" ? "contained" : "outlined"} onClick={() => setResultViewMode("tile")}>タイル表示</Button>
           <Button size="small" variant={resultViewMode === "page" ? "contained" : "outlined"} onClick={() => setResultViewMode("page")}>ページ表示</Button>
-          <SmallNumberField label="タイル/ページ行数" value={String(resultRowsPerTile || "1000")} onChange={(v) => { setResultRowsPerTile(v); setTimeout(() => onReadPage(1), 0); }} min="50" step="50" sx={{ width: 150 }} />
+          <SmallNumberField label="タイル/ページ行数" value={resultRowsDraft} onChange={setResultRowsDraft} min="50" step="50" sx={{ width: 150 }} />
+          <Button size="small" variant="outlined" onClick={applyResultRowsPerTile}>件数を適用</Button>
           {resultViewMode === "page" && <Button size="small" onClick={() => onReadPage(Math.max(1, Number(resultPage || 1) - 1))}>Prev</Button>}
           {resultViewMode === "page" && <Typography variant="caption">Page {Number(resultPage || 1).toLocaleString()} / {Number(resultPageMax || 0).toLocaleString()}</Typography>}
           {resultViewMode === "page" && <Button size="small" onClick={() => onReadPage(Math.min(Number(resultPageMax || 1), Number(resultPage || 1) + 1))}>Next</Button>}
