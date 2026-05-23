@@ -24,6 +24,7 @@
   <script id="worker-code" type="text/plain">
 
 
+
 let state = {
   file:null,
   encoding:"utf-8",
@@ -36,6 +37,7 @@ let state = {
   searchMatches:[],
   dataQueryMatches:null,
   dataQueryMeta:null,
+  graphJoinResult:null,
   pivotTable:null,
   pivotTileIndex:null,
   timeTable:null,
@@ -2358,6 +2360,7 @@ async function listDatasets(){
         rows:m.totalRows||0,
         sourceRows:m.sourceRows||0,
         columns:(m.columns||[]).length,
+        schemaColumns:(m.columns||[]).map(c=>({index:Number(c.index),name:c.name,type:c.type})),
         chunks:m.chunks||0,
         fileSize:m.fileSize||0,
         mode:m.mode||"",
@@ -3012,6 +3015,220 @@ async function readDataQueryPage(page,pageSize,cols){
   return {...result, startRow:start, totalMatches:total};
 }
 
+
+function normalizeGraphJoinLimit(value){
+  const n = Number(value || 0);
+  return Number.isFinite(n) && n > 0 ? Math.floor(n) : 100000;
+}
+
+function cleanJoinAlias(value, fallback){
+  const s = String(value || "").normalize("NFKC").trim().replace(/[^A-Za-z0-9_\u3040-\u30ff\u3400-\u9fff-]+/g, "_");
+  return s || fallback;
+}
+
+async function readStoredDatasetChunkColumns(opened, chunkIndex, colIndices){
+  const chunkDir = await opened.dir.getDirectoryHandle(`chunk_${String(chunkIndex).padStart(6,"0")}`);
+  const meta = opened.chunks?.[chunkIndex] || await readJson(chunkDir,"meta.json");
+  const rowCount = Number(meta?.rowCount || 0);
+  const result = {rowCount, columns:new Map()};
+  const cols = opened.manifest?.columns || [];
+  const unique = [...new Set((Array.isArray(colIndices) ? colIndices : []).map(Number).filter(i => Number.isFinite(i) && cols[i]))];
+  for (const idx of unique){
+    const col = cols[idx];
+    if (col.type === "number"){
+      const buf = await readBuffer(chunkDir, colFileName(col.index, col.type));
+      result.columns.set(idx, {type:"number", data:new Float64Array(buf)});
+    } else {
+      const buf = await readBuffer(chunkDir, colFileName(col.index, col.type));
+      const dict = await readJson(chunkDir, dictFileName(col.index));
+      result.columns.set(idx, {type:"string", ids:new Int32Array(buf), dict});
+    }
+  }
+  return result;
+}
+
+function normalizeJoinFieldRef(raw){
+  if (!raw) return null;
+  if (typeof raw === "string"){
+    const [sourceId, col] = raw.split(":");
+    const columnIndex = Number(col);
+    return sourceId && Number.isFinite(columnIndex) ? {sourceId, columnIndex} : null;
+  }
+  const sourceId = raw.sourceId || raw.source || raw.dataset || "";
+  const columnIndex = Number(raw.columnIndex);
+  return sourceId && Number.isFinite(columnIndex) ? {sourceId, columnIndex} : null;
+}
+
+function joinFieldKey(field){ return `${field.sourceId}:${field.columnIndex}`; }
+
+function sourceSpecById(sources, id){ return (sources || []).find(s => String(s.id) === String(id)) || null; }
+
+function sourceManifestColumn(sourceSpec, openedMap, columnIndex){
+  const opened = openedMap.get(sourceSpec.id);
+  return opened?.manifest?.columns?.[Number(columnIndex)] || null;
+}
+
+function joinOutputHeader(selectedFields, sources, openedMap){
+  return selectedFields.map((f) => {
+    const src = sourceSpecById(sources, f.sourceId) || {alias:f.sourceId};
+    const col = sourceManifestColumn(src, openedMap, f.columnIndex);
+    return `${cleanJoinAlias(src.alias || src.id, src.id)}.${col?.name || `Column${Number(f.columnIndex)+1}`}`;
+  });
+}
+
+function makeBlankPayload(fields){
+  const out = new Map();
+  for (const f of fields) out.set(joinFieldKey(f), "");
+  return out;
+}
+
+function payloadFromChunk(sourceId, chunk, localRow, fields){
+  const out = new Map();
+  for (const f of fields){
+    if (f.sourceId !== sourceId) continue;
+    out.set(joinFieldKey(f), valueFromColumn(chunk.columns.get(f.columnIndex), localRow));
+  }
+  return out;
+}
+
+function rowFromPayloads(selectedFields, payloads){
+  return selectedFields.map((f) => {
+    const key = joinFieldKey(f);
+    for (const p of payloads){ if (p && p.has(key)) return p.get(key); }
+    return "";
+  });
+}
+
+async function buildJoinSideHash(opened, sourceId, keyColumnIndex, outputFields){
+  const sourceFields = outputFields.filter(f => f.sourceId === sourceId);
+  const required = [...new Set([Number(keyColumnIndex), ...sourceFields.map(f => Number(f.columnIndex))].filter(Number.isFinite))];
+  const map = new Map();
+  let rows = 0;
+  for (let c=0; c<(opened.chunks || []).length; c++){
+    if (state.cancelled) throw new Error("Cancelled");
+    const chunk = await readStoredDatasetChunkColumns(opened, c, required);
+    for (let r=0; r<chunk.rowCount; r++){
+      const key = valueFromColumn(chunk.columns.get(Number(keyColumnIndex)), r);
+      if (key === "" || key == null) continue;
+      const k = String(key);
+      const payload = payloadFromChunk(sourceId, chunk, r, sourceFields);
+      if (!map.has(k)) map.set(k, []);
+      map.get(k).push(payload);
+      rows++;
+    }
+    if (c % 5 === 0) post("PROGRESS", {value:Math.min(70, Math.floor((c+1)/Math.max(1, opened.chunks.length)*45)), text:`JOIN hash build: ${fmt(rows)} rows indexed`});
+  }
+  return {map, rows, blank:makeBlankPayload(sourceFields)};
+}
+
+function defaultJoinSelectedFields(sources, openedMap){
+  const out=[];
+  for (const src of sources){
+    const cols = openedMap.get(src.id)?.manifest?.columns || [];
+    for (const c of cols.slice(0, Math.min(6, cols.length))) out.push({sourceId:src.id, columnIndex:Number(c.index)});
+  }
+  return out.slice(0, 16);
+}
+
+async function runGraphJoinQuery({plan, pageSize}){
+  const t0 = now();
+  if (!plan || !Array.isArray(plan.sources) || plan.sources.length < 2) throw new Error("JOIN requires at least two Dataset Source nodes");
+  if (!Array.isArray(plan.joins) || !plan.joins.length) throw new Error("JOIN node is not configured");
+
+  const sources = plan.sources.map((s, i) => ({
+    id:String(s.id || `source_${i+1}`),
+    datasetId:String(s.datasetId || ""),
+    alias:cleanJoinAlias(s.alias || `t${i+1}`, `t${i+1}`)
+  }));
+  for (const src of sources){
+    if (!src.datasetId || src.datasetId === "__active__") {
+      if (!state.dataset?.id) throw new Error(`Source ${src.alias} has no saved dataset id`);
+      src.datasetId = state.dataset.id;
+    }
+  }
+
+  const openedMap = new Map();
+  for (const src of sources){
+    openedMap.set(src.id, await loadValidatedDataset(src.datasetId, {rebuildStats:false}));
+  }
+
+  const join = plan.joins[0];
+  const leftSourceId = String(join.leftSourceId || sources[0].id);
+  const rightSourceId = String(join.rightSourceId || sources[1].id);
+  const left = sourceSpecById(sources, leftSourceId);
+  const right = sourceSpecById(sources, rightSourceId);
+  if (!left || !right) throw new Error("JOIN source is not selected");
+  const leftKey = Number(join.leftColumnIndex);
+  const rightKey = Number(join.rightColumnIndex);
+  if (!Number.isFinite(leftKey) || !Number.isFinite(rightKey)) throw new Error("JOIN key columns are not selected");
+  const joinType = ["left","inner"].includes(String(join.joinType || "inner")) ? String(join.joinType || "inner") : "inner";
+  const requestedLimit = normalizeGraphJoinLimit(plan.maxRows || pageSize || 100000);
+
+  let selectedFields = (Array.isArray(plan.selectedFields) ? plan.selectedFields : []).map(normalizeJoinFieldRef).filter(Boolean);
+  if (!selectedFields.length) selectedFields = defaultJoinSelectedFields(sources, openedMap);
+  selectedFields = selectedFields.filter(f => openedMap.get(f.sourceId)?.manifest?.columns?.[f.columnIndex]);
+  if (!selectedFields.length) throw new Error("No output columns are selected for JOIN");
+
+  const rightHash = await buildJoinSideHash(openedMap.get(right.id), right.id, rightKey, selectedFields);
+  const leftFields = selectedFields.filter(f => f.sourceId === left.id);
+  const leftRequired = [...new Set([leftKey, ...leftFields.map(f => f.columnIndex)].filter(Number.isFinite))];
+  const rows=[];
+  let scanned=0, matched=0, capped=false;
+  const leftOpened = openedMap.get(left.id);
+  post("PROGRESS", {value:72, text:`JOIN probing ${left.alias} against ${right.alias}...`});
+
+  outer:
+  for (let c=0; c<(leftOpened.chunks || []).length; c++){
+    if (state.cancelled) throw new Error("Cancelled");
+    const chunk = await readStoredDatasetChunkColumns(leftOpened, c, leftRequired);
+    for (let r=0; r<chunk.rowCount; r++){
+      scanned++;
+      const key = valueFromColumn(chunk.columns.get(leftKey), r);
+      const matches = key === "" || key == null ? null : rightHash.map.get(String(key));
+      const leftPayload = payloadFromChunk(left.id, chunk, r, leftFields);
+      if (matches && matches.length){
+        for (const rp of matches){
+          rows.push(rowFromPayloads(selectedFields, [leftPayload, rp]));
+          matched++;
+          if (rows.length >= requestedLimit){ capped=true; break outer; }
+        }
+      } else if (joinType === "left"){
+        rows.push(rowFromPayloads(selectedFields, [leftPayload, rightHash.blank]));
+        if (rows.length >= requestedLimit){ capped=true; break outer; }
+      }
+    }
+    if (c % 5 === 0) post("PROGRESS", {value:72 + Math.min(25, Math.floor((c+1)/Math.max(1, leftOpened.chunks.length)*25)), text:`JOIN probing chunks... ${c+1}/${leftOpened.chunks.length} / rows ${fmt(rows.length)}`});
+  }
+
+  const header = joinOutputHeader(selectedFields, sources, openedMap);
+  state.graphJoinResult = {header, rows, plan, sources, selectedFields, totalMatches:rows.length, capped, scanned, matched, ms:now()-t0};
+  const ps = Number(pageSize || 500);
+  return {
+    active:true,
+    matches:rows.length,
+    totalMatches:rows.length,
+    capped,
+    scanned,
+    matched,
+    rightIndexed:rightHash.rows,
+    header,
+    rows:rows.slice(0, ps),
+    startRow:0,
+    page:1,
+    pageSize:ps,
+    joinType,
+    ms:now()-t0
+  };
+}
+
+async function readGraphJoinPage(page,pageSize){
+  if (!state.graphJoinResult) throw new Error("Graph JOIN result is not active");
+  const total = state.graphJoinResult.rows.length;
+  const start = Math.max(0, (Number(page || 1)-1) * Number(pageSize || 500));
+  const rows = state.graphJoinResult.rows.slice(start, start + Number(pageSize || 500));
+  return {header:state.graphJoinResult.header, rows, startRow:start, totalMatches:total, page:Number(page||1), pageSize:Number(pageSize||500), ms:state.graphJoinResult.ms || 0};
+}
+
 function makeAgg(){ return {count:0,n:0,sum:0,min:null,max:null}; }
 function addAgg(a, v, countMode){
   a.count++;
@@ -3570,6 +3787,25 @@ self.onmessage=async(e)=>{
       return;
     }
 
+
+
+    if (msg.type==="RUN_GRAPH_JOIN_QUERY"){
+      state.cancelled=false;
+      post("PROGRESS",{value:0,text:"Running Graph JOIN query..."});
+      const result=await runGraphJoinQuery({plan:msg.plan,pageSize:Number(msg.pageSize||500)});
+      post("GRAPH_JOIN_DONE",result);
+      post("PROGRESS",{value:100,text:"Graph JOIN query complete"});
+      return;
+    }
+
+    if (msg.type==="READ_GRAPH_JOIN_PAGE"){
+      state.cancelled=false;
+      const t0=now();
+      const result=await readGraphJoinPage(Number(msg.page||1),Number(msg.pageSize||500));
+      post("GRAPH_JOIN_PAGE_RESULT",{...result,ms:now()-t0});
+      return;
+    }
+
     if (msg.type==="CLEAR_DATA_QUERY"){
       state.dataQueryMatches=null;
       state.dataQueryMeta=null;
@@ -3641,10 +3877,12 @@ self.onmessage=async(e)=>{
 };
 
 
+
 </script>
 
   <!-- JSX application source. It is transformed by Babel in the module below. -->
   <script id="app-code" type="text/plain">
+
 
 
 const { useCallback, useEffect, useMemo, useRef, useState } = React;
@@ -5143,16 +5381,64 @@ function columnBySqlName(columns, raw){
   return (columns || []).find((c) => String(c.name).toLowerCase() === name.toLowerCase() || String(c.index) === name) || null;
 }
 
+
+
+function normalizeGraphAlias(value, fallback="t"){
+  const s = String(value || "").normalize("NFKC").trim().replace(/[^A-Za-z0-9_\u3040-\u30ff\u3400-\u9fff-]+/g, "_");
+  return s || fallback;
+}
+
+function graphDatasetColumns(source, activeColumns, datasets){
+  const datasetId = source?.datasetId || "__active__";
+  if (!datasetId || datasetId === "__active__") return activeColumns || [];
+  const ds = (datasets || []).find((d) => String(d.id) === String(datasetId));
+  return ds?.schemaColumns || ds?.columnsMeta || [];
+}
+
+function graphDatasetLabel(datasetId, datasets, manifest){
+  if (!datasetId || datasetId === "__active__") return manifest?.tableName || manifest?.name || "Active Dataset";
+  const ds = (datasets || []).find((d) => String(d.id) === String(datasetId));
+  return ds?.path || ds?.tableName || ds?.name || datasetId;
+}
+
+function graphSourceNodes(nodes){
+  return (nodes || []).filter((n) => n.data?.kind === "source" && !n.data?.disabled);
+}
+
+function graphSourceAlias(node){
+  return normalizeGraphAlias(node?.data?.alias || (node?.id === "source" ? "t1" : node?.id), node?.id || "t");
+}
+
+function graphFieldValue(sourceId, columnIndex){ return `${sourceId}:${Number(columnIndex)}`; }
+function parseGraphFieldValue(value){
+  const [sourceId, col] = String(value || "").split(":");
+  const columnIndex = Number(col);
+  return sourceId && Number.isFinite(columnIndex) ? { sourceId, columnIndex } : null;
+}
+
+function graphAllFieldOptions(nodes, activeColumns, datasets){
+  const out = [];
+  for (const src of graphSourceNodes(nodes)){
+    const alias = graphSourceAlias(src);
+    const cols = graphDatasetColumns(src.data || {}, activeColumns, datasets);
+    for (const c of cols || []) out.push({ sourceId:src.id, alias, columnIndex:Number(c.index), name:c.name, type:c.type, value:graphFieldValue(src.id, c.index) });
+  }
+  return out;
+}
+
+function graphSourceById(nodes, id){ return graphSourceNodes(nodes).find((n) => String(n.id) === String(id)) || null; }
+
 function defaultProjection(columns){
   return (columns || []).slice(0, Math.min(12, columns.length)).map((c) => Number(c.index));
 }
 
-function normalizeGraphNodeLabel(node, columns) {
+function normalizeGraphNodeLabel(node, columns, datasets=[]) {
   if (!node) return "Node";
   const data = node.data || {};
   const col = columnByIndex(columns, data.columnIndex);
-  if (data.kind === "source") return "Active Dataset";
-  if (data.kind === "select") return `Select: ${(data.selectedColumns || []).length || "all"} cols`;
+  if (data.kind === "source") return `Source: ${data.alias || (node.id === "source" ? "t1" : node.id)}`;
+  if (data.kind === "join") return `Join: ${data.joinType || "inner"}`;
+  if (data.kind === "select") return `Select: ${(data.selectedFields || data.selectedColumns || []).length || "all"} cols`;
   if (data.kind === "filter") return `Filter: ${col?.name || "column"} ${data.op || "contains"}`;
   if (data.kind === "sort") return `Sort: ${col?.name || "column"} ${(data.direction || "asc").toUpperCase()}`;
   if (data.kind === "limit") return `Limit: ${Number(data.maxRows || 0) || "all"}`;
@@ -5166,6 +5452,7 @@ const GRAPH_KIND_META = {
   source:   { jp:"データ入力", category:"データ", bg:"#eff6ff", border:"#60a5fa", accent:"#2563eb", text:"#0f172a", description:"分析対象のActive Datasetです" },
   select:   { jp:"列選択", category:"データ", bg:"#f0fdfa", border:"#2dd4bf", accent:"#0f766e", text:"#0f172a", description:"出力するカラムを選びます" },
   filter:   { jp:"条件抽出", category:"処理", bg:"#fff7ed", border:"#fb923c", accent:"#ea580c", text:"#111827", description:"WHERE条件で行を絞り込みます" },
+  join:     { jp:"テーブル結合", category:"処理", bg:"#eef2ff", border:"#818cf8", accent:"#4f46e5", text:"#111827", description:"複数DatasetをキーでJOINします" },
   sort:     { jp:"並び替え", category:"処理", bg:"#faf5ff", border:"#c084fc", accent:"#7e22ce", text:"#111827", description:"ORDER BYを指定します" },
   limit:    { jp:"件数制限", category:"制御", bg:"#fefce8", border:"#eab308", accent:"#a16207", text:"#111827", description:"取得する最大行数を指定します" },
   aggregate:{ jp:"集計", category:"処理", bg:"#fdf2f8", border:"#f472b6", accent:"#db2777", text:"#111827", description:"GROUP BYや集計処理の予約ノードです" },
@@ -5195,8 +5482,9 @@ function graphNodeStyle(kind) {
 function makeGraphNode(id, kind, position, columns, extra={}) {
   const firstCol = columns[0]?.index ?? 0;
   const base = { id, position, data: { kind, label: kind }, style: graphNodeStyle(kind), ...extra };
-  if (kind === "source") return { ...base, data: { kind, label: "Active Dataset" } };
-  if (kind === "select") return { ...base, data: { kind, label: "Select", selectedColumns: defaultProjection(columns) } };
+  if (kind === "source") return { ...base, data: { kind, label: "Source", datasetId: extra?.data?.datasetId || "__active__", alias: extra?.data?.alias || (id === "source" ? "t1" : id.replace(/[^A-Za-z0-9_]/g, "_")) } };
+  if (kind === "join") return { ...base, data: { kind, label: "Join", leftSourceId: "source", rightSourceId: "", leftColumnIndex: firstCol, rightColumnIndex: firstCol, joinType: "inner" } };
+  if (kind === "select") return { ...base, data: { kind, label: "Select", selectedColumns: defaultProjection(columns), selectedFields: [] } };
   if (kind === "filter") return { ...base, data: { kind, label: "Filter", columnIndex: firstCol, op: "contains", value: "" } };
   if (kind === "sort") return { ...base, data: { kind, label: "Sort", columnIndex: firstCol, direction: "asc" } };
   if (kind === "limit") return { ...base, data: { kind, label: "Limit", maxRows: "0" } };
@@ -5224,15 +5512,18 @@ function filterToSql(filter, columns) {
   return `${sqlIdentifier(col?.name || `Column${Number(filter.columnIndex)+1}`)} ${opToSql(filter.op, filter.value, col?.type)}`;
 }
 
-function graphToSqlPreview(plan, columns) {
+function graphSourceSqlName(source){ return sqlIdentifier(graphSourceAlias(source)); }
+
+function graphColumnSqlName(field, plan, activeColumns, datasets){
+  const source = (plan.sources || []).find((s) => s.id === field.sourceId) || {id:field.sourceId, alias:field.sourceId, datasetId:"__active__"};
+  const sourceNodeLike = {data:{datasetId:source.datasetId}};
+  const cols = graphDatasetColumns(sourceNodeLike.data, activeColumns, datasets);
+  const col = columnByIndex(cols, field.columnIndex);
+  return `${sqlIdentifier(source.alias || source.id)}.${sqlIdentifier(col?.name || `Column${Number(field.columnIndex)+1}`)}`;
+}
+
+function graphToSqlPreview(plan, columns, datasets=[]) {
   const subqueries = plan.subqueries || [];
-  const projection = plan.projection?.length ? plan.projection : [];
-  const selectList = projection.length
-    ? projection.map((idx) => sqlIdentifier(columnByIndex(columns, idx)?.name || `Column${Number(idx)+1}`)).join(", ")
-    : "*";
-  const fromName = plan.sourceAlias || GRAPH_SQL_DATASET_NAME;
-  const whereSql = (plan.filters || []).map((f) => filterToSql(f, columns));
-  const sortCol = plan.sort ? columnByIndex(columns, plan.sort.columnIndex) : null;
   const lines = [];
   if (subqueries.length) {
     lines.push("WITH " + subqueries.map((s) => {
@@ -5241,6 +5532,30 @@ function graphToSqlPreview(plan, columns) {
       return `${sqlIdentifier(s.alias)} AS (\n  ${body.join("\n  ")}\n)`;
     }).join(",\n"));
   }
+
+  if (plan.mode === "join" && (plan.sources || []).length >= 2 && (plan.joins || []).length) {
+    const fields = (plan.selectedFields || []).map(parseGraphFieldValue).filter(Boolean);
+    const selectList = fields.length ? fields.map((f) => graphColumnSqlName(f, plan, columns, datasets)).join(", ") : "*";
+    const join = plan.joins[0];
+    const left = (plan.sources || []).find((s) => s.id === join.leftSourceId) || plan.sources[0];
+    const right = (plan.sources || []).find((s) => s.id === join.rightSourceId) || plan.sources[1];
+    const leftCol = columnByIndex(graphDatasetColumns({datasetId:left.datasetId}, columns, datasets), join.leftColumnIndex);
+    const rightCol = columnByIndex(graphDatasetColumns({datasetId:right.datasetId}, columns, datasets), join.rightColumnIndex);
+    lines.push(`SELECT ${selectList}`);
+    lines.push(`FROM ${sqlIdentifier(left.alias)} /* ${graphDatasetLabel(left.datasetId, datasets)} */`);
+    lines.push(`${String(join.joinType || "inner").toUpperCase()} JOIN ${sqlIdentifier(right.alias)} /* ${graphDatasetLabel(right.datasetId, datasets)} */`);
+    lines.push(`  ON ${sqlIdentifier(left.alias)}.${sqlIdentifier(leftCol?.name || "key")} = ${sqlIdentifier(right.alias)}.${sqlIdentifier(rightCol?.name || "key")}`);
+    if (Number(plan.maxRows || 0) > 0) lines.push(`LIMIT ${Number(plan.maxRows || 0)}`);
+    return `${lines.join("\n")};`;
+  }
+
+  const projection = plan.projection?.length ? plan.projection : [];
+  const selectList = projection.length
+    ? projection.map((idx) => sqlIdentifier(columnByIndex(columns, idx)?.name || `Column${Number(idx)+1}`)).join(", ")
+    : "*";
+  const fromName = plan.sourceAlias || GRAPH_SQL_DATASET_NAME;
+  const whereSql = (plan.filters || []).map((f) => filterToSql(f, columns));
+  const sortCol = plan.sort ? columnByIndex(columns, plan.sort.columnIndex) : null;
   lines.push(`SELECT ${selectList}`);
   lines.push(`FROM ${sqlIdentifier(fromName)}`);
   if (whereSql.length) lines.push(`WHERE ${whereSql.join(" AND ")}`);
@@ -5249,21 +5564,43 @@ function graphToSqlPreview(plan, columns) {
   return `${lines.join("\n")};`;
 }
 
-function compileGraphQuery(nodes, edges, columns) {
+function compileGraphQuery(nodes, edges, columns, datasets=[]) {
   const filters = [];
   let sort = null;
   let maxRows = 0;
   let projection = [];
+  let selectedFields = [];
   const subqueries = [];
   const active = (nodes || []).filter((n) => !(n.data || {}).disabled);
+  const sources = graphSourceNodes(active).map((n, idx) => ({
+    id:n.id,
+    datasetId:n.data?.datasetId || "__active__",
+    alias:graphSourceAlias(n),
+    name:graphDatasetLabel(n.data?.datasetId || "__active__", datasets),
+    order:idx
+  }));
+  const joins = [];
   for (const n of active) {
     const d = n.data || {};
+    if (d.kind === "join") {
+      joins.push({
+        id:n.id,
+        leftSourceId:d.leftSourceId || sources[0]?.id || "source",
+        rightSourceId:d.rightSourceId || sources[1]?.id || "",
+        leftColumnIndex:Number(d.leftColumnIndex),
+        rightColumnIndex:Number(d.rightColumnIndex),
+        joinType:d.joinType === "left" ? "left" : "inner"
+      });
+    }
     if (d.kind === "filter") {
       filters.push({ id: n.id, columnIndex: Number(d.columnIndex), op: d.op || "contains", value: d.value ?? "", parentId: n.parentId || null });
     }
     if (d.kind === "sort") sort = { columnIndex: Number(d.columnIndex), direction: d.direction === "desc" ? "desc" : "asc" };
     if (d.kind === "limit") maxRows = Math.max(0, Number(d.maxRows || 0));
-    if (d.kind === "select") projection = (Array.isArray(d.selectedColumns) ? d.selectedColumns : []).map(Number).filter((idx) => (columns || []).some((c) => Number(c.index) === idx));
+    if (d.kind === "select") {
+      projection = (Array.isArray(d.selectedColumns) ? d.selectedColumns : []).map(Number).filter((idx) => (columns || []).some((c) => Number(c.index) === idx));
+      selectedFields = (Array.isArray(d.selectedFields) ? d.selectedFields : []).map(String).filter(Boolean);
+    }
     if (d.kind === "subquery") {
       const childFilters = active
         .filter((x) => x.parentId === n.id && x.data?.kind === "filter")
@@ -5271,8 +5608,9 @@ function compileGraphQuery(nodes, edges, columns) {
       subqueries.push({ id: n.id, alias: d.alias || n.id, filters: childFilters });
     }
   }
-  const plan = { filters, sort, maxRows, projection, subqueries, edges: (edges || []).map((e) => ({ id:e.id, source:e.source, target:e.target })) };
-  plan.sql = graphToSqlPreview(plan, columns);
+  const mode = sources.length >= 2 && joins.length ? "join" : "single";
+  const plan = { mode, sources, joins, filters, sort, maxRows, projection, selectedFields, subqueries, edges: (edges || []).map((e) => ({ id:e.id, source:e.source, target:e.target })) };
+  plan.sql = graphToSqlPreview(plan, columns, datasets);
   return plan;
 }
 
@@ -5420,11 +5758,11 @@ function QueryGraphEdge(props) {
   );
 }
 
-function GraphQueryEditor({ columns, nodes, setNodes, edges, setEdges, onApply, onReadPage=()=>{}, disabled, dataQueryActive, dataQueryCount, resultTable, resultStatus, resultTime, resultPage, resultPageMax, sqlText="", setSqlText=()=>{}, sqlMode=false, setSqlMode=()=>{} }) {
+function GraphQueryEditor({ columns, datasets=[], manifest=null, nodes, setNodes, edges, setEdges, onApply, onReadPage=()=>{}, disabled, dataQueryActive, dataQueryCount, resultTable, resultStatus, resultTime, resultPage, resultPageMax, sqlText="", setSqlText=()=>{}, sqlMode=false, setSqlMode=()=>{} }) {
   const [selectedId, setSelectedId] = useState(nodes?.[0]?.id || "source");
   const [sqlErrors, setSqlErrors] = useState([]);
   const selectedNode = useMemo(() => nodes.find((n) => n.id === selectedId) || null, [nodes, selectedId]);
-  const plan = useMemo(() => compileGraphQuery(nodes, edges, columns), [nodes, edges, columns]);
+  const plan = useMemo(() => compileGraphQuery(nodes, edges, columns, datasets), [nodes, edges, columns, datasets]);
   const graphReady = !!ReactFlowCanvas;
   const safeSetSqlText = typeof setSqlText === "function" ? setSqlText : () => {};
   const safeSetSqlMode = typeof setSqlMode === "function" ? setSqlMode : () => {};
@@ -5437,19 +5775,19 @@ function GraphQueryEditor({ columns, nodes, setNodes, edges, setEdges, onApply, 
     setNodes((prev) => prev.map((n) => {
       if (n.id !== id) return n;
       const next = { ...n, data: { ...(n.data || {}), ...patch } };
-      next.data.label = normalizeGraphNodeLabel(next, columns);
+      next.data.label = normalizeGraphNodeLabel(next, columns, datasets);
       return next;
     }));
   };
 
   const addNode = (kind, extra={}) => {
     const id = `${kind}-${Date.now().toString(36)}`;
-    const x = kind === "subquery" ? 130 : 190 + Math.max(0, nodes.length - 2) * 130;
-    const y = kind === "filter" ? 105 : kind === "sort" ? 210 : kind === "select" ? 40 : kind === "aggregate" ? 300 : kind === "subquery" ? 355 : 380;
+    const x = kind === "subquery" ? 130 : kind === "source" ? 30 + graphSourceNodes(nodes).length * 220 : 190 + Math.max(0, nodes.length - 2) * 130;
+    const y = kind === "source" ? 360 : kind === "join" ? 260 : kind === "filter" ? 105 : kind === "sort" ? 210 : kind === "select" ? 40 : kind === "aggregate" ? 300 : kind === "subquery" ? 355 : 380;
     const node = makeGraphNode(id, kind, { x, y }, columns, extra);
-    node.data.label = normalizeGraphNodeLabel(node, columns);
+    node.data.label = normalizeGraphNodeLabel(node, columns, datasets);
     setNodes((prev) => [...prev, node]);
-    if (kind !== "subquery") {
+    if (!["subquery", "source"].includes(kind)) {
       setEdges((prev) => [...prev, { id: `e-${prev.length}-${Date.now().toString(36)}`, source: "source", target: id, animated: true, reconnectable: true, markerEnd: RFMarkerType ? { type: RFMarkerType.ArrowClosed } : undefined }]);
     }
     setSelectedId(id);
@@ -5513,7 +5851,7 @@ function GraphQueryEditor({ columns, nodes, setNodes, edges, setEdges, onApply, 
     if (action === "insertFilter") {
       const nodeId = `filter-${Date.now().toString(36)}`;
       const node = makeGraphNode(nodeId, "filter", { x: (nodes.find(n=>n.id===edge.source)?.position?.x || 200) + 120, y: (nodes.find(n=>n.id===edge.source)?.position?.y || 100) + 45 }, columns);
-      node.data.label = normalizeGraphNodeLabel(node, columns);
+      node.data.label = normalizeGraphNodeLabel(node, columns, datasets);
       setNodes((prev) => [...prev, node]);
       setEdges((prev) => prev.filter((e) => e.id !== id).concat([
         { id: `${edge.source}-${nodeId}`, source: edge.source, target: nodeId, animated: true, reconnectable: true, markerEnd: RFMarkerType ? { type: RFMarkerType.ArrowClosed } : undefined },
@@ -5560,20 +5898,29 @@ function GraphQueryEditor({ columns, nodes, setNodes, edges, setEdges, onApply, 
   };
 
   const selectedProjection = selectedNode?.data?.selectedColumns || [];
+  const sourceNodes = graphSourceNodes(nodes);
+  const allFieldOptions = graphAllFieldOptions(nodes, columns, datasets);
+  const selectedFields = selectedNode?.data?.selectedFields || [];
+  const selectedLeftSource = graphSourceById(nodes, selectedNode?.data?.leftSourceId || sourceNodes[0]?.id);
+  const selectedRightSource = graphSourceById(nodes, selectedNode?.data?.rightSourceId || sourceNodes[1]?.id);
+  const leftJoinColumns = graphDatasetColumns(selectedLeftSource?.data || {}, columns, datasets);
+  const rightJoinColumns = graphDatasetColumns(selectedRightSource?.data || {}, columns, datasets);
   return (
     <Stack spacing={1.1} sx={{ minWidth: 0 }}>
       <Box sx={{ display: "grid", gridTemplateColumns: { xs: "1fr", lg: "minmax(0, 1fr) 360px" }, gap: 1, minWidth: 0 }}>
         <Paper elevation={0} sx={{ p: 1, bgcolor: "background.default", borderRadius: 2, minWidth: 0 }}>
           <Stack direction="row" useFlexGap flexWrap="wrap" spacing={0.75} alignItems="center" sx={{ mb: 1 }}>
             <Typography variant="subtitle2" sx={{ fontWeight: 900 }}>Graph Query / グラフィカルクエリ</Typography>
-            <Tooltip title="出力する列を選ぶノードを追加"><span><Button size="small" variant="outlined" onClick={() => addNode("select")} disabled={!columns.length}>+ 列選択</Button></span></Tooltip>
+            <Tooltip title="JOIN用のDataset Sourceノードを追加"><span><Button size="small" variant="outlined" onClick={() => addNode("source", { data: { datasetId: datasets[0]?.id || "__active__", alias: `t${graphSourceNodes(nodes).length + 1}` } })}>+ データソース</Button></span></Tooltip>
+            <Tooltip title="複数Datasetをキーで結合するJOINノードを追加"><span><Button size="small" variant="outlined" onClick={() => addNode("join")} disabled={graphSourceNodes(nodes).length < 2}>+ JOIN</Button></span></Tooltip>
+            <Tooltip title="出力する列を選ぶノードを追加"><span><Button size="small" variant="outlined" onClick={() => addNode("select")} disabled={!columns.length && !datasets.length}>+ 列選択</Button></span></Tooltip>
             <Tooltip title="WHERE条件で行を絞るノードを追加"><span><Button size="small" variant="outlined" onClick={() => addNode("filter")} disabled={!columns.length}>+ 条件抽出</Button></span></Tooltip>
             <Tooltip title="ORDER BYで並び替えるノードを追加"><span><Button size="small" variant="outlined" onClick={() => addNode("sort")} disabled={!columns.length}>+ 並び替え</Button></span></Tooltip>
             <Tooltip title="取得件数を制限するノードを追加"><Button size="small" variant="outlined" onClick={() => addNode("limit")}>+ 件数制限</Button></Tooltip>
             <Tooltip title="集計ノードを追加。実集計接続は次段階で有効化"><span><Button size="small" variant="outlined" onClick={() => addNode("aggregate")} disabled={!columns.length}>+ 集計</Button></span></Tooltip>
             <Tooltip title="サブクエリ用のグループを追加"><Button size="small" variant="outlined" onClick={() => addNode("subquery")}>+ サブクエリ</Button></Tooltip>
             <Tooltip title="初期ノード構成へ戻します"><Button size="small" onClick={resetGraph}>リセット</Button></Tooltip>
-            <Tooltip title="グラフからQueryPlanを生成して実行"><span><Button size="small" variant="contained" onClick={runFromGraph} disabled={disabled || !columns.length}>グラフ実行</Button></span></Tooltip>
+            <Tooltip title="グラフからQueryPlanを生成して実行"><span><Button size="small" variant="contained" onClick={runFromGraph} disabled={disabled || (!columns.length && !datasets.length)}>グラフ実行</Button></span></Tooltip>
             {dataQueryActive && <Chip color="success" size="small" label={`実行中 ${Number(dataQueryCount || 0).toLocaleString()} 行`} />}
           </Stack>
           {!graphReady ? (
@@ -5611,13 +5958,52 @@ function GraphQueryEditor({ columns, nodes, setNodes, edges, setEdges, onApply, 
           ) : (
             <Stack spacing={1}>
               <Chip label={`${selectedNode.id} / ${graphKindMeta(selectedNode.data?.kind).jp}`} sx={{ bgcolor: graphKindMeta(selectedNode.data?.kind).bg, border: "1px solid", borderColor: graphKindMeta(selectedNode.data?.kind).border, fontWeight: 900 }} />
+              {selectedNode.data?.kind === "source" && (
+                <>
+                  <TextField select label="Dataset" size="small" value={selectedNode.data.datasetId || "__active__"} onChange={(e) => updateNodeData(selectedNode.id, { datasetId: e.target.value })} fullWidth>
+                    <MenuItem value="__active__">Active Dataset: {manifest?.tableName || manifest?.name || "active"}</MenuItem>
+                    {datasets.map((d) => <MenuItem key={d.id} value={d.id}>{d.path || d.tableName || d.name || d.id}</MenuItem>)}
+                  </TextField>
+                  <TextField label="Alias" size="small" value={selectedNode.data.alias || selectedNode.id} onChange={(e) => updateNodeData(selectedNode.id, { alias: e.target.value })} fullWidth />
+                  <Alert severity="info">JOINに使うDataset Sourceです。Storageに保存済みのDatasetを選ぶと、列情報をJOIN/SELECTで利用できます。</Alert>
+                </>
+              )}
+              {selectedNode.data?.kind === "join" && (
+                <>
+                  <TextField select label="左Source" size="small" value={selectedNode.data.leftSourceId || sourceNodes[0]?.id || ""} onChange={(e) => updateNodeData(selectedNode.id, { leftSourceId: e.target.value })} fullWidth>
+                    {sourceNodes.map((n) => <MenuItem key={n.id} value={n.id}>{graphSourceAlias(n)} / {graphDatasetLabel(n.data?.datasetId, datasets, manifest)}</MenuItem>)}
+                  </TextField>
+                  <TextField select label="右Source" size="small" value={selectedNode.data.rightSourceId || sourceNodes[1]?.id || ""} onChange={(e) => updateNodeData(selectedNode.id, { rightSourceId: e.target.value })} fullWidth>
+                    {sourceNodes.map((n) => <MenuItem key={n.id} value={n.id}>{graphSourceAlias(n)} / {graphDatasetLabel(n.data?.datasetId, datasets, manifest)}</MenuItem>)}
+                  </TextField>
+                  <TextField select label="JOIN種別" size="small" value={selectedNode.data.joinType || "inner"} onChange={(e) => updateNodeData(selectedNode.id, { joinType: e.target.value })} fullWidth>
+                    <MenuItem value="inner">INNER JOIN</MenuItem>
+                    <MenuItem value="left">LEFT JOIN</MenuItem>
+                  </TextField>
+                  <TextField select label="左キー" size="small" value={String(selectedNode.data.leftColumnIndex ?? leftJoinColumns[0]?.index ?? 0)} onChange={(e) => updateNodeData(selectedNode.id, { leftColumnIndex: Number(e.target.value) })} fullWidth>
+                    {leftJoinColumns.map((c) => <MenuItem key={c.index} value={String(c.index)}>{c.name} ({c.type})</MenuItem>)}
+                  </TextField>
+                  <TextField select label="右キー" size="small" value={String(selectedNode.data.rightColumnIndex ?? rightJoinColumns[0]?.index ?? 0)} onChange={(e) => updateNodeData(selectedNode.id, { rightColumnIndex: Number(e.target.value) })} fullWidth>
+                    {rightJoinColumns.map((c) => <MenuItem key={c.index} value={String(c.index)}>{c.name} ({c.type})</MenuItem>)}
+                  </TextField>
+                </>
+              )}
               {selectedNode.data?.kind === "select" && (
-                <FormControl size="small" fullWidth>
-                  <InputLabel>出力カラム</InputLabel>
-                  <Select multiple value={selectedProjection.map(String)} label="出力カラム" onChange={(e) => updateNodeData(selectedNode.id, { selectedColumns: (Array.isArray(e.target.value) ? e.target.value : String(e.target.value).split(',')).map(Number) })} renderValue={(vals) => `${vals.length} 列`}>
-                    {columns.map((c) => <MenuItem key={c.index} value={String(c.index)}><Checkbox checked={selectedProjection.map(Number).includes(Number(c.index))} />{c.name} ({c.type})</MenuItem>)}
-                  </Select>
-                </FormControl>
+                sourceNodes.length >= 2 ? (
+                  <FormControl size="small" fullWidth>
+                    <InputLabel>JOIN出力カラム</InputLabel>
+                    <Select multiple value={selectedFields.map(String)} label="JOIN出力カラム" onChange={(e) => updateNodeData(selectedNode.id, { selectedFields: Array.isArray(e.target.value) ? e.target.value : String(e.target.value).split(',') })} renderValue={(vals) => `${vals.length} 列`}>
+                      {allFieldOptions.map((f) => <MenuItem key={f.value} value={f.value}><Checkbox checked={selectedFields.includes(f.value)} />{f.alias}.{f.name} ({f.type})</MenuItem>)}
+                    </Select>
+                  </FormControl>
+                ) : (
+                  <FormControl size="small" fullWidth>
+                    <InputLabel>出力カラム</InputLabel>
+                    <Select multiple value={selectedProjection.map(String)} label="出力カラム" onChange={(e) => updateNodeData(selectedNode.id, { selectedColumns: (Array.isArray(e.target.value) ? e.target.value : String(e.target.value).split(',')).map(Number) })} renderValue={(vals) => `${vals.length} 列`}>
+                      {columns.map((c) => <MenuItem key={c.index} value={String(c.index)}><Checkbox checked={selectedProjection.map(Number).includes(Number(c.index))} />{c.name} ({c.type})</MenuItem>)}
+                    </Select>
+                  </FormControl>
+                )
               )}
               {selectedNode.data?.kind === "filter" && (
                 <>
@@ -5643,10 +6029,10 @@ function GraphQueryEditor({ columns, nodes, setNodes, edges, setEdges, onApply, 
               {selectedNode.data?.kind === "limit" && <SmallNumberField label="最大行数 0=全件" value={String(selectedNode.data.maxRows ?? "0")} onChange={(v) => updateNodeData(selectedNode.id, { maxRows: v })} min="0" step="100000" fullWidth />}
               {selectedNode.data?.kind === "aggregate" && <Alert severity="info">集計ノードはSQLプレビューへ表現を追加するための予約ノードです。実集計はPivot/Time基盤へ接続する次段階で有効化します。</Alert>}
               {selectedNode.data?.kind === "subquery" && <TextField label="サブクエリ名" size="small" value={selectedNode.data.alias || selectedNode.id} onChange={(e) => updateNodeData(selectedNode.id, { alias: e.target.value })} fullWidth />}
-              {["source", "output"].includes(selectedNode.data?.kind) && <Alert severity="info">このノードは固定です。条件抽出 / 並び替え / 件数制限 / 列選択 / サブクエリを追加して条件を作成します。</Alert>}
+              {selectedNode.data?.kind === "output" && <Alert severity="info">このノードは結果出力です。JOIN/条件抽出/並び替え/件数制限/列選択を追加して条件を作成します。</Alert>}
               <Divider />
               <Typography variant="subtitle2" sx={{ fontWeight: 900 }}>コンパイル済みプラン</Typography>
-              <Typography component="pre" variant="caption" sx={{ p: 1, bgcolor: "background.paper", borderRadius: 1, overflow: "auto", maxHeight: 180 }}>{JSON.stringify({ filters: plan.filters, sort: plan.sort, maxRows: plan.maxRows, projection: plan.projection, subqueries: plan.subqueries }, null, 2)}</Typography>
+              <Typography component="pre" variant="caption" sx={{ p: 1, bgcolor: "background.paper", borderRadius: 1, overflow: "auto", maxHeight: 180 }}>{JSON.stringify({ mode: plan.mode, sources: plan.sources, joins: plan.joins, filters: plan.filters, sort: plan.sort, maxRows: plan.maxRows, projection: plan.projection, selectedFields: plan.selectedFields, subqueries: plan.subqueries }, null, 2)}</Typography>
             </Stack>
           )}
         </Paper>
@@ -5656,12 +6042,12 @@ function GraphQueryEditor({ columns, nodes, setNodes, edges, setEdges, onApply, 
         <Stack direction="row" useFlexGap flexWrap="wrap" spacing={1} alignItems="center" sx={{ mb: 1 }}>
           <Typography variant="subtitle2" sx={{ fontWeight: 900 }}>SQLプレビュー / SQL実行</Typography>
           <FormControlLabel control={<Switch size="small" checked={sqlMode} onChange={(e) => safeSetSqlMode(e.target.checked)} />} label="SQLを編集" />
-          <Button size="small" variant="contained" onClick={sqlMode ? runFromSql : runFromGraph} disabled={disabled || !columns.length}>{sqlMode ? "SQL実行" : "グラフ実行"}</Button>
+          <Button size="small" variant="contained" onClick={sqlMode ? runFromSql : runFromGraph} disabled={disabled || (!columns.length && !datasets.length)}>{sqlMode ? "SQL実行" : "グラフ実行"}</Button>
           <Button size="small" onClick={() => { safeSetSqlMode(false); safeSetSqlText(plan.sql || ""); setSqlErrors([]); }}>グラフから同期</Button>
         </Stack>
         <TextField multiline minRows={7} fullWidth value={sqlMode ? sqlText : (plan.sql || "")} onChange={(e) => { safeSetSqlMode(true); safeSetSqlText(e.target.value); }} InputProps={{ readOnly: !sqlMode }} sx={{ '& textarea': { fontFamily: 'Roboto Mono, Consolas, monospace', fontSize: 12 } }} />
         {sqlErrors.length > 0 && <Alert severity="warning" sx={{ mt: 0.75 }}>{sqlErrors.join(" / ")}</Alert>}
-        <Typography variant="caption" color="text.secondary">対応SQL: SELECT / FROM / WHERE AND / ORDER BY / LIMIT。WITHはPreview出力対応、手書きSQLでは最終SELECT部分を実行します。JOINは現時点では未対応です。複数テーブルJOINは次段階でDataset Store横断実行として追加します。</Typography>
+        <Typography variant="caption" color="text.secondary">対応SQL: SELECT / FROM / WHERE AND / ORDER BY / LIMIT。WITHはPreview出力対応、手書きSQLでは最終SELECT部分を実行します。JOINはGraph実行で対応済みです。手書きSQLのJOINパースはPreview用途に限定し、実行はJOINノードから行います。</Typography>
       </Paper>
 
       <Paper elevation={0} sx={{ p: 1, bgcolor: "background.default", borderRadius: 2 }}>
@@ -5765,6 +6151,12 @@ function App() {
   ]);
   const [graphSqlText, setGraphSqlText] = useState("");
   const [graphSqlMode, setGraphSqlMode] = useState(false);
+  const [graphResultMode, setGraphResultMode] = useState("data");
+  const [graphResultTable, setGraphResultTable] = useState(null);
+  const [graphResultCount, setGraphResultCount] = useState(0);
+  const [graphResultPage, setGraphResultPage] = useState(1);
+  const [graphResultStatus, setGraphResultStatus] = useState("Graph Queryを実行してください。");
+  const [graphResultTime, setGraphResultTime] = useState("");
 
   const [searchColumn, setSearchColumn] = useState("0");
   const [searchOp, setSearchOp] = useState("contains");
@@ -6282,6 +6674,26 @@ function App() {
         return;
       }
 
+
+      if (msg.type === "GRAPH_JOIN_DONE") {
+        setGraphResultMode("join");
+        setGraphResultTable({ header: msg.header, rows: msg.rows });
+        setGraphResultCount(msg.totalMatches || msg.matches || 0);
+        setGraphResultPage(1);
+        setGraphResultStatus(`JOIN result: ${fmt(msg.totalMatches || msg.matches || 0)} rows / scanned ${fmt(msg.scanned || 0)} / right indexed ${fmt(msg.rightIndexed || 0)}${msg.capped ? " / limitで打ち切り" : ""}`);
+        setGraphResultTime(ms(msg.ms));
+        return;
+      }
+
+      if (msg.type === "GRAPH_JOIN_PAGE_RESULT") {
+        setGraphResultTable({ header: msg.header, rows: msg.rows });
+        setGraphResultCount(msg.totalMatches || 0);
+        setGraphResultPage(msg.page || 1);
+        setGraphResultStatus(`JOIN rows ${fmt(msg.startRow + 1)} - ${fmt(msg.startRow + msg.rows.length)} / ${fmt(msg.totalMatches)} / page ${fmt(msg.page)}`);
+        setGraphResultTime(ms(msg.ms));
+        return;
+      }
+
       if (msg.type === "DATA_QUERY_CLEARED") {
         setDataQueryActive(false);
         setDataQueryCount(0);
@@ -6490,13 +6902,24 @@ function App() {
         data.columnIndex = columns[0]?.index ?? 0;
       }
       const next = { ...n, data };
-      next.data.label = normalizeGraphNodeLabel(next, columns);
+      next.data.label = normalizeGraphNodeLabel(next, columns, datasets);
       return next;
     }));
-  }, [columns.map((c) => `${c.index}:${c.name}:${c.type}`).join("|")]);
+  }, [columns.map((c) => `${c.index}:${c.name}:${c.type}`).join("|"), datasets.map((d)=>`${d.id}:${d.columns}`).join("|")]);
 
   function runGraphQueryPlan(plan) {
-    if (!manifest) return;
+    if (!manifest && !(plan?.mode === "join")) return;
+    if (plan?.mode === "join") {
+      setGraphResultMode("join");
+      setGraphResultTable(null);
+      setGraphResultCount(0);
+      setGraphResultPage(1);
+      setGraphResultStatus("Graph JOINを実行中...");
+      post({ type: "RUN_GRAPH_JOIN_QUERY", plan, pageSize: pageSizeRef.current });
+      return;
+    }
+    setGraphResultMode("data");
+    setGraphResultTable(null);
     const filters = (plan?.filters || []).map((f) => ({ ...f, id: f.id || `${Date.now()}-${Math.random()}` }));
     const sort = plan?.sort || null;
     const maxRows = Number(plan?.maxRows || 0);
@@ -6513,6 +6936,16 @@ function App() {
       maxRows,
       projection,
     });
+  }
+
+  function readGraphQueryPage(next = graphResultPage) {
+    if (graphResultMode === "join") {
+      const safe = Math.max(1, Number(next || 1));
+      setGraphResultPage(safe);
+      post({ type: "READ_GRAPH_JOIN_PAGE", page: safe, pageSize: pageSizeRef.current });
+      return;
+    }
+    readPage(next);
   }
 
   function runDataQuery() {
@@ -7281,20 +7714,22 @@ function App() {
             <Section title="Graph Query" icon={<Analytics />} hint="ノード編集、SQL風クエリ、実行結果テーブルをこのタブ内で完結表示します。">
                 <GraphQueryEditor
                   columns={columns}
+                  datasets={hierarchicalDatasets}
+                  manifest={manifest}
                   nodes={graphNodes}
                   setNodes={setGraphNodes}
                   edges={graphEdges}
                   setEdges={setGraphEdges}
                   onApply={runGraphQueryPlan}
-                  onReadPage={readPage}
-                  disabled={!manifest || busy}
-                  dataQueryActive={dataQueryActive}
-                  dataQueryCount={dataQueryCount}
-                  resultTable={dataTable}
-                  resultStatus={dataStatus}
-                  resultTime={dataTime}
-                  resultPage={page}
-                  resultPageMax={pageMax}
+                  onReadPage={readGraphQueryPage}
+                  disabled={(!manifest && !hierarchicalDatasets.length) || busy}
+                  dataQueryActive={graphResultMode === "join" ? graphResultCount > 0 : dataQueryActive}
+                  dataQueryCount={graphResultMode === "join" ? graphResultCount : dataQueryCount}
+                  resultTable={graphResultMode === "join" ? graphResultTable : (graphResultTable || dataTable)}
+                  resultStatus={graphResultMode === "join" ? graphResultStatus : dataStatus}
+                  resultTime={graphResultMode === "join" ? graphResultTime : dataTime}
+                  resultPage={graphResultMode === "join" ? graphResultPage : page}
+                  resultPageMax={graphResultMode === "join" ? Math.ceil((graphResultCount || 0) / Number(pageSize || 500)) : pageMax}
                   sqlText={graphSqlText}
                   setSqlText={setGraphSqlText}
                   sqlMode={graphSqlMode}
@@ -7636,7 +8071,8 @@ root.render(
 
   
   
-  </script>
+  
+</script>
 
   <!-- React 19 / MUI 7.3.5 / Icons via CDN ESM -->
   <script type="module">
