@@ -968,20 +968,117 @@ function executionProgressText(label, ctx){
   return `${label}... ${ctx.position + 1}/${ctx.totalChunks} / skipped ${fmt(ctx.skippedChunks)} / rows ${fmt(ctx.scanned)} / matches ${fmt(ctx.matched)}`;
 }
 
-function sortPlanRows(sortable, sortSpec){
-  if (!Array.isArray(sortable) || !sortSpec) return [];
-  const sortDirection = sortSpec.direction === "desc" ? "desc" : "asc";
+function sortComparatorForPlan(sortSpec){
+  const sortDirection = sortSpec?.direction === "desc" ? "desc" : "asc";
   const dir = sortDirection === "desc" ? -1 : 1;
-  const type = sortSpec.type;
-  return sortable.sort((a,b)=>{
+  const type = sortSpec?.type;
+  const collator = type === "number" ? null : new Intl.Collator("ja", {numeric:true, sensitivity:"base"});
+  return (a,b)=>{
     if (type === "number") {
-      const an = Number(a.value), bn = Number(b.value);
+      const an = Number(a?.value), bn = Number(b?.value);
       const av = Number.isFinite(an) ? an : (sortDirection === "desc" ? -Infinity : Infinity);
       const bv = Number.isFinite(bn) ? bn : (sortDirection === "desc" ? -Infinity : Infinity);
-      return (av - bv) * dir || (a.rowId - b.rowId);
+      return (av - bv) * dir || (Number(a?.rowId || 0) - Number(b?.rowId || 0));
     }
-    return String(a.value ?? "").localeCompare(String(b.value ?? ""), "ja", {numeric:true}) * dir || (a.rowId - b.rowId);
-  });
+    return collator.compare(String(a?.value ?? ""), String(b?.value ?? "")) * dir || (Number(a?.rowId || 0) - Number(b?.rowId || 0));
+  };
+}
+
+function sortPlanRows(sortable, sortSpec){
+  if (!Array.isArray(sortable) || !sortSpec) return [];
+  return sortable.sort(sortComparatorForPlan(sortSpec));
+}
+
+function workerYield(){ return new Promise(resolve => setTimeout(resolve, 0)); }
+
+function heapPush(heap, item, cmp){
+  heap.push(item);
+  let i=heap.length-1;
+  while(i>0){
+    const p=(i-1)>>1;
+    if (cmp(heap[i].item, heap[p].item) >= 0) break;
+    [heap[i], heap[p]] = [heap[p], heap[i]];
+    i=p;
+  }
+}
+
+function heapPop(heap, cmp){
+  if (!heap.length) return null;
+  const top=heap[0];
+  const last=heap.pop();
+  if (heap.length && last){
+    heap[0]=last;
+    let i=0;
+    for(;;){
+      const l=i*2+1, r=l+1;
+      let s=i;
+      if (l<heap.length && cmp(heap[l].item, heap[s].item) < 0) s=l;
+      if (r<heap.length && cmp(heap[r].item, heap[s].item) < 0) s=r;
+      if (s===i) break;
+      [heap[i], heap[s]] = [heap[s], heap[i]];
+      i=s;
+    }
+  }
+  return top;
+}
+
+async function sortPlanRowsToRowIds(sortable, sortSpec, limit=Number.POSITIVE_INFINITY, options={}){
+  if (!Array.isArray(sortable) || !sortSpec) return [];
+  const total=sortable.length;
+  const cmp=sortComparatorForPlan(sortSpec);
+  const requested=Number.isFinite(limit) ? Math.max(0, Number(limit)) : Number.POSITIVE_INFINITY;
+  const takeAll=!Number.isFinite(requested);
+  if (!total || requested === 0) return [];
+
+  const label = options.label || "Global data query";
+  const base = Number(options.progressBase ?? 88);
+  const span = Number(options.progressSpan ?? 10);
+  const chunkSize = Math.max(25000, Math.min(200000, Number(options.chunkSize || 100000)));
+  const runCount = Math.ceil(total / chunkSize);
+
+  postProgress(base, `${label}: sorting ${fmt(total)} rows...`);
+
+  if (runCount <= 1){
+    sortable.sort(cmp);
+    postProgress(Math.min(99, base + span), `${label}: sorting complete / building row index...`);
+    return (takeAll ? sortable : sortable.slice(0, requested)).map(x => x.rowId);
+  }
+
+  const runs=[];
+  for(let start=0; start<total; start+=chunkSize){
+    if (state.cancelled) throw new Error("Cancelled");
+    const end=Math.min(total,start+chunkSize);
+    const run=sortable.slice(start,end);
+    run.sort(cmp);
+    runs.push(run);
+    const pct = runs.length / runCount;
+    postProgress(base + Math.floor(span * 0.55 * pct), `${label}: sorted runs ${fmt(runs.length)}/${fmt(runCount)} / rows ${fmt(end)}/${fmt(total)}`);
+    await workerYield();
+  }
+
+  const heap=[];
+  for(let i=0;i<runs.length;i++){
+    if (runs[i].length) heapPush(heap,{runIndex:i,itemIndex:0,item:runs[i][0]},cmp);
+  }
+  const out=[];
+  const target = takeAll ? total : Math.min(total, requested);
+  let merged=0;
+  while(heap.length && out.length < target){
+    if (state.cancelled) throw new Error("Cancelled");
+    const top=heapPop(heap,cmp);
+    out.push(top.item.rowId);
+    merged++;
+    const nextIndex=top.itemIndex+1;
+    const run=runs[top.runIndex];
+    if (nextIndex < run.length) heapPush(heap,{runIndex:top.runIndex,itemIndex:nextIndex,item:run[nextIndex]},cmp);
+    if (merged % 100000 === 0){
+      const pct = merged / Math.max(1,target);
+      postProgress(base + Math.floor(span * (0.55 + 0.45 * pct)), `${label}: merging sorted runs ${fmt(merged)}/${fmt(target)} rows`);
+      await workerYield();
+    }
+  }
+  postProgress(Math.min(99, base + span), `${label}: row index ready ${fmt(out.length)} rows`);
+  return out;
 }
 
 
@@ -3001,12 +3098,17 @@ async function runDataQuery({filters, sort, maxRows, projection}){
 
   let capped = exec.capped;
   if (hasSort) {
-    const sorted = sortPlanRows(exec.sortable, plan.sort);
-    capped = Number.isFinite(requestedLimit) && sorted.length > requestedLimit;
-    state.dataQueryMatches = Number.isFinite(requestedLimit) ? sorted.slice(0, requestedLimit).map(x=>x.rowId) : sorted.map(x=>x.rowId);
+    capped = Number.isFinite(requestedLimit) && exec.sortable.length > requestedLimit;
+    state.dataQueryMatches = await sortPlanRowsToRowIds(exec.sortable, plan.sort, requestedLimit, {
+      label:"Global data query",
+      progressBase:88,
+      progressSpan:10,
+      chunkSize:100000
+    });
   } else {
     state.dataQueryMatches = exec.refs;
   }
+  postProgress(99, `Global data query row index ready: ${fmt(state.dataQueryMatches.length)} rows`);
 
   state.dataQueryMeta = {
     filters:normalizedFilters,
@@ -4005,7 +4107,7 @@ self.onmessage=async(e)=>{
       post("PROGRESS",{value:0,text:"Building global filter/sort row index..."});
       const result=await runDataQuery(msg);
       post("DATA_QUERY_DONE",{...result,origin:msg.origin || ""});
-      post("PROGRESS",{value:100,text:result.active ? "Global data query complete" : "Global data query cleared"});
+      post("PROGRESS",{value:100,text:result.active ? `Global data query complete: ${fmt(result.matches || 0)} rows` : "Global data query cleared"});
       return;
     }
 
@@ -4110,8 +4212,14 @@ self.onmessage=async(e)=>{
     }
 
   }catch(err){
-    post("ERROR",{message:err?.message || String(err)});
-    postProgress(0,"Error");
+    post("ERROR",{
+      message:err?.message || String(err),
+      stack:err?.stack || "",
+      requestType:msg?.type || "",
+      origin:msg?.origin || "",
+      plan:msg?.plan || null
+    });
+    postProgress(0,`Error: ${err?.message || String(err)}`);
   }
 };
   
@@ -6015,7 +6123,8 @@ async function applyGraphDerivedColumnsToTableAsync(table, derivedColumns=[], op
   const rows = [];
   const sourceRows = table.rows || [];
   const evaluators = normalized.map((d) => (rowMap) => evaluateGraphDerivedColumn(d, rowMap));
-  const chunkSize = Math.max(50, Number(options.chunkSize || 200));
+  const chunkSize = Math.max(25, Number(options.chunkSize || 120));
+  const onProgress = typeof options.onProgress === "function" ? options.onProgress : null;
   for (let start=0; start<sourceRows.length; start += chunkSize) {
     const end = Math.min(sourceRows.length, start + chunkSize);
     for (let r=start; r<end; r++) {
@@ -6025,6 +6134,7 @@ async function applyGraphDerivedColumnsToTableAsync(table, derivedColumns=[], op
       const extra = evaluators.map((fn) => fn(rowMap));
       rows.push([...row, ...extra]);
     }
+    if (onProgress) onProgress(end, sourceRows.length);
     if (end < sourceRows.length) await graphYieldFrame();
   }
   return { ...table, header, rows };
@@ -7083,6 +7193,43 @@ function App() {
     setLogs((prev) => [...prev.slice(-500), line]);
   }
 
+
+  async function setGraphResultTableWithDerived(table, derivedColumns=[]) {
+    const seq = ++graphDerivedApplySeqRef.current;
+    const normalized = normalizeGraphDerivedColumns(derivedColumns);
+    if (!table || !Array.isArray(table.header)) {
+      setGraphResultTable(table || null);
+      return;
+    }
+    if (!normalized.length) {
+      setGraphResultTable(table);
+      return;
+    }
+    const sourceRows = Array.isArray(table.rows) ? table.rows.length : 0;
+    const headerPreview = [...table.header, ...normalized.map((d) => d.newColumnName)];
+    setGraphResultTable({ ...table, header: headerPreview, rows: [] });
+    setGraphResultStatus(`計算列を適用中... 0/${fmt(sourceRows)} rows / ${fmt(normalized.length)}列`);
+    try {
+      const applied = await applyGraphDerivedColumnsToTableAsync(table, normalized, {
+        chunkSize: 80,
+        onProgress: (done, total) => {
+          if (seq !== graphDerivedApplySeqRef.current) return;
+          if (done === total || done % 240 === 0) {
+            setGraphResultStatus(`計算列を適用中... ${fmt(done)}/${fmt(total)} rows / ${fmt(normalized.length)}列`);
+          }
+        }
+      });
+      if (seq !== graphDerivedApplySeqRef.current) return;
+      setGraphResultTable(applied);
+      setGraphResultStatus(`計算列を適用しました: ${fmt(sourceRows)} rows / ${fmt(normalized.length)}列`);
+    } catch (e) {
+      if (seq !== graphDerivedApplySeqRef.current) return;
+      appendLog(`Graph derived column error: ${e?.message || e}`);
+      setGraphResultStatus(`計算列エラー: ${e?.message || e}`);
+      setGraphResultTable(table);
+    }
+  }
+
   function acceptedCsvFiles(fileList) {
     return Array.from(fileList || []).filter((file) => {
       const name = String(file.name || "").toLowerCase();
@@ -7229,9 +7376,18 @@ function App() {
 
       if (msg.type === "ERROR") {
         setBusy(false); setBusyLabel("");
-        appendLog(`ERROR: ${msg.message}`);
+        const detail = [
+          `ERROR: ${msg.message}`,
+          msg.requestType ? `request=${msg.requestType}` : "",
+          msg.origin ? `origin=${msg.origin}` : "",
+          msg.stack ? String(msg.stack).split("\n").slice(0,6).join("\n") : ""
+        ].filter(Boolean).join("\n");
+        appendLog(detail);
         setProgressText(msg.message || "Error");
         setStatus(msg.message || "Error");
+        if (msg.origin === "graph" || graphExecutionRef.current?.active) {
+          setGraphResultStatus(`Graph Query エラー: ${msg.message || "Error"}`);
+        }
         return;
       }
 
@@ -7771,6 +7927,7 @@ function App() {
 
   function clearGraphQueryResult(message="Graph Query結果をクリアしました。") {
     graphExecutionRef.current = { active:false, mode:"data", readMode:"dataQuery", derivedColumns:[] };
+    graphDerivedApplySeqRef.current++;
     setGraphResultTable(null);
     setGraphResultCount(0);
     setGraphResultPage(1);
@@ -7781,6 +7938,8 @@ function App() {
   function runGraphQueryPlan(plan) {
     if (!manifest && !(plan?.mode === "join")) return;
     const derivedColumns = normalizeGraphDerivedColumns(plan?.derivedColumns || []);
+    graphDerivedApplySeqRef.current++;
+    appendLog(`Graph Query run: ${JSON.stringify({ mode: plan?.mode || "single", filters: plan?.filters?.length || 0, sort: plan?.sort || null, projection: plan?.projection?.length || 0, derivedColumns: derivedColumns.map(d => d.newColumnName), maxRows: plan?.maxRows || 0 })}`);
     graphExecutionRef.current = { active:true, mode:plan?.mode === "join" ? "join" : "data", readMode:"dataQuery", derivedColumns };
     if (plan?.mode === "join") {
       setGraphResultMode("join");
