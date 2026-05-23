@@ -807,16 +807,26 @@ function canSkipChunkForTime(chunkIndex, timeField){
 const QUERY_PLAN_VERSION = 1;
 
 function normalizeQueryOp(op, type){
-  const raw=String(op || "contains").toLowerCase().trim();
+  const raw=String(op || "contains").toLowerCase().trim().replace(/[\s_-]+/g," ");
   const aliases={
-    "=":"eq", "==":"eq", "===":"eq",
-    "!=" :"ne", "!==":"ne", "<>":"ne",
-    ">":"gt", ">=":"ge", "<":"lt", "<=":"le",
+    "=":"eq", "==":"eq", "===":"eq", "eq":"eq", "equal":"eq", "equals":"eq", "is":"eq",
+    "!=" :"ne", "!==":"ne", "<>":"ne", "ne":"ne", "not equal":"ne", "not equals":"ne", "is not":"ne",
+    ">":"gt", "gt":"gt", "greater than":"gt",
+    ">=":"ge", "ge":"ge", "greater or equal":"ge", "greater than or equal":"ge",
+    "<":"lt", "lt":"lt", "less than":"lt",
+    "<=":"le", "le":"le", "less or equal":"le", "less than or equal":"le",
+    "like":"contains", "contains":"contains", "contain":"contains", "includes":"contains",
+    "not like":"notcontains", "not contains":"notcontains", "not contain":"notcontains", "does not contain":"notcontains", "excludes":"notcontains",
+    "starts with":"startswith", "start with":"startswith", "begins with":"startswith", "prefix":"startswith",
+    "ends with":"endswith", "end with":"endswith", "suffix":"endswith",
+    "regex":"regex", "regexp":"regex", "rlike":"regex", "matches":"regex",
     "is null":"isnull", "null":"isnull",
-    "is not null":"notnull", "not null":"notnull"
+    "is not null":"notnull", "not null":"notnull",
+    "is empty":"isempty", "empty":"isempty", "blank":"isempty",
+    "is not empty":"notempty", "not empty":"notempty", "not blank":"notempty"
   };
-  const x=aliases[raw] || raw;
-  if (["eq","ne","gt","ge","lt","le","contains","isnull","notnull"].includes(x)) return x;
+  const x=aliases[raw] || raw.replace(/\s+/g,"");
+  if (["eq","ne","gt","ge","lt","le","contains","notcontains","startswith","endswith","regex","isnull","notnull","isempty","notempty"].includes(x)) return x;
   return type === "number" ? "eq" : "contains";
 }
 
@@ -2884,17 +2894,32 @@ async function readRowsByGlobal(rowIds, cols){
 }
 
 function compareValue(v, op, target, type){
+  const o=normalizeQueryOp(op, type);
   const isNull = v === "" || v == null || (typeof v === "number" && Number.isNaN(v));
-  if (op === "isnull") return isNull;
-  if (op === "notnull") return !isNull;
-  if (type === "number"){
+  if (o === "isnull") return isNull;
+  if (o === "notnull") return !isNull;
+  if (o === "isempty") return isNull || String(v ?? "").trim() === "";
+  if (o === "notempty") return !isNull && String(v ?? "").trim() !== "";
+  if (type === "number" && ["eq","ne","gt","ge","lt","le"].includes(o)){
     const n=Number(v), t=Number(target);
     if (!Number.isFinite(n) || !Number.isFinite(t)) return false;
-    if (op==="eq") return n===t; if (op==="ne") return n!==t; if (op==="gt") return n>t; if (op==="ge") return n>=t; if (op==="lt") return n<t; if (op==="le") return n<=t;
-    return String(n).includes(String(target));
+    if (o==="eq") return n===t; if (o==="ne") return n!==t; if (o==="gt") return n>t; if (o==="ge") return n>=t; if (o==="lt") return n<t; if (o==="le") return n<=t;
   }
-  const s=String(v ?? "").toLowerCase(), q=String(target ?? "").toLowerCase();
-  if (op==="contains") return s.includes(q); if (op==="eq") return s===q; if (op==="ne") return s!==q;
+  const raw=String(v ?? ""), rawTarget=String(target ?? "");
+  const s=raw.toLowerCase(), q=rawTarget.toLowerCase();
+  if (o==="contains") return s.includes(q);
+  if (o==="notcontains") return !s.includes(q);
+  if (o==="startswith") return s.startsWith(q);
+  if (o==="endswith") return s.endsWith(q);
+  if (o==="regex") {
+    try { return new RegExp(rawTarget, "i").test(raw); } catch { return false; }
+  }
+  if (o==="eq") return s===q;
+  if (o==="ne") return s!==q;
+  if (o==="gt") return raw.localeCompare(rawTarget, undefined, {numeric:true, sensitivity:"base"}) > 0;
+  if (o==="ge") return raw.localeCompare(rawTarget, undefined, {numeric:true, sensitivity:"base"}) >= 0;
+  if (o==="lt") return raw.localeCompare(rawTarget, undefined, {numeric:true, sensitivity:"base"}) < 0;
+  if (o==="le") return raw.localeCompare(rawTarget, undefined, {numeric:true, sensitivity:"base"}) <= 0;
   return false;
 }
 
@@ -5377,11 +5402,92 @@ function columnByIndex(columns, index){
 }
 
 function columnBySqlName(columns, raw){
-  const name = String(raw || "").trim().replace(/^"|"$/g, "").replace(/^`|`$/g, "");
+  const name = String(raw || "").trim().replace(/^"|"$/g, "").replace(/^`|`$/g, "").replace(/\s*\/\*.*?\*\//g, "").trim();
   return (columns || []).find((c) => String(c.name).toLowerCase() === name.toLowerCase() || String(c.index) === name) || null;
 }
 
+const GRAPH_SQL_COMMANDS = {
+  WITH: "サブクエリ定義",
+  SELECT: "列選択",
+  FROM: "入力元",
+  WHERE: "条件抽出",
+  JOIN: "テーブル結合",
+  ON: "結合条件",
+  ORDER_BY: "並び替え",
+  LIMIT: "件数制限",
+};
 
+function sqlCommandComment(command){
+  const key = String(command || "").toUpperCase().replace(/\s+/g, "_");
+  const jp = GRAPH_SQL_COMMANDS[key] || "SQLコマンド";
+  return `-- ${String(command).toUpperCase()}（${jp}）`;
+}
+
+const GRAPH_OPERATOR_DEFS = [
+  { op:"eq", code:"EQ", symbol:"=", jp:"等しい", category:"比較", types:["number","string"] },
+  { op:"ne", code:"NE", symbol:"!= / <>", jp:"等しくない", category:"比較", types:["number","string"] },
+  { op:"lt", code:"LT", symbol:"<", jp:"より小さい", category:"数値/辞書順", types:["number","string"] },
+  { op:"gt", code:"GT", symbol:">", jp:"より大きい", category:"数値/辞書順", types:["number","string"] },
+  { op:"le", code:"LE", symbol:"<=", jp:"以下", category:"数値/辞書順", types:["number","string"] },
+  { op:"ge", code:"GE", symbol:">=", jp:"以上", category:"数値/辞書順", types:["number","string"] },
+  { op:"contains", code:"CONTAINS", symbol:"LIKE %x%", jp:"含む", category:"文字列", types:["string"] },
+  { op:"notcontains", code:"NOT CONTAINS", symbol:"NOT LIKE %x%", jp:"含まない", category:"文字列", types:["string"] },
+  { op:"startswith", code:"STARTS WITH", symbol:"LIKE x%", jp:"前方一致", category:"文字列", types:["string"] },
+  { op:"endswith", code:"ENDS WITH", symbol:"LIKE %x", jp:"後方一致", category:"文字列", types:["string"] },
+  { op:"regex", code:"REGEX", symbol:"REGEXP", jp:"正規表現に一致", category:"文字列", types:["string"] },
+  { op:"isnull", code:"IS NULL", symbol:"IS NULL", jp:"NULL", category:"NULL/空", types:["number","string"] },
+  { op:"notnull", code:"IS NOT NULL", symbol:"IS NOT NULL", jp:"NULLではない", category:"NULL/空", types:["number","string"] },
+  { op:"isempty", code:"IS EMPTY", symbol:"= ''", jp:"空文字またはNULL", category:"NULL/空", types:["string"] },
+  { op:"notempty", code:"IS NOT EMPTY", symbol:"<> ''", jp:"空ではない", category:"NULL/空", types:["string"] },
+];
+
+function graphOperatorDef(op){
+  return GRAPH_OPERATOR_DEFS.find((d) => d.op === String(op || "").toLowerCase()) || GRAPH_OPERATOR_DEFS.find((d) => d.op === "contains");
+}
+
+function graphOperatorLabel(op){
+  const d = graphOperatorDef(op);
+  return `${d.code}（${d.jp}） ${d.symbol}`;
+}
+
+function graphOperatorShortLabel(op){
+  const d = graphOperatorDef(op);
+  return `${d.code}（${d.jp}）`;
+}
+
+function graphOperatorNeedsValue(op){
+  return !["isnull","notnull","isempty","notempty"].includes(String(op || "").toLowerCase());
+}
+
+function graphOperatorOptionsForColumn(col){
+  const type = col?.type === "number" ? "number" : "string";
+  return GRAPH_OPERATOR_DEFS.filter((d) => d.types.includes(type));
+}
+
+function normalizeGraphOperatorForColumn(op, col){
+  const opts = graphOperatorOptionsForColumn(col);
+  return opts.some((d) => d.op === op) ? op : (col?.type === "number" ? "eq" : "contains");
+}
+
+function stripSqlComments(sql){
+  return String(sql || "")
+    .replace(/\/\*[\s\S]*?\*\//g, " ")
+    .split(/\r?\n/)
+    .map((line) => line.replace(/--.*$/g, ""))
+    .join("\n");
+}
+
+function normalizeSqlLikeOperator(pattern, negated=false){
+  const raw = parseSqlValue(pattern);
+  const starts = raw.startsWith("%");
+  const ends = raw.endsWith("%");
+  const value = raw.replace(/^%/, "").replace(/%$/, "");
+  if (negated) return { op:"notcontains", value };
+  if (starts && ends) return { op:"contains", value };
+  if (!starts && ends) return { op:"startswith", value };
+  if (starts && !ends) return { op:"endswith", value };
+  return { op:"contains", value };
+}
 
 function normalizeGraphAlias(value, fallback="t"){
   const s = String(value || "").normalize("NFKC").trim().replace(/[^A-Za-z0-9_\u3040-\u30ff\u3400-\u9fff-]+/g, "_");
@@ -5439,7 +5545,7 @@ function normalizeGraphNodeLabel(node, columns, datasets=[]) {
   if (data.kind === "source") return `Source: ${data.alias || (node.id === "source" ? "t1" : node.id)}`;
   if (data.kind === "join") return `Join: ${data.joinType || "inner"}`;
   if (data.kind === "select") return `Select: ${(data.selectedFields || data.selectedColumns || []).length || "all"} cols`;
-  if (data.kind === "filter") return `Filter: ${col?.name || "column"} ${data.op || "contains"}`;
+  if (data.kind === "filter") return `Filter: ${col?.name || "column"} ${graphOperatorShortLabel(data.op || "contains")}`;
   if (data.kind === "sort") return `Sort: ${col?.name || "column"} ${(data.direction || "asc").toUpperCase()}`;
   if (data.kind === "limit") return `Limit: ${Number(data.maxRows || 0) || "all"}`;
   if (data.kind === "aggregate") return `Aggregate: ${data.aggregation || "Count"}`;
@@ -5495,16 +5601,23 @@ function makeGraphNode(id, kind, position, columns, extra={}) {
 
 function opToSql(op, value, colType="string") {
   const o = String(op || "contains").toLowerCase();
-  if (o === "contains") return `LIKE ${sqlLiteral(`%${value || ""}%`)}`;
-  if (o === "eq") return `= ${colType === "number" && Number.isFinite(Number(value)) ? Number(value) : sqlLiteral(value)}`;
-  if (o === "ne") return `<> ${colType === "number" && Number.isFinite(Number(value)) ? Number(value) : sqlLiteral(value)}`;
-  if (o === "gt") return `> ${Number.isFinite(Number(value)) ? Number(value) : sqlLiteral(value)}`;
-  if (o === "ge") return `>= ${Number.isFinite(Number(value)) ? Number(value) : sqlLiteral(value)}`;
-  if (o === "lt") return `< ${Number.isFinite(Number(value)) ? Number(value) : sqlLiteral(value)}`;
-  if (o === "le") return `<= ${Number.isFinite(Number(value)) ? Number(value) : sqlLiteral(value)}`;
-  if (o === "isnull") return "IS NULL";
-  if (o === "notnull") return "IS NOT NULL";
-  return `LIKE ${sqlLiteral(`%${value || ""}%`)}`;
+  const typedValue = colType === "number" && Number.isFinite(Number(value)) ? Number(value) : sqlLiteral(value);
+  if (o === "contains") return `LIKE ${sqlLiteral(`%${value || ""}%`)} /* CONTAINS（含む） */`;
+  if (o === "notcontains") return `NOT LIKE ${sqlLiteral(`%${value || ""}%`)} /* NOT CONTAINS（含まない） */`;
+  if (o === "startswith") return `LIKE ${sqlLiteral(`${value || ""}%`)} /* STARTS WITH（前方一致） */`;
+  if (o === "endswith") return `LIKE ${sqlLiteral(`%${value || ""}`)} /* ENDS WITH（後方一致） */`;
+  if (o === "regex") return `REGEXP ${sqlLiteral(value)} /* REGEX（正規表現） */`;
+  if (o === "eq") return `= ${typedValue} /* EQ（等しい） */`;
+  if (o === "ne") return `<> ${typedValue} /* NE（等しくない） */`;
+  if (o === "gt") return `> ${typedValue} /* GT（より大きい） */`;
+  if (o === "ge") return `>= ${typedValue} /* GE（以上） */`;
+  if (o === "lt") return `< ${typedValue} /* LT（より小さい） */`;
+  if (o === "le") return `<= ${typedValue} /* LE（以下） */`;
+  if (o === "isnull") return "IS NULL /* NULL */";
+  if (o === "notnull") return "IS NOT NULL /* NULLではない */";
+  if (o === "isempty") return "IS EMPTY /* 空文字またはNULL */";
+  if (o === "notempty") return "IS NOT EMPTY /* 空ではない */";
+  return `LIKE ${sqlLiteral(`%${value || ""}%`)} /* CONTAINS（含む） */`;
 }
 
 function filterToSql(filter, columns) {
@@ -5526,9 +5639,13 @@ function graphToSqlPreview(plan, columns, datasets=[]) {
   const subqueries = plan.subqueries || [];
   const lines = [];
   if (subqueries.length) {
+    lines.push(sqlCommandComment("WITH"));
     lines.push("WITH " + subqueries.map((s) => {
-      const body = [`SELECT *`, `FROM ${GRAPH_SQL_DATASET_NAME}`];
-      if (s.filters?.length) body.push(`WHERE ${s.filters.map((f) => filterToSql(f, columns)).join(" AND ")}`);
+      const body = [`${sqlCommandComment("SELECT")}
+SELECT *`, `${sqlCommandComment("FROM")}
+FROM ${GRAPH_SQL_DATASET_NAME}`];
+      if (s.filters?.length) body.push(`${sqlCommandComment("WHERE")}
+WHERE ${s.filters.map((f) => filterToSql(f, columns)).join(" AND ")}`);
       return `${sqlIdentifier(s.alias)} AS (\n  ${body.join("\n  ")}\n)`;
     }).join(",\n"));
   }
@@ -5541,11 +5658,15 @@ function graphToSqlPreview(plan, columns, datasets=[]) {
     const right = (plan.sources || []).find((s) => s.id === join.rightSourceId) || plan.sources[1];
     const leftCol = columnByIndex(graphDatasetColumns({datasetId:left.datasetId}, columns, datasets), join.leftColumnIndex);
     const rightCol = columnByIndex(graphDatasetColumns({datasetId:right.datasetId}, columns, datasets), join.rightColumnIndex);
+    lines.push(sqlCommandComment("SELECT"));
     lines.push(`SELECT ${selectList}`);
+    lines.push(sqlCommandComment("FROM"));
     lines.push(`FROM ${sqlIdentifier(left.alias)} /* ${graphDatasetLabel(left.datasetId, datasets)} */`);
+    lines.push(sqlCommandComment("JOIN"));
     lines.push(`${String(join.joinType || "inner").toUpperCase()} JOIN ${sqlIdentifier(right.alias)} /* ${graphDatasetLabel(right.datasetId, datasets)} */`);
+    lines.push(sqlCommandComment("ON"));
     lines.push(`  ON ${sqlIdentifier(left.alias)}.${sqlIdentifier(leftCol?.name || "key")} = ${sqlIdentifier(right.alias)}.${sqlIdentifier(rightCol?.name || "key")}`);
-    if (Number(plan.maxRows || 0) > 0) lines.push(`LIMIT ${Number(plan.maxRows || 0)}`);
+    if (Number(plan.maxRows || 0) > 0) { lines.push(sqlCommandComment("LIMIT")); lines.push(`LIMIT ${Number(plan.maxRows || 0)}`); }
     return `${lines.join("\n")};`;
   }
 
@@ -5556,11 +5677,13 @@ function graphToSqlPreview(plan, columns, datasets=[]) {
   const fromName = plan.sourceAlias || GRAPH_SQL_DATASET_NAME;
   const whereSql = (plan.filters || []).map((f) => filterToSql(f, columns));
   const sortCol = plan.sort ? columnByIndex(columns, plan.sort.columnIndex) : null;
+  lines.push(sqlCommandComment("SELECT"));
   lines.push(`SELECT ${selectList}`);
+  lines.push(sqlCommandComment("FROM"));
   lines.push(`FROM ${sqlIdentifier(fromName)}`);
-  if (whereSql.length) lines.push(`WHERE ${whereSql.join(" AND ")}`);
-  if (sortCol) lines.push(`ORDER BY ${sqlIdentifier(sortCol.name)} ${(plan.sort.direction || "asc").toUpperCase()}`);
-  if (Number(plan.maxRows || 0) > 0) lines.push(`LIMIT ${Number(plan.maxRows || 0)}`);
+  if (whereSql.length) { lines.push(sqlCommandComment("WHERE")); lines.push(`WHERE ${whereSql.join(" AND ")}`); }
+  if (sortCol) { lines.push(sqlCommandComment("ORDER BY")); lines.push(`ORDER BY ${sqlIdentifier(sortCol.name)} ${(plan.sort.direction || "asc").toUpperCase()}`); }
+  if (Number(plan.maxRows || 0) > 0) { lines.push(sqlCommandComment("LIMIT")); lines.push(`LIMIT ${Number(plan.maxRows || 0)}`); }
   return `${lines.join("\n")};`;
 }
 
@@ -5624,7 +5747,7 @@ function parseSqlToGraphPlan(sql, columns) {
   const original = String(sql || "").trim();
   const errors = [];
   if (!original) return { filters: [], sort: null, maxRows: 0, projection: [], errors: ["SQLが空です。"] };
-  let body = original.replace(/;\s*$/g, "");
+  let body = stripSqlComments(original).replace(/;\s*$/g, "").trim();
   const selectMatches = [...body.matchAll(/\bSELECT\b/ig)];
   if (selectMatches.length > 1) body = body.slice(selectMatches[selectMatches.length - 1].index);
   const m = body.match(/select\s+([\s\S]+?)\s+from\s+([\s\S]+?)(?:\s+where\s+([\s\S]+?))?(?:\s+order\s+by\s+([\s\S]+?))?(?:\s+limit\s+(\d+))?\s*$/i);
@@ -5646,13 +5769,28 @@ function parseSqlToGraphPlan(sql, columns) {
       if (fm) { const c=columnBySqlName(columns,fm[1]); if(c) filters.push({id:`sql-${filters.length}`,columnIndex:Number(c.index),op:"notnull",value:""}); else errors.push(`WHERE列を解決できません: ${fm[1]}`); continue; }
       fm = part.match(/^(.+?)\s+IS\s+NULL$/i);
       if (fm) { const c=columnBySqlName(columns,fm[1]); if(c) filters.push({id:`sql-${filters.length}`,columnIndex:Number(c.index),op:"isnull",value:""}); else errors.push(`WHERE列を解決できません: ${fm[1]}`); continue; }
+      fm = part.match(/^(.+?)\s+IS\s+NOT\s+EMPTY$/i);
+      if (fm) { const c=columnBySqlName(columns,fm[1]); if(c) filters.push({id:`sql-${filters.length}`,columnIndex:Number(c.index),op:"notempty",value:""}); else errors.push(`WHERE列を解決できません: ${fm[1]}`); continue; }
+      fm = part.match(/^(.+?)\s+IS\s+EMPTY$/i);
+      if (fm) { const c=columnBySqlName(columns,fm[1]); if(c) filters.push({id:`sql-${filters.length}`,columnIndex:Number(c.index),op:"isempty",value:""}); else errors.push(`WHERE列を解決できません: ${fm[1]}`); continue; }
+      fm = part.match(/^(.+?)\s+NOT\s+LIKE\s+(.+)$/i);
+      if (fm) { const c=columnBySqlName(columns,fm[1]); const like=normalizeSqlLikeOperator(fm[2], true); if(c) filters.push({id:`sql-${filters.length}`,columnIndex:Number(c.index),op:like.op,value:like.value}); else errors.push(`WHERE列を解決できません: ${fm[1]}`); continue; }
       fm = part.match(/^(.+?)\s+LIKE\s+(.+)$/i);
-      if (fm) { const c=columnBySqlName(columns,fm[1]); const v=parseSqlValue(fm[2]).replace(/^%|%$/g, ""); if(c) filters.push({id:`sql-${filters.length}`,columnIndex:Number(c.index),op:"contains",value:v}); else errors.push(`WHERE列を解決できません: ${fm[1]}`); continue; }
-      fm = part.match(/^(.+?)\s*(>=|<=|<>|!=|=|>|<)\s*(.+)$/i);
+      if (fm) { const c=columnBySqlName(columns,fm[1]); const like=normalizeSqlLikeOperator(fm[2], false); if(c) filters.push({id:`sql-${filters.length}`,columnIndex:Number(c.index),op:like.op,value:like.value}); else errors.push(`WHERE列を解決できません: ${fm[1]}`); continue; }
+      fm = part.match(/^(.+?)\s+(REGEXP|RLIKE)\s+(.+)$/i);
+      if (fm) { const c=columnBySqlName(columns,fm[1]); if(c) filters.push({id:`sql-${filters.length}`,columnIndex:Number(c.index),op:"regex",value:parseSqlValue(fm[3])}); else errors.push(`WHERE列を解決できません: ${fm[1]}`); continue; }
+      fm = part.match(/^(.+?)\s+STARTS\s+WITH\s+(.+)$/i);
+      if (fm) { const c=columnBySqlName(columns,fm[1]); if(c) filters.push({id:`sql-${filters.length}`,columnIndex:Number(c.index),op:"startswith",value:parseSqlValue(fm[2])}); else errors.push(`WHERE列を解決できません: ${fm[1]}`); continue; }
+      fm = part.match(/^(.+?)\s+ENDS\s+WITH\s+(.+)$/i);
+      if (fm) { const c=columnBySqlName(columns,fm[1]); if(c) filters.push({id:`sql-${filters.length}`,columnIndex:Number(c.index),op:"endswith",value:parseSqlValue(fm[2])}); else errors.push(`WHERE列を解決できません: ${fm[1]}`); continue; }
+      fm = part.match(/^(.+?)\s+CONTAINS\s+(.+)$/i);
+      if (fm) { const c=columnBySqlName(columns,fm[1]); if(c) filters.push({id:`sql-${filters.length}`,columnIndex:Number(c.index),op:"contains",value:parseSqlValue(fm[2])}); else errors.push(`WHERE列を解決できません: ${fm[1]}`); continue; }
+      fm = part.match(/^(.+?)\s*(>=|<=|<>|!=|=|>|<|\bEQ\b|\bNE\b|\bLT\b|\bGT\b|\bLE\b|\bGE\b)\s*(.+)$/i);
       if (fm) {
         const c=columnBySqlName(columns,fm[1]);
-        const opMap={">=":"ge","<=":"le","<>":"ne","!=":"ne","=":"eq",">":"gt","<":"lt"};
-        if(c) filters.push({id:`sql-${filters.length}`,columnIndex:Number(c.index),op:opMap[fm[2]] || "eq",value:parseSqlValue(fm[3])}); else errors.push(`WHERE列を解決できません: ${fm[1]}`);
+        const opToken=String(fm[2] || "").toUpperCase();
+        const opMap={">=":"ge","<=":"le","<>":"ne","!=":"ne","=":"eq",">":"gt","<":"lt", "EQ":"eq", "NE":"ne", "LT":"lt", "GT":"gt", "LE":"le", "GE":"ge"};
+        if(c) filters.push({id:`sql-${filters.length}`,columnIndex:Number(c.index),op:opMap[opToken] || opMap[fm[2]] || "eq",value:parseSqlValue(fm[3])}); else errors.push(`WHERE列を解決できません: ${fm[1]}`);
         continue;
       }
       errors.push(`未対応WHERE条件: ${part}`);
@@ -6007,13 +6145,14 @@ function GraphQueryEditor({ columns, datasets=[], manifest=null, nodes, setNodes
               )}
               {selectedNode.data?.kind === "filter" && (
                 <>
-                  <TextField select label="対象カラム" size="small" value={String(selectedNode.data.columnIndex ?? columns[0]?.index ?? 0)} onChange={(e) => updateNodeData(selectedNode.id, { columnIndex: Number(e.target.value) })} fullWidth>
+                  <TextField select label="対象カラム" size="small" value={String(selectedNode.data.columnIndex ?? columns[0]?.index ?? 0)} onChange={(e) => { const nextIndex = Number(e.target.value); const nextCol = columnByIndex(columns, nextIndex); updateNodeData(selectedNode.id, { columnIndex: nextIndex, op: normalizeGraphOperatorForColumn(selectedNode.data.op || "contains", nextCol) }); }} fullWidth>
                     {columns.map((c) => <MenuItem key={c.index} value={String(c.index)}>{c.name} ({c.type})</MenuItem>)}
                   </TextField>
-                  <TextField select label="条件" size="small" value={selectedNode.data.op || "contains"} onChange={(e) => updateNodeData(selectedNode.id, { op: e.target.value })} fullWidth>
-                    {["contains", "eq", "ne", "gt", "ge", "lt", "le", "isnull", "notnull"].map((x) => <MenuItem key={x} value={x}>{x}</MenuItem>)}
+                  <TextField select label="比較演算子 / Operator" size="small" value={selectedNode.data.op || "contains"} onChange={(e) => updateNodeData(selectedNode.id, { op: e.target.value })} fullWidth helperText={graphOperatorDef(selectedNode.data.op || "contains")?.category || "比較"}>
+                    {graphOperatorOptionsForColumn(columnByIndex(columns, selectedNode.data.columnIndex)).map((x) => <MenuItem key={x.op} value={x.op}>{x.code}（{x.jp}） — {x.symbol}</MenuItem>)}
                   </TextField>
-                  <TextField label="値" size="small" value={selectedNode.data.value || ""} onChange={(e) => updateNodeData(selectedNode.id, { value: e.target.value })} fullWidth />
+                  <TextField label="値 / Value" size="small" value={selectedNode.data.value || ""} onChange={(e) => updateNodeData(selectedNode.id, { value: e.target.value })} fullWidth disabled={!graphOperatorNeedsValue(selectedNode.data.op || "contains")} placeholder={graphOperatorNeedsValue(selectedNode.data.op || "contains") ? "比較する値を入力" : "この演算子では値は不要です"} />
+                  <Alert severity="info" sx={{ py: 0.25 }}>比較演算子: EQ（等しい）, NE（等しくない）, LT（より小さい）, GT（より大きい）, LE（以下）, GE（以上）。文字列: CONTAINS（含む）, NOT CONTAINS（含まない）, STARTS WITH（前方一致）, ENDS WITH（後方一致）, REGEX（正規表現）。</Alert>
                 </>
               )}
               {selectedNode.data?.kind === "sort" && (
@@ -6022,7 +6161,7 @@ function GraphQueryEditor({ columns, datasets=[], manifest=null, nodes, setNodes
                     {columns.map((c) => <MenuItem key={c.index} value={String(c.index)}>{c.name} ({c.type})</MenuItem>)}
                   </TextField>
                   <TextField select label="方向" size="small" value={selectedNode.data.direction || "asc"} onChange={(e) => updateNodeData(selectedNode.id, { direction: e.target.value })} fullWidth>
-                    <MenuItem value="asc">ASC</MenuItem><MenuItem value="desc">DESC</MenuItem>
+                    <MenuItem value="asc">ASC（昇順）</MenuItem><MenuItem value="desc">DESC（降順）</MenuItem>
                   </TextField>
                 </>
               )}
@@ -6047,7 +6186,7 @@ function GraphQueryEditor({ columns, datasets=[], manifest=null, nodes, setNodes
         </Stack>
         <TextField multiline minRows={7} fullWidth value={sqlMode ? sqlText : (plan.sql || "")} onChange={(e) => { safeSetSqlMode(true); safeSetSqlText(e.target.value); }} InputProps={{ readOnly: !sqlMode }} sx={{ '& textarea': { fontFamily: 'Roboto Mono, Consolas, monospace', fontSize: 12 } }} />
         {sqlErrors.length > 0 && <Alert severity="warning" sx={{ mt: 0.75 }}>{sqlErrors.join(" / ")}</Alert>}
-        <Typography variant="caption" color="text.secondary">対応SQL: SELECT / FROM / WHERE AND / ORDER BY / LIMIT。WITHはPreview出力対応、手書きSQLでは最終SELECT部分を実行します。JOINはGraph実行で対応済みです。手書きSQLのJOINパースはPreview用途に限定し、実行はJOINノードから行います。</Typography>
+        <Typography variant="caption" color="text.secondary">対応SQL: SELECT（列選択） / FROM（入力元） / WHERE（条件抽出） / ORDER BY（並び替え） / LIMIT（件数制限）。比較: EQ/NE/LT/GT/LE/GE または =, &lt;&gt;, &lt;, &gt;, &lt;=, &gt;=。文字列: LIKE, NOT LIKE, CONTAINS, STARTS WITH, ENDS WITH, REGEXP/RLIKE。WITHはPreview出力対応、JOINはGraph実行で対応済みです。</Typography>
       </Paper>
 
       <Paper elevation={0} sx={{ p: 1, bgcolor: "background.default", borderRadius: 2 }}>
@@ -7676,7 +7815,7 @@ function App() {
                     {columns.map((c) => <MenuItem key={c.index} value={String(c.index)}>{c.name} ({c.type})</MenuItem>)}
                   </TextField>
                   <TextField select label="条件" size="small" value={draftFilterOp} onChange={(e) => setDraftFilterOp(e.target.value)} sx={{ width: 140 }}>
-                    {["contains", "eq", "ne", "gt", "ge", "lt", "le", "isnull", "notnull"].map((x) => <MenuItem key={x} value={x}>{x}</MenuItem>)}
+                    {GRAPH_OPERATOR_DEFS.map((x) => <MenuItem key={x.op} value={x.op}>{x.code}（{x.jp}）</MenuItem>)}
                   </TextField>
                   <TextField label="値" size="small" value={draftFilterValue} onChange={(e) => setDraftFilterValue(e.target.value)} sx={{ width: 220 }} />
                   <Button variant="outlined" onClick={addDataQueryFilter}>Add filter</Button>
@@ -7745,7 +7884,7 @@ function App() {
                   {columns.map((c) => <MenuItem key={c.index} value={String(c.index)}>{c.name} ({c.type})</MenuItem>)}
                 </TextField>
                 <TextField select label="条件" size="small" value={searchOp} onChange={(e) => setSearchOp(e.target.value)} sx={{ width: 140 }}>
-                  {["contains", "eq", "ne", "gt", "ge", "lt", "le", "isnull", "notnull"].map((x) => <MenuItem key={x} value={x}>{x}</MenuItem>)}
+                  {GRAPH_OPERATOR_DEFS.map((x) => <MenuItem key={x.op} value={x.op}>{x.code}（{x.jp}）</MenuItem>)}
                 </TextField>
                 <TextField label="値" size="small" value={searchValue} onChange={(e) => setSearchValue(e.target.value)} sx={{ width: 260 }} />
                 <SmallNumberField label="Max matches" value={maxMatches} onChange={setMaxMatches} min="100" step="1000" />
