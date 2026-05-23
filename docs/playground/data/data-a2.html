@@ -7341,18 +7341,25 @@ function App() {
   async function setGraphResultTableWithDerived(table, derivedColumns=[]) {
     const seq = ++graphDerivedApplySeqRef.current;
     const normalized = normalizeGraphDerivedColumns(derivedColumns);
+    const outputColumnNames = graphExecutionRef.current?.outputColumnNames || null;
+
     if (!table || !Array.isArray(table.header)) {
       setGraphResultTable(table || null);
       return;
     }
+
     if (!normalized.length) {
-      setGraphResultTable(table);
+      setGraphResultTable(projectGraphResultOutputTable(table, outputColumnNames, []));
       return;
     }
+
     const sourceRows = Array.isArray(table.rows) ? table.rows.length : 0;
-    const headerPreview = [...table.header, ...normalized.map((d) => d.newColumnName)];
-    setGraphResultTable({ ...table, header: headerPreview, rows: [] });
+    const previewHeader = outputColumnNames?.length
+      ? [...outputColumnNames, ...normalized.map((d) => d.newColumnName)]
+      : [...table.header, ...normalized.map((d) => d.newColumnName)];
+    setGraphResultTable({ ...table, header: previewHeader, rows: [] });
     setGraphResultStatus(`計算列を適用中... 0/${fmt(sourceRows)} rows / ${fmt(normalized.length)}列`);
+
     try {
       const applied = await applyGraphDerivedColumnsToTableAsync(table, normalized, {
         chunkSize: 80,
@@ -7364,13 +7371,13 @@ function App() {
         }
       });
       if (seq !== graphDerivedApplySeqRef.current) return;
-      setGraphResultTable(applied);
+      setGraphResultTable(projectGraphResultOutputTable(applied, outputColumnNames, normalized));
       setGraphResultStatus(`計算列を適用しました: ${fmt(sourceRows)} rows / ${fmt(normalized.length)}列`);
     } catch (e) {
       if (seq !== graphDerivedApplySeqRef.current) return;
       appendLog(`Graph derived column error: ${e?.message || e}`);
       setGraphResultStatus(`計算列エラー: ${e?.message || e}`);
-      setGraphResultTable(table);
+      setGraphResultTable(projectGraphResultOutputTable(table, outputColumnNames, []));
     }
   }
 
@@ -7500,6 +7507,71 @@ function App() {
     const all = m?.columns || [];
     if (!all.length) return [];
     return visible.length === all.length ? [] : visible.map(Number);
+  }
+
+  function graphDerivedReferencedColumnNames(derivedColumns=[]) {
+    const names = new Set();
+    const list = normalizeGraphDerivedColumns(derivedColumns);
+    for (const item of list) {
+      const expr = String(item.formulaExpression || "");
+      expr.replace(/col\(\s*(["'`])((?:\\.|(?!\1).)*)\1\s*\)/g, (_, quote, raw) => {
+        let name = String(raw || "");
+        try {
+          if (quote === "\"") name = JSON.parse(`"${name}"`);
+          else name = name.replace(/\\([\\'"`nrt])/g, (m, ch) => ch === "n" ? "\n" : ch === "r" ? "\r" : ch === "t" ? "\t" : ch);
+        } catch {}
+        if (name) names.add(name);
+        return _;
+      });
+    }
+    return [...names];
+  }
+
+  function graphColumnIndexByHeaderName(name, m = manifestRef.current) {
+    const all = m?.columns || [];
+    const raw = String(name || "");
+    const unqualified = raw.includes(".") ? raw.split(".").slice(1).join(".") : raw;
+    const found = all.find((c) => String(c.name) === raw) || all.find((c) => String(c.name) === unqualified);
+    return found ? Number(found.index) : null;
+  }
+
+  function graphPlanReadColumnsForPost(plan, derivedColumns=[], m = manifestRef.current) {
+    const all = m?.columns || [];
+    if (!all.length) return [];
+    const projection = Array.isArray(plan?.projection) ? plan.projection.map(Number).filter(Number.isFinite) : [];
+    const base = projection.length ? projection : selectedColumnsForPost(m, visibleColsRef.current);
+    if (!projection.length && base.length === 0) return []; // all columns are already requested
+    const set = new Set(base.map(Number));
+    for (const name of graphDerivedReferencedColumnNames(derivedColumns)) {
+      const idx = graphColumnIndexByHeaderName(name, m);
+      if (idx != null && Number.isFinite(idx)) set.add(Number(idx));
+    }
+    return set.size >= all.length ? [] : [...set].sort((a,b)=>a-b);
+  }
+
+  function graphOutputColumnNamesForPlan(plan, m = manifestRef.current) {
+    const projection = Array.isArray(plan?.projection) ? plan.projection.map(Number).filter(Number.isFinite) : [];
+    if (!projection.length) return null;
+    const all = m?.columns || [];
+    return projection.map((idx) => all.find((c) => Number(c.index) === Number(idx))?.name).filter(Boolean);
+  }
+
+  function projectGraphResultOutputTable(table, outputColumnNames=null, derivedColumns=[]) {
+    if (!table || !Array.isArray(table.header) || !Array.isArray(outputColumnNames) || !outputColumnNames.length) return table;
+    const derivedNames = normalizeGraphDerivedColumns(derivedColumns).map((d) => d.newColumnName).filter(Boolean);
+    const desired = [...outputColumnNames, ...derivedNames];
+    const used = new Set();
+    const indexes = desired.map((name) => {
+      const idx = table.header.findIndex((h, i) => !used.has(i) && String(h) === String(name));
+      if (idx >= 0) used.add(idx);
+      return idx;
+    }).filter((idx) => idx >= 0);
+    if (!indexes.length) return table;
+    return {
+      ...table,
+      header: indexes.map((idx) => table.header[idx]),
+      rows: (table.rows || []).map((row) => indexes.map((idx) => row?.[idx] ?? "")),
+    };
   }
 
   useEffect(() => {
@@ -7779,9 +7851,11 @@ function App() {
           setGraphResultTime(ms(msg.ms));
           graphExecutionRef.current.readMode = msg.active ? "dataQuery" : "page";
           if (!msg.active) {
-            worker.postMessage({ type: "READ_PAGE", origin: "graph", page: 1, pageSize: graphResultPageSizeRef.current, columns: projection || selectedColumnsForPost() });
+            const readColumns = graphExecutionRef.current?.readColumns || [];
+            worker.postMessage({ type: "READ_PAGE", origin: "graph", page: 1, pageSize: graphResultPageSizeRef.current, columns: readColumns });
           } else {
-            worker.postMessage({ type: "READ_DATA_QUERY_PAGE", origin: "graph", page: 1, pageSize: graphResultPageSizeRef.current, columns: Array.isArray(msg.projection) && msg.projection.length ? msg.projection : selectedColumnsForPost() });
+            const readColumns = graphExecutionRef.current?.readColumns || [];
+            worker.postMessage({ type: "READ_DATA_QUERY_PAGE", origin: "graph", page: 1, pageSize: graphResultPageSizeRef.current, columns: readColumns });
           }
           return;
         }
@@ -8082,9 +8156,12 @@ function App() {
   function runGraphQueryPlan(plan) {
     if (!manifest && !(plan?.mode === "join")) return;
     const derivedColumns = normalizeGraphDerivedColumns(plan?.derivedColumns || []);
+    const projection = Array.isArray(plan?.projection) ? plan.projection.map(Number).filter((v) => Number.isFinite(v)) : [];
+    const outputColumnNames = graphOutputColumnNamesForPlan(plan);
+    const readColumns = plan?.mode === "join" ? [] : graphPlanReadColumnsForPost(plan, derivedColumns);
     graphDerivedApplySeqRef.current++;
-    appendLog(`Graph Query run: ${JSON.stringify({ mode: plan?.mode || "single", filters: plan?.filters?.length || 0, sort: plan?.sort || null, projection: plan?.projection?.length || 0, derivedColumns: derivedColumns.map(d => d.newColumnName), maxRows: plan?.maxRows || 0 })}`);
-    graphExecutionRef.current = { active:true, mode:plan?.mode === "join" ? "join" : "data", readMode:"dataQuery", derivedColumns };
+    appendLog(`Graph Query run: ${JSON.stringify({ mode: plan?.mode || "single", filters: plan?.filters?.length || 0, sort: plan?.sort || null, projection: projection.length, readColumns: readColumns.length ? readColumns.length : "all", outputColumns: outputColumnNames?.length || "all", derivedColumns: derivedColumns.map(d => d.newColumnName), refs: graphDerivedReferencedColumnNames(derivedColumns), maxRows: plan?.maxRows || 0 })}`);
+    graphExecutionRef.current = { active:true, mode:plan?.mode === "join" ? "join" : "data", readMode:"dataQuery", derivedColumns, projection, readColumns, outputColumnNames };
     if (plan?.mode === "join") {
       setGraphResultMode("join");
       setGraphResultTable(null);
@@ -8108,7 +8185,6 @@ function App() {
     setDataSortColumn(sort ? String(sort.columnIndex) : "-1");
     setDataSortDirection(sort?.direction === "desc" ? "desc" : "asc");
     setDataQueryMaxRows(String(maxRows || 0));
-    const projection = Array.isArray(plan?.projection) ? plan.projection.map(Number).filter((v) => Number.isFinite(v)) : [];
     if (projection.length) { setVisibleCols(projection); visibleColsRef.current = projection; }
     post({
       type: "RUN_DATA_QUERY",
@@ -8133,9 +8209,9 @@ function App() {
     setGraphResultPage(safe);
     const readMode = graphExecutionRef.current?.readMode || "dataQuery";
     if (readMode === "page") {
-      post({ type: "READ_PAGE", origin: "graph", page: safe, pageSize: requestedPageSize, columns: selectedColumnsForPost() });
+      post({ type: "READ_PAGE", origin: "graph", page: safe, pageSize: requestedPageSize, columns: graphExecutionRef.current?.readColumns || [] });
     } else {
-      post({ type: "READ_DATA_QUERY_PAGE", origin: "graph", page: safe, pageSize: requestedPageSize, columns: selectedColumnsForPost() });
+      post({ type: "READ_DATA_QUERY_PAGE", origin: "graph", page: safe, pageSize: requestedPageSize, columns: graphExecutionRef.current?.readColumns || [] });
     }
   }
 
@@ -8149,7 +8225,7 @@ function App() {
     post({
       type: "EXPORT_GRAPH_QUERY_CSV",
       mode: graphResultMode === "join" ? "join" : "data",
-      columns: selectedColumnsForPost(),
+      columns: ctx.readColumns || selectedColumnsForPost(),
       derivedColumns: ctx.derivedColumns || [],
       maxRows: 0,
       chunkRows: 5000,
