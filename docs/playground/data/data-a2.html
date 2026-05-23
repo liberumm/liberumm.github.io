@@ -6707,6 +6707,387 @@ function GraphQueryVirtualTable({ table, totalRows=0, page=1, pageSize=1000, onR
   );
 }
 
+
+function GraphQueryEditor({ columns, datasets=[], manifest=null, nodes, setNodes, edges, setEdges, onApply, onReadPage=()=>{}, onClearResult=()=>{}, onExportCsv=()=>{}, disabled, dataQueryActive, dataQueryCount, resultTable, resultStatus, resultTime, resultPage, resultPageMax, resultViewMode="tile", setResultViewMode=()=>{}, resultRowsPerTile="1000", setResultRowsPerTile=()=>{}, sqlText="", setSqlText=()=>{}, sqlMode=false, setSqlMode=()=>{} }) {
+  const [selectedId, setSelectedId] = useState(nodes?.[0]?.id || "source");
+  const [sqlErrors, setSqlErrors] = useState([]);
+  const [showMiniMap, setShowMiniMap] = useState(false);
+  const [resultRowsDraft, setResultRowsDraft] = useState(String(resultRowsPerTile || "1000"));
+  const flowPanelRef = useRef(null);
+  const selectedNode = useMemo(() => nodes.find((n) => n.id === selectedId) || null, [nodes, selectedId]);
+  const plan = useMemo(() => compileGraphQuery(nodes, edges, columns, datasets), [nodes, edges, columns, datasets]);
+  const graphReady = !!ReactFlowCanvas;
+  const safeSetSqlText = typeof setSqlText === "function" ? setSqlText : () => {};
+  const safeSetSqlMode = typeof setSqlMode === "function" ? setSqlMode : () => {};
+
+  useEffect(() => {
+    setResultRowsDraft(String(resultRowsPerTile || "1000"));
+  }, [resultRowsPerTile]);
+
+  const applyResultRowsPerTile = () => {
+    const next = String(Math.max(50, Math.floor(Number(resultRowsDraft || resultRowsPerTile || 1000) || 1000)));
+    setResultRowsPerTile(next);
+    setTimeout(() => onReadPage(1), 0);
+  };
+
+  useEffect(() => {
+    if (!sqlMode) safeSetSqlText(plan.sql || "");
+  }, [plan.sql, sqlMode, safeSetSqlText]);
+
+  const updateNodeData = (id, patch) => {
+    setNodes((prev) => prev.map((n) => {
+      if (n.id !== id) return n;
+      const next = { ...n, data: { ...(n.data || {}), ...patch } };
+      next.data.label = normalizeGraphNodeLabel(next, columns, datasets);
+      return next;
+    }));
+  };
+
+  const addNode = (kind, extra={}) => {
+    const id = `${kind}-${Date.now().toString(36)}`;
+    const x = kind === "subquery" ? 130 : kind === "source" ? 30 + graphSourceNodes(nodes).length * 220 : 190 + Math.max(0, nodes.length - 2) * 130;
+    const y = kind === "source" ? 360 : kind === "join" ? 260 : kind === "filter" ? 105 : kind === "sort" ? 210 : kind === "select" ? 40 : kind === "derived" ? 300 : kind === "aggregate" ? 330 : kind === "subquery" ? 355 : 380;
+    const node = makeGraphNode(id, kind, { x, y }, columns, extra);
+    node.data.label = normalizeGraphNodeLabel(node, columns, datasets);
+    setNodes((prev) => [...prev, node]);
+    if (!["subquery", "source"].includes(kind)) {
+      setEdges((prev) => [...prev, { id: `e-${prev.length}-${Date.now().toString(36)}`, source: "source", target: id, animated: true, reconnectable: true, markerEnd: RFMarkerType ? { type: RFMarkerType.ArrowClosed } : undefined }]);
+    }
+    setSelectedId(id);
+  };
+
+  const resetGraph = () => {
+    const baseNodes = [
+      makeGraphNode("source", "source", { x: 20, y: 130 }, columns),
+      makeGraphNode("select-1", "select", { x: 230, y: 40 }, columns),
+      makeGraphNode("filter-1", "filter", { x: 230, y: 145 }, columns),
+      makeGraphNode("sort-1", "sort", { x: 460, y: 145 }, columns),
+      makeGraphNode("limit-1", "limit", { x: 690, y: 145 }, columns),
+      makeGraphNode("output", "output", { x: 910, y: 130 }, columns),
+    ].map((n) => ({ ...n, data: { ...n.data, label: normalizeGraphNodeLabel(n, columns) } }));
+    setNodes(baseNodes);
+    setEdges([
+      { id: "source-select", source: "source", target: "select-1", animated: true, reconnectable: true, markerEnd: RFMarkerType ? { type: RFMarkerType.ArrowClosed } : undefined },
+      { id: "select-filter", source: "select-1", target: "filter-1", animated: true, reconnectable: true, markerEnd: RFMarkerType ? { type: RFMarkerType.ArrowClosed } : undefined },
+      { id: "filter-sort", source: "filter-1", target: "sort-1", animated: true, reconnectable: true, markerEnd: RFMarkerType ? { type: RFMarkerType.ArrowClosed } : undefined },
+      { id: "sort-limit", source: "sort-1", target: "limit-1", animated: true, reconnectable: true, markerEnd: RFMarkerType ? { type: RFMarkerType.ArrowClosed } : undefined },
+      { id: "limit-output", source: "limit-1", target: "output", animated: true, reconnectable: true, markerEnd: RFMarkerType ? { type: RFMarkerType.ArrowClosed } : undefined },
+    ]);
+    setSelectedId("filter-1");
+    safeSetSqlMode(false);
+  };
+
+
+  const autoArrangeGraph = () => {
+    setNodes((prev) => autoArrangeGraphNodesNoOverlap(prev));
+  };
+
+  const downloadFlowImage = async () => {
+    try {
+      if (!htmlToImageToPng) { alert("画像出力ライブラリを読み込めませんでした。"); return; }
+      const target = flowPanelRef.current?.querySelector?.(".react-flow__viewport") || flowPanelRef.current;
+      if (!target) { alert("フローキャンバスが見つかりません。"); return; }
+      const dataUrl = await htmlToImageToPng(target, { cacheBust: true, backgroundColor: "#ffffff", pixelRatio: 2 });
+      const a = document.createElement("a");
+      a.download = `graph_query_flow_${new Date().toISOString().replace(/[:.]/g,"-")}.png`;
+      a.href = dataUrl;
+      a.click();
+    } catch (e) {
+      alert(`画像出力に失敗しました: ${e?.message || e}`);
+    }
+  };
+
+  const firstSubqueryId = () => nodes.find((n) => n.data?.kind === "subquery")?.id || null;
+
+  const handleNodeAction = (action, id) => {
+    const node = nodes.find((n) => n.id === id);
+    if (!node) return;
+    if (action === "delete") {
+      if (["source", "output"].includes(id) || node.data?.kind === "subquery") return;
+      setNodes((prev) => prev.filter((n) => n.id !== id));
+      setEdges((prev) => prev.filter((e) => e.source !== id && e.target !== id));
+      setSelectedId("source");
+      return;
+    }
+    if (action === "toggle") { updateNodeData(id, { disabled: !node.data?.disabled }); return; }
+    if (action === "duplicate") {
+      const next = { ...node, id: `${node.data?.kind || "node"}-${Date.now().toString(36)}`, position: { x: node.position.x + 40, y: node.position.y + 40 }, selected: false, parentId: node.parentId, extent: node.extent, data: { ...(node.data || {}) } };
+      setNodes((prev) => [...prev, next]); setSelectedId(next.id); return;
+    }
+    if (action === "intoSubquery") {
+      const subId = firstSubqueryId();
+      if (!subId || ["source", "output"].includes(id) || node.data?.kind === "subquery") return;
+      setNodes((prev) => prev.map((n) => n.id === id ? { ...n, parentId: subId, extent: "parent", position: { x: 30, y: 80 + Math.random()*120 } } : n));
+      return;
+    }
+    if (action === "outSubquery") {
+      setNodes((prev) => prev.map((n) => n.id === id ? { ...n, parentId: undefined, extent: undefined, position: { x: 250 + Math.random()*160, y: 280 + Math.random()*120 } } : n));
+      return;
+    }
+  };
+
+  const handleEdgeAction = (action, id) => {
+    const edge = edges.find((e) => e.id === id);
+    if (!edge) return;
+    if (action === "delete") { setEdges((prev) => prev.filter((e) => e.id !== id)); return; }
+    if (action === "reverse") { setEdges((prev) => prev.map((e) => e.id === id ? { ...e, source: e.target, target: e.source } : e)); return; }
+    if (action === "insertFilter") {
+      const nodeId = `filter-${Date.now().toString(36)}`;
+      const node = makeGraphNode(nodeId, "filter", { x: (nodes.find(n=>n.id===edge.source)?.position?.x || 200) + 120, y: (nodes.find(n=>n.id===edge.source)?.position?.y || 100) + 45 }, columns);
+      node.data.label = normalizeGraphNodeLabel(node, columns, datasets);
+      setNodes((prev) => [...prev, node]);
+      setEdges((prev) => prev.filter((e) => e.id !== id).concat([
+        { id: `${edge.source}-${nodeId}`, source: edge.source, target: nodeId, animated: true, reconnectable: true, markerEnd: RFMarkerType ? { type: RFMarkerType.ArrowClosed } : undefined },
+        { id: `${nodeId}-${edge.target}`, source: nodeId, target: edge.target, animated: true, reconnectable: true, markerEnd: RFMarkerType ? { type: RFMarkerType.ArrowClosed } : undefined },
+      ]));
+      setSelectedId(nodeId);
+    }
+  };
+
+  const handleReconnect = (oldEdge, newConnection) => {
+    setEdges((eds) => {
+      const nextConnection = {
+        ...newConnection,
+        type: "queryEdge",
+        animated: true,
+        reconnectable: true,
+        markerEnd: RFMarkerType ? { type: RFMarkerType.ArrowClosed } : undefined,
+      };
+      if (rfReconnectEdge) return rfReconnectEdge(oldEdge, nextConnection, eds);
+      return eds.map((e) => e.id === oldEdge.id ? { ...e, ...nextConnection, id: oldEdge.id } : e);
+    });
+  };
+
+  const nodeTypes = useMemo(() => ({ queryNode: QueryGraphNode }), []);
+  const edgeTypes = useMemo(() => ({ queryEdge: QueryGraphEdge }), []);
+  const renderedNodes = useMemo(() => nodes.map((n) => ({
+    ...n,
+    type: "queryNode",
+    data: { ...(n.data || {}), onNodeAction: handleNodeAction },
+    style: { ...(n.style || graphNodeStyle(n.data?.kind)), ...(selectedId === n.id ? { boxShadow: "0 0 0 2px #2563eb" } : {}) },
+  })), [nodes, selectedId, columns]);
+  const renderedEdges = useMemo(() => edges.map((e) => ({ ...e, type: "queryEdge", data: { ...(e.data || {}), color: graphEdgeColor(e, nodes), onEdgeAction: handleEdgeAction } })), [edges, nodes, columns]);
+
+  const runFromSql = () => {
+    const parsed = parseSqlToGraphPlan(sqlText, columns);
+    setSqlErrors(parsed.errors || []);
+    if (parsed.errors?.length) return;
+    onApply(parsed, { source: "sql" });
+  };
+
+  const runFromGraph = () => {
+    setSqlErrors([]);
+    onApply(plan, { source: "graph" });
+  };
+
+  const selectedProjection = selectedNode?.data?.selectedColumns || [];
+  const sourceNodes = graphSourceNodes(nodes);
+  const allFieldOptions = graphAllFieldOptions(nodes, columns, datasets);
+  const selectedFields = selectedNode?.data?.selectedFields || [];
+  const selectedLeftSource = graphSourceById(nodes, selectedNode?.data?.leftSourceId || sourceNodes[0]?.id);
+  const selectedRightSource = graphSourceById(nodes, selectedNode?.data?.rightSourceId || sourceNodes[1]?.id);
+  const leftJoinColumns = graphDatasetColumns(selectedLeftSource?.data || {}, columns, datasets);
+  const rightJoinColumns = graphDatasetColumns(selectedRightSource?.data || {}, columns, datasets);
+  return (
+    <Stack spacing={1.1} sx={{ minWidth: 0 }}>
+      <Box sx={{ display: "grid", gridTemplateColumns: { xs: "1fr", lg: "minmax(0, 1fr) 360px" }, gap: 1, minWidth: 0 }}>
+        <Paper elevation={0} sx={{ p: 1, bgcolor: "background.default", borderRadius: 2, minWidth: 0 }}>
+          <Stack direction="row" useFlexGap flexWrap="wrap" spacing={0.75} alignItems="center" sx={{ mb: 1 }}>
+            <Typography variant="subtitle2" sx={{ fontWeight: 900 }}>Graph Query / グラフィカルクエリ</Typography>
+            <Tooltip title="JOIN用のDataset Sourceノードを追加"><span><Button size="small" variant="outlined" onClick={() => addNode("source", { data: { datasetId: datasets[0]?.id || "__active__", alias: `t${graphSourceNodes(nodes).length + 1}` } })}>+ データソース</Button></span></Tooltip>
+            <Tooltip title="複数Datasetをキーで結合するJOINノードを追加"><span><Button size="small" variant="outlined" onClick={() => addNode("join")} disabled={graphSourceNodes(nodes).length < 2}>+ JOIN</Button></span></Tooltip>
+            <Tooltip title="出力する列を選ぶノードを追加"><span><Button size="small" variant="outlined" onClick={() => addNode("select")} disabled={!columns.length && !datasets.length}>+ 列選択</Button></span></Tooltip>
+            <Tooltip title="WHERE条件で行を絞るノードを追加"><span><Button size="small" variant="outlined" onClick={() => addNode("filter")} disabled={!columns.length}>+ 条件抽出</Button></span></Tooltip>
+            <Tooltip title="ORDER BYで並び替えるノードを追加"><span><Button size="small" variant="outlined" onClick={() => addNode("sort")} disabled={!columns.length}>+ 並び替え</Button></span></Tooltip>
+            <Tooltip title="取得件数を制限するノードを追加"><Button size="small" variant="outlined" onClick={() => addNode("limit")}>+ 件数制限</Button></Tooltip>
+            <Tooltip title="固定値または数式で新しい列を作るノードを追加"><span><Button size="small" variant="outlined" onClick={() => addNode("derived")} disabled={!columns.length && !datasets.length}>+ 計算列</Button></span></Tooltip>
+            <Tooltip title="集計ノードを追加。実集計接続は次段階で有効化"><span><Button size="small" variant="outlined" onClick={() => addNode("aggregate")} disabled={!columns.length}>+ 集計</Button></span></Tooltip>
+            <Tooltip title="サブクエリ用のグループを追加"><Button size="small" variant="outlined" onClick={() => addNode("subquery")}>+ サブクエリ</Button></Tooltip>
+            <Tooltip title="初期ノード構成へ戻します"><Button size="small" onClick={resetGraph}>リセット</Button></Tooltip>
+            <Tooltip title="ノードが重なりにくい位置へ整列します"><Button size="small" onClick={autoArrangeGraph}>重なり回避</Button></Tooltip>
+            <Tooltip title="ミニマップの表示/非表示を切り替えます"><Button size="small" variant={showMiniMap ? "contained" : "outlined"} onClick={() => setShowMiniMap((v) => !v)}>{showMiniMap ? "ミニマップ非表示" : "ミニマップ表示"}</Button></Tooltip>
+            <Tooltip title="現在のフロー図をPNG画像として保存します"><Button size="small" variant="outlined" onClick={downloadFlowImage}>画像保存</Button></Tooltip>
+            <Tooltip title="グラフからQueryPlanを生成して実行"><span><Button size="small" variant="contained" onClick={runFromGraph} disabled={disabled || (!columns.length && !datasets.length)}>グラフ実行</Button></span></Tooltip>
+            {dataQueryActive && <Chip color="success" size="small" label={`実行中 ${Number(dataQueryCount || 0).toLocaleString()} 行`} />}
+          </Stack>
+          {!graphReady ? (
+            <Alert severity="warning">React Flow CDNを読み込めませんでした。ネットワークまたはCDN制限を確認してください。</Alert>
+          ) : (
+            <Box ref={flowPanelRef} className="graph-query-flow-panel" sx={{ height: 560, border: "1px solid", borderColor: "divider", borderRadius: 2, overflow: "hidden", bgcolor: "background.paper" }}>
+              <ReactFlowCanvas
+                nodes={renderedNodes}
+                edges={renderedEdges}
+                nodeTypes={nodeTypes}
+                edgeTypes={edgeTypes}
+                onNodesChange={(changes) => setNodes((nds) => rfApplyNodeChanges ? rfApplyNodeChanges(changes, nds) : nds)}
+                onEdgesChange={(changes) => setEdges((eds) => rfApplyEdgeChanges ? rfApplyEdgeChanges(changes, eds) : eds)}
+                onConnect={(params) => setEdges((eds) => rfAddEdge ? rfAddEdge({ ...params, type: "queryEdge", animated: true, reconnectable: true, markerEnd: RFMarkerType ? { type: RFMarkerType.ArrowClosed } : undefined }, eds) : eds)}
+                onReconnect={handleReconnect}
+                edgesReconnectable={true}
+                onNodeClick={(e, node) => setSelectedId(node.id)}
+                onlyRenderVisibleElements={true}
+                elevateEdgesOnSelect={true}
+                fitView
+              >
+                {showMiniMap && RFMiniMap && <RFMiniMap pannable zoomable nodeColor={(node) => graphKindMeta(node?.data?.kind).accent} />}
+                {RFControls && <RFControls />}
+                {RFBackground && <RFBackground gap={18} />}
+              </ReactFlowCanvas>
+            </Box>
+          )}
+          <Typography variant="caption" color="text.secondary" sx={{ display: "block", mt: 0.75 }}>
+            ノードは種類ごとに色分け、エッジは接続元/先に応じた色で表示します。ミニマップは必要時だけ表示、画像保存、重なり回避配置に対応しています。計算列は非同期チャンク処理で結果テーブルに追加されます。
+          </Typography>
+        </Paper>
+
+        <Paper elevation={0} sx={{ p: 1, bgcolor: "background.default", borderRadius: 2 }}>
+          <Typography variant="subtitle2" sx={{ fontWeight: 900, mb: 1 }}>選択ノード</Typography>
+          {!selectedNode ? (
+            <Typography variant="body2" color="text.secondary">ノードを選択してください。</Typography>
+          ) : (
+            <Stack spacing={1}>
+              <Chip label={`${selectedNode.id} / ${graphKindMeta(selectedNode.data?.kind).jp}`} sx={{ bgcolor: graphKindMeta(selectedNode.data?.kind).bg, border: "1px solid", borderColor: graphKindMeta(selectedNode.data?.kind).border, fontWeight: 900 }} />
+              {selectedNode.data?.kind === "source" && (
+                <>
+                  <TextField select label="Dataset" size="small" value={selectedNode.data.datasetId || "__active__"} onChange={(e) => updateNodeData(selectedNode.id, { datasetId: e.target.value })} fullWidth>
+                    <MenuItem value="__active__">Active Dataset: {manifest?.tableName || manifest?.name || "active"}</MenuItem>
+                    {datasets.map((d) => <MenuItem key={d.id} value={d.id}>{d.path || d.tableName || d.name || d.id}</MenuItem>)}
+                  </TextField>
+                  <TextField label="Alias" size="small" value={selectedNode.data.alias || selectedNode.id} onChange={(e) => updateNodeData(selectedNode.id, { alias: e.target.value })} fullWidth />
+                  <Alert severity="info">JOINに使うDataset Sourceです。Storageに保存済みのDatasetを選ぶと、列情報をJOIN/SELECTで利用できます。</Alert>
+                </>
+              )}
+              {selectedNode.data?.kind === "join" && (
+                <>
+                  <TextField select label="左Source" size="small" value={selectedNode.data.leftSourceId || sourceNodes[0]?.id || ""} onChange={(e) => updateNodeData(selectedNode.id, { leftSourceId: e.target.value })} fullWidth>
+                    {sourceNodes.map((n) => <MenuItem key={n.id} value={n.id}>{graphSourceAlias(n)} / {graphDatasetLabel(n.data?.datasetId, datasets, manifest)}</MenuItem>)}
+                  </TextField>
+                  <TextField select label="右Source" size="small" value={selectedNode.data.rightSourceId || sourceNodes[1]?.id || ""} onChange={(e) => updateNodeData(selectedNode.id, { rightSourceId: e.target.value })} fullWidth>
+                    {sourceNodes.map((n) => <MenuItem key={n.id} value={n.id}>{graphSourceAlias(n)} / {graphDatasetLabel(n.data?.datasetId, datasets, manifest)}</MenuItem>)}
+                  </TextField>
+                  <TextField select label="JOIN種別" size="small" value={selectedNode.data.joinType || "inner"} onChange={(e) => updateNodeData(selectedNode.id, { joinType: e.target.value })} fullWidth>
+                    <MenuItem value="inner">INNER JOIN</MenuItem>
+                    <MenuItem value="left">LEFT JOIN</MenuItem>
+                  </TextField>
+                  <TextField select label="左キー" size="small" value={String(selectedNode.data.leftColumnIndex ?? leftJoinColumns[0]?.index ?? 0)} onChange={(e) => updateNodeData(selectedNode.id, { leftColumnIndex: Number(e.target.value) })} fullWidth>
+                    {leftJoinColumns.map((c) => <MenuItem key={c.index} value={String(c.index)}>{c.name} ({c.type})</MenuItem>)}
+                  </TextField>
+                  <TextField select label="右キー" size="small" value={String(selectedNode.data.rightColumnIndex ?? rightJoinColumns[0]?.index ?? 0)} onChange={(e) => updateNodeData(selectedNode.id, { rightColumnIndex: Number(e.target.value) })} fullWidth>
+                    {rightJoinColumns.map((c) => <MenuItem key={c.index} value={String(c.index)}>{c.name} ({c.type})</MenuItem>)}
+                  </TextField>
+                </>
+              )}
+              {selectedNode.data?.kind === "select" && (
+                sourceNodes.length >= 2 ? (
+                  <FormControl size="small" fullWidth>
+                    <InputLabel>JOIN出力カラム</InputLabel>
+                    <Select multiple value={selectedFields.map(String)} label="JOIN出力カラム" onChange={(e) => updateNodeData(selectedNode.id, { selectedFields: Array.isArray(e.target.value) ? e.target.value : String(e.target.value).split(',') })} renderValue={(vals) => `${vals.length} 列`}>
+                      {allFieldOptions.map((f) => <MenuItem key={f.value} value={f.value}><Checkbox checked={selectedFields.includes(f.value)} />{f.alias}.{f.name} ({f.type})</MenuItem>)}
+                    </Select>
+                  </FormControl>
+                ) : (
+                  <FormControl size="small" fullWidth>
+                    <InputLabel>出力カラム</InputLabel>
+                    <Select multiple value={selectedProjection.map(String)} label="出力カラム" onChange={(e) => updateNodeData(selectedNode.id, { selectedColumns: (Array.isArray(e.target.value) ? e.target.value : String(e.target.value).split(',')).map(Number) })} renderValue={(vals) => `${vals.length} 列`}>
+                      {columns.map((c) => <MenuItem key={c.index} value={String(c.index)}><Checkbox checked={selectedProjection.map(Number).includes(Number(c.index))} />{c.name} ({c.type})</MenuItem>)}
+                    </Select>
+                  </FormControl>
+                )
+              )}
+              {selectedNode.data?.kind === "filter" && (
+                <>
+                  <TextField select label="対象カラム" size="small" value={String(selectedNode.data.columnIndex ?? columns[0]?.index ?? 0)} onChange={(e) => { const nextIndex = Number(e.target.value); const nextCol = columnByIndex(columns, nextIndex); updateNodeData(selectedNode.id, { columnIndex: nextIndex, op: normalizeGraphOperatorForColumn(selectedNode.data.op || "contains", nextCol) }); }} fullWidth>
+                    {columns.map((c) => <MenuItem key={c.index} value={String(c.index)}>{c.name} ({c.type})</MenuItem>)}
+                  </TextField>
+                  <TextField select label="比較演算子 / Operator" size="small" value={selectedNode.data.op || "contains"} onChange={(e) => updateNodeData(selectedNode.id, { op: e.target.value })} fullWidth helperText={graphOperatorDef(selectedNode.data.op || "contains")?.category || "比較"}>
+                    {graphOperatorOptionsForColumn(columnByIndex(columns, selectedNode.data.columnIndex)).map((x) => <MenuItem key={x.op} value={x.op}>{x.code}（{x.jp}） — {x.symbol}</MenuItem>)}
+                  </TextField>
+                  <TextField label="値 / Value" size="small" value={selectedNode.data.value || ""} onChange={(e) => updateNodeData(selectedNode.id, { value: e.target.value })} fullWidth disabled={!graphOperatorNeedsValue(selectedNode.data.op || "contains")} placeholder={graphOperatorNeedsValue(selectedNode.data.op || "contains") ? "比較する値を入力" : "この演算子では値は不要です"} />
+                  <Alert severity="info" sx={{ py: 0.25 }}>比較演算子: EQ（等しい）, NE（等しくない）, LT（より小さい）, GT（より大きい）, LE（以下）, GE（以上）。文字列: CONTAINS（含む）, NOT CONTAINS（含まない）, STARTS WITH（前方一致）, ENDS WITH（後方一致）, REGEX（正規表現）。</Alert>
+                </>
+              )}
+              {selectedNode.data?.kind === "sort" && (
+                <>
+                  <TextField select label="並び替えカラム" size="small" value={String(selectedNode.data.columnIndex ?? columns[0]?.index ?? 0)} onChange={(e) => updateNodeData(selectedNode.id, { columnIndex: Number(e.target.value) })} fullWidth>
+                    {columns.map((c) => <MenuItem key={c.index} value={String(c.index)}>{c.name} ({c.type})</MenuItem>)}
+                  </TextField>
+                  <TextField select label="方向" size="small" value={selectedNode.data.direction || "asc"} onChange={(e) => updateNodeData(selectedNode.id, { direction: e.target.value })} fullWidth>
+                    <MenuItem value="asc">ASC（昇順）</MenuItem><MenuItem value="desc">DESC（降順）</MenuItem>
+                  </TextField>
+                </>
+              )}
+              {selectedNode.data?.kind === "limit" && <SmallNumberField label="最大行数 0=全件" value={String(selectedNode.data.maxRows ?? "0")} onChange={(v) => updateNodeData(selectedNode.id, { maxRows: v })} min="0" step="100000" fullWidth />}
+              {selectedNode.data?.kind === "derived" && (
+                <>
+                  <TextField label="新しい列名" size="small" value={selectedNode.data.newColumnName || "new_column"} onChange={(e) => updateNodeData(selectedNode.id, { newColumnName: e.target.value })} fullWidth />
+                  <TextField select label="作成方法" size="small" value={selectedNode.data.valueMode || "constant"} onChange={(e) => updateNodeData(selectedNode.id, { valueMode: e.target.value })} fullWidth>
+                    <MenuItem value="constant">固定値をセット</MenuItem>
+                    <MenuItem value="formula">行ごとの数式で計算</MenuItem>
+                  </TextField>
+                  {(selectedNode.data.valueMode || "constant") === "constant" ? (
+                    <TextField label="セットする値" size="small" value={selectedNode.data.constantValue || ""} onChange={(e) => updateNodeData(selectedNode.id, { constantValue: e.target.value })} fullWidth placeholder="例: 未分類 / 1 / TRUE" />
+                  ) : (
+                    <TextField label="数式 / Formula" size="small" multiline minRows={3} value={selectedNode.data.formulaExpression || ""} onChange={(e) => updateNodeData(selectedNode.id, { formulaExpression: e.target.value })} fullWidth placeholder={'例: num(col("amount")) * 1.1\n例: basename(col("full_path"))\n例: dirname(col("full_path"))\n例: pathPart(col("full_path"), -2)\n例: regexExtract(col("full_path"), "([^/]+)\\.csv$", 1)'} />
+                  )}
+                  {(selectedNode.data.valueMode || "constant") === "formula" && (
+                    <FormulaRecipePanel fieldOptions={allFieldOptions} onPick={(expr) => updateNodeData(selectedNode.id, { formulaExpression: selectedNode.data.formulaExpression ? `${selectedNode.data.formulaExpression}${selectedNode.data.formulaExpression.endsWith(" ") ? "" : " "}${expr}` : expr })} />
+                  )}
+                  <Alert severity="info" sx={{ py: 0.25 }}>数式では col("列名") で同じ行の列値を参照します。num/str/concat/coalesce/lower/upper/round のほか、basename, dirname, ext, stem, pathPart, before/after/between, sliceText, left/right, replaceText, regexExtract でパスや文字列を切り出せます。計算列は保存済みDatasetを破壊せず、Graph Query結果テーブルに追加されます。</Alert>
+                </>
+              )}
+              {selectedNode.data?.kind === "aggregate" && <Alert severity="info">集計ノードはSQLプレビューへ表現を追加するための予約ノードです。実集計はPivot/Time基盤へ接続する次段階で有効化します。</Alert>}
+              {selectedNode.data?.kind === "subquery" && <TextField label="サブクエリ名" size="small" value={selectedNode.data.alias || selectedNode.id} onChange={(e) => updateNodeData(selectedNode.id, { alias: e.target.value })} fullWidth />}
+              {selectedNode.data?.kind === "output" && <Alert severity="info">このノードは結果出力です。JOIN/条件抽出/並び替え/件数制限/列選択を追加して条件を作成します。</Alert>}
+              <Divider />
+              <Typography variant="subtitle2" sx={{ fontWeight: 900 }}>コンパイル済みプラン</Typography>
+              <Typography component="pre" variant="caption" sx={{ p: 1, bgcolor: "background.paper", borderRadius: 1, overflow: "auto", maxHeight: 180 }}>{JSON.stringify({ mode: plan.mode, sources: plan.sources, joins: plan.joins, filters: plan.filters, sort: plan.sort, maxRows: plan.maxRows, projection: plan.projection, selectedFields: plan.selectedFields, derivedColumns: plan.derivedColumns, subqueries: plan.subqueries }, null, 2)}</Typography>
+            </Stack>
+          )}
+        </Paper>
+      </Box>
+
+      <Paper elevation={0} sx={{ p: 1, bgcolor: "background.default", borderRadius: 2 }}>
+        <Stack direction="row" useFlexGap flexWrap="wrap" spacing={1} alignItems="center" sx={{ mb: 1 }}>
+          <Typography variant="subtitle2" sx={{ fontWeight: 900 }}>SQLプレビュー / SQL実行</Typography>
+          <FormControlLabel control={<Switch size="small" checked={sqlMode} onChange={(e) => safeSetSqlMode(e.target.checked)} />} label="SQLを編集" />
+          <Button size="small" variant="contained" onClick={sqlMode ? runFromSql : runFromGraph} disabled={disabled || (!columns.length && !datasets.length)}>{sqlMode ? "SQL実行" : "グラフ実行"}</Button>
+          <Button size="small" onClick={() => { safeSetSqlMode(false); safeSetSqlText(plan.sql || ""); setSqlErrors([]); }}>グラフから同期</Button>
+        </Stack>
+        <TextField multiline minRows={7} fullWidth value={sqlMode ? sqlText : (plan.sql || "")} onChange={(e) => { safeSetSqlMode(true); safeSetSqlText(e.target.value); }} InputProps={{ readOnly: !sqlMode }} sx={{ '& textarea': { fontFamily: 'Roboto Mono, Consolas, monospace', fontSize: 12 } }} />
+        {sqlErrors.length > 0 && <Alert severity="warning" sx={{ mt: 0.75 }}>{sqlErrors.join(" / ")}</Alert>}
+        <Typography variant="caption" color="text.secondary">対応SQL: SELECT（列選択） / FROM（入力元） / WHERE（条件抽出） / ORDER BY（並び替え） / LIMIT（件数制限）。比較: EQ/NE/LT/GT/LE/GE または =, &lt;&gt;, &lt;, &gt;, &lt;=, &gt;=。文字列: LIKE, NOT LIKE, CONTAINS, STARTS WITH, ENDS WITH, REGEXP/RLIKE。WITHはPreview出力対応、JOINはGraph実行で対応済みです。</Typography>
+      </Paper>
+
+      <Paper elevation={0} sx={{ p: 1, bgcolor: "background.default", borderRadius: 2 }}>
+        <Stack direction="row" useFlexGap flexWrap="wrap" spacing={1} alignItems="center" sx={{ mb: 0.75 }}>
+          <Typography variant="subtitle2" sx={{ fontWeight: 900 }}>Graph Query Result / 実行結果</Typography>
+          <Button size="small" color="warning" variant="outlined" onClick={() => onClearResult()}>結果クリア</Button>
+          <Button size="small" variant="contained" startIcon={<Download />} onClick={onExportCsv} disabled={!Number(dataQueryCount || 0)}>CSV全件出力</Button>
+          <Button size="small" variant={resultViewMode === "tile" ? "contained" : "outlined"} onClick={() => { setResultViewMode("tile"); setTimeout(() => onReadPage(1), 0); }}>全件パネル表示</Button>
+          <Button size="small" variant={resultViewMode === "page" ? "contained" : "outlined"} onClick={() => setResultViewMode("page")}>ページ表示</Button>
+          {resultViewMode === "page" && <SmallNumberField label="ページ行数" value={resultRowsDraft} onChange={setResultRowsDraft} min="50" step="50" sx={{ width: 130 }} />}
+          {resultViewMode === "page" && <Button size="small" variant="outlined" onClick={applyResultRowsPerTile}>件数を適用</Button>}
+          {resultViewMode === "page" && <Button size="small" onClick={() => onReadPage(Math.max(1, Number(resultPage || 1) - 1))}>Prev</Button>}
+          {resultViewMode === "page" && <Typography variant="caption">Page {Number(resultPage || 1).toLocaleString()} / {Number(resultPageMax || 0).toLocaleString()}</Typography>}
+          {resultViewMode === "page" && <Button size="small" onClick={() => onReadPage(Math.min(Number(resultPageMax || 1), Number(resultPage || 1) + 1))}>Next</Button>}
+          {resultViewMode === "tile" && <Chip size="small" color="primary" label={`全件パネル / 表示中 ${Number(resultTable?.rows?.length || 0).toLocaleString()} / 全 ${Number(dataQueryCount || 0).toLocaleString()}`} />}
+          <Chip size="small" label={`${Number(dataQueryCount || 0).toLocaleString()} rows`} />
+        </Stack>
+        {resultViewMode === "tile" ? (
+          <GraphQueryVirtualTable table={resultTable} totalRows={Number(dataQueryCount || 0)} page={Number(resultPage || 1)} pageSize={Number(resultRowsPerTile || 1000)} onReadPage={onReadPage} height={420} />
+        ) : (
+          <DataTable table={resultTable} tableId="graphQueryResult" height={360} />
+        )}
+        <Stack direction="row" justifyContent="space-between" sx={{ mt: 0.6 }}>
+          <Typography variant="caption" color="text.secondary">{resultStatus || "Run graph query to show results here."}</Typography>
+          <Typography variant="caption" color="text.secondary">{resultTime || ""}</Typography>
+        </Stack>
+      </Paper>
+    </Stack>
+  );
+}
+
+
 function App() {
   const workerRef = useRef(null);
   const pageSizeRef = useRef(500);
