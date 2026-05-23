@@ -25,6 +25,7 @@
 
 
 
+
 let state = {
   file:null,
   encoding:"utf-8",
@@ -3246,12 +3247,12 @@ async function runGraphJoinQuery({plan, pageSize}){
   };
 }
 
-async function readGraphJoinPage(page,pageSize){
+async function readGraphJoinPage(page,pageSize,origin=""){
   if (!state.graphJoinResult) throw new Error("Graph JOIN result is not active");
   const total = state.graphJoinResult.rows.length;
   const start = Math.max(0, (Number(page || 1)-1) * Number(pageSize || 500));
   const rows = state.graphJoinResult.rows.slice(start, start + Number(pageSize || 500));
-  return {header:state.graphJoinResult.header, rows, startRow:start, totalMatches:total, page:Number(page||1), pageSize:Number(pageSize||500), ms:state.graphJoinResult.ms || 0};
+  return {header:state.graphJoinResult.header, rows, startRow:start, totalMatches:total, page:Number(page||1), pageSize:Number(pageSize||500), ms:state.graphJoinResult.ms || 0, origin};
 }
 
 function makeAgg(){ return {count:0,n:0,sum:0,min:null,max:null}; }
@@ -3603,6 +3604,134 @@ function csvEscape(v){
   return /[",\r\n]/.test(s) ? `"${s}"` : s;
 }
 
+
+const GRAPH_DERIVED_FORBIDDEN_WORKER = /\b(?:window|document|self|globalThis|Function|eval|fetch|XMLHttpRequest|WebSocket|Worker|importScripts|postMessage|navigator|localStorage|indexedDB|crypto|process|require)\b/;
+
+function normalizeGraphDerivedColumnsForWorker(items){
+  return (Array.isArray(items) ? items : [])
+    .map((d, i) => ({
+      id:String(d?.id || `derived_${i+1}`),
+      newColumnName:String(d?.newColumnName || d?.name || `new_column_${i+1}`).trim() || `new_column_${i+1}`,
+      valueMode:String(d?.valueMode || "constant"),
+      constantValue:d?.constantValue ?? "",
+      formulaExpression:String(d?.formulaExpression || "")
+    }))
+    .filter((d) => d.newColumnName);
+}
+
+function valueByFlexibleNameForWorker(rowMap, key){
+  if (rowMap == null) return undefined;
+  if (Object.prototype.hasOwnProperty.call(rowMap, key)) return rowMap[key];
+  const lower = String(key || "").toLowerCase();
+  const found = Object.keys(rowMap).find((k) => String(k).toLowerCase() === lower);
+  return found == null ? undefined : rowMap[found];
+}
+
+function evaluateGraphDerivedColumnForWorker(d, rowMap){
+  try{
+    if ((d.valueMode || "constant") !== "formula") return d.constantValue ?? "";
+    const expr = String(d.formulaExpression || "").trim();
+    if (!expr) return "";
+    if (GRAPH_DERIVED_FORBIDDEN_WORKER.test(expr)) return "#BLOCKED";
+    const col = (name) => valueByFlexibleNameForWorker(rowMap, name);
+    const num = (v, fallback=0) => {
+      const n = Number(v);
+      return Number.isFinite(n) ? n : fallback;
+    };
+    const str = (v) => v == null ? "" : String(v);
+    const concat = (...xs) => xs.map((x) => x == null ? "" : String(x)).join("");
+    const coalesce = (...xs) => xs.find((x) => x !== null && x !== undefined && x !== "") ?? "";
+    const lower = (v) => str(v).toLowerCase();
+    const upper = (v) => str(v).toUpperCase();
+    const round = (v, digits=0) => {
+      const m = Math.pow(10, Number(digits) || 0);
+      return Math.round(num(v) * m) / m;
+    };
+    const fn = new Function("col", "num", "str", "concat", "coalesce", "lower", "upper", "round", "abs", "min", "max", "row", `"use strict"; return (${expr});`);
+    const value = fn(col, num, str, concat, coalesce, lower, upper, round, Math.abs, Math.min, Math.max, rowMap);
+    return value == null ? "" : value;
+  }catch(e){
+    return `#ERR ${e?.message || "formula"}`;
+  }
+}
+
+function appendRowsToCsvLines(lines, header, rows, derivedColumns){
+  const derived = normalizeGraphDerivedColumnsForWorker(derivedColumns);
+  if (!derived.length){
+    for (const row of rows || []) lines.push((row || []).map(csvEscape).join(","));
+    return;
+  }
+  for (const row of rows || []){
+    const rowMap = {};
+    header.forEach((h, i) => { rowMap[h] = row?.[i]; });
+    const extra = derived.map((d) => evaluateGraphDerivedColumnForWorker(d, rowMap));
+    lines.push([...(row || []), ...extra].map(csvEscape).join(","));
+  }
+}
+
+function graphExportHeader(header, derivedColumns){
+  const derived = normalizeGraphDerivedColumnsForWorker(derivedColumns);
+  return [...(header || []), ...derived.map((d) => d.newColumnName)];
+}
+
+function normalizeExportLimit(value){
+  const n = Number(value || 0);
+  return Number.isFinite(n) && n > 0 ? Math.floor(n) : Number.POSITIVE_INFINITY;
+}
+
+async function exportGraphQueryCsv(msg={}){
+  const mode = String(msg.mode || "data");
+  const derivedColumns = normalizeGraphDerivedColumnsForWorker(msg.derivedColumns || []);
+  const maxRows = normalizeExportLimit(msg.maxRows);
+  const chunkRows = Math.max(100, Math.min(10000, Number(msg.chunkRows || 3000)));
+  const lines = [];
+  let exportedRows = 0;
+  const t0 = now();
+
+  if (mode === "join"){
+    if (!state.graphJoinResult) throw new Error("Graph JOIN result is not active");
+    const header = state.graphJoinResult.header || [];
+    lines.push(graphExportHeader(header, derivedColumns).map(csvEscape).join(","));
+    const rows = state.graphJoinResult.rows || [];
+    const total = Math.min(rows.length, maxRows);
+    for (let start=0; start<total; start+=chunkRows){
+      if (state.cancelled) throw new Error("Cancelled");
+      appendRowsToCsvLines(lines, header, rows.slice(start, Math.min(total, start + chunkRows)), derivedColumns);
+      exportedRows = Math.min(total, start + chunkRows);
+      post("PROGRESS", {value:Math.min(99, Math.floor((exportedRows / Math.max(1,total)) * 100)), text:`Exporting Graph JOIN CSV... ${fmt(exportedRows)}/${fmt(total)} rows`});
+    }
+    return {csv:lines.join("\n"), rows:exportedRows, totalRows:rows.length, mode, ms:now()-t0};
+  }
+
+  const selected = normalizeCols(Array.isArray(msg.columns) && msg.columns.length ? msg.columns : (state.dataQueryMeta?.projection || []));
+  const header = selected.map(i => state.manifest.columns[i].name);
+  lines.push(graphExportHeader(header, derivedColumns).map(csvEscape).join(","));
+
+  if (Array.isArray(state.dataQueryMatches)){
+    const total = Math.min(state.dataQueryMatches.length, maxRows);
+    for (let start=0; start<total; start+=chunkRows){
+      if (state.cancelled) throw new Error("Cancelled");
+      const ids = state.dataQueryMatches.slice(start, Math.min(total, start + chunkRows));
+      const table = await readRowsByGlobal(ids, selected);
+      appendRowsToCsvLines(lines, table.header, table.rows, derivedColumns);
+      exportedRows = Math.min(total, start + chunkRows);
+      post("PROGRESS", {value:Math.min(99, Math.floor((exportedRows / Math.max(1,total)) * 100)), text:`Exporting Graph Query CSV... ${fmt(exportedRows)}/${fmt(total)} rows`});
+    }
+    return {csv:lines.join("\n"), rows:exportedRows, totalRows:state.dataQueryMatches.length, mode, ms:now()-t0};
+  }
+
+  const totalRows = Math.min(Number(state.manifest?.totalRows || 0), maxRows);
+  for (let start=0; start<totalRows; start+=chunkRows){
+    if (state.cancelled) throw new Error("Cancelled");
+    const page = Math.floor(start / chunkRows) + 1;
+    const table = await readPage(page, Math.min(chunkRows, totalRows - start), selected);
+    appendRowsToCsvLines(lines, table.header, table.rows, derivedColumns);
+    exportedRows = Math.min(totalRows, start + chunkRows);
+    post("PROGRESS", {value:Math.min(99, Math.floor((exportedRows / Math.max(1,totalRows)) * 100)), text:`Exporting Graph Query CSV... ${fmt(exportedRows)}/${fmt(totalRows)} rows`});
+  }
+  return {csv:lines.join("\n"), rows:exportedRows, totalRows:Number(state.manifest?.totalRows || 0), mode, ms:now()-t0};
+}
+
 self.onmessage=async(e)=>{
   const msg=e.data||{};
   try{
@@ -3791,7 +3920,7 @@ self.onmessage=async(e)=>{
       state.cancelled=false;
       const t0=now();
       const result=await readPage(Number(msg.page||1),Number(msg.pageSize||500),msg.columns||[]);
-      post("PAGE_RESULT",{...result,page:Number(msg.page||1),ms:now()-t0});
+      post("PAGE_RESULT",{...result,page:Number(msg.page||1),ms:now()-t0,origin:msg.origin || ""});
       return;
     }
 
@@ -3799,7 +3928,7 @@ self.onmessage=async(e)=>{
       state.cancelled=false;
       post("PROGRESS",{value:0,text:"Building global filter/sort row index..."});
       const result=await runDataQuery(msg);
-      post("DATA_QUERY_DONE",result);
+      post("DATA_QUERY_DONE",{...result,origin:msg.origin || ""});
       post("PROGRESS",{value:100,text:result.active ? "Global data query complete" : "Global data query cleared"});
       return;
     }
@@ -3808,7 +3937,7 @@ self.onmessage=async(e)=>{
       state.cancelled=false;
       const t0=now();
       const result=await readDataQueryPage(Number(msg.page||1),Number(msg.pageSize||500),msg.columns||[]);
-      post("DATA_QUERY_PAGE_RESULT",{...result,page:Number(msg.page||1),ms:now()-t0});
+      post("DATA_QUERY_PAGE_RESULT",{...result,page:Number(msg.page||1),ms:now()-t0,origin:msg.origin || ""});
       return;
     }
 
@@ -3826,8 +3955,17 @@ self.onmessage=async(e)=>{
     if (msg.type==="READ_GRAPH_JOIN_PAGE"){
       state.cancelled=false;
       const t0=now();
-      const result=await readGraphJoinPage(Number(msg.page||1),Number(msg.pageSize||500));
-      post("GRAPH_JOIN_PAGE_RESULT",{...result,ms:now()-t0});
+      const result=await readGraphJoinPage(Number(msg.page||1),Number(msg.pageSize||500),msg.origin || "");
+      post("GRAPH_JOIN_PAGE_RESULT",{...result,ms:now()-t0,origin:msg.origin || ""});
+      return;
+    }
+
+    if (msg.type==="EXPORT_GRAPH_QUERY_CSV"){
+      state.cancelled=false;
+      post("PROGRESS",{value:0,text:"Exporting Graph Query CSV..."});
+      const result=await exportGraphQueryCsv(msg);
+      post("GRAPH_QUERY_CSV",result);
+      post("PROGRESS",{value:100,text:`Graph Query CSV export complete: ${fmt(result.rows)} rows`});
       return;
     }
 
@@ -3900,9 +4038,7 @@ self.onmessage=async(e)=>{
     postProgress(0,"Error");
   }
 };
-
-
-
+  
 </script>
 
   <!-- JSX application source. It is transformed by Babel in the module below. -->
@@ -5548,6 +5684,7 @@ function normalizeGraphNodeLabel(node, columns, datasets=[]) {
   if (data.kind === "filter") return `Filter: ${col?.name || "column"} ${graphOperatorShortLabel(data.op || "contains")}`;
   if (data.kind === "sort") return `Sort: ${col?.name || "column"} ${(data.direction || "asc").toUpperCase()}`;
   if (data.kind === "limit") return `Limit: ${Number(data.maxRows || 0) || "all"}`;
+  if (data.kind === "derived") return `Derived: ${data.newColumnName || "new_column"}`;
   if (data.kind === "aggregate") return `Aggregate: ${data.aggregation || "Count"}`;
   if (data.kind === "subquery") return `Subquery: ${data.alias || node.id}`;
   if (data.kind === "output") return "Output: Result Table";
@@ -5561,6 +5698,7 @@ const GRAPH_KIND_META = {
   join:     { jp:"テーブル結合", category:"処理", bg:"#eef2ff", border:"#818cf8", accent:"#4f46e5", text:"#111827", description:"複数DatasetをキーでJOINします" },
   sort:     { jp:"並び替え", category:"処理", bg:"#faf5ff", border:"#c084fc", accent:"#7e22ce", text:"#111827", description:"ORDER BYを指定します" },
   limit:    { jp:"件数制限", category:"制御", bg:"#fefce8", border:"#eab308", accent:"#a16207", text:"#111827", description:"取得する最大行数を指定します" },
+  derived:  { jp:"計算列", category:"出力", bg:"#f0f9ff", border:"#38bdf8", accent:"#0284c7", text:"#082f49", description:"既存列や固定値から新しい列を追加します" },
   aggregate:{ jp:"集計", category:"処理", bg:"#fdf2f8", border:"#f472b6", accent:"#db2777", text:"#111827", description:"GROUP BYや集計処理の予約ノードです" },
   subquery: { jp:"サブクエリ", category:"構造", bg:"#f8fafc", border:"#64748b", accent:"#334155", text:"#0f172a", description:"子ノードをWITH句としてまとめます" },
   output:   { jp:"結果出力", category:"出力", bg:"#ecfdf5", border:"#34d399", accent:"#059669", text:"#052e16", description:"Graph Queryタブ下の結果テーブルへ出力します" },
@@ -5594,6 +5732,7 @@ function makeGraphNode(id, kind, position, columns, extra={}) {
   if (kind === "filter") return { ...base, data: { kind, label: "Filter", columnIndex: firstCol, op: "contains", value: "" } };
   if (kind === "sort") return { ...base, data: { kind, label: "Sort", columnIndex: firstCol, direction: "asc" } };
   if (kind === "limit") return { ...base, data: { kind, label: "Limit", maxRows: "0" } };
+  if (kind === "derived") return { ...base, data: { kind, label: "Derived", newColumnName: "new_column", valueMode: "constant", constantValue: "", formulaExpression: "" } };
   if (kind === "aggregate") return { ...base, data: { kind, label: "Aggregate", groupBy: [], valueField: "-1", aggregation: "Count" } };
   if (kind === "subquery") return { ...base, data: { kind, label: "Subquery", alias: id.replace(/[^A-Za-z0-9_]/g, "_") } };
   return { ...base, data: { kind: "output", label: "Output: Result Table" } };
@@ -5635,6 +5774,79 @@ function graphColumnSqlName(field, plan, activeColumns, datasets){
   return `${sqlIdentifier(source.alias || source.id)}.${sqlIdentifier(col?.name || `Column${Number(field.columnIndex)+1}`)}`;
 }
 
+
+function normalizeGraphDerivedColumns(items=[]) {
+  return (Array.isArray(items) ? items : [])
+    .map((d, i) => ({
+      id: String(d?.id || `derived_${i + 1}`),
+      newColumnName: String(d?.newColumnName || `new_column_${i + 1}`).trim() || `new_column_${i + 1}`,
+      valueMode: d?.valueMode === "formula" ? "formula" : "constant",
+      constantValue: d?.constantValue ?? "",
+      formulaExpression: String(d?.formulaExpression || "").trim(),
+    }))
+    .filter((d) => d.newColumnName);
+}
+
+function graphDerivedSqlExpression(d) {
+  const alias = sqlIdentifier(d.newColumnName || "new_column");
+  if (d.valueMode === "formula") {
+    const expr = String(d.formulaExpression || "NULL").trim() || "NULL";
+    return `${expr} AS ${alias} /* 計算列 */`;
+  }
+  return `${sqlLiteral(d.constantValue ?? "")} AS ${alias} /* 固定値列 */`;
+}
+
+const GRAPH_DERIVED_FORBIDDEN = /\b(window|document|fetch|XMLHttpRequest|localStorage|sessionStorage|indexedDB|Function|eval|import|constructor|prototype|globalThis|self|postMessage)\b/i;
+
+function valueByFlexibleName(rowMap, name) {
+  const key = String(name || "");
+  if (Object.prototype.hasOwnProperty.call(rowMap, key)) return rowMap[key];
+  const lower = key.toLowerCase();
+  const found = Object.keys(rowMap).find((k) => String(k).toLowerCase() === lower);
+  return found == null ? undefined : rowMap[found];
+}
+
+function evaluateGraphDerivedColumn(d, rowMap) {
+  try {
+    if ((d.valueMode || "constant") !== "formula") return d.constantValue ?? "";
+    const expr = String(d.formulaExpression || "").trim();
+    if (!expr) return "";
+    if (GRAPH_DERIVED_FORBIDDEN.test(expr)) return "#BLOCKED";
+    const col = (name) => valueByFlexibleName(rowMap, name);
+    const num = (v, fallback=0) => {
+      const n = Number(v);
+      return Number.isFinite(n) ? n : fallback;
+    };
+    const str = (v) => v == null ? "" : String(v);
+    const concat = (...xs) => xs.map((x) => x == null ? "" : String(x)).join("");
+    const coalesce = (...xs) => xs.find((x) => x !== null && x !== undefined && x !== "") ?? "";
+    const lower = (v) => str(v).toLowerCase();
+    const upper = (v) => str(v).toUpperCase();
+    const round = (v, digits=0) => {
+      const m = Math.pow(10, Number(digits) || 0);
+      return Math.round(num(v) * m) / m;
+    };
+    const fn = new Function("col", "num", "str", "concat", "coalesce", "lower", "upper", "round", "abs", "min", "max", "row", `"use strict"; return (${expr});`);
+    const value = fn(col, num, str, concat, coalesce, lower, upper, round, Math.abs, Math.min, Math.max, rowMap);
+    return value == null ? "" : value;
+  } catch (e) {
+    return `#ERR ${e?.message || "formula"}`;
+  }
+}
+
+function applyGraphDerivedColumnsToTable(table, derivedColumns=[]) {
+  const normalized = normalizeGraphDerivedColumns(derivedColumns);
+  if (!table || !Array.isArray(table.header) || !normalized.length) return table;
+  const header = [...table.header, ...normalized.map((d) => d.newColumnName)];
+  const rows = (table.rows || []).map((row) => {
+    const rowMap = {};
+    table.header.forEach((h, i) => { rowMap[h] = row[i]; });
+    const extra = normalized.map((d) => evaluateGraphDerivedColumn(d, rowMap));
+    return [...row, ...extra];
+  });
+  return { ...table, header, rows };
+}
+
 function graphToSqlPreview(plan, columns, datasets=[]) {
   const subqueries = plan.subqueries || [];
   const lines = [];
@@ -5652,7 +5864,9 @@ WHERE ${s.filters.map((f) => filterToSql(f, columns)).join(" AND ")}`);
 
   if (plan.mode === "join" && (plan.sources || []).length >= 2 && (plan.joins || []).length) {
     const fields = (plan.selectedFields || []).map(parseGraphFieldValue).filter(Boolean);
-    const selectList = fields.length ? fields.map((f) => graphColumnSqlName(f, plan, columns, datasets)).join(", ") : "*";
+    const derivedSelects = normalizeGraphDerivedColumns(plan.derivedColumns).map(graphDerivedSqlExpression);
+    const baseSelects = fields.length ? fields.map((f) => graphColumnSqlName(f, plan, columns, datasets)) : ["*"];
+    const selectList = [...baseSelects, ...derivedSelects].join(", ");
     const join = plan.joins[0];
     const left = (plan.sources || []).find((s) => s.id === join.leftSourceId) || plan.sources[0];
     const right = (plan.sources || []).find((s) => s.id === join.rightSourceId) || plan.sources[1];
@@ -5671,9 +5885,11 @@ WHERE ${s.filters.map((f) => filterToSql(f, columns)).join(" AND ")}`);
   }
 
   const projection = plan.projection?.length ? plan.projection : [];
-  const selectList = projection.length
-    ? projection.map((idx) => sqlIdentifier(columnByIndex(columns, idx)?.name || `Column${Number(idx)+1}`)).join(", ")
-    : "*";
+  const derivedSelects = normalizeGraphDerivedColumns(plan.derivedColumns).map(graphDerivedSqlExpression);
+  const baseSelects = projection.length
+    ? projection.map((idx) => sqlIdentifier(columnByIndex(columns, idx)?.name || `Column${Number(idx)+1}`))
+    : ["*"];
+  const selectList = [...baseSelects, ...derivedSelects].join(", ");
   const fromName = plan.sourceAlias || GRAPH_SQL_DATASET_NAME;
   const whereSql = (plan.filters || []).map((f) => filterToSql(f, columns));
   const sortCol = plan.sort ? columnByIndex(columns, plan.sort.columnIndex) : null;
@@ -5693,6 +5909,7 @@ function compileGraphQuery(nodes, edges, columns, datasets=[]) {
   let maxRows = 0;
   let projection = [];
   let selectedFields = [];
+  const derivedColumns = [];
   const subqueries = [];
   const active = (nodes || []).filter((n) => !(n.data || {}).disabled);
   const sources = graphSourceNodes(active).map((n, idx) => ({
@@ -5720,6 +5937,15 @@ function compileGraphQuery(nodes, edges, columns, datasets=[]) {
     }
     if (d.kind === "sort") sort = { columnIndex: Number(d.columnIndex), direction: d.direction === "desc" ? "desc" : "asc" };
     if (d.kind === "limit") maxRows = Math.max(0, Number(d.maxRows || 0));
+    if (d.kind === "derived") {
+      derivedColumns.push({
+        id:n.id,
+        newColumnName:d.newColumnName || "new_column",
+        valueMode:d.valueMode === "formula" ? "formula" : "constant",
+        constantValue:d.constantValue ?? "",
+        formulaExpression:d.formulaExpression || ""
+      });
+    }
     if (d.kind === "select") {
       projection = (Array.isArray(d.selectedColumns) ? d.selectedColumns : []).map(Number).filter((idx) => (columns || []).some((c) => Number(c.index) === idx));
       selectedFields = (Array.isArray(d.selectedFields) ? d.selectedFields : []).map(String).filter(Boolean);
@@ -5732,7 +5958,7 @@ function compileGraphQuery(nodes, edges, columns, datasets=[]) {
     }
   }
   const mode = sources.length >= 2 && joins.length ? "join" : "single";
-  const plan = { mode, sources, joins, filters, sort, maxRows, projection, selectedFields, subqueries, edges: (edges || []).map((e) => ({ id:e.id, source:e.source, target:e.target })) };
+  const plan = { mode, sources, joins, filters, sort, maxRows, projection, selectedFields, derivedColumns: normalizeGraphDerivedColumns(derivedColumns), subqueries, edges: (edges || []).map((e) => ({ id:e.id, source:e.source, target:e.target })) };
   plan.sql = graphToSqlPreview(plan, columns, datasets);
   return plan;
 }
@@ -5896,7 +6122,7 @@ function QueryGraphEdge(props) {
   );
 }
 
-function GraphQueryEditor({ columns, datasets=[], manifest=null, nodes, setNodes, edges, setEdges, onApply, onReadPage=()=>{}, disabled, dataQueryActive, dataQueryCount, resultTable, resultStatus, resultTime, resultPage, resultPageMax, sqlText="", setSqlText=()=>{}, sqlMode=false, setSqlMode=()=>{} }) {
+function GraphQueryEditor({ columns, datasets=[], manifest=null, nodes, setNodes, edges, setEdges, onApply, onReadPage=()=>{}, onClearResult=()=>{}, disabled, dataQueryActive, dataQueryCount, resultTable, resultStatus, resultTime, resultPage, resultPageMax, sqlText="", setSqlText=()=>{}, sqlMode=false, setSqlMode=()=>{} }) {
   const [selectedId, setSelectedId] = useState(nodes?.[0]?.id || "source");
   const [sqlErrors, setSqlErrors] = useState([]);
   const selectedNode = useMemo(() => nodes.find((n) => n.id === selectedId) || null, [nodes, selectedId]);
@@ -5921,7 +6147,7 @@ function GraphQueryEditor({ columns, datasets=[], manifest=null, nodes, setNodes
   const addNode = (kind, extra={}) => {
     const id = `${kind}-${Date.now().toString(36)}`;
     const x = kind === "subquery" ? 130 : kind === "source" ? 30 + graphSourceNodes(nodes).length * 220 : 190 + Math.max(0, nodes.length - 2) * 130;
-    const y = kind === "source" ? 360 : kind === "join" ? 260 : kind === "filter" ? 105 : kind === "sort" ? 210 : kind === "select" ? 40 : kind === "aggregate" ? 300 : kind === "subquery" ? 355 : 380;
+    const y = kind === "source" ? 360 : kind === "join" ? 260 : kind === "filter" ? 105 : kind === "sort" ? 210 : kind === "select" ? 40 : kind === "derived" ? 300 : kind === "aggregate" ? 330 : kind === "subquery" ? 355 : 380;
     const node = makeGraphNode(id, kind, { x, y }, columns, extra);
     node.data.label = normalizeGraphNodeLabel(node, columns, datasets);
     setNodes((prev) => [...prev, node]);
@@ -6055,6 +6281,7 @@ function GraphQueryEditor({ columns, datasets=[], manifest=null, nodes, setNodes
             <Tooltip title="WHERE条件で行を絞るノードを追加"><span><Button size="small" variant="outlined" onClick={() => addNode("filter")} disabled={!columns.length}>+ 条件抽出</Button></span></Tooltip>
             <Tooltip title="ORDER BYで並び替えるノードを追加"><span><Button size="small" variant="outlined" onClick={() => addNode("sort")} disabled={!columns.length}>+ 並び替え</Button></span></Tooltip>
             <Tooltip title="取得件数を制限するノードを追加"><Button size="small" variant="outlined" onClick={() => addNode("limit")}>+ 件数制限</Button></Tooltip>
+            <Tooltip title="固定値または数式で新しい列を作るノードを追加"><span><Button size="small" variant="outlined" onClick={() => addNode("derived")} disabled={!columns.length && !datasets.length}>+ 計算列</Button></span></Tooltip>
             <Tooltip title="集計ノードを追加。実集計接続は次段階で有効化"><span><Button size="small" variant="outlined" onClick={() => addNode("aggregate")} disabled={!columns.length}>+ 集計</Button></span></Tooltip>
             <Tooltip title="サブクエリ用のグループを追加"><Button size="small" variant="outlined" onClick={() => addNode("subquery")}>+ サブクエリ</Button></Tooltip>
             <Tooltip title="初期ノード構成へ戻します"><Button size="small" onClick={resetGraph}>リセット</Button></Tooltip>
@@ -6085,7 +6312,7 @@ function GraphQueryEditor({ columns, datasets=[], manifest=null, nodes, setNodes
             </Box>
           )}
           <Typography variant="caption" color="text.secondary" sx={{ display: "block", mt: 0.75 }}>
-            ノードは種類ごとに色分けしています。上下左右の接続ポイントを使えます。ノード/エッジの小型ツールバーから複製・無効化・削除・条件挿入ができます。サブクエリはWITH句としてSQLプレビューに出力します。
+            ノードは種類ごとに色分けしています。上下左右の接続ポイントを使えます。ノード/エッジの小型ツールバーから複製・無効化・削除・条件挿入ができます。計算列は結果テーブルに追加されます。サブクエリはWITH句としてSQLプレビューに出力します。
           </Typography>
         </Paper>
 
@@ -6166,12 +6393,27 @@ function GraphQueryEditor({ columns, datasets=[], manifest=null, nodes, setNodes
                 </>
               )}
               {selectedNode.data?.kind === "limit" && <SmallNumberField label="最大行数 0=全件" value={String(selectedNode.data.maxRows ?? "0")} onChange={(v) => updateNodeData(selectedNode.id, { maxRows: v })} min="0" step="100000" fullWidth />}
+              {selectedNode.data?.kind === "derived" && (
+                <>
+                  <TextField label="新しい列名" size="small" value={selectedNode.data.newColumnName || "new_column"} onChange={(e) => updateNodeData(selectedNode.id, { newColumnName: e.target.value })} fullWidth />
+                  <TextField select label="作成方法" size="small" value={selectedNode.data.valueMode || "constant"} onChange={(e) => updateNodeData(selectedNode.id, { valueMode: e.target.value })} fullWidth>
+                    <MenuItem value="constant">固定値をセット</MenuItem>
+                    <MenuItem value="formula">行ごとの数式で計算</MenuItem>
+                  </TextField>
+                  {(selectedNode.data.valueMode || "constant") === "constant" ? (
+                    <TextField label="セットする値" size="small" value={selectedNode.data.constantValue || ""} onChange={(e) => updateNodeData(selectedNode.id, { constantValue: e.target.value })} fullWidth placeholder="例: 未分類 / 1 / TRUE" />
+                  ) : (
+                    <TextField label="数式 / Formula" size="small" multiline minRows={3} value={selectedNode.data.formulaExpression || ""} onChange={(e) => updateNodeData(selectedNode.id, { formulaExpression: e.target.value })} fullWidth placeholder={'例: num(col("amount")) * 1.1\n例: concat(col("姓"), " ", col("名"))'} />
+                  )}
+                  <Alert severity="info" sx={{ py: 0.25 }}>数式では col("列名"), num(x), str(x), concat(...), coalesce(...), lower(x), upper(x), round(x, 桁) を使えます。計算列は保存済みDatasetを破壊せず、Graph Query結果テーブルに追加されます。</Alert>
+                </>
+              )}
               {selectedNode.data?.kind === "aggregate" && <Alert severity="info">集計ノードはSQLプレビューへ表現を追加するための予約ノードです。実集計はPivot/Time基盤へ接続する次段階で有効化します。</Alert>}
               {selectedNode.data?.kind === "subquery" && <TextField label="サブクエリ名" size="small" value={selectedNode.data.alias || selectedNode.id} onChange={(e) => updateNodeData(selectedNode.id, { alias: e.target.value })} fullWidth />}
               {selectedNode.data?.kind === "output" && <Alert severity="info">このノードは結果出力です。JOIN/条件抽出/並び替え/件数制限/列選択を追加して条件を作成します。</Alert>}
               <Divider />
               <Typography variant="subtitle2" sx={{ fontWeight: 900 }}>コンパイル済みプラン</Typography>
-              <Typography component="pre" variant="caption" sx={{ p: 1, bgcolor: "background.paper", borderRadius: 1, overflow: "auto", maxHeight: 180 }}>{JSON.stringify({ mode: plan.mode, sources: plan.sources, joins: plan.joins, filters: plan.filters, sort: plan.sort, maxRows: plan.maxRows, projection: plan.projection, selectedFields: plan.selectedFields, subqueries: plan.subqueries }, null, 2)}</Typography>
+              <Typography component="pre" variant="caption" sx={{ p: 1, bgcolor: "background.paper", borderRadius: 1, overflow: "auto", maxHeight: 180 }}>{JSON.stringify({ mode: plan.mode, sources: plan.sources, joins: plan.joins, filters: plan.filters, sort: plan.sort, maxRows: plan.maxRows, projection: plan.projection, selectedFields: plan.selectedFields, derivedColumns: plan.derivedColumns, subqueries: plan.subqueries }, null, 2)}</Typography>
             </Stack>
           )}
         </Paper>
@@ -6191,7 +6433,8 @@ function GraphQueryEditor({ columns, datasets=[], manifest=null, nodes, setNodes
 
       <Paper elevation={0} sx={{ p: 1, bgcolor: "background.default", borderRadius: 2 }}>
         <Stack direction="row" useFlexGap flexWrap="wrap" spacing={1} alignItems="center" sx={{ mb: 0.75 }}>
-          <Typography variant="subtitle2" sx={{ fontWeight: 900 }}>Graph Query Result</Typography>
+          <Typography variant="subtitle2" sx={{ fontWeight: 900 }}>Graph Query Result / 実行結果</Typography>
+          <Button size="small" color="warning" variant="outlined" onClick={onClearResult}>結果クリア</Button>
           <Button size="small" onClick={() => onReadPage(Math.max(1, Number(resultPage || 1) - 1))}>Prev</Button>
           <Typography variant="caption">Page {Number(resultPage || 1).toLocaleString()} / {Number(resultPageMax || 0).toLocaleString()}</Typography>
           <Button size="small" onClick={() => onReadPage(Math.min(Number(resultPageMax || 1), Number(resultPage || 1) + 1))}>Next</Button>
@@ -6214,6 +6457,7 @@ function App() {
   const manifestRef = useRef(null);
   const searchPageRef = useRef(1);
   const pageRef = useRef(1);
+  const graphExecutionRef = useRef({ active:false, mode:"data", readMode:"dataQuery", derivedColumns:[] });
   const initialSettingsRef = useRef(loadSettings());
   const initialSettings = initialSettingsRef.current;
 
@@ -6776,13 +7020,40 @@ function App() {
       }
 
       if (msg.type === "PAGE_RESULT") {
-        setDataTable({ header: msg.header, rows: msg.rows });
+        const table = { header: msg.header, rows: msg.rows };
+        if (msg.origin === "graph") {
+          const derived = graphExecutionRef.current?.derivedColumns || [];
+          setGraphResultTable(applyGraphDerivedColumnsToTable(table, derived));
+          setGraphResultMode("data");
+          setGraphResultPage(msg.page || 1);
+          setGraphResultCount(manifestRef.current?.totalRows || msg.totalMatches || 0);
+          setGraphResultStatus(`Graph rows ${fmt(msg.startRow + 1)} - ${fmt(msg.startRow + msg.rows.length)} / page ${fmt(msg.page)}${derived.length ? ` / 計算列 ${fmt(derived.length)}列` : ""}`);
+          setGraphResultTime(ms(msg.ms));
+          return;
+        }
+        setDataTable(table);
         setDataStatus(`Rows ${fmt(msg.startRow + 1)} - ${fmt(msg.startRow + msg.rows.length)} / page ${fmt(msg.page)}`);
         setDataTime(ms(msg.ms));
         return;
       }
 
       if (msg.type === "DATA_QUERY_DONE") {
+        if (msg.origin === "graph") {
+          const projection = Array.isArray(msg.projection) && msg.projection.length ? msg.projection.map(Number) : null;
+          const derived = graphExecutionRef.current?.derivedColumns || [];
+          setGraphResultMode("data");
+          setGraphResultCount(msg.matches || 0);
+          setGraphResultPage(1);
+          setGraphResultStatus(`Graph Queryを実行しました。結果ページを読み込み中...${projection ? ` / SELECT ${fmt(projection.length)}列` : ""}${derived.length ? ` / 計算列 ${fmt(derived.length)}列` : ""}`);
+          setGraphResultTime(ms(msg.ms));
+          graphExecutionRef.current.readMode = msg.active ? "dataQuery" : "page";
+          if (!msg.active) {
+            worker.postMessage({ type: "READ_PAGE", origin: "graph", page: 1, pageSize: pageSizeRef.current, columns: projection || selectedColumnsForPost() });
+          } else {
+            worker.postMessage({ type: "READ_DATA_QUERY_PAGE", origin: "graph", page: 1, pageSize: pageSizeRef.current, columns: Array.isArray(msg.projection) && msg.projection.length ? msg.projection : selectedColumnsForPost() });
+          }
+          return;
+        }
         if (!msg.active) {
           const projection = Array.isArray(msg.projection) && msg.projection.length ? msg.projection.map(Number) : null;
           if (projection) { setVisibleCols(projection); visibleColsRef.current = projection; }
@@ -6806,7 +7077,18 @@ function App() {
       }
 
       if (msg.type === "DATA_QUERY_PAGE_RESULT") {
-        setDataTable({ header: msg.header, rows: msg.rows });
+        const table = { header: msg.header, rows: msg.rows };
+        if (msg.origin === "graph") {
+          const derived = graphExecutionRef.current?.derivedColumns || [];
+          setGraphResultMode("data");
+          setGraphResultTable(applyGraphDerivedColumnsToTable(table, derived));
+          setGraphResultCount(msg.totalMatches || 0);
+          setGraphResultPage(msg.page || 1);
+          setGraphResultStatus(`Graph rows ${fmt(msg.startRow + 1)} - ${fmt(msg.startRow + msg.rows.length)} / ${fmt(msg.totalMatches)} / page ${fmt(msg.page)}${derived.length ? ` / 計算列 ${fmt(derived.length)}列` : ""}`);
+          setGraphResultTime(ms(msg.ms));
+          return;
+        }
+        setDataTable(table);
         setDataQueryCount(msg.totalMatches || 0);
         setDataStatus(`Global rows ${fmt(msg.startRow + 1)} - ${fmt(msg.startRow + msg.rows.length)} / ${fmt(msg.totalMatches)} / page ${fmt(msg.page)}`);
         setDataTime(ms(msg.ms));
@@ -6815,20 +7097,22 @@ function App() {
 
 
       if (msg.type === "GRAPH_JOIN_DONE") {
+        const derived = graphExecutionRef.current?.derivedColumns || [];
         setGraphResultMode("join");
-        setGraphResultTable({ header: msg.header, rows: msg.rows });
+        setGraphResultTable(applyGraphDerivedColumnsToTable({ header: msg.header, rows: msg.rows }, derived));
         setGraphResultCount(msg.totalMatches || msg.matches || 0);
         setGraphResultPage(1);
-        setGraphResultStatus(`JOIN result: ${fmt(msg.totalMatches || msg.matches || 0)} rows / scanned ${fmt(msg.scanned || 0)} / right indexed ${fmt(msg.rightIndexed || 0)}${msg.capped ? " / limitで打ち切り" : ""}`);
+        setGraphResultStatus(`JOIN result: ${fmt(msg.totalMatches || msg.matches || 0)} rows / scanned ${fmt(msg.scanned || 0)} / right indexed ${fmt(msg.rightIndexed || 0)}${derived.length ? ` / 計算列 ${fmt(derived.length)}列` : ""}${msg.capped ? " / limitで打ち切り" : ""}`);
         setGraphResultTime(ms(msg.ms));
         return;
       }
 
       if (msg.type === "GRAPH_JOIN_PAGE_RESULT") {
-        setGraphResultTable({ header: msg.header, rows: msg.rows });
+        const derived = graphExecutionRef.current?.derivedColumns || [];
+        setGraphResultTable(applyGraphDerivedColumnsToTable({ header: msg.header, rows: msg.rows }, derived));
         setGraphResultCount(msg.totalMatches || 0);
         setGraphResultPage(msg.page || 1);
-        setGraphResultStatus(`JOIN rows ${fmt(msg.startRow + 1)} - ${fmt(msg.startRow + msg.rows.length)} / ${fmt(msg.totalMatches)} / page ${fmt(msg.page)}`);
+        setGraphResultStatus(`JOIN rows ${fmt(msg.startRow + 1)} - ${fmt(msg.startRow + msg.rows.length)} / ${fmt(msg.totalMatches)} / page ${fmt(msg.page)}${derived.length ? ` / 計算列 ${fmt(derived.length)}列` : ""}`);
         setGraphResultTime(ms(msg.ms));
         return;
       }
@@ -7046,19 +7330,35 @@ function App() {
     }));
   }, [columns.map((c) => `${c.index}:${c.name}:${c.type}`).join("|"), datasets.map((d)=>`${d.id}:${d.columns}`).join("|")]);
 
+  function clearGraphQueryResult(message="Graph Query結果をクリアしました。") {
+    graphExecutionRef.current = { active:false, mode:"data", readMode:"dataQuery", derivedColumns:[] };
+    setGraphResultTable(null);
+    setGraphResultCount(0);
+    setGraphResultPage(1);
+    setGraphResultStatus(message);
+    setGraphResultTime("");
+  }
+
   function runGraphQueryPlan(plan) {
     if (!manifest && !(plan?.mode === "join")) return;
+    const derivedColumns = normalizeGraphDerivedColumns(plan?.derivedColumns || []);
+    graphExecutionRef.current = { active:true, mode:plan?.mode === "join" ? "join" : "data", readMode:"dataQuery", derivedColumns };
     if (plan?.mode === "join") {
       setGraphResultMode("join");
       setGraphResultTable(null);
       setGraphResultCount(0);
       setGraphResultPage(1);
-      setGraphResultStatus("Graph JOINを実行中...");
+      setGraphResultStatus(`Graph JOINを実行中... 旧結果をクリアしました。${derivedColumns.length ? ` / 計算列 ${fmt(derivedColumns.length)}列` : ""}`);
+      setGraphResultTime("");
       post({ type: "RUN_GRAPH_JOIN_QUERY", plan, pageSize: pageSizeRef.current });
       return;
     }
     setGraphResultMode("data");
     setGraphResultTable(null);
+    setGraphResultCount(0);
+    setGraphResultPage(1);
+    setGraphResultStatus(`Graph Queryを実行中... 旧結果をクリアしました。${derivedColumns.length ? ` / 計算列 ${fmt(derivedColumns.length)}列` : ""}`);
+    setGraphResultTime("");
     const filters = (plan?.filters || []).map((f) => ({ ...f, id: f.id || `${Date.now()}-${Math.random()}` }));
     const sort = plan?.sort || null;
     const maxRows = Number(plan?.maxRows || 0);
@@ -7070,6 +7370,7 @@ function App() {
     if (projection.length) { setVisibleCols(projection); visibleColsRef.current = projection; }
     post({
       type: "RUN_DATA_QUERY",
+      origin: "graph",
       filters,
       sort,
       maxRows,
@@ -7078,17 +7379,24 @@ function App() {
   }
 
   function readGraphQueryPage(next = graphResultPage) {
+    const safe = Math.max(1, Number(next || 1));
     if (graphResultMode === "join") {
-      const safe = Math.max(1, Number(next || 1));
       setGraphResultPage(safe);
       post({ type: "READ_GRAPH_JOIN_PAGE", page: safe, pageSize: pageSizeRef.current });
       return;
     }
-    readPage(next);
+    setGraphResultPage(safe);
+    const readMode = graphExecutionRef.current?.readMode || "dataQuery";
+    if (readMode === "page") {
+      post({ type: "READ_PAGE", origin: "graph", page: safe, pageSize: pageSizeRef.current, columns: selectedColumnsForPost() });
+    } else {
+      post({ type: "READ_DATA_QUERY_PAGE", origin: "graph", page: safe, pageSize: pageSizeRef.current, columns: selectedColumnsForPost() });
+    }
   }
 
   function runDataQuery() {
     if (!manifest) return;
+    graphExecutionRef.current.active = false;
     post({
       type: "RUN_DATA_QUERY",
       filters: dataQueryFilters,
@@ -7098,6 +7406,7 @@ function App() {
   }
 
   function clearDataQuery() {
+    graphExecutionRef.current.active = false;
     setDataQueryFilters([]);
     setDraftFilterValue("");
     setDataSortColumn("-1");
@@ -7861,14 +8170,15 @@ function App() {
                   setEdges={setGraphEdges}
                   onApply={runGraphQueryPlan}
                   onReadPage={readGraphQueryPage}
+                  onClearResult={clearGraphQueryResult}
                   disabled={(!manifest && !hierarchicalDatasets.length) || busy}
-                  dataQueryActive={graphResultMode === "join" ? graphResultCount > 0 : dataQueryActive}
-                  dataQueryCount={graphResultMode === "join" ? graphResultCount : dataQueryCount}
-                  resultTable={graphResultMode === "join" ? graphResultTable : (graphResultTable || dataTable)}
+                  dataQueryActive={graphResultCount > 0}
+                  dataQueryCount={graphResultCount}
+                  resultTable={graphResultTable}
                   resultStatus={graphResultMode === "join" ? graphResultStatus : dataStatus}
                   resultTime={graphResultMode === "join" ? graphResultTime : dataTime}
                   resultPage={graphResultMode === "join" ? graphResultPage : page}
-                  resultPageMax={graphResultMode === "join" ? Math.ceil((graphResultCount || 0) / Number(pageSize || 500)) : pageMax}
+                  resultPageMax={Math.max(1, Math.ceil((graphResultCount || 0) / Number(pageSize || 500)))}
                   sqlText={graphSqlText}
                   setSqlText={setGraphSqlText}
                   sqlMode={graphSqlMode}
@@ -8211,7 +8521,7 @@ root.render(
   
   
   
-</script>
+  </script>
 
   <!-- React 19 / MUI 7.3.5 / Icons via CDN ESM -->
   <script type="module">
