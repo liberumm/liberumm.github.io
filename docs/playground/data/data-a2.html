@@ -3146,7 +3146,7 @@ async function readDataQueryPage(page,pageSize,cols){
 
 function normalizeGraphJoinLimit(value){
   const n = Number(value || 0);
-  return Number.isFinite(n) && n > 0 ? Math.floor(n) : 100000;
+  return Number.isFinite(n) && n > 0 ? Math.floor(n) : Number.POSITIVE_INFINITY;
 }
 
 function cleanJoinAlias(value, fallback){
@@ -3290,7 +3290,7 @@ async function runGraphJoinQuery({plan, pageSize}){
   const rightKey = Number(join.rightColumnIndex);
   if (!Number.isFinite(leftKey) || !Number.isFinite(rightKey)) throw new Error("JOIN key columns are not selected");
   const joinType = ["left","inner"].includes(String(join.joinType || "inner")) ? String(join.joinType || "inner") : "inner";
-  const requestedLimit = normalizeGraphJoinLimit(plan.maxRows || pageSize || 100000);
+  const requestedLimit = normalizeGraphJoinLimit(plan.maxRows || 0);
 
   let selectedFields = (Array.isArray(plan.selectedFields) ? plan.selectedFields : []).map(normalizeJoinFieldRef).filter(Boolean);
   if (!selectedFields.length) selectedFields = defaultJoinSelectedFields(sources, openedMap);
@@ -6548,10 +6548,19 @@ function GraphQueryVirtualTable({ table, totalRows=0, page=1, pageSize=1000, onR
   const safePage = Math.max(1, Number(page || 1));
   const startIndex = (safePage - 1) * safePageSize;
   const totalPages = Math.max(1, Math.ceil(safeTotal / safePageSize));
-  const contentHeight = Math.max(safeTotal * rowHeight, Math.max(0, height - headerHeight));
+  const viewportHeight = Math.max(120, Number(height || 420));
+  const viewportRows = Math.max(1, Math.ceil(viewportHeight / rowHeight));
+  const MAX_PHYSICAL_SCROLL_HEIGHT = 12000000;
+  const rawContentHeight = safeTotal * rowHeight;
+  const contentHeight = Math.max(
+    viewportHeight - headerHeight,
+    Math.min(rawContentHeight, MAX_PHYSICAL_SCROLL_HEIGHT)
+  );
+  const isCompressedScroll = rawContentHeight > MAX_PHYSICAL_SCROLL_HEIGHT;
   const lastRequestedRef = useRef({ page:safePage, at:0 });
   const rafRef = useRef(0);
   const resizeRef = useRef(null);
+  const scrollRef = useRef(null);
   const [scrollTop, setScrollTop] = useState(0);
   const [selectedAbsRow, setSelectedAbsRow] = useState(-1);
   const [columnWidths, setColumnWidths] = useState({});
@@ -6616,15 +6625,30 @@ function GraphQueryVirtualTable({ table, totalRows=0, page=1, pageSize=1000, onR
     window.addEventListener("touchend", onUp);
   };
 
+  const maxScrollableTop = Math.max(1, contentHeight - viewportHeight);
+  const virtualRowFromScroll = (top) => {
+    if (!safeTotal) return 0;
+    if (!isCompressedScroll) return Math.max(0, Math.floor(top / rowHeight));
+    const ratio = Math.max(0, Math.min(1, Number(top || 0) / maxScrollableTop));
+    return Math.max(0, Math.min(Math.max(0, safeTotal - viewportRows), Math.floor(ratio * Math.max(0, safeTotal - viewportRows))));
+  };
+  const scrollFromVirtualRow = (row) => {
+    if (!safeTotal) return 0;
+    if (!isCompressedScroll) return row * rowHeight;
+    const denom = Math.max(1, safeTotal - viewportRows);
+    return Math.max(0, Math.min(maxScrollableTop, (Math.max(0, row) / denom) * maxScrollableTop));
+  };
+
   const onScroll = (event) => {
     if (!safeTotal) return;
     const top = event.currentTarget.scrollTop || 0;
     if (rafRef.current) cancelAnimationFrame(rafRef.current);
     rafRef.current = requestAnimationFrame(() => setScrollTop(top));
 
-    const nextPage = Math.min(Math.max(1, Math.floor(top / (rowHeight * safePageSize)) + 1), totalPages);
+    const virtualStart = virtualRowFromScroll(top);
+    const nextPage = Math.min(Math.max(1, Math.floor(virtualStart / safePageSize) + 1), totalPages);
     const t = performance.now();
-    if (nextPage !== lastRequestedRef.current.page && t - lastRequestedRef.current.at > 220) {
+    if (nextPage !== lastRequestedRef.current.page && t - lastRequestedRef.current.at > 120) {
       lastRequestedRef.current = { page:nextPage, at:t };
       onReadPage(nextPage);
     }
@@ -6642,25 +6666,30 @@ function GraphQueryVirtualTable({ table, totalRows=0, page=1, pageSize=1000, onR
   const gridTemplateColumns = widths.map((w) => `${w}px`).join(" ");
   const minWidth = Math.max(720, widths.reduce((sum, width) => sum + width, 0));
   const overscan = 12;
-  const visibleAbsStart = Math.max(0, Math.floor(scrollTop / rowHeight) - overscan);
-  const visibleAbsEnd = Math.min(safeTotal, Math.ceil((scrollTop + height) / rowHeight) + overscan);
+  const visibleAbsStart = Math.max(0, virtualRowFromScroll(scrollTop) - overscan);
+  const visibleAbsEnd = Math.min(safeTotal, visibleAbsStart + viewportRows + overscan * 2);
   const loadedAbsStart = startIndex;
   const loadedAbsEnd = startIndex + rows.length;
   const localStart = Math.max(0, visibleAbsStart - loadedAbsStart);
   const localEnd = Math.min(rows.length, Math.max(localStart, visibleAbsEnd - loadedAbsStart));
   const visibleRows = rows.slice(localStart, localEnd);
-  const visibleTop = (startIndex + localStart) * rowHeight;
+  const visibleTop = isCompressedScroll
+    ? Math.max(0, Math.min(contentHeight - (visibleRows.length * rowHeight), scrollFromVirtualRow(loadedAbsStart + localStart)))
+    : (startIndex + localStart) * rowHeight;
+  const loadedRangeText = rows.length ? `${fmt(startIndex + 1)} - ${fmt(Math.min(startIndex + rows.length, safeTotal))}` : "未読込";
+  const virtualRangeText = safeTotal ? `${fmt(visibleAbsStart + 1)} - ${fmt(Math.min(visibleAbsEnd, safeTotal))}` : "0";
 
   return (
     <Box sx={{ border:"1px solid", borderColor:"divider", borderRadius:1.5, overflow:"hidden", bgcolor:"background.paper" }}>
       <Box sx={{ px:1, py:0.6, bgcolor:"action.hover", borderBottom:"1px solid", borderColor:"divider", display:"flex", gap:1, alignItems:"center", flexWrap:"wrap" }}>
         <Typography variant="caption" sx={{ fontWeight:900 }}>
-          全{fmt(safeTotal)}行を1つの結果パネルとして表示 / 読込タイル: {rows.length ? `${fmt(startIndex + 1)} - ${fmt(Math.min(startIndex + rows.length, safeTotal))}` : "未読込"} / 描画中: {fmt(visibleRows.length)}行
+          全{fmt(safeTotal)}行をlazy全件パネル表示 / 表示位置: {virtualRangeText} / 読込タイル: {loadedRangeText} / 描画中: {fmt(visibleRows.length)}行
         </Typography>
+        {isCompressedScroll && <Chip size="small" color="warning" variant="outlined" label="リミットレス圧縮スクロール" />}
         {selectedAbsRow >= 0 && <Chip size="small" color="primary" label={`選択行: ${fmt(selectedAbsRow + 1)}`} />}
         <Typography variant="caption" color="text.secondary">列幅はヘッダー右端をドラッグ、ダブルクリックでリセットできます。</Typography>
       </Box>
-      <Box onScroll={onScroll} sx={{ height, overflow:"auto", position:"relative" }}>
+      <Box ref={scrollRef} onScroll={onScroll} sx={{ height:viewportHeight, overflow:"auto", position:"relative" }}>
         <Box sx={{ position:"sticky", top:0, zIndex:4, display:"grid", gridTemplateColumns, minWidth, bgcolor:"background.paper", borderBottom:"1px solid", borderColor:"divider" }}>
           {header.map((h, i) => (
             <Box key={i} sx={{ position:"relative", px:1, py:0.8, fontWeight:900, whiteSpace:"nowrap", overflow:"hidden", textOverflow:"ellipsis", borderRight:"1px solid", borderColor:"divider" }}>
@@ -6694,7 +6723,7 @@ function GraphQueryVirtualTable({ table, totalRows=0, page=1, pageSize=1000, onR
                 <Box
                   key={`${startIndex + localStart}-${ri}`}
                   onClick={() => setSelectedAbsRow(absRow)}
-                  sx={{ display:"grid", gridTemplateColumns, height:rowHeight, borderBottom:"1px solid", borderColor:"divider", cursor:"pointer", bgcolor:selectedAbsRow === absRow ? "action.selected" : "transparent", '&:hover':{ bgcolor:"action.hover" } }}
+                  sx={{ display:"grid", gridTemplateColumns, height:rowHeight, borderBottom:"1px solid", borderColor:"divider", cursor:"pointer", bgcolor:selectedAbsRow === absRow ? "action.selected" : "background.paper", '&:hover':{ bgcolor:"action.hover" } }}
                 >
                   {header.map((_, ci) => <Box key={ci} title={String(row?.[ci] ?? "")} sx={{ px:1, py:0.65, whiteSpace:"nowrap", overflow:"hidden", textOverflow:"ellipsis", borderRight:"1px solid", borderColor:"divider" }}>{String(row?.[ci] ?? "")}</Box>)}
                 </Box>
@@ -6706,7 +6735,6 @@ function GraphQueryVirtualTable({ table, totalRows=0, page=1, pageSize=1000, onR
     </Box>
   );
 }
-
 
 function GraphQueryEditor({ columns, datasets=[], manifest=null, nodes, setNodes, edges, setEdges, onApply, onReadPage=()=>{}, onClearResult=()=>{}, onExportCsv=()=>{}, disabled, dataQueryActive, dataQueryCount, resultTable, resultStatus, resultTime, resultPage, resultPageMax, resultViewMode="tile", setResultViewMode=()=>{}, resultRowsPerTile="1000", setResultRowsPerTile=()=>{}, sqlText="", setSqlText=()=>{}, sqlMode=false, setSqlMode=()=>{} }) {
   const [selectedId, setSelectedId] = useState(nodes?.[0]?.id || "source");
@@ -6725,9 +6753,22 @@ function GraphQueryEditor({ columns, datasets=[], manifest=null, nodes, setNodes
   }, [resultRowsPerTile]);
 
   const applyResultRowsPerTile = () => {
-    const next = String(Math.max(50, Math.floor(Number(resultRowsDraft || resultRowsPerTile || 1000) || 1000)));
+    const nextNumber = Math.max(50, Math.floor(Number(resultRowsDraft || resultRowsPerTile || 100) || 100));
+    const next = String(nextNumber);
     setResultRowsPerTile(next);
+    setTimeout(() => onReadPage(1, nextNumber), 0);
+  };
+
+  const switchGraphResultToTile = () => {
+    setResultViewMode("tile");
     setTimeout(() => onReadPage(1), 0);
+  };
+
+  const switchGraphResultToPage = () => {
+    setResultViewMode("page");
+    setResultRowsDraft("100");
+    setResultRowsPerTile("100");
+    setTimeout(() => onReadPage(1, 100), 0);
   };
 
   useEffect(() => {
@@ -7063,14 +7104,14 @@ function GraphQueryEditor({ columns, datasets=[], manifest=null, nodes, setNodes
           <Typography variant="subtitle2" sx={{ fontWeight: 900 }}>Graph Query Result / 実行結果</Typography>
           <Button size="small" color="warning" variant="outlined" onClick={() => onClearResult()}>結果クリア</Button>
           <Button size="small" variant="contained" startIcon={<Download />} onClick={onExportCsv} disabled={!Number(dataQueryCount || 0)}>CSV全件出力</Button>
-          <Button size="small" variant={resultViewMode === "tile" ? "contained" : "outlined"} onClick={() => { setResultViewMode("tile"); setTimeout(() => onReadPage(1), 0); }}>全件パネル表示</Button>
-          <Button size="small" variant={resultViewMode === "page" ? "contained" : "outlined"} onClick={() => setResultViewMode("page")}>ページ表示</Button>
+          <Button size="small" variant={resultViewMode === "tile" ? "contained" : "outlined"} onClick={switchGraphResultToTile}>全件パネル表示</Button>
+          <Button size="small" variant={resultViewMode === "page" ? "contained" : "outlined"} onClick={switchGraphResultToPage}>ページ表示（100件）</Button>
           {resultViewMode === "page" && <SmallNumberField label="ページ行数" value={resultRowsDraft} onChange={setResultRowsDraft} min="50" step="50" sx={{ width: 130 }} />}
           {resultViewMode === "page" && <Button size="small" variant="outlined" onClick={applyResultRowsPerTile}>件数を適用</Button>}
           {resultViewMode === "page" && <Button size="small" onClick={() => onReadPage(Math.max(1, Number(resultPage || 1) - 1))}>Prev</Button>}
           {resultViewMode === "page" && <Typography variant="caption">Page {Number(resultPage || 1).toLocaleString()} / {Number(resultPageMax || 0).toLocaleString()}</Typography>}
           {resultViewMode === "page" && <Button size="small" onClick={() => onReadPage(Math.min(Number(resultPageMax || 1), Number(resultPage || 1) + 1))}>Next</Button>}
-          {resultViewMode === "tile" && <Chip size="small" color="primary" label={`全件パネル / 表示中 ${Number(resultTable?.rows?.length || 0).toLocaleString()} / 全 ${Number(dataQueryCount || 0).toLocaleString()}`} />}
+          {resultViewMode === "tile" && <Chip size="small" color="primary" label={`lazy全件パネル / 読込中 ${Number(resultTable?.rows?.length || 0).toLocaleString()} / 全 ${Number(dataQueryCount || 0).toLocaleString()}`} />}
           <Chip size="small" label={`${Number(dataQueryCount || 0).toLocaleString()} rows`} />
         </Stack>
         {resultViewMode === "tile" ? (
@@ -8079,19 +8120,22 @@ function App() {
     });
   }
 
-  function readGraphQueryPage(next = graphResultPage) {
+  function readGraphQueryPage(next = graphResultPage, pageSizeOverride = null) {
     const safe = Math.max(1, Number(next || 1));
+    const requestedPageSize = Math.max(1, Number(pageSizeOverride || graphResultPageSizeRef.current || 1000));
+    graphResultPageSizeRef.current = requestedPageSize;
+    if (pageSizeOverride != null) setGraphResultPageSize(String(requestedPageSize));
     if (graphResultMode === "join") {
       setGraphResultPage(safe);
-      post({ type: "READ_GRAPH_JOIN_PAGE", page: safe, pageSize: graphResultPageSizeRef.current });
+      post({ type: "READ_GRAPH_JOIN_PAGE", page: safe, pageSize: requestedPageSize });
       return;
     }
     setGraphResultPage(safe);
     const readMode = graphExecutionRef.current?.readMode || "dataQuery";
     if (readMode === "page") {
-      post({ type: "READ_PAGE", origin: "graph", page: safe, pageSize: graphResultPageSizeRef.current, columns: selectedColumnsForPost() });
+      post({ type: "READ_PAGE", origin: "graph", page: safe, pageSize: requestedPageSize, columns: selectedColumnsForPost() });
     } else {
-      post({ type: "READ_DATA_QUERY_PAGE", origin: "graph", page: safe, pageSize: graphResultPageSizeRef.current, columns: selectedColumnsForPost() });
+      post({ type: "READ_DATA_QUERY_PAGE", origin: "graph", page: safe, pageSize: requestedPageSize, columns: selectedColumnsForPost() });
     }
   }
 
