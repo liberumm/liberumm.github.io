@@ -4905,6 +4905,120 @@ function saveSettings(settings) {
   catch {}
 }
 
+
+const GRAPH_QUERY_SESSIONS_KEY = "quantumCsvGrid.graphQuery.sessions.v1";
+
+function newGraphSessionId(){
+  return `gq_session_${Date.now().toString(36)}_${Math.random().toString(36).slice(2,8)}`;
+}
+
+function stripGraphNodeForSession(node){
+  if (!node || typeof node !== "object") return null;
+  return {
+    id:String(node.id || newGraphSessionId()),
+    type:node.type || undefined,
+    position:{x:Number(node.position?.x || 0), y:Number(node.position?.y || 0)},
+    parentId:node.parentId || undefined,
+    extent:node.extent || undefined,
+    data:{...(node.data || {})},
+  };
+}
+
+function stripGraphEdgeForSession(edge){
+  if (!edge || typeof edge !== "object") return null;
+  return {
+    id:String(edge.id || `edge_${Date.now().toString(36)}`),
+    source:String(edge.source || ""),
+    target:String(edge.target || ""),
+    sourceHandle:edge.sourceHandle || undefined,
+    targetHandle:edge.targetHandle || undefined,
+    type:edge.type || undefined,
+    animated:edge.animated !== false,
+    reconnectable:edge.reconnectable !== false,
+    data:{...(edge.data || {})},
+    markerEnd:edge.markerEnd || undefined,
+  };
+}
+
+function graphSessionDatasetRefs(nodes){
+  return graphSourceNodes(nodes || []).map((n) => ({
+    sourceId:n.id,
+    alias:n.data?.alias || n.id,
+    datasetId:n.data?.datasetId || "__active__",
+  }));
+}
+
+function normalizeGraphSession(raw){
+  if (!raw || typeof raw !== "object") return null;
+  const nodes = Array.isArray(raw.nodes) ? raw.nodes.map(stripGraphNodeForSession).filter(Boolean) : [];
+  const edges = Array.isArray(raw.edges) ? raw.edges.map(stripGraphEdgeForSession).filter(Boolean) : [];
+  if (!nodes.length) return null;
+  const id = String(raw.id || newGraphSessionId());
+  const now = new Date().toISOString();
+  return {
+    id,
+    name:String(raw.name || "Graph Query Session"),
+    createdAt:raw.createdAt || now,
+    updatedAt:raw.updatedAt || raw.createdAt || now,
+    nodes,
+    edges,
+    sqlText:String(raw.sqlText || ""),
+    sqlMode:!!raw.sqlMode,
+    datasets:Array.isArray(raw.datasets) ? raw.datasets : graphSessionDatasetRefs(nodes),
+    resultSaved:false,
+    version:1,
+  };
+}
+
+function loadGraphQuerySessions(){
+  try{
+    const raw=JSON.parse(localStorage.getItem(GRAPH_QUERY_SESSIONS_KEY) || "[]");
+    return (Array.isArray(raw) ? raw : raw.sessions || []).map(normalizeGraphSession).filter(Boolean);
+  }catch{ return []; }
+}
+
+function saveGraphQuerySessions(sessions){
+  try{
+    const list=(Array.isArray(sessions) ? sessions : []).map(normalizeGraphSession).filter(Boolean).slice(0,100);
+    localStorage.setItem(GRAPH_QUERY_SESSIONS_KEY, JSON.stringify({version:1, updatedAt:new Date().toISOString(), sessions:list}));
+    return true;
+  }catch{ return false; }
+}
+
+function defaultGraphNodes(columns=[]){
+  return [
+    makeGraphNode("source", "source", { x: 20, y: 140 }, columns),
+    makeGraphNode("filter-1", "filter", { x: 240, y: 70 }, columns),
+    makeGraphNode("sort-1", "sort", { x: 460, y: 170 }, columns),
+    makeGraphNode("output", "output", { x: 700, y: 140 }, columns),
+  ].map((n) => ({ ...n, data: { ...n.data, label: normalizeGraphNodeLabel(n, columns) } }));
+}
+
+function defaultGraphEdges(){
+  return [
+    { id: "source-filter", source: "source", target: "filter-1", animated: true, reconnectable:true, markerEnd: RFMarkerType ? { type: RFMarkerType.ArrowClosed } : undefined },
+    { id: "filter-sort", source: "filter-1", target: "sort-1", animated: true, reconnectable:true, markerEnd: RFMarkerType ? { type: RFMarkerType.ArrowClosed } : undefined },
+    { id: "sort-output", source: "sort-1", target: "output", animated: true, reconnectable:true, markerEnd: RFMarkerType ? { type: RFMarkerType.ArrowClosed } : undefined },
+  ];
+}
+
+function restoreGraphSessionNodes(session, columns=[], datasets=[]){
+  return (Array.isArray(session?.nodes) ? session.nodes : defaultGraphNodes(columns)).map((node) => {
+    const n={...node, data:{...(node.data || {})}};
+    n.data.label=normalizeGraphNodeLabel(n, columns, datasets);
+    return n;
+  });
+}
+
+function restoreGraphSessionEdges(session){
+  return (Array.isArray(session?.edges) ? session.edges : defaultGraphEdges()).map((edge) => ({
+    ...edge,
+    animated:edge.animated !== false,
+    reconnectable:edge.reconnectable !== false,
+    markerEnd:edge.markerEnd || (RFMarkerType ? { type: RFMarkerType.ArrowClosed } : undefined),
+  }));
+}
+
 const CATALOG_SCOPES_KEY = "quantumCsvGrid.storageCatalogScopes.v1";
 function loadCatalogScopes() {
   try {
@@ -6783,7 +6897,7 @@ function GraphQueryVirtualTable({ table, totalRows=0, page=1, pageSize=1000, onR
   );
 }
 
-function GraphQueryEditor({ columns, datasets=[], manifest=null, nodes, setNodes, edges, setEdges, onApply, onReadPage=()=>{}, onClearResult=()=>{}, onExportCsv=()=>{}, disabled, dataQueryActive, dataQueryCount, resultTable, resultStatus, resultTime, resultPage, resultPageMax, resultViewMode="tile", setResultViewMode=()=>{}, resultRowsPerTile="1000", setResultRowsPerTile=()=>{}, sqlText="", setSqlText=()=>{}, sqlMode=false, setSqlMode=()=>{} }) {
+function GraphQueryEditor({ columns, datasets=[], manifest=null, nodes, setNodes, edges, setEdges, onApply, onReadPage=()=>{}, onClearResult=()=>{}, onExportCsv=()=>{}, disabled, dataQueryActive, dataQueryCount, resultTable, resultStatus, resultTime, resultPage, resultPageMax, resultViewMode="tile", setResultViewMode=()=>{}, resultRowsPerTile="1000", setResultRowsPerTile=()=>{}, sqlText="", setSqlText=()=>{}, sqlMode=false, setSqlMode=()=>{}, graphSessions=[], activeSessionId="", sessionName="", setSessionName=()=>{}, onSessionNew=()=>{}, onSessionSave=()=>{}, onSessionSaveAs=()=>{}, onSessionLoad=()=>{}, onSessionDelete=()=>{}, onSessionDuplicate=()=>{}, autoStandby=true, setAutoStandby=()=>{}, onDatasetStandby=()=>{} }) {
   const [selectedId, setSelectedId] = useState(nodes?.[0]?.id || "source");
   const [sqlErrors, setSqlErrors] = useState([]);
   const [showMiniMap, setShowMiniMap] = useState(false);
@@ -6978,6 +7092,23 @@ function GraphQueryEditor({ columns, datasets=[], manifest=null, nodes, setNodes
   const rightJoinColumns = graphDatasetColumns(selectedRightSource?.data || {}, columns, datasets);
   return (
     <Stack spacing={1.1} sx={{ minWidth: 0 }}>
+      <Paper elevation={0} sx={{ p: 1, bgcolor: "background.default", borderRadius: 2 }}>
+        <Stack direction="row" useFlexGap flexWrap="wrap" spacing={1} alignItems="center">
+          <Typography variant="subtitle2" sx={{ fontWeight: 900 }}>Session / クエリ保存</Typography>
+          <TextField size="small" label="セッション名" value={sessionName || ""} onChange={(e) => setSessionName(e.target.value)} sx={{ minWidth: 220 }} />
+          <TextField select size="small" label="開く" value={activeSessionId || ""} onChange={(e) => e.target.value && onSessionLoad(e.target.value)} sx={{ minWidth: 260 }}>
+            <MenuItem value="">未選択</MenuItem>
+            {(graphSessions || []).map((s) => <MenuItem key={s.id} value={s.id}>{s.name} / {new Date(s.updatedAt || s.createdAt || Date.now()).toLocaleString()}</MenuItem>)}
+          </TextField>
+          <Button size="small" variant="outlined" onClick={onSessionNew}>新規</Button>
+          <Button size="small" variant="contained" onClick={() => onSessionSave(false)}>保存</Button>
+          <Button size="small" variant="outlined" onClick={() => onSessionSaveAs()}>別名保存</Button>
+          <Button size="small" variant="outlined" onClick={onSessionDuplicate} disabled={!activeSessionId}>複製</Button>
+          <Button size="small" color="error" variant="outlined" onClick={onSessionDelete} disabled={!activeSessionId}>削除</Button>
+          <FormControlLabel control={<Switch size="small" checked={!!autoStandby} onChange={(e) => setAutoStandby(e.target.checked)} />} label="Dataset自動スタンバイ" />
+          <Chip size="small" label={`保存対象: ノード/エッジ/SQLのみ・結果は保存しません`} />
+        </Stack>
+      </Paper>
       <Box sx={{ display: "grid", gridTemplateColumns: { xs: "1fr", lg: "minmax(0, 1fr) 360px" }, gap: 1, minWidth: 0 }}>
         <Paper elevation={0} sx={{ p: 1, bgcolor: "background.default", borderRadius: 2, minWidth: 0 }}>
           <Stack direction="row" useFlexGap flexWrap="wrap" spacing={0.75} alignItems="center" sx={{ mb: 1 }}>
@@ -7037,7 +7168,7 @@ function GraphQueryEditor({ columns, datasets=[], manifest=null, nodes, setNodes
               <Chip label={`${selectedNode.id} / ${graphKindMeta(selectedNode.data?.kind).jp}`} sx={{ bgcolor: graphKindMeta(selectedNode.data?.kind).bg, border: "1px solid", borderColor: graphKindMeta(selectedNode.data?.kind).border, fontWeight: 900 }} />
               {selectedNode.data?.kind === "source" && (
                 <>
-                  <TextField select label="Dataset" size="small" value={selectedNode.data.datasetId || "__active__"} onChange={(e) => updateNodeData(selectedNode.id, { datasetId: e.target.value })} fullWidth>
+                  <TextField select label="Dataset" size="small" value={selectedNode.data.datasetId || "__active__"} onChange={(e) => { const datasetId=e.target.value; updateNodeData(selectedNode.id, { datasetId }); onDatasetStandby(datasetId, { sourceId:selectedNode.id, sourceCount:sourceNodes.length }); }} fullWidth>
                     <MenuItem value="__active__">Active Dataset: {manifest?.tableName || manifest?.name || "active"}</MenuItem>
                     {datasets.map((d) => <MenuItem key={d.id} value={d.id}>{d.path || d.tableName || d.name || d.id}</MenuItem>)}
                   </TextField>
@@ -7262,6 +7393,10 @@ function App() {
   ]);
   const [graphSqlText, setGraphSqlText] = useState("");
   const [graphSqlMode, setGraphSqlMode] = useState(false);
+  const [graphSessions, setGraphSessions] = useState(() => loadGraphQuerySessions());
+  const [activeGraphSessionId, setActiveGraphSessionId] = useState("");
+  const [graphSessionName, setGraphSessionName] = useState("Untitled Graph Query");
+  const [graphAutoStandby, setGraphAutoStandby] = useState(true);
   const [graphResultMode, setGraphResultMode] = useState("data");
   const [graphResultTable, setGraphResultTable] = useState(null);
   const [graphResultCount, setGraphResultCount] = useState(0);
@@ -8200,6 +8335,143 @@ function App() {
     setGraphResultTime("");
   }
 
+  function graphSessionPayload(nameOverride=null){
+    const name = String(nameOverride || graphSessionName || "Untitled Graph Query").trim() || "Untitled Graph Query";
+    const nodes = (graphNodes || []).map(stripGraphNodeForSession).filter(Boolean);
+    const edges = (graphEdges || []).map(stripGraphEdgeForSession).filter(Boolean);
+    return normalizeGraphSession({
+      id: activeGraphSessionId || newGraphSessionId(),
+      name,
+      nodes,
+      edges,
+      sqlText:graphSqlText,
+      sqlMode:graphSqlMode,
+      datasets:graphSessionDatasetRefs(nodes),
+      createdAt: graphSessions.find((s) => s.id === activeGraphSessionId)?.createdAt,
+      updatedAt:new Date().toISOString(),
+    });
+  }
+
+  function persistGraphSessions(next, activeId=null){
+    const normalized=(Array.isArray(next) ? next : []).map(normalizeGraphSession).filter(Boolean);
+    setGraphSessions(normalized);
+    saveGraphQuerySessions(normalized);
+    if (activeId != null) setActiveGraphSessionId(activeId);
+  }
+
+  function standbyGraphDataset(datasetId, options={}){
+    const id=String(datasetId || "__active__");
+    if (!graphAutoStandby) return;
+    if (!id || id === "__active__") {
+      appendLog("Graph Dataset standby: Active Datasetを使用します。");
+      return;
+    }
+    const sourceCount=Number(options.sourceCount || graphSourceNodes(graphNodes).length || 1);
+    const ds=datasets.find((d) => String(d.id) === id);
+    if (!ds) {
+      appendLog(`Graph Dataset standby: ${id} はDataset一覧にないため一覧を更新します。`);
+      post({ type:"OPFS_LIST" });
+      return;
+    }
+    if (sourceCount <= 1 && String(manifest?.id || "") !== id) {
+      appendLog(`Graph Dataset standby: 単一SourceのためActive Datasetへ自動Openします: ${ds.tableName || ds.name || id}`);
+      setGraphResultStatus(`Datasetを自動スタンバイ中: ${ds.tableName || ds.name || id}`);
+      post({ type:"OPFS_LOAD", id });
+    } else {
+      appendLog(`Graph Dataset standby: schema ready ${ds.tableName || ds.name || id} / ${fmt(ds.schemaColumns?.length || ds.columns || 0)} columns`);
+      setGraphResultStatus(`Dataset schema ready: ${ds.tableName || ds.name || id}`);
+    }
+  }
+
+  function standbyDatasetsForSession(session){
+    if (!graphAutoStandby || !session) return;
+    const sources=graphSessionDatasetRefs(session.nodes || []);
+    const concrete=sources.map((s) => s.datasetId).filter((id) => id && id !== "__active__");
+    if (!concrete.length) return;
+    const missing=concrete.filter((id) => !datasets.some((d) => String(d.id) === String(id)));
+    if (missing.length) post({ type:"OPFS_LIST" });
+    if (concrete.length === 1 && String(manifest?.id || "") !== String(concrete[0])) {
+      post({ type:"OPFS_LOAD", id:concrete[0] });
+      appendLog(`Graph Session standby: Active Datasetへ自動Open ${concrete[0]}`);
+    } else {
+      appendLog(`Graph Session standby: ${fmt(concrete.length)} dataset schemas are ready or pending list refresh`);
+    }
+  }
+
+  function newGraphSession(){
+    const nodes=defaultGraphNodes(columns);
+    setGraphNodes(nodes);
+    setGraphEdges(defaultGraphEdges());
+    setGraphSqlMode(false);
+    setGraphSqlText("");
+    setActiveGraphSessionId("");
+    setGraphSessionName("Untitled Graph Query");
+    clearGraphQueryResult("新しいGraph Query Sessionを開始しました。結果は保存されません。");
+  }
+
+  function saveGraphSession(asNew=false){
+    const payload=graphSessionPayload();
+    if (!payload) return;
+    const id = asNew || !activeGraphSessionId ? newGraphSessionId() : activeGraphSessionId;
+    const nextSession={...payload, id, createdAt: graphSessions.find((s) => s.id === id)?.createdAt || new Date().toISOString(), updatedAt:new Date().toISOString()};
+    const next=[nextSession, ...graphSessions.filter((s) => s.id !== id)].slice(0,100);
+    persistGraphSessions(next, id);
+    setGraphSessionName(nextSession.name);
+    appendLog(`Graph Session saved: ${nextSession.name} / nodes ${fmt(nextSession.nodes.length)} / edges ${fmt(nextSession.edges.length)} / results not saved`);
+    setGraphResultStatus(`Session保存: ${nextSession.name}（結果は保存していません）`);
+  }
+
+  function saveGraphSessionAs(){
+    const base=String(graphSessionName || "Graph Query").trim() || "Graph Query";
+    const name=window.prompt("別名保存するセッション名", `${base} copy`);
+    if (!name) return;
+    setGraphSessionName(name);
+    const payload=graphSessionPayload(name);
+    if (!payload) return;
+    const id=newGraphSessionId();
+    const nextSession={...payload, id, name:String(name).trim(), createdAt:new Date().toISOString(), updatedAt:new Date().toISOString()};
+    const next=[nextSession, ...graphSessions].slice(0,100);
+    persistGraphSessions(next, id);
+    appendLog(`Graph Session saved as: ${nextSession.name}`);
+    setGraphResultStatus(`Session別名保存: ${nextSession.name}（結果は保存していません）`);
+  }
+
+  function loadGraphSession(id){
+    const session=graphSessions.find((s) => String(s.id) === String(id));
+    if (!session) return;
+    setActiveGraphSessionId(session.id);
+    setGraphSessionName(session.name || "Graph Query Session");
+    setGraphNodes(restoreGraphSessionNodes(session, columns, datasets));
+    setGraphEdges(restoreGraphSessionEdges(session));
+    setGraphSqlText(session.sqlText || "");
+    setGraphSqlMode(!!session.sqlMode);
+    clearGraphQueryResult(`Sessionを開きました: ${session.name}。結果は保存されていないため、実行すると最新データで再計算します。`);
+    appendLog(`Graph Session loaded: ${session.name} / results not restored`);
+    setTimeout(() => standbyDatasetsForSession(session), 0);
+  }
+
+  function deleteGraphSession(){
+    if (!activeGraphSessionId) return;
+    const current=graphSessions.find((s) => s.id === activeGraphSessionId);
+    const ok=window.confirm(`Graph Query Sessionを削除しますか？\n${current?.name || activeGraphSessionId}\n※結果データは元々保存していません。`);
+    if (!ok) return;
+    const next=graphSessions.filter((s) => s.id !== activeGraphSessionId);
+    persistGraphSessions(next, "");
+    setGraphSessionName("Untitled Graph Query");
+    appendLog(`Graph Session deleted: ${current?.name || activeGraphSessionId}`);
+    setGraphResultStatus("Sessionを削除しました。Graph Query結果はクリアしていません。");
+  }
+
+  function duplicateGraphSession(){
+    const current=graphSessions.find((s) => s.id === activeGraphSessionId);
+    if (!current) return;
+    const copy={...current, id:newGraphSessionId(), name:`${current.name} copy`, createdAt:new Date().toISOString(), updatedAt:new Date().toISOString()};
+    const next=[copy, ...graphSessions].slice(0,100);
+    persistGraphSessions(next, copy.id);
+    setGraphSessionName(copy.name);
+    appendLog(`Graph Session duplicated: ${copy.name}`);
+  }
+
   function runGraphQueryPlan(plan) {
     if (!manifest && !(plan?.mode === "join")) return;
     const derivedColumns = normalizeGraphDerivedColumns(plan?.derivedColumns || []);
@@ -9075,6 +9347,19 @@ function App() {
                   setSqlText={setGraphSqlText}
                   sqlMode={graphSqlMode}
                   setSqlMode={setGraphSqlMode}
+                  graphSessions={graphSessions}
+                  activeSessionId={activeGraphSessionId}
+                  sessionName={graphSessionName}
+                  setSessionName={setGraphSessionName}
+                  onSessionNew={newGraphSession}
+                  onSessionSave={saveGraphSession}
+                  onSessionSaveAs={saveGraphSessionAs}
+                  onSessionLoad={loadGraphSession}
+                  onSessionDelete={deleteGraphSession}
+                  onSessionDuplicate={duplicateGraphSession}
+                  autoStandby={graphAutoStandby}
+                  setAutoStandby={setGraphAutoStandby}
+                  onDatasetStandby={standbyGraphDataset}
                 />
             </Section>
           )}
