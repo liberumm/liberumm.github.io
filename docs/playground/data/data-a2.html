@@ -4829,6 +4829,7 @@ const TILE_TABLE_OVERSCAN_ROWS = 12;
 const TILE_TABLE_OVERSCAN_COL_PX = 420;
 const TILE_TABLE_READ_THROTTLE_MS = 90;
 const TILE_TABLE_READ_DEBOUNCE_MS = 90;
+const GRAPH_RESULT_PANEL_TILE_ROWS = 1000;
 
 function defaultTileColumnWidth(index, minColumnWidth = 150) {
   if (index === 0) return Math.max(96, Number(minColumnWidth || 150));
@@ -4969,6 +4970,7 @@ function CommonTileTableView({
   onReadPage = null,
   statusLabel = "",
   sourceLabel = "TileTable",
+  resetKey = "",
 }) {
   const baseHeader = Array.isArray(header) ? header : [];
   const baseRows = Array.isArray(rows) ? rows : [];
@@ -5015,9 +5017,30 @@ function CommonTileTableView({
     }
   }, [dataResetKey, externalLazy]);
 
+  const lazyResetKey = useMemo(() => {
+    if (!externalLazy) return "";
+    return `${tableId}|${headerKey}|${Number(totalRows || 0)}|${Math.max(1, Number(pageSize || 1000) || 1000)}|${resetKey || ""}`;
+  }, [externalLazy, tableId, headerKey, totalRows, pageSize, resetKey]);
+
   useEffect(() => {
-    requestRef.current.page = Number(page || 1);
-  }, [page]);
+    if (!externalLazy) return;
+    if (readTimerRef.current) {
+      clearTimeout(readTimerRef.current);
+      readTimerRef.current = 0;
+    }
+    requestRef.current = { page: 0, at: 0 };
+    setPendingPage(null);
+    setScroll({ top: 0, left: 0 });
+    setSelectedAbsRow(-1);
+    if (scrollRef.current) {
+      scrollRef.current.scrollTop = 0;
+      scrollRef.current.scrollLeft = 0;
+    }
+  }, [externalLazy, lazyResetKey]);
+
+  useEffect(() => {
+    requestRef.current = { ...requestRef.current, page: Number(page || 1), pageSize: safePageSize };
+  }, [page, safePageSize]);
 
   useEffect(() => () => {
     if (rafRef.current) cancelAnimationFrame(rafRef.current);
@@ -5096,24 +5119,26 @@ function CommonTileTableView({
     const safeNext = Math.min(Math.max(1, Math.floor(Number(nextPage || 1) || 1)), totalPages);
     const force = Boolean(options.force);
     const now = performance.now();
+    const currentRequestPageSize = Number(requestRef.current.pageSize || 0);
+    const pageSizeChanged = currentRequestPageSize !== safePageSize;
     const send = () => {
       if (readTimerRef.current) {
         clearTimeout(readTimerRef.current);
         readTimerRef.current = 0;
       }
-      requestRef.current = { page: safeNext, at: performance.now() };
+      requestRef.current = { page: safeNext, pageSize: safePageSize, at: performance.now() };
       setPendingPage(safeNext);
-      onReadPage(safeNext);
+      onReadPage(safeNext, safePageSize);
     };
-    if (!force && safeNext === requestRef.current.page && now - requestRef.current.at < TILE_TABLE_READ_THROTTLE_MS) return;
+    if (!force && !pageSizeChanged && safeNext === requestRef.current.page && now - requestRef.current.at < TILE_TABLE_READ_THROTTLE_MS) return;
     const wait = Math.max(0, TILE_TABLE_READ_THROTTLE_MS - (now - requestRef.current.at));
-    if (force || wait <= 0) {
+    if (force || pageSizeChanged || wait <= 0) {
       send();
       return;
     }
     if (readTimerRef.current) clearTimeout(readTimerRef.current);
     readTimerRef.current = setTimeout(send, Math.max(wait, TILE_TABLE_READ_DEBOUNCE_MS));
-  }, [externalLazy, onReadPage, safeTotal, totalPages]);
+  }, [externalLazy, onReadPage, safePageSize, safeTotal, totalPages]);
 
   useEffect(() => {
     if (!externalLazy || !displayHeader.length || !safeTotal || baseRows.length) return;
@@ -7302,7 +7327,7 @@ function FormulaRecipePanel({ onPick, fieldOptions=[] }) {
 }
 
 
-function GraphQueryVirtualTable({ table, totalRows=0, page=1, pageSize=1000, onReadPage=()=>{}, height=420 }) {
+function GraphQueryVirtualTable({ table, totalRows=0, page=1, pageSize=GRAPH_RESULT_PANEL_TILE_ROWS, onReadPage=()=>{}, height=420, resetKey="" }) {
   const header = table?.header || [];
   const rows = table?.rows || [];
   const safePage = Math.max(1, Number(page || 1));
@@ -7333,6 +7358,7 @@ function GraphQueryVirtualTable({ table, totalRows=0, page=1, pageSize=1000, onR
       emptyMessage="Graph Queryを実行すると、ここに結果パネルが表示されます。"
       sourceLabel="Graph Query Result"
       statusLabel={`全${fmt(safeTotal)}行 / page ${fmt(safePage)} / tile ${fmt(safePageSize)} rows`}
+      resetKey={resetKey}
     />
   );
 }
@@ -7389,8 +7415,13 @@ function GraphQueryEditor({ columns, datasets=[], manifest=null, nodes, setNodes
   };
 
   const switchGraphResultToTile = () => {
+    // パネル表示はページ表示の件数設定から切り離し、固定tile単位でlazyに読む。
+    // ページ表示で1000件などへ変更した直後に戻っても、古いpage/table範囲を使わない。
+    const tileRows = GRAPH_RESULT_PANEL_TILE_ROWS;
     setResultViewMode("tile");
-    setTimeout(() => onReadPage(1), 0);
+    setResultRowsDraft(String(tileRows));
+    setResultRowsPerTile(String(tileRows));
+    setTimeout(() => onReadPage(1, tileRows), 0);
   };
 
   const switchGraphResultToPage = () => {
@@ -7830,7 +7861,15 @@ function GraphQueryEditor({ columns, datasets=[], manifest=null, nodes, setNodes
           <Chip size="small" label={`${Number(dataQueryCount || 0).toLocaleString()} rows`} />
         </Stack>
         {resultViewMode === "tile" ? (
-          <GraphQueryVirtualTable table={resultTable} totalRows={Number(dataQueryCount || 0)} page={Number(resultPage || 1)} pageSize={Number(resultRowsPerTile || 1000)} onReadPage={onReadPage} height={420} />
+          <GraphQueryVirtualTable
+            table={resultTable}
+            totalRows={Number(dataQueryCount || 0)}
+            page={Number(resultPage || 1)}
+            pageSize={GRAPH_RESULT_PANEL_TILE_ROWS}
+            onReadPage={onReadPage}
+            height={420}
+            resetKey={`graph-result-panel:${Number(dataQueryCount || 0)}:${resultHeader.join("\u001f")}`}
+          />
         ) : (
           <DataTable table={resultTable} tableId="graphQueryResult" height={360} />
         )}
