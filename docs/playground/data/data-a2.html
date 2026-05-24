@@ -3941,6 +3941,213 @@ async function exportGraphQueryCsv(msg={}){
   return {csv:lines.join("\n"), rows:exportedRows, totalRows:Number(state.manifest?.totalRows || 0), mode, ms:now()-t0};
 }
 
+
+
+// Graph Query Result as a temporary, non-persisted dataset for Search / Pivot / Time.
+// The result itself is not stored; each analysis reads the latest Graph Result lazily.
+function graphApplyDerivedRows(header, rows, derivedColumns=[], outputColumnNames=null){
+  const derived = normalizeGraphDerivedColumnsForWorker(derivedColumns);
+  const fullHeader = graphExportHeader(header, derived, null);
+  const outHeader = graphExportHeader(header, derived, outputColumnNames);
+  const indexes = graphExportIndexesForHeader(header, derived, outputColumnNames);
+  const useProjection = Array.isArray(outputColumnNames) && outputColumnNames.length && indexes.length;
+  if (!derived.length){
+    return {header: useProjection ? outHeader : fullHeader, rows: (rows || []).map((row)=> useProjection ? indexes.map((idx)=> row?.[idx] ?? "") : row)};
+  }
+  const outRows=[];
+  for (const row of rows || []){
+    const rowMap={};
+    header.forEach((h,i)=>{ rowMap[h]=row?.[i]; });
+    const extra=derived.map((d)=>evaluateGraphDerivedColumnForWorker(d,rowMap));
+    const full=[...(row || []), ...extra];
+    outRows.push(useProjection ? indexes.map((idx)=>full?.[idx] ?? "") : full);
+  }
+  return {header: useProjection ? outHeader : fullHeader, rows:outRows};
+}
+
+function graphResultTotalRows(mode){
+  if (mode === "join") return Number(state.graphJoinResult?.rows?.length || 0);
+  if (Array.isArray(state.dataQueryMatches)) return Number(state.dataQueryMatches.length || 0);
+  return Number(state.manifest?.totalRows || 0);
+}
+
+async function readGraphResultWindow({mode="data", page=1, pageSize=1000, columns=[], derivedColumns=[], outputColumnNames=null}={}){
+  const safePage=Math.max(1, Number(page || 1));
+  const safePageSize=Math.max(1, Math.min(50000, Number(pageSize || 1000)));
+  const start=Math.max(0,(safePage-1)*safePageSize);
+  const total=graphResultTotalRows(mode);
+  let header=[], rows=[];
+  if (mode === "join"){
+    if (!state.graphJoinResult) throw new Error("Graph JOIN result is not active");
+    header=state.graphJoinResult.header || [];
+    rows=(state.graphJoinResult.rows || []).slice(start, start + safePageSize);
+  } else {
+    if (!state.manifest) throw new Error("Active dataset is not open");
+    const selected=normalizeCols(Array.isArray(columns) && columns.length ? columns : (state.dataQueryMeta?.projection || []));
+    if (Array.isArray(state.dataQueryMatches)){
+      const ids=state.dataQueryMatches.slice(start, start + safePageSize);
+      const table=await readRowsByGlobal(ids, selected);
+      header=table.header; rows=table.rows;
+    } else {
+      const table=await readPage(safePage, safePageSize, selected);
+      header=table.header; rows=table.rows;
+    }
+  }
+  const applied=graphApplyDerivedRows(header, rows, derivedColumns, outputColumnNames);
+  return {...applied, startRow:start, totalMatches:total, page:safePage, pageSize:safePageSize};
+}
+
+async function runGraphResultSearch(msg={}){
+  const mode=String(msg.mode || "data");
+  const colIndex=Number(msg.columnIndex || 0);
+  const op=msg.op || "contains";
+  const value=msg.value ?? "";
+  const cap=normalizePlanLimit(msg.maxMatches || 100000);
+  const chunkRows=Math.max(500, Math.min(20000, Number(msg.chunkRows || 5000)));
+  const total=graphResultTotalRows(mode);
+  const matched=[];
+  let header=[];
+  const t0=now();
+  for (let start=0; start<total; start+=chunkRows){
+    if (state.cancelled) throw new Error("Cancelled");
+    const page=Math.floor(start/chunkRows)+1;
+    const table=await readGraphResultWindow({...msg, mode, page, pageSize:Math.min(chunkRows, total-start)});
+    if (!header.length) header=table.header;
+    const type="string";
+    for (let i=0;i<table.rows.length;i++){
+      const row=table.rows[i] || [];
+      if (compareValue(row[colIndex], op, value, type)){
+        matched.push({rowNumber:start+i+1,row});
+        if (matched.length >= cap) break;
+      }
+    }
+    post("PROGRESS", {value:Math.min(99, Math.floor(((start+table.rows.length)/Math.max(1,total))*100)), text:`Graph Result search... ${fmt(start+table.rows.length)}/${fmt(total)} / matches ${fmt(matched.length)}`});
+    if (matched.length >= cap) break;
+    if (start % (chunkRows*4) === 0) await workerYield();
+  }
+  state.graphResultSearch={header:["Result Row", ...header], rows:matched.map(x=>[x.rowNumber, ...x.row]), totalSourceRows:total, capped:matched.length >= cap, ms:now()-t0};
+  return {matches:matched.length,totalSourceRows:total,capped:matched.length >= cap,header:state.graphResultSearch.header,rows:state.graphResultSearch.rows.slice(0,Math.min(500,Number(msg.pageSize||500))),ms:state.graphResultSearch.ms};
+}
+
+function readGraphResultSearchPage(page=1,pageSize=500){
+  if (!state.graphResultSearch) throw new Error("Graph Result search is not active");
+  const safePage=Math.max(1,Number(page||1));
+  const safeSize=Math.max(1,Number(pageSize||500));
+  const start=(safePage-1)*safeSize;
+  return {header:state.graphResultSearch.header, rows:state.graphResultSearch.rows.slice(start,start+safeSize), page:safePage, pageSize:safeSize, totalMatches:state.graphResultSearch.rows.length, startRow:start, ms:state.graphResultSearch.ms};
+}
+
+async function buildGraphResultPivot(msg={}){
+  const mode=String(msg.mode || "data");
+  const rowFields=(msg.rowFields||[]).map(Number).filter(Number.isFinite);
+  const columnFields=(msg.columnFields||[]).map(Number).filter(Number.isFinite);
+  const valIdx=Number(msg.valueField);
+  const countMode=!Number.isFinite(valIdx) || valIdx < 0;
+  const aggMode=countMode ? "Count" : (msg.aggregation || "Count");
+  const rowLimit=Math.max(1,Number(msg.maxRows||10000));
+  const colLimit=Math.max(1,Number(msg.maxCols||1000));
+  const chunkRows=Math.max(500, Math.min(20000, Number(msg.chunkRows || 5000)));
+  const total=graphResultTotalRows(mode);
+  let header=[];
+  const rowKeys=[], colKeys=[], rowSet=new Set(), colSet=new Set(), cells=new Map(), rowTotals=new Map(), colTotals=new Map();
+  const grand=makeAgg();
+  let limitHit=false, scanned=0;
+  const t0=now();
+  for (let start=0; start<total; start+=chunkRows){
+    if (state.cancelled) throw new Error("Cancelled");
+    const page=Math.floor(start/chunkRows)+1;
+    const table=await readGraphResultWindow({...msg, mode, page, pageSize:Math.min(chunkRows,total-start)});
+    if (!header.length) header=table.header;
+    for (const row of table.rows){
+      scanned++;
+      const rParts=rowFields.length ? rowFields.map(i=>row?.[i]) : ["(All)"];
+      const cParts=columnFields.length ? columnFields.map(i=>row?.[i]) : ["Value"];
+      const rk=keyOf(rParts), ck=keyOf(cParts);
+      if (!rowSet.has(rk)){
+        if (rowKeys.length >= rowLimit){ limitHit=true; continue; }
+        rowSet.add(rk); rowKeys.push(rk);
+      }
+      if (!colSet.has(ck)){
+        if (colKeys.length >= colLimit){ limitHit=true; continue; }
+        colSet.add(ck); colKeys.push(ck);
+      }
+      if (!cells.has(rk)) cells.set(rk,new Map());
+      const rowMap=cells.get(rk);
+      if (!rowMap.has(ck)) rowMap.set(ck,makeAgg());
+      if (!rowTotals.has(rk)) rowTotals.set(rk,makeAgg());
+      if (!colTotals.has(ck)) colTotals.set(ck,makeAgg());
+      const v=countMode ? null : row?.[valIdx];
+      addAgg(rowMap.get(ck),v,countMode); addAgg(rowTotals.get(rk),v,countMode); addAgg(colTotals.get(ck),v,countMode); addAgg(grand,v,countMode);
+    }
+    post("PROGRESS", {value:Math.min(99, Math.floor(((start+table.rows.length)/Math.max(1,total))*100)), text:`Graph Result pivot... ${fmt(start+table.rows.length)}/${fmt(total)} rows / groups ${fmt(rowKeys.length)} x ${fmt(colKeys.length)}`});
+    if (start % (chunkRows*4) === 0) await workerYield();
+  }
+  const rowHeaderNames=rowFields.length ? rowFields.map(i=>header[i] || `Field ${i+1}`) : ["Rows"];
+  const colLabels=colKeys.map(k=>pivotColumnLabel(k, columnFields));
+  const outHeader=[...rowHeaderNames, ...colLabels, "Grand Total"];
+  const outRows=[];
+  for (const rk of rowKeys){
+    const labels=pivotRowLabelParts(rk);
+    while(labels.length < rowHeaderNames.length) labels.push("");
+    const row=[...labels];
+    const rowMap=cells.get(rk) || new Map();
+    for (const ck of colKeys) row.push(aggValue(rowMap.get(ck),aggMode));
+    row.push(aggValue(rowTotals.get(rk),aggMode));
+    outRows.push(row);
+  }
+  const grandRow=["Grand Total"];
+  while(grandRow.length < rowHeaderNames.length) grandRow.push("");
+  for (const ck of colKeys) grandRow.push(aggValue(colTotals.get(ck),aggMode));
+  grandRow.push(aggValue(grand,aggMode));
+  outRows.push(grandRow);
+  state.graphResultPivot={header:outHeader, rows:outRows, scanned, limitHit, ms:now()-t0};
+  return state.graphResultPivot;
+}
+
+async function buildGraphResultTime(msg={}){
+  const mode=String(msg.mode || "data");
+  const timeIdx=Number(msg.timeField);
+  const groupIdx=Number(msg.groupField);
+  const valIdx=Number(msg.valueField);
+  const hasGroup=Number.isFinite(groupIdx) && groupIdx >= 0;
+  const countMode=!Number.isFinite(valIdx) || valIdx < 0;
+  const aggMode=countMode ? "Count" : (msg.aggregation || "Count");
+  const bucket=msg.bucket || "month";
+  const bucketLimit=Math.max(1,Number(msg.maxBuckets||10000));
+  const chunkRows=Math.max(500, Math.min(20000, Number(msg.chunkRows || 5000)));
+  const total=graphResultTotalRows(mode);
+  const states=new Map();
+  let header=[], scanned=0, invalidTime=0, limitHit=false;
+  const t0=now();
+  for (let start=0; start<total; start+=chunkRows){
+    if (state.cancelled) throw new Error("Cancelled");
+    const page=Math.floor(start/chunkRows)+1;
+    const table=await readGraphResultWindow({...msg, mode, page, pageSize:Math.min(chunkRows,total-start)});
+    if (!header.length) header=table.header;
+    for (const row of table.rows){
+      scanned++;
+      const b=parseTimeBucket(row?.[timeIdx], bucket);
+      if (!b){ invalidTime++; continue; }
+      const g=hasGroup ? keyCellValue(row?.[groupIdx]) : "";
+      const key=JSON.stringify([b,g]);
+      if (!states.has(key)){
+        if (states.size >= bucketLimit){ limitHit=true; continue; }
+        states.set(key,makeAgg());
+      }
+      addAgg(states.get(key), countMode ? null : row?.[valIdx], countMode);
+    }
+    post("PROGRESS", {value:Math.min(99, Math.floor(((start+table.rows.length)/Math.max(1,total))*100)), text:`Graph Result time... ${fmt(start+table.rows.length)}/${fmt(total)} rows / buckets ${fmt(states.size)}`});
+    if (start % (chunkRows*4) === 0) await workerYield();
+  }
+  const outHeader=hasGroup ? ["Time", "Group", aggMode] : ["Time", aggMode];
+  const outRows=[...states.entries()].sort((a,b)=>a[0].localeCompare(b[0])).map(([key,agg])=>{
+    let b="", g=""; try{ [b,g]=JSON.parse(key); }catch{ [b,g]=String(key).split("\u001f"); }
+    return hasGroup ? [b,g,aggValue(agg,aggMode)] : [b,aggValue(agg,aggMode)];
+  });
+  state.graphResultTime={header:outHeader, rows:outRows, scanned, invalidTime, limitHit, ms:now()-t0};
+  return state.graphResultTime;
+}
+
 self.onmessage=async(e)=>{
   const msg=e.data||{};
   try{
@@ -4166,6 +4373,40 @@ self.onmessage=async(e)=>{
       const t0=now();
       const result=await readGraphJoinPage(Number(msg.page||1),Number(msg.pageSize||500),msg.origin || "");
       post("GRAPH_JOIN_PAGE_RESULT",{...result,ms:now()-t0,origin:msg.origin || ""});
+      return;
+    }
+
+
+    if (msg.type==="RUN_GRAPH_RESULT_SEARCH"){
+      state.cancelled=false;
+      post("PROGRESS",{value:0,text:"Searching Graph Query Result..."});
+      const result=await runGraphResultSearch(msg);
+      post("GRAPH_RESULT_SEARCH_DONE",result);
+      post("PROGRESS",{value:100,text:`Graph Result search complete: ${fmt(result.matches)} matches`});
+      return;
+    }
+
+    if (msg.type==="READ_GRAPH_RESULT_SEARCH_PAGE"){
+      const result=readGraphResultSearchPage(Number(msg.page||1),Number(msg.pageSize||500));
+      post("GRAPH_RESULT_SEARCH_PAGE_RESULT",result);
+      return;
+    }
+
+    if (msg.type==="BUILD_GRAPH_RESULT_PIVOT"){
+      state.cancelled=false;
+      post("PROGRESS",{value:0,text:"Building Pivot from Graph Query Result..."});
+      const result=await buildGraphResultPivot(msg);
+      post("GRAPH_RESULT_PIVOT_DONE",result);
+      post("PROGRESS",{value:100,text:`Graph Result pivot complete: ${fmt(result.rows?.length || 0)} rows`});
+      return;
+    }
+
+    if (msg.type==="BUILD_GRAPH_RESULT_TIME"){
+      state.cancelled=false;
+      post("PROGRESS",{value:0,text:"Building Time view from Graph Query Result..."});
+      const result=await buildGraphResultTime(msg);
+      post("GRAPH_RESULT_TIME_DONE",result);
+      post("PROGRESS",{value:100,text:`Graph Result time complete: ${fmt(result.rows?.length || 0)} rows`});
       return;
     }
 
@@ -4508,89 +4749,85 @@ function dataTableStorageId(tableId, header) {
   return `auto_${Math.abs(hash)}`;
 }
 
-function DataTable({ table, tableId, height = 520, dense: denseProp, filterable = true, sortable = true, minColumnWidth = 150, showRowNumber = false, rowNumberOffset = 0 }) {
-  const ui = React.useContext(UiSettingsContext);
-  const dense = denseProp ?? ui.dense;
-  const header = table?.header || [];
-  const rows = table?.rows || [];
-  const [sort, setSort] = useState({ index: -1, direction: "asc" });
-  const [filters, setFilters] = useState({});
+
+// ===== Common Tile Table Engine =====
+// 1ファイル構成を維持しつつ、通常の行テーブル表示をこの共通基盤へ集約する。
+// DataTable / GraphQueryVirtualTable は薄いAdapterになり、行・列virtual、列幅調整、選択、lazy読込を共通化する。
+const TILE_TABLE_MAX_SCROLL_PX = 12000000;
+const TILE_TABLE_OVERSCAN_ROWS = 12;
+const TILE_TABLE_OVERSCAN_COL_PX = 420;
+
+function defaultTileColumnWidth(index, minColumnWidth = 150) {
+  if (index === 0) return Math.max(96, Number(minColumnWidth || 150));
+  return Math.max(72, Number(minColumnWidth || 150));
+}
+
+function clampTileColumnWidth(width, fallback = 150) {
+  return Math.max(56, Math.min(1600, Math.round(Number(width) || fallback || 150)));
+}
+
+function normalizeTileCell(value) {
+  if (value == null) return "";
+  if (typeof value === "object") {
+    try { return JSON.stringify(value); } catch { return String(value); }
+  }
+  return String(value);
+}
+
+function useTileColumnWidths(header, tableId, minColumnWidth = 150) {
+  const headerKey = useMemo(() => (header || []).join("\u001f"), [header]);
   const [columnWidths, setColumnWidths] = useState({});
-  const [selectedRowIndex, setSelectedRowIndex] = useState(-1);
   const resizeRef = useRef(null);
-  const headerKey = header.join("\u001f");
-  const storageId = useMemo(() => dataTableStorageId(tableId, header), [tableId, headerKey]);
-  const widthStorageKey = `qcsv:datatable:columnWidths:${storageId}`;
 
   useEffect(() => {
-    setSort({ index: -1, direction: "asc" });
-    setFilters({});
-    setSelectedRowIndex(-1);
-  }, [headerKey]);
-
-  useEffect(() => {
-    if (selectedRowIndex >= rows.length) setSelectedRowIndex(-1);
-  }, [rows.length, selectedRowIndex]);
-
-  useEffect(() => {
-    try {
-      const raw = localStorage.getItem(widthStorageKey);
-      const parsed = raw ? JSON.parse(raw) : {};
-      setColumnWidths(parsed && typeof parsed === "object" ? parsed : {});
-    } catch {
-      setColumnWidths({});
-    }
-  }, [widthStorageKey]);
-
-  useEffect(() => {
-    try {
-      if (Object.keys(columnWidths).length) localStorage.setItem(widthStorageKey, JSON.stringify(columnWidths));
-      else localStorage.removeItem(widthStorageKey);
-    } catch {}
-  }, [columnWidths, widthStorageKey]);
+    setColumnWidths({});
+  }, [headerKey, tableId]);
 
   useEffect(() => {
     return () => {
       const state = resizeRef.current;
-      if (state) {
-        window.removeEventListener("mousemove", state.onMove);
-        window.removeEventListener("mouseup", state.onUp);
-        window.removeEventListener("touchmove", state.onMove);
-        window.removeEventListener("touchend", state.onUp);
-        resizeRef.current = null;
-      }
+      if (!state) return;
+      window.removeEventListener("mousemove", state.onMove);
+      window.removeEventListener("mouseup", state.onUp);
+      window.removeEventListener("touchmove", state.onMove);
+      window.removeEventListener("touchend", state.onUp);
+      resizeRef.current = null;
+      document.body.style.cursor = "";
+      document.body.style.userSelect = "";
     };
   }, []);
 
-  const getColumnWidth = (index) => {
+  const getColumnWidth = useCallback((index) => {
     const value = Number(columnWidths[index]);
-    return Number.isFinite(value) && value > 0 ? value : minColumnWidth;
-  };
+    return Number.isFinite(value) && value > 0 ? value : defaultTileColumnWidth(index, minColumnWidth);
+  }, [columnWidths, minColumnWidth]);
 
-  const setColumnWidth = (index, width) => {
-    const nextWidth = Math.max(72, Math.min(1200, Math.round(Number(width) || minColumnWidth)));
+  const setColumnWidth = useCallback((index, width) => {
+    const fallback = defaultTileColumnWidth(index, minColumnWidth);
+    const nextWidth = clampTileColumnWidth(width, fallback);
     setColumnWidths((prev) => ({ ...prev, [index]: nextWidth }));
-  };
+  }, [minColumnWidth]);
 
-  const resetColumnWidth = (index) => {
+  const resetColumnWidth = useCallback((index) => {
     setColumnWidths((prev) => {
       const next = { ...prev };
       delete next[index];
       return next;
     });
-  };
+  }, []);
+
+  const clearColumnWidths = useCallback(() => setColumnWidths({}), []);
 
   const clientXOf = (event) => event.touches?.[0]?.clientX ?? event.clientX ?? 0;
 
-  const startColumnResize = (event, index) => {
+  const startColumnResize = useCallback((event, index) => {
     event.preventDefault();
     event.stopPropagation();
     const startX = clientXOf(event);
     const startWidth = getColumnWidth(index);
     const onMove = (moveEvent) => {
       moveEvent.preventDefault?.();
-      const delta = clientXOf(moveEvent) - startX;
-      setColumnWidth(index, startWidth + delta);
+      setColumnWidth(index, startWidth + clientXOf(moveEvent) - startX);
     };
     const onUp = () => {
       window.removeEventListener("mousemove", onMove);
@@ -4608,26 +4845,108 @@ function DataTable({ table, tableId, height = 520, dense: denseProp, filterable 
     window.addEventListener("mouseup", onUp);
     window.addEventListener("touchmove", onMove, { passive: false });
     window.addEventListener("touchend", onUp);
-  };
+  }, [getColumnWidth, setColumnWidth]);
 
-  const handleResizerKeyDown = (event, index) => {
+  const handleResizerKeyDown = useCallback((event, index) => {
     if (event.key === "ArrowLeft") { event.preventDefault(); setColumnWidth(index, getColumnWidth(index) - (event.shiftKey ? 40 : 12)); }
     if (event.key === "ArrowRight") { event.preventDefault(); setColumnWidth(index, getColumnWidth(index) + (event.shiftKey ? 40 : 12)); }
-    if (event.key === "Home") { event.preventDefault(); setColumnWidth(index, 72); }
+    if (event.key === "Home") { event.preventDefault(); setColumnWidth(index, 56); }
     if (event.key === "End") { event.preventDefault(); setColumnWidth(index, 420); }
-    if (event.key === "Enter" || event.key === "Backspace" || event.key === "Delete") { event.preventDefault(); resetColumnWidth(index); }
-  };
+    if (["Enter", "Backspace", "Delete"].includes(event.key)) { event.preventDefault(); resetColumnWidth(index); }
+  }, [getColumnWidth, resetColumnWidth, setColumnWidth]);
 
-  const filteredRows = useMemo(() => {
-    let next = rows;
+  return { columnWidths, getColumnWidth, setColumnWidth, resetColumnWidth, clearColumnWidths, startColumnResize, handleResizerKeyDown };
+}
+
+function useTileViewport(ref) {
+  const [size, setSize] = useState({ width: 900, height: 420 });
+  useEffect(() => {
+    const el = ref.current;
+    if (!el) return;
+    const update = () => setSize({ width: Math.max(240, el.clientWidth || 900), height: Math.max(120, el.clientHeight || 420) });
+    update();
+    if (typeof ResizeObserver === "undefined") {
+      window.addEventListener("resize", update);
+      return () => window.removeEventListener("resize", update);
+    }
+    const ro = new ResizeObserver(update);
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, [ref]);
+  return size;
+}
+
+function CommonTileTableView({
+  tableId = "tileTable",
+  header = [],
+  rows = [],
+  height = 520,
+  dense = false,
+  filterable = true,
+  sortable = true,
+  minColumnWidth = 150,
+  showRowNumber = false,
+  rowNumberOffset = 0,
+  emptyMessage = "表示するデータがありません",
+  externalLazy = false,
+  totalRows = null,
+  loadedStart = 0,
+  page = 1,
+  pageSize = 1000,
+  onReadPage = null,
+  statusLabel = "",
+  sourceLabel = "TileTable",
+}) {
+  const baseHeader = Array.isArray(header) ? header : [];
+  const baseRows = Array.isArray(rows) ? rows : [];
+  const rowHeight = dense ? 28 : 34;
+  const filterHeight = filterable && !externalLazy ? (dense ? 36 : 42) : 0;
+  const headerHeight = dense ? 34 : 40;
+  const stickyHeight = filterHeight + headerHeight;
+  const scrollRef = useRef(null);
+  const rafRef = useRef(0);
+  const requestRef = useRef({ page: Number(page || 1), at: 0 });
+  const viewport = useTileViewport(scrollRef);
+  const [scroll, setScroll] = useState({ top: 0, left: 0 });
+  const [sort, setSort] = useState({ index: -1, direction: "asc" });
+  const [filters, setFilters] = useState({});
+  const [selectedAbsRow, setSelectedAbsRow] = useState(-1);
+
+  const displayHeader = useMemo(() => showRowNumber ? ["#", ...baseHeader] : baseHeader, [baseHeader, showRowNumber]);
+  const headerKey = useMemo(() => displayHeader.join("\u001f"), [displayHeader]);
+  const { columnWidths, getColumnWidth, resetColumnWidth, clearColumnWidths, startColumnResize, handleResizerKeyDown } = useTileColumnWidths(displayHeader, tableId, minColumnWidth);
+
+  useEffect(() => {
+    setSort({ index: -1, direction: "asc" });
+    setFilters({});
+    setSelectedAbsRow(-1);
+  }, [headerKey, tableId]);
+
+  useEffect(() => {
+    requestRef.current.page = Number(page || 1);
+  }, [page]);
+
+  useEffect(() => () => {
+    if (rafRef.current) cancelAnimationFrame(rafRef.current);
+  }, []);
+
+  const decoratedRows = useMemo(() => {
+    if (!showRowNumber) return baseRows;
+    const offset = Number(rowNumberOffset || 0);
+    const start = Number(loadedStart || 0);
+    return baseRows.map((row, index) => [start + index + offset + 1, ...(Array.isArray(row) ? row : [])]);
+  }, [baseRows, showRowNumber, rowNumberOffset, loadedStart]);
+
+  const processedRows = useMemo(() => {
+    if (externalLazy) return decoratedRows;
+    let next = decoratedRows;
     const activeFilters = Object.entries(filters).filter(([, value]) => String(value || "").trim() !== "");
     if (activeFilters.length) {
       next = next.filter((row) => activeFilters.every(([index, value]) => {
-        const q = String(value).toLowerCase();
-        return String(row[Number(index)] ?? "").toLowerCase().includes(q);
+        const q = String(value || "").toLowerCase();
+        return normalizeTileCell(row?.[Number(index)]).toLowerCase().includes(q);
       }));
     }
-
     if (sort.index >= 0) {
       const dir = sort.direction === "desc" ? -1 : 1;
       next = [...next].sort((a, b) => {
@@ -4636,14 +4955,77 @@ function DataTable({ table, tableId, height = 520, dense: denseProp, filterable 
         const an = Number(av);
         const bn = Number(bv);
         if (Number.isFinite(an) && Number.isFinite(bn)) return (an - bn) * dir;
-        return String(av ?? "").localeCompare(String(bv ?? ""), "ja", { numeric: true }) * dir;
+        return normalizeTileCell(av).localeCompare(normalizeTileCell(bv), "ja", { numeric: true }) * dir;
       });
     }
     return next;
-  }, [rows, filters, sort]);
+  }, [decoratedRows, externalLazy, filters, sort]);
+
+  const safeTotal = Math.max(0, Number(totalRows == null ? processedRows.length : totalRows) || 0, externalLazy ? baseRows.length : 0);
+  const safePageSize = Math.max(1, Number(pageSize || 1000) || 1000);
+  const totalPages = Math.max(1, Math.ceil(Math.max(1, safeTotal) / safePageSize));
+  const safeLoadedStart = externalLazy ? Math.max(0, Number(loadedStart || 0) || 0) : 0;
+
+  useEffect(() => {
+    if (!externalLazy || !displayHeader.length || !safeTotal || baseRows.length) return;
+    const t = performance.now();
+    if (t - requestRef.current.at < 120) return;
+    requestRef.current = { page: Math.max(1, Number(page || 1)), at: t };
+    onReadPage?.(Math.max(1, Number(page || 1)));
+  }, [externalLazy, displayHeader.length, safeTotal, baseRows.length, page, onReadPage]);
+
+  const widths = useMemo(() => displayHeader.map((_, i) => getColumnWidth(i)), [displayHeader, getColumnWidth, columnWidths]);
+  const prefix = useMemo(() => {
+    const out = [];
+    let x = 0;
+    for (const w of widths) { out.push(x); x += w; }
+    out.total = x;
+    return out;
+  }, [widths]);
+  const totalWidth = Math.max(720, Number(prefix.total || 0));
+  const bodyViewportHeight = Math.max(120, Number(height || 520) - stickyHeight);
+  const logicalContentHeight = Math.max(1, safeTotal * rowHeight);
+  const contentHeight = Math.max(bodyViewportHeight, Math.min(logicalContentHeight, TILE_TABLE_MAX_SCROLL_PX));
+  const compressedY = logicalContentHeight > TILE_TABLE_MAX_SCROLL_PX;
+  const maxScrollableTop = Math.max(1, contentHeight - bodyViewportHeight);
+  const viewportRows = Math.max(1, Math.ceil(bodyViewportHeight / rowHeight));
+
+  const virtualRowFromBodyTop = useCallback((bodyTop) => {
+    if (!safeTotal) return 0;
+    const top = Math.max(0, Number(bodyTop || 0));
+    if (!compressedY) return Math.max(0, Math.min(Math.max(0, safeTotal - 1), Math.floor(top / rowHeight)));
+    const ratio = Math.max(0, Math.min(1, top / maxScrollableTop));
+    return Math.max(0, Math.min(Math.max(0, safeTotal - viewportRows), Math.floor(ratio * Math.max(0, safeTotal - viewportRows))));
+  }, [compressedY, maxScrollableTop, rowHeight, safeTotal, viewportRows]);
+
+  const bodyTopFromVirtualRow = useCallback((row) => {
+    if (!safeTotal) return 0;
+    if (!compressedY) return Math.max(0, row * rowHeight);
+    const denom = Math.max(1, safeTotal - viewportRows);
+    return Math.max(0, Math.min(maxScrollableTop, (Math.max(0, row) / denom) * maxScrollableTop));
+  }, [compressedY, maxScrollableTop, rowHeight, safeTotal, viewportRows]);
+
+  const handleScroll = useCallback((event) => {
+    const el = event.currentTarget;
+    const nextTop = el.scrollTop || 0;
+    const nextLeft = el.scrollLeft || 0;
+    if (rafRef.current) cancelAnimationFrame(rafRef.current);
+    rafRef.current = requestAnimationFrame(() => setScroll({ top: nextTop, left: nextLeft }));
+
+    if (externalLazy && safeTotal && typeof onReadPage === "function") {
+      const bodyTop = Math.max(0, nextTop - stickyHeight);
+      const virtualStart = virtualRowFromBodyTop(bodyTop);
+      const nextPage = Math.min(Math.max(1, Math.floor(virtualStart / safePageSize) + 1), totalPages);
+      const t = performance.now();
+      if (nextPage !== requestRef.current.page && t - requestRef.current.at > 120) {
+        requestRef.current = { page: nextPage, at: t };
+        onReadPage(nextPage);
+      }
+    }
+  }, [externalLazy, onReadPage, safePageSize, safeTotal, stickyHeight, totalPages, virtualRowFromBodyTop]);
 
   const toggleSort = (index) => {
-    if (!sortable) return;
+    if (!sortable || externalLazy) return;
     setSort((prev) => {
       if (prev.index !== index) return { index, direction: "asc" };
       if (prev.direction === "asc") return { index, direction: "desc" };
@@ -4651,170 +5033,186 @@ function DataTable({ table, tableId, height = 520, dense: denseProp, filterable 
     });
   };
 
-  if (!header.length) {
+  if (!displayHeader.length) {
     return (
       <Box sx={{ height, display: "grid", placeItems: "center", color: "text.secondary", border: "1px dashed", borderColor: "divider", borderRadius: 1.5 }}>
-        表示するデータがありません
+        {emptyMessage}
       </Box>
     );
   }
 
-  const widths = header.map((_, i) => getColumnWidth(i));
-  const tableMinWidth = Math.max(720, widths.reduce((sum, width) => sum + width, 0));
+  const bodyScrollTop = Math.max(0, scroll.top - stickyHeight);
+  const visibleAbsStartRaw = Math.max(0, virtualRowFromBodyTop(bodyScrollTop) - TILE_TABLE_OVERSCAN_ROWS);
+  const visibleAbsEndRaw = Math.min(safeTotal, visibleAbsStartRaw + viewportRows + TILE_TABLE_OVERSCAN_ROWS * 2);
+  let renderRows = [];
+  let renderAbsStart = visibleAbsStartRaw;
+  let localStart = 0;
+  let loadedRangeText = `${fmt(1)} - ${fmt(processedRows.length)}`;
+
+  if (externalLazy) {
+    const loadedAbsStart = safeLoadedStart;
+    const loadedAbsEnd = loadedAbsStart + decoratedRows.length;
+    const visibleMissesLoadedTile = decoratedRows.length > 0 && (visibleAbsEndRaw <= loadedAbsStart || visibleAbsStartRaw >= loadedAbsEnd);
+    renderAbsStart = visibleMissesLoadedTile ? loadedAbsStart : visibleAbsStartRaw;
+    const renderAbsEnd = visibleMissesLoadedTile ? Math.min(loadedAbsEnd, loadedAbsStart + viewportRows + TILE_TABLE_OVERSCAN_ROWS * 2) : visibleAbsEndRaw;
+    localStart = Math.max(0, renderAbsStart - loadedAbsStart);
+    const localEnd = Math.min(decoratedRows.length, Math.max(localStart, renderAbsEnd - loadedAbsStart));
+    renderRows = decoratedRows.slice(localStart, localEnd);
+    loadedRangeText = decoratedRows.length ? `${fmt(loadedAbsStart + 1)} - ${fmt(Math.min(loadedAbsEnd, safeTotal))}` : "未読込";
+  } else {
+    localStart = visibleAbsStartRaw;
+    const localEnd = Math.min(processedRows.length, visibleAbsEndRaw);
+    renderRows = processedRows.slice(localStart, localEnd);
+    renderAbsStart = localStart;
+  }
+
+  const rowTop = bodyTopFromVirtualRow(renderAbsStart);
+  const colStart = (() => {
+    const left = Math.max(0, scroll.left - TILE_TABLE_OVERSCAN_COL_PX);
+    for (let i = 0; i < widths.length; i++) {
+      if ((prefix[i] || 0) + widths[i] >= left) return i;
+    }
+    return 0;
+  })();
+  const colEnd = (() => {
+    const right = Math.max(viewport.width, scroll.left + viewport.width + TILE_TABLE_OVERSCAN_COL_PX);
+    for (let i = colStart; i < widths.length; i++) {
+      if ((prefix[i] || 0) > right) return Math.max(colStart + 1, i);
+    }
+    return widths.length;
+  })();
+  const visibleCols = [];
+  for (let i = colStart; i < colEnd; i++) visibleCols.push(i);
   const hasColumnWidths = Object.keys(columnWidths).length > 0;
+  const hasLocalControls = !externalLazy && (Object.values(filters).some((v) => String(v || "").trim()) || sort.index >= 0);
+  const selectedLabel = selectedAbsRow >= 0 ? `選択行: ${fmt(selectedAbsRow + 1)}` : "";
+  const modeChip = externalLazy
+    ? `lazy tile / ${compressedY ? "圧縮スクロール" : "通常スクロール"}`
+    : `in-memory tile / rows ${fmt(processedRows.length)}`;
 
   return (
     <Box sx={{ width: "100%", maxWidth: "100%", minWidth: 0, overflow: "hidden" }}>
-      <TableContainer sx={{ width: "100%", maxWidth: "100%", maxHeight: height, overflowX: "auto", overflowY: "auto", border: "1px solid", borderColor: "divider", borderRadius: 1.5 }}>
-        <Table stickyHeader size={dense ? "small" : "medium"} sx={{ minWidth: tableMinWidth, tableLayout: "fixed", borderCollapse: "separate" }}>
-          <colgroup>
-            {widths.map((width, i) => <col key={i} style={{ width: `${width}px` }} />)}
-          </colgroup>
-          <TableHead>
-            {filterable && (
-              <TableRow>
-                {header.map((h, i) => (
-                  <TableCell
-                    key={`filter-${i}`}
-                    sx={{
-                      position: "sticky",
-                      top: 0,
-                      zIndex: 9,
-                      bgcolor: "background.paper",
-                      p: dense ? 0.5 : 1,
-                      width: widths[i],
-                      minWidth: 72,
-                      maxWidth: 1200,
-                      boxShadow: "inset 0 -1px 0",
-                      borderColor: "divider",
-                    }}
-                  >
-                    <TextField
-                      value={filters[i] || ""}
-                      onChange={(event) => setFilters((prev) => ({ ...prev, [i]: event.target.value }))}
-                      placeholder={`${h} filter`}
-                      size="small"
-                      variant="outlined"
-                      fullWidth
-                      inputProps={{ style: { fontSize: dense ? 12 : 14, padding: dense ? "5px 7px" : undefined } }}
-                    />
-                  </TableCell>
-                ))}
-              </TableRow>
-            )}
-            <TableRow>
-              {header.map((h, i) => (
-                <TableCell
-                  key={i}
-                  sx={{
-                    position: "sticky",
-                    top: filterable ? (dense ? 42 : 56) : 0,
-                    zIndex: 8,
-                    fontWeight: 900,
-                    bgcolor: "background.paper",
-                    whiteSpace: "nowrap",
-                    width: widths[i],
-                    minWidth: 72,
-                    maxWidth: 1200,
-                    pr: 1.6,
-                    boxShadow: "inset 0 -1px 0",
-                    color: "text.primary",
-                    borderColor: "divider",
-                  }}
-                >
-                  <Box sx={{ display: "flex", alignItems: "center", minWidth: 0 }}>
-                    {sortable ? (
-                      <TableSortLabel
-                        active={sort.index === i}
-                        direction={sort.index === i ? sort.direction : "asc"}
-                        onClick={() => toggleSort(i)}
-                        sx={{ minWidth: 0, ".MuiTableSortLabel-icon": { flexShrink: 0 } }}
-                      >
-                        <Box component="span" sx={{ overflow: "hidden", textOverflow: "ellipsis" }}>{h}</Box>
+      <Box sx={{ border: "1px solid", borderColor: "divider", borderRadius: 1.5, overflow: "hidden", bgcolor: "background.paper" }}>
+        <Stack direction="row" spacing={0.75} useFlexGap flexWrap="wrap" alignItems="center" sx={{ px: 1, py: 0.55, bgcolor: "action.hover", borderBottom: "1px solid", borderColor: "divider" }}>
+          <Chip size="small" color="primary" variant="outlined" label={sourceLabel} />
+          <Chip size="small" label={modeChip} />
+          <Chip size="small" label={`rows ${fmt(safeTotal)}`} />
+          <Chip size="small" label={`cols ${fmt(displayHeader.length)}`} />
+          {externalLazy && <Chip size="small" label={`loaded ${loadedRangeText}`} />}
+          {selectedLabel && <Chip size="small" color="success" label={selectedLabel} />}
+          {statusLabel && <Typography variant="caption" color="text.secondary">{statusLabel}</Typography>}
+        </Stack>
+        <Box
+          ref={scrollRef}
+          onScroll={handleScroll}
+          sx={{ height, overflow: "auto", position: "relative", overscrollBehavior: "contain", bgcolor: "background.default" }}
+        >
+          <Box sx={{ position: "relative", width: totalWidth, height: stickyHeight + contentHeight, minWidth: "100%" }}>
+            <Box sx={{ position: "sticky", top: 0, left: 0, zIndex: 10, width: totalWidth, height: stickyHeight, bgcolor: "background.paper", borderBottom: "1px solid", borderColor: "divider" }}>
+              {filterable && !externalLazy && (
+                <Box sx={{ position: "absolute", top: 0, left: 0, height: filterHeight, width: totalWidth, bgcolor: "background.paper" }}>
+                  {visibleCols.map((i) => (
+                    <Box key={`filter:${i}`} sx={{ position: "absolute", left: prefix[i], top: 0, width: widths[i], height: filterHeight, p: dense ? 0.35 : 0.5, borderRight: "1px solid", borderColor: "divider" }}>
+                      <TextField
+                        value={filters[i] || ""}
+                        onChange={(event) => setFilters((prev) => ({ ...prev, [i]: event.target.value }))}
+                        placeholder={`${displayHeader[i]} filter`}
+                        size="small"
+                        variant="outlined"
+                        fullWidth
+                        inputProps={{ style: { fontSize: dense ? 11 : 12, padding: dense ? "4px 6px" : "6px 7px" } }}
+                      />
+                    </Box>
+                  ))}
+                </Box>
+              )}
+              <Box sx={{ position: "absolute", top: filterHeight, left: 0, height: headerHeight, width: totalWidth, bgcolor: "background.paper" }}>
+                {visibleCols.map((i) => (
+                  <Box key={`header:${i}`} sx={{ position: "absolute", left: prefix[i], top: 0, width: widths[i], height: headerHeight, px: 1, py: dense ? 0.65 : 0.85, pr: 1.6, fontWeight: 900, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis", borderRight: "1px solid", borderColor: "divider", color: "text.primary" }}>
+                    {sortable && !externalLazy ? (
+                      <TableSortLabel active={sort.index === i} direction={sort.index === i ? sort.direction : "asc"} onClick={() => toggleSort(i)} sx={{ minWidth: 0, ".MuiTableSortLabel-icon": { flexShrink: 0 } }}>
+                        <Box component="span" sx={{ overflow: "hidden", textOverflow: "ellipsis" }}>{displayHeader[i]}</Box>
                       </TableSortLabel>
                     ) : (
-                      <Box component="span" sx={{ overflow: "hidden", textOverflow: "ellipsis" }}>{h}</Box>
+                      <Box component="span" sx={{ overflow: "hidden", textOverflow: "ellipsis" }}>{displayHeader[i]}</Box>
                     )}
+                    <Box
+                      role="separator"
+                      aria-label={`${displayHeader[i]} 列幅を調整`}
+                      tabIndex={0}
+                      onMouseDown={(event) => startColumnResize(event, i)}
+                      onTouchStart={(event) => startColumnResize(event, i)}
+                      onDoubleClick={() => resetColumnWidth(i)}
+                      onKeyDown={(event) => handleResizerKeyDown(event, i)}
+                      sx={{
+                        position: "absolute", top: 0, right: 0, bottom: 0, width: 10, cursor: "col-resize", zIndex: 4, outline: "none",
+                        "&::after": { content: '\"\"', position: "absolute", top: 7, bottom: 7, right: 3, width: 2, bgcolor: "divider", borderRadius: 999, opacity: 0.55 },
+                        "&:hover::after, &:focus-visible::after": { bgcolor: "primary.main", opacity: 1, width: 3 },
+                      }}
+                    />
                   </Box>
+                ))}
+              </Box>
+            </Box>
+
+            <Box sx={{ position: "absolute", left: 0, right: 0, top: stickyHeight + rowTop, width: totalWidth }}>
+              {renderRows.map((row, rowIndex) => {
+                const absRow = renderAbsStart + rowIndex;
+                return (
                   <Box
-                    role="separator"
-                    aria-label={`${h} 列幅を調整`}
-                    tabIndex={0}
-                    onMouseDown={(event) => startColumnResize(event, i)}
-                    onTouchStart={(event) => startColumnResize(event, i)}
-                    onDoubleClick={() => resetColumnWidth(i)}
-                    onKeyDown={(event) => handleResizerKeyDown(event, i)}
-                    sx={{
-                      position: "absolute",
-                      top: 0,
-                      right: 0,
-                      bottom: 0,
-                      width: 10,
-                      cursor: "col-resize",
-                      zIndex: 3,
-                      outline: "none",
-                      "&::after": {
-                        content: '""',
-                        position: "absolute",
-                        top: 7,
-                        bottom: 7,
-                        right: 3,
-                        width: "2px",
-                        bgcolor: "divider",
-                        borderRadius: 999,
-                        opacity: 0.55,
-                      },
-                      "&:hover::after, &:focus-visible::after": { bgcolor: "primary.main", opacity: 1, width: "3px" },
-                    }}
-                  />
-                </TableCell>
-              ))}
-            </TableRow>
-          </TableHead>
-          <TableBody>
-            {filteredRows.map((row, ri) => (
-              <TableRow
-                hover
-                key={ri}
-                selected={selectedRowIndex === ri}
-                onClick={() => setSelectedRowIndex(ri)}
-                sx={{ cursor: showRowNumber ? "pointer" : "default" }}
-              >
-                {header.map((_, ci) => {
-                  const cell = row?.[ci];
-                  return (
-                    <TableCell
-                      key={ci}
-                      title={String(cell ?? "")}
-                      sx={{ width: widths[ci], minWidth: 72, maxWidth: 1200, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}
-                    >
-                      {String(cell ?? "")}
-                    </TableCell>
-                  );
-                })}
-              </TableRow>
-            ))}
-          </TableBody>
-        </Table>
-      </TableContainer>
+                    key={`r:${absRow}:${rowIndex}`}
+                    onClick={() => setSelectedAbsRow(absRow)}
+                    sx={{ position: "relative", height: rowHeight, width: totalWidth, borderBottom: "1px solid", borderColor: "divider", cursor: "pointer", bgcolor: selectedAbsRow === absRow ? "action.selected" : "background.paper", "&:hover": { bgcolor: "action.hover" } }}
+                  >
+                    {visibleCols.map((ci) => {
+                      const cell = row?.[ci];
+                      const text = normalizeTileCell(cell);
+                      return (
+                        <Box key={`c:${ci}`} title={text} sx={{ position: "absolute", left: prefix[ci], top: 0, width: widths[ci], height: rowHeight, px: 1, py: dense ? 0.45 : 0.7, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis", borderRight: "1px solid", borderColor: "divider", fontSize: dense ? 12 : 13 }}>
+                          {text}
+                        </Box>
+                      );
+                    })}
+                  </Box>
+                );
+              })}
+            </Box>
+          </Box>
+        </Box>
+      </Box>
       <Stack direction="row" justifyContent="space-between" alignItems="center" spacing={1} sx={{ mt: 0.75, flexWrap: "wrap" }}>
         <Typography variant="caption" color="text.secondary">
-          表示中 {fmt(filteredRows.length)} / 元 {fmt(rows.length)} 行。フィルター/ソートは現在読み込んだ表示データに適用します。ヘッダーはスクロール時に固定されます。列幅はヘッダー右端をドラッグで調整できます。
+          TileTable共通基盤: 行/列virtual表示、列幅リサイズ、選択行表示、lazy読込を共通化。{externalLazy ? "表示範囲に応じて必要ページだけ読みます。" : `表示中 ${fmt(processedRows.length)} / 元 ${fmt(baseRows.length)} 行。`}
         </Typography>
         <Stack direction="row" spacing={0.5} sx={{ flexWrap: "wrap" }}>
-          {hasColumnWidths && (
-            <Button size="small" onClick={() => setColumnWidths({})}>
-              Reset column widths
-            </Button>
-          )}
-          {(Object.values(filters).some((v) => String(v || "").trim()) || sort.index >= 0) && (
-            <Button size="small" onClick={() => { setFilters({}); setSort({ index: -1, direction: "asc" }); }}>
-              Clear table filters
-            </Button>
-          )}
+          {hasColumnWidths && <Button size="small" onClick={clearColumnWidths}>Reset column widths</Button>}
+          {hasLocalControls && <Button size="small" onClick={() => { setFilters({}); setSort({ index: -1, direction: "asc" }); }}>Clear table filters</Button>}
         </Stack>
       </Stack>
     </Box>
+  );
+}
+
+function DataTable({ table, tableId, height = 520, dense: denseProp, filterable = true, sortable = true, minColumnWidth = 150, showRowNumber = false, rowNumberOffset = 0 }) {
+  const ui = React.useContext(UiSettingsContext);
+  const dense = denseProp ?? ui.dense;
+  const header = table?.header || [];
+  const rows = table?.rows || [];
+  return (
+    <CommonTileTableView
+      tableId={tableId || "dataTable"}
+      header={header}
+      rows={rows}
+      height={height}
+      dense={dense}
+      filterable={filterable}
+      sortable={sortable}
+      minColumnWidth={minColumnWidth}
+      showRowNumber={showRowNumber}
+      rowNumberOffset={rowNumberOffset}
+      emptyMessage="表示するデータがありません"
+      sourceLabel={`Table: ${tableId || "result"}`}
+    />
   );
 }
 
@@ -6683,229 +7081,71 @@ function FormulaRecipePanel({ onPick, fieldOptions=[] }) {
   );
 }
 
+
 function GraphQueryVirtualTable({ table, totalRows=0, page=1, pageSize=1000, onReadPage=()=>{}, height=420 }) {
   const header = table?.header || [];
   const rows = table?.rows || [];
-  const rowHeight = 34;
-  const headerHeight = 42;
-  const safePageSize = Math.max(1, Number(pageSize || 1000));
-  const safeTotal = Math.max(Number(totalRows || 0), rows.length);
   const safePage = Math.max(1, Number(page || 1));
-  const startIndex = (safePage - 1) * safePageSize;
-  const totalPages = Math.max(1, Math.ceil(safeTotal / safePageSize));
-  const viewportHeight = Math.max(120, Number(height || 420));
-  const viewportRows = Math.max(1, Math.ceil(viewportHeight / rowHeight));
-  const MAX_PHYSICAL_SCROLL_HEIGHT = 12000000;
-  const rawContentHeight = safeTotal * rowHeight;
-  const contentHeight = Math.max(
-    viewportHeight - headerHeight,
-    Math.min(rawContentHeight, MAX_PHYSICAL_SCROLL_HEIGHT)
-  );
-  const isCompressedScroll = rawContentHeight > MAX_PHYSICAL_SCROLL_HEIGHT;
-  const lastRequestedRef = useRef({ page:safePage, at:0 });
-  const rafRef = useRef(0);
-  const resizeRef = useRef(null);
-  const scrollRef = useRef(null);
-  const [scrollTop, setScrollTop] = useState(0);
-  const [selectedAbsRow, setSelectedAbsRow] = useState(-1);
-  const [columnWidths, setColumnWidths] = useState({});
-  const headerKey = header.join("\u001f");
+  const safePageSize = Math.max(1, Number(pageSize || 1000));
   const tablePage = Math.max(1, Number(table?.page || safePage || 1));
   const tablePageSize = Math.max(1, Number(table?.pageSize || safePageSize || 1000));
   const tableStartRow = Number.isFinite(Number(table?.startRow))
     ? Math.max(0, Number(table.startRow || 0))
     : (tablePage - 1) * tablePageSize;
-
-  useEffect(() => {
-    lastRequestedRef.current.page = safePage;
-  }, [safePage]);
-
-  useEffect(() => {
-    setSelectedAbsRow(-1);
-    setColumnWidths({});
-  }, [headerKey]);
-
-  useEffect(() => () => {
-    if (rafRef.current) cancelAnimationFrame(rafRef.current);
-    const state = resizeRef.current;
-    if (state) {
-      window.removeEventListener("mousemove", state.onMove);
-      window.removeEventListener("mouseup", state.onUp);
-      window.removeEventListener("touchmove", state.onMove);
-      window.removeEventListener("touchend", state.onUp);
-      resizeRef.current = null;
-    }
-  }, []);
-  useEffect(() => {
-    if (!header.length || !safeTotal || rows.length) return;
-    const t = performance.now();
-    if (t - lastRequestedRef.current.at < 120) return;
-    lastRequestedRef.current = { page:safePage, at:t };
-    onReadPage(safePage);
-  }, [headerKey, safeTotal, rows.length, safePage]);
-
-
-  const clientXOf = (event) => event.touches?.[0]?.clientX ?? event.clientX ?? 0;
-  const getColumnWidth = (index) => {
-    const value = Number(columnWidths[index]);
-    return Number.isFinite(value) && value > 0 ? value : 160;
-  };
-  const setColumnWidth = (index, width) => {
-    const nextWidth = Math.max(72, Math.min(1400, Math.round(Number(width) || 160)));
-    setColumnWidths((prev) => ({ ...prev, [index]: nextWidth }));
-  };
-  const resetColumnWidth = (index) => setColumnWidths((prev) => { const next = { ...prev }; delete next[index]; return next; });
-
-  const startColumnResize = (event, index) => {
-    event.preventDefault();
-    event.stopPropagation();
-    const startX = clientXOf(event);
-    const startWidth = getColumnWidth(index);
-    const onMove = (moveEvent) => {
-      moveEvent.preventDefault?.();
-      setColumnWidth(index, startWidth + clientXOf(moveEvent) - startX);
-    };
-    const onUp = () => {
-      window.removeEventListener("mousemove", onMove);
-      window.removeEventListener("mouseup", onUp);
-      window.removeEventListener("touchmove", onMove);
-      window.removeEventListener("touchend", onUp);
-      resizeRef.current = null;
-      document.body.style.cursor = "";
-      document.body.style.userSelect = "";
-    };
-    resizeRef.current = { onMove, onUp };
-    document.body.style.cursor = "col-resize";
-    document.body.style.userSelect = "none";
-    window.addEventListener("mousemove", onMove);
-    window.addEventListener("mouseup", onUp);
-    window.addEventListener("touchmove", onMove, { passive:false });
-    window.addEventListener("touchend", onUp);
-  };
-
-  const maxScrollableTop = Math.max(1, contentHeight - viewportHeight);
-  const virtualRowFromScroll = (top) => {
-    if (!safeTotal) return 0;
-    if (!isCompressedScroll) return Math.max(0, Math.floor(top / rowHeight));
-    const ratio = Math.max(0, Math.min(1, Number(top || 0) / maxScrollableTop));
-    return Math.max(0, Math.min(Math.max(0, safeTotal - viewportRows), Math.floor(ratio * Math.max(0, safeTotal - viewportRows))));
-  };
-  const scrollFromVirtualRow = (row) => {
-    if (!safeTotal) return 0;
-    if (!isCompressedScroll) return row * rowHeight;
-    const denom = Math.max(1, safeTotal - viewportRows);
-    return Math.max(0, Math.min(maxScrollableTop, (Math.max(0, row) / denom) * maxScrollableTop));
-  };
-
-  const onScroll = (event) => {
-    if (!safeTotal) return;
-    const top = event.currentTarget.scrollTop || 0;
-    if (rafRef.current) cancelAnimationFrame(rafRef.current);
-    rafRef.current = requestAnimationFrame(() => setScrollTop(top));
-
-    const virtualStart = virtualRowFromScroll(top);
-    const nextPage = Math.min(Math.max(1, Math.floor(virtualStart / safePageSize) + 1), totalPages);
-    const t = performance.now();
-    if (nextPage !== lastRequestedRef.current.page && t - lastRequestedRef.current.at > 120) {
-      lastRequestedRef.current = { page:nextPage, at:t };
-      onReadPage(nextPage);
-    }
-  };
-
-  if (!header.length) {
-    return (
-      <Box sx={{ height, display:"grid", placeItems:"center", color:"text.secondary", border:"1px dashed", borderColor:"divider", borderRadius:1.5 }}>
-        Graph Queryを実行すると、ここに結果パネルが表示されます。
-      </Box>
-    );
-  }
-
-  const widths = header.map((_, i) => getColumnWidth(i));
-  const gridTemplateColumns = widths.map((w) => `${w}px`).join(" ");
-  const minWidth = Math.max(720, widths.reduce((sum, width) => sum + width, 0));
-  const overscan = 12;
-  const visibleAbsStart = Math.max(0, virtualRowFromScroll(scrollTop) - overscan);
-  const visibleAbsEnd = Math.min(safeTotal, visibleAbsStart + viewportRows + overscan * 2);
-  const loadedAbsStart = tableStartRow;
-  const loadedAbsEnd = loadedAbsStart + rows.length;
-  const visibleMissesLoadedTile = rows.length > 0 && (visibleAbsEnd <= loadedAbsStart || visibleAbsStart >= loadedAbsEnd);
-  const renderAbsStart = visibleMissesLoadedTile ? loadedAbsStart : visibleAbsStart;
-  const renderAbsEnd = visibleMissesLoadedTile ? Math.min(loadedAbsEnd, loadedAbsStart + viewportRows + overscan * 2) : visibleAbsEnd;
-  const localStart = Math.max(0, renderAbsStart - loadedAbsStart);
-  const localEnd = Math.min(rows.length, Math.max(localStart, renderAbsEnd - loadedAbsStart));
-  const visibleRows = rows.slice(localStart, localEnd);
-  const visibleTop = isCompressedScroll
-    ? Math.max(0, Math.min(contentHeight - (visibleRows.length * rowHeight), scrollFromVirtualRow(loadedAbsStart + localStart)))
-    : (loadedAbsStart + localStart) * rowHeight;
-  const loadedRangeText = rows.length ? `${fmt(loadedAbsStart + 1)} - ${fmt(Math.min(loadedAbsStart + rows.length, safeTotal))}` : "未読込";
-  const virtualRangeText = safeTotal ? `${fmt(visibleAbsStart + 1)} - ${fmt(Math.min(visibleAbsEnd, safeTotal))}` : "0";
+  const safeTotal = Math.max(Number(totalRows || 0), rows.length);
 
   return (
-    <Box sx={{ border:"1px solid", borderColor:"divider", borderRadius:1.5, overflow:"hidden", bgcolor:"background.paper" }}>
-      <Box sx={{ px:1, py:0.6, bgcolor:"action.hover", borderBottom:"1px solid", borderColor:"divider", display:"flex", gap:1, alignItems:"center", flexWrap:"wrap" }}>
-        <Typography variant="caption" sx={{ fontWeight:900 }}>
-          全{fmt(safeTotal)}行をlazy全件パネル表示 / 表示位置: {visibleMissesLoadedTile ? `${fmt(loadedAbsStart + 1)} - ${fmt(Math.min(loadedAbsEnd, safeTotal))}` : virtualRangeText} / 読込タイル: {loadedRangeText} / 描画中: {fmt(visibleRows.length)}行
-        </Typography>
-        {isCompressedScroll && <Chip size="small" color="warning" variant="outlined" label="リミットレス圧縮スクロール" />}
-        {selectedAbsRow >= 0 && <Chip size="small" color="primary" label={`選択行: ${fmt(selectedAbsRow + 1)}`} />}
-        <Typography variant="caption" color="text.secondary">列幅はヘッダー右端をドラッグ、ダブルクリックでリセットできます。</Typography>
-      </Box>
-      <Box ref={scrollRef} onScroll={onScroll} sx={{ height:viewportHeight, overflow:"auto", position:"relative" }}>
-        <Box sx={{ position:"sticky", top:0, zIndex:4, display:"grid", gridTemplateColumns, minWidth, bgcolor:"background.paper", borderBottom:"1px solid", borderColor:"divider" }}>
-          {header.map((h, i) => (
-            <Box key={i} sx={{ position:"relative", px:1, py:0.8, fontWeight:900, whiteSpace:"nowrap", overflow:"hidden", textOverflow:"ellipsis", borderRight:"1px solid", borderColor:"divider" }}>
-              {h}
-              <Box
-                role="separator"
-                aria-label={`${h} 列幅を調整`}
-                tabIndex={0}
-                onMouseDown={(event) => startColumnResize(event, i)}
-                onTouchStart={(event) => startColumnResize(event, i)}
-                onDoubleClick={() => resetColumnWidth(i)}
-                onKeyDown={(event) => {
-                  if (event.key === "ArrowLeft") { event.preventDefault(); setColumnWidth(i, getColumnWidth(i) - (event.shiftKey ? 40 : 12)); }
-                  if (event.key === "ArrowRight") { event.preventDefault(); setColumnWidth(i, getColumnWidth(i) + (event.shiftKey ? 40 : 12)); }
-                  if (["Enter", "Backspace", "Delete"].includes(event.key)) { event.preventDefault(); resetColumnWidth(i); }
-                }}
-                sx={{
-                  position:"absolute", top:0, right:0, bottom:0, width:10, cursor:"col-resize", zIndex:5, outline:"none",
-                  "&::after":{ content:'""', position:"absolute", top:7, bottom:7, right:3, width:2, borderRadius:999, bgcolor:"divider", opacity:0.6 },
-                  "&:hover::after, &:focus-visible::after":{ bgcolor:"primary.main", opacity:1, width:3 }
-                }}
-              />
-            </Box>
-          ))}
-        </Box>
-        <Box sx={{ height:contentHeight, position:"relative", minWidth }}>
-          <Box sx={{ position:"absolute", left:0, right:0, top:visibleTop }}>
-            {visibleRows.map((row, ri) => {
-              const absRow = loadedAbsStart + localStart + ri;
-              return (
-                <Box
-                  key={`${loadedAbsStart + localStart}-${ri}`}
-                  onClick={() => setSelectedAbsRow(absRow)}
-                  sx={{ display:"grid", gridTemplateColumns, height:rowHeight, borderBottom:"1px solid", borderColor:"divider", cursor:"pointer", bgcolor:selectedAbsRow === absRow ? "action.selected" : "background.paper", '&:hover':{ bgcolor:"action.hover" } }}
-                >
-                  {header.map((_, ci) => <Box key={ci} title={String(row?.[ci] ?? "")} sx={{ px:1, py:0.65, whiteSpace:"nowrap", overflow:"hidden", textOverflow:"ellipsis", borderRight:"1px solid", borderColor:"divider" }}>{String(row?.[ci] ?? "")}</Box>)}
-                </Box>
-              );
-            })}
-          </Box>
-        </Box>
-      </Box>
-    </Box>
+    <CommonTileTableView
+      tableId="graphQueryResultLazy"
+      header={header}
+      rows={rows}
+      height={height}
+      dense={false}
+      filterable={false}
+      sortable={false}
+      minColumnWidth={160}
+      externalLazy
+      totalRows={safeTotal}
+      loadedStart={tableStartRow}
+      page={safePage}
+      pageSize={safePageSize}
+      onReadPage={onReadPage}
+      emptyMessage="Graph Queryを実行すると、ここに結果パネルが表示されます。"
+      sourceLabel="Graph Query Result"
+      statusLabel={`全${fmt(safeTotal)}行 / page ${fmt(safePage)} / tile ${fmt(safePageSize)} rows`}
+    />
   );
 }
 
-function GraphQueryEditor({ columns, datasets=[], manifest=null, nodes, setNodes, edges, setEdges, onApply, onReadPage=()=>{}, onClearResult=()=>{}, onExportCsv=()=>{}, disabled, dataQueryActive, dataQueryCount, resultTable, resultStatus, resultTime, resultPage, resultPageMax, resultViewMode="tile", setResultViewMode=()=>{}, resultRowsPerTile="1000", setResultRowsPerTile=()=>{}, sqlText="", setSqlText=()=>{}, sqlMode=false, setSqlMode=()=>{}, graphSessions=[], activeSessionId="", sessionName="", setSessionName=()=>{}, onSessionNew=()=>{}, onSessionSave=()=>{}, onSessionSaveAs=()=>{}, onSessionLoad=()=>{}, onSessionDelete=()=>{}, onSessionDuplicate=()=>{}, autoStandby=true, setAutoStandby=()=>{}, onDatasetStandby=()=>{} }) {
+function GraphQueryEditor({ columns, datasets=[], manifest=null, nodes, setNodes, edges, setEdges, onApply, onReadPage=()=>{}, onClearResult=()=>{}, onExportCsv=()=>{}, onResultSearch=()=>{}, onResultSearchPage=()=>{}, onResultPivot=()=>{}, onResultTime=()=>{}, resultSearchTable=null, resultSearchCount=0, resultSearchPage=1, resultSearchStatus="", resultSearchTime="", resultPivotTable=null, resultPivotStatus="", resultPivotTime="", resultTimeTable=null, resultTimeStatus="", resultTimeTime="", disabled, dataQueryActive, dataQueryCount, resultTable, resultStatus, resultTime, resultPage, resultPageMax, resultViewMode="tile", setResultViewMode=()=>{}, resultRowsPerTile="1000", setResultRowsPerTile=()=>{}, sqlText="", setSqlText=()=>{}, sqlMode=false, setSqlMode=()=>{}, graphSessions=[], activeSessionId="", sessionName="", setSessionName=()=>{}, onSessionNew=()=>{}, onSessionSave=()=>{}, onSessionSaveAs=()=>{}, onSessionLoad=()=>{}, onSessionDelete=()=>{}, onSessionDuplicate=()=>{}, autoStandby=true, setAutoStandby=()=>{}, onDatasetStandby=()=>{} }) {
   const [selectedId, setSelectedId] = useState(nodes?.[0]?.id || "source");
   const [sqlErrors, setSqlErrors] = useState([]);
   const [showMiniMap, setShowMiniMap] = useState(false);
   const [resultRowsDraft, setResultRowsDraft] = useState(String(resultRowsPerTile || "1000"));
+  const [resultAnalysisTab, setResultAnalysisTab] = useState("search");
+  const [resultSearchColumn, setResultSearchColumn] = useState("0");
+  const [resultSearchOp, setResultSearchOp] = useState("contains");
+  const [resultSearchValue, setResultSearchValue] = useState("");
+  const [resultSearchMax, setResultSearchMax] = useState("100000");
+  const [resultPivotRows, setResultPivotRows] = useState([]);
+  const [resultPivotCols, setResultPivotCols] = useState([]);
+  const [resultPivotValue, setResultPivotValue] = useState("-1");
+  const [resultPivotAgg, setResultPivotAgg] = useState("Count");
+  const [resultTimeField, setResultTimeField] = useState("0");
+  const [resultTimeBucket, setResultTimeBucket] = useState("month");
+  const [resultTimeGroup, setResultTimeGroup] = useState("-1");
+  const [resultTimeValue, setResultTimeValue] = useState("-1");
+  const [resultTimeAgg, setResultTimeAgg] = useState("Count");
   const flowPanelRef = useRef(null);
   const selectedNode = useMemo(() => nodes.find((n) => n.id === selectedId) || null, [nodes, selectedId]);
   const plan = useMemo(() => compileGraphQuery(nodes, edges, columns, datasets), [nodes, edges, columns, datasets]);
   const graphReady = !!ReactFlowCanvas;
+  const resultHeader = Array.isArray(resultTable?.header) ? resultTable.header : [];
+  useEffect(() => {
+    if (!resultHeader.length) return;
+    if (Number(resultSearchColumn) >= resultHeader.length) setResultSearchColumn("0");
+    if (Number(resultTimeField) >= resultHeader.length) setResultTimeField("0");
+  }, [resultHeader.length]);
   const safeSetSqlText = typeof setSqlText === "function" ? setSqlText : () => {};
   const safeSetSqlMode = typeof setSqlMode === "function" ? setSqlMode : () => {};
 
@@ -7301,6 +7541,90 @@ function GraphQueryEditor({ columns, datasets=[], manifest=null, nodes, setNodes
           <Typography variant="caption" color="text.secondary">{resultStatus || "Run graph query to show results here."}</Typography>
           <Typography variant="caption" color="text.secondary">{resultTime || ""}</Typography>
         </Stack>
+
+      </Paper>
+
+      <Paper elevation={0} sx={{ p: 1, bgcolor: "background.default", borderRadius: 2 }}>
+        <Stack direction="row" useFlexGap flexWrap="wrap" spacing={1} alignItems="center" sx={{ mb: 1 }}>
+          <Typography variant="subtitle2" sx={{ fontWeight: 900 }}>Graph Result Analysis / 結果データの再分析</Typography>
+          <Chip size="small" color="info" variant="outlined" label="結果は保存せず、最新Graph Resultをlazy再スキャン" />
+        </Stack>
+        {!resultHeader.length ? (
+          <Alert severity="info">Graph Queryを実行すると、その結果データに対してSearch / Pivot / Timeを実行できます。</Alert>
+        ) : (
+          <>
+            <Tabs value={resultAnalysisTab} onChange={(e,v)=>setResultAnalysisTab(v)} sx={{ minHeight: 34, mb: 1 }}>
+              <Tab value="search" label="Search（検索）" sx={{ minHeight: 34 }} />
+              <Tab value="pivot" label="Pivot（集計）" sx={{ minHeight: 34 }} />
+              <Tab value="time" label="Time（時系列）" sx={{ minHeight: 34 }} />
+            </Tabs>
+            {resultAnalysisTab === "search" && (
+              <Stack spacing={1}>
+                <Stack direction="row" useFlexGap flexWrap="wrap" spacing={1} alignItems="center">
+                  <TextField select size="small" label="対象列" value={resultSearchColumn} onChange={(e)=>setResultSearchColumn(e.target.value)} sx={{ minWidth: 220 }}>
+                    {resultHeader.map((h,i)=><MenuItem key={i} value={String(i)}>{h}</MenuItem>)}
+                  </TextField>
+                  <TextField select size="small" label="演算子" value={resultSearchOp} onChange={(e)=>setResultSearchOp(e.target.value)} sx={{ minWidth: 190 }}>
+                    {GRAPH_OPERATOR_DEFS.map((x)=><MenuItem key={x.op} value={x.op}>{x.code}（{x.jp}）</MenuItem>)}
+                  </TextField>
+                  <TextField size="small" label="値" value={resultSearchValue} onChange={(e)=>setResultSearchValue(e.target.value)} sx={{ minWidth: 220 }} />
+                  <SmallNumberField label="最大一致" value={resultSearchMax} onChange={setResultSearchMax} min="1" step="10000" sx={{ width: 130 }} />
+                  <Button size="small" variant="contained" onClick={()=>onResultSearch({ columnIndex:Number(resultSearchColumn), op:resultSearchOp, value:resultSearchValue, maxMatches:Number(resultSearchMax || 100000) })}>結果内検索</Button>
+                  <Button size="small" onClick={()=>onResultSearchPage(Math.max(1, Number(resultSearchPage || 1)-1))}>Prev</Button>
+                  <Typography variant="caption">Page {Number(resultSearchPage || 1).toLocaleString()} / {Math.max(1, Math.ceil(Number(resultSearchCount || 0) / 500)).toLocaleString()}</Typography>
+                  <Button size="small" onClick={()=>onResultSearchPage(Math.min(Math.max(1, Math.ceil(Number(resultSearchCount || 0) / 500)), Number(resultSearchPage || 1)+1))}>Next</Button>
+                </Stack>
+                <DataTable table={resultSearchTable} tableId="graphResultSearch" height={260} />
+                <Stack direction="row" justifyContent="space-between"><Typography variant="caption" color="text.secondary">{resultSearchStatus}</Typography><Typography variant="caption" color="text.secondary">{resultSearchTime}</Typography></Stack>
+              </Stack>
+            )}
+            {resultAnalysisTab === "pivot" && (
+              <Stack spacing={1}>
+                <Stack direction="row" useFlexGap flexWrap="wrap" spacing={1} alignItems="center">
+                  <TextField select SelectProps={{ multiple:true }} size="small" label="行フィールド" value={resultPivotRows} onChange={(e)=>setResultPivotRows(typeof e.target.value === "string" ? e.target.value.split(",") : e.target.value)} sx={{ minWidth: 230 }}>
+                    {resultHeader.map((h,i)=><MenuItem key={i} value={String(i)}>{h}</MenuItem>)}
+                  </TextField>
+                  <TextField select SelectProps={{ multiple:true }} size="small" label="列フィールド" value={resultPivotCols} onChange={(e)=>setResultPivotCols(typeof e.target.value === "string" ? e.target.value.split(",") : e.target.value)} sx={{ minWidth: 230 }}>
+                    {resultHeader.map((h,i)=><MenuItem key={i} value={String(i)}>{h}</MenuItem>)}
+                  </TextField>
+                  <TextField select size="small" label="値フィールド" value={resultPivotValue} onChange={(e)=>setResultPivotValue(e.target.value)} sx={{ minWidth: 210 }}>
+                    <MenuItem value="-1">Count（件数）</MenuItem>{resultHeader.map((h,i)=><MenuItem key={i} value={String(i)}>{h}</MenuItem>)}
+                  </TextField>
+                  <TextField select size="small" label="集計" value={resultPivotAgg} onChange={(e)=>setResultPivotAgg(e.target.value)} sx={{ width: 150 }}>
+                    {["Count","Sum","Average","Min","Max"].map(x=><MenuItem key={x} value={x}>{x}</MenuItem>)}
+                  </TextField>
+                  <Button size="small" variant="contained" onClick={()=>onResultPivot({ rowFields:resultPivotRows.map(Number), columnFields:resultPivotCols.map(Number), valueField:Number(resultPivotValue), aggregation:resultPivotAgg, maxRows:10000, maxCols:1000 })}>Pivot作成</Button>
+                </Stack>
+                <DataTable table={resultPivotTable} tableId="graphResultPivot" height={300} />
+                <Stack direction="row" justifyContent="space-between"><Typography variant="caption" color="text.secondary">{resultPivotStatus}</Typography><Typography variant="caption" color="text.secondary">{resultPivotTime}</Typography></Stack>
+              </Stack>
+            )}
+            {resultAnalysisTab === "time" && (
+              <Stack spacing={1}>
+                <Stack direction="row" useFlexGap flexWrap="wrap" spacing={1} alignItems="center">
+                  <TextField select size="small" label="時刻列" value={resultTimeField} onChange={(e)=>setResultTimeField(e.target.value)} sx={{ minWidth: 220 }}>
+                    {resultHeader.map((h,i)=><MenuItem key={i} value={String(i)}>{h}</MenuItem>)}
+                  </TextField>
+                  <TextField select size="small" label="粒度" value={resultTimeBucket} onChange={(e)=>setResultTimeBucket(e.target.value)} sx={{ width: 140 }}>
+                    {[["year","年"],["month","月"],["day","日"],["hour","時"]].map(([v,l])=><MenuItem key={v} value={v}>{l}</MenuItem>)}
+                  </TextField>
+                  <TextField select size="small" label="グループ" value={resultTimeGroup} onChange={(e)=>setResultTimeGroup(e.target.value)} sx={{ minWidth: 210 }}>
+                    <MenuItem value="-1">なし</MenuItem>{resultHeader.map((h,i)=><MenuItem key={i} value={String(i)}>{h}</MenuItem>)}
+                  </TextField>
+                  <TextField select size="small" label="値" value={resultTimeValue} onChange={(e)=>setResultTimeValue(e.target.value)} sx={{ minWidth: 190 }}>
+                    <MenuItem value="-1">Count（件数）</MenuItem>{resultHeader.map((h,i)=><MenuItem key={i} value={String(i)}>{h}</MenuItem>)}
+                  </TextField>
+                  <TextField select size="small" label="集計" value={resultTimeAgg} onChange={(e)=>setResultTimeAgg(e.target.value)} sx={{ width: 150 }}>
+                    {["Count","Sum","Average","Min","Max"].map(x=><MenuItem key={x} value={x}>{x}</MenuItem>)}
+                  </TextField>
+                  <Button size="small" variant="contained" onClick={()=>onResultTime({ timeField:Number(resultTimeField), bucket:resultTimeBucket, groupField:Number(resultTimeGroup), valueField:Number(resultTimeValue), aggregation:resultTimeAgg, maxBuckets:10000 })}>Time作成</Button>
+                </Stack>
+                <DataTable table={resultTimeTable} tableId="graphResultTime" height={300} />
+                <Stack direction="row" justifyContent="space-between"><Typography variant="caption" color="text.secondary">{resultTimeStatus}</Typography><Typography variant="caption" color="text.secondary">{resultTimeTime}</Typography></Stack>
+              </Stack>
+            )}
+          </>
+        )}
       </Paper>
     </Stack>
   );
@@ -7405,6 +7729,17 @@ function App() {
   const [graphResultTime, setGraphResultTime] = useState("");
   const [graphResultViewMode, setGraphResultViewMode] = useState("tile");
   const [graphResultPageSize, setGraphResultPageSize] = useState(initialSettings.graphResultPageSize || "1000");
+  const [graphResultSearchTable, setGraphResultSearchTable] = useState(null);
+  const [graphResultSearchCount, setGraphResultSearchCount] = useState(0);
+  const [graphResultSearchPage, setGraphResultSearchPage] = useState(1);
+  const [graphResultSearchStatus, setGraphResultSearchStatus] = useState("Graph Query結果に対してSearchできます。");
+  const [graphResultSearchTime, setGraphResultSearchTime] = useState("");
+  const [graphResultPivotTable, setGraphResultPivotTable] = useState(null);
+  const [graphResultPivotStatus, setGraphResultPivotStatus] = useState("Graph Query結果に対してPivotできます。");
+  const [graphResultPivotTime, setGraphResultPivotTime] = useState("");
+  const [graphResultTimeTable, setGraphResultTimeTable] = useState(null);
+  const [graphResultTimeStatus, setGraphResultTimeStatus] = useState("Graph Query結果に対してTime viewを作れます。");
+  const [graphResultTimeTime, setGraphResultTimeTime] = useState("");
 
   const [searchColumn, setSearchColumn] = useState("0");
   const [searchOp, setSearchOp] = useState("contains");
@@ -8195,6 +8530,9 @@ function App() {
       EXTERNAL_STORAGE_LIST: "External Storage一覧取得",
       EXTERNAL_STORAGE_SYNC: "External Storage同期",
       EXTERNAL_STORAGE_OPEN: "External Storage Dataset読込",
+      RUN_GRAPH_RESULT_SEARCH: "Graph Query結果内検索",
+      BUILD_GRAPH_RESULT_PIVOT: "Graph Query結果Pivot",
+      BUILD_GRAPH_RESULT_TIME: "Graph Query結果Time",
     };
     if (labels[msg.type]) {
       setBusy(true);
@@ -8474,6 +8812,7 @@ function App() {
 
   function runGraphQueryPlan(plan) {
     if (!manifest && !(plan?.mode === "join")) return;
+    clearGraphResultAnalysis();
     const derivedColumns = normalizeGraphDerivedColumns(plan?.derivedColumns || []);
     const projection = Array.isArray(plan?.projection) ? plan.projection.map(Number).filter((v) => Number.isFinite(v)) : [];
     const outputColumnNames = graphOutputColumnNamesForPlan(plan);
@@ -8551,6 +8890,49 @@ function App() {
       maxRows: 0,
       chunkRows: 5000,
     });
+  }
+
+  function graphResultPayload(extra={}) {
+    const ctx = graphExecutionRef.current || {};
+    return {
+      mode: graphResultMode === "join" ? "join" : "data",
+      columns: ctx.readColumns || selectedColumnsForPost(),
+      outputColumnNames: ctx.outputColumnNames || null,
+      derivedColumns: ctx.derivedColumns || [],
+      ...extra,
+    };
+  }
+
+  function runGraphResultSearch(params={}) {
+    if (!graphResultCount) { setGraphResultSearchStatus("先にGraph Queryを実行してください。"); return; }
+    setGraphResultSearchTable(null);
+    setGraphResultSearchCount(0);
+    setGraphResultSearchPage(1);
+    setGraphResultSearchStatus("Graph Query Result内を検索中...");
+    appendLog(`Graph Result Search: ${JSON.stringify(params)}`);
+    post({ type:"RUN_GRAPH_RESULT_SEARCH", ...graphResultPayload(params), pageSize:Number(pageSizeRef.current || 500) });
+  }
+
+  function readGraphResultSearchPage(next=graphResultSearchPage) {
+    const safe=Math.max(1,Number(next||1));
+    setGraphResultSearchPage(safe);
+    post({ type:"READ_GRAPH_RESULT_SEARCH_PAGE", page:safe, pageSize:Number(pageSizeRef.current || 500) });
+  }
+
+  function runGraphResultPivot(params={}) {
+    if (!graphResultCount) { setGraphResultPivotStatus("先にGraph Queryを実行してください。"); return; }
+    setGraphResultPivotTable(null);
+    setGraphResultPivotStatus("Graph Query ResultからPivotを作成中...");
+    appendLog(`Graph Result Pivot: ${JSON.stringify(params)}`);
+    post({ type:"BUILD_GRAPH_RESULT_PIVOT", ...graphResultPayload(params) });
+  }
+
+  function runGraphResultTime(params={}) {
+    if (!graphResultCount) { setGraphResultTimeStatus("先にGraph Queryを実行してください。"); return; }
+    setGraphResultTimeTable(null);
+    setGraphResultTimeStatus("Graph Query ResultからTime viewを作成中...");
+    appendLog(`Graph Result Time: ${JSON.stringify(params)}`);
+    post({ type:"BUILD_GRAPH_RESULT_TIME", ...graphResultPayload(params) });
   }
 
   function runDataQuery() {
@@ -9331,6 +9713,21 @@ function App() {
                   onReadPage={readGraphQueryPage}
                   onClearResult={clearGraphQueryResult}
                   onExportCsv={exportGraphQueryCsvAll}
+                  onResultSearch={runGraphResultSearch}
+                  onResultSearchPage={readGraphResultSearchPage}
+                  onResultPivot={runGraphResultPivot}
+                  onResultTime={runGraphResultTime}
+                  resultSearchTable={graphResultSearchTable}
+                  resultSearchCount={graphResultSearchCount}
+                  resultSearchPage={graphResultSearchPage}
+                  resultSearchStatus={graphResultSearchStatus}
+                  resultSearchTime={graphResultSearchTime}
+                  resultPivotTable={graphResultPivotTable}
+                  resultPivotStatus={graphResultPivotStatus}
+                  resultPivotTime={graphResultPivotTime}
+                  resultTimeTable={graphResultTimeTable}
+                  resultTimeStatus={graphResultTimeStatus}
+                  resultTimeTime={graphResultTimeTime}
                   disabled={(!manifest && !hierarchicalDatasets.length) || busy}
                   dataQueryActive={graphResultCount > 0}
                   dataQueryCount={graphResultCount}
