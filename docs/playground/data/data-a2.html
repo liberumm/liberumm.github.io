@@ -7161,6 +7161,14 @@ function GraphQueryEditor({ columns, datasets=[], manifest=null, nodes, setNodes
   const safeSetSqlText = typeof setSqlText === "function" ? setSqlText : () => {};
   const safeSetSqlMode = typeof setSqlMode === "function" ? setSqlMode : () => {};
 
+  const markGraphDefinitionChanged = useCallback((reason = "graph") => {
+    // ノードの条件・列・JOIN・計算列などをGUI側で変更したら、
+    // 手書きSQLモードを解除してGraph由来SQLプレビューへ必ず戻す。
+    // これにより「条件は変わったのにSQL欄だけ古い」状態を防ぐ。
+    safeSetSqlMode(false);
+    setSqlErrors([]);
+  }, [safeSetSqlMode]);
+
   useEffect(() => {
     setResultRowsDraft(String(resultRowsPerTile || "1000"));
   }, [resultRowsPerTile]);
@@ -7189,6 +7197,7 @@ function GraphQueryEditor({ columns, datasets=[], manifest=null, nodes, setNodes
   }, [plan.sql, sqlMode, safeSetSqlText]);
 
   const updateNodeData = (id, patch) => {
+    markGraphDefinitionChanged("node-data");
     setNodes((prev) => prev.map((n) => {
       if (n.id !== id) return n;
       const next = { ...n, data: { ...(n.data || {}), ...patch } };
@@ -7203,6 +7212,7 @@ function GraphQueryEditor({ columns, datasets=[], manifest=null, nodes, setNodes
     const y = kind === "source" ? 360 : kind === "join" ? 260 : kind === "filter" ? 105 : kind === "sort" ? 210 : kind === "select" ? 40 : kind === "derived" ? 300 : kind === "aggregate" ? 330 : kind === "subquery" ? 355 : 380;
     const node = makeGraphNode(id, kind, { x, y }, columns, extra);
     node.data.label = normalizeGraphNodeLabel(node, columns, datasets);
+    markGraphDefinitionChanged("add-node");
     setNodes((prev) => [...prev, node]);
     if (!["subquery", "source"].includes(kind)) {
       setEdges((prev) => [...prev, { id: `e-${prev.length}-${Date.now().toString(36)}`, source: "source", target: id, animated: true, reconnectable: true, markerEnd: RFMarkerType ? { type: RFMarkerType.ArrowClosed } : undefined }]);
@@ -7219,6 +7229,7 @@ function GraphQueryEditor({ columns, datasets=[], manifest=null, nodes, setNodes
       makeGraphNode("limit-1", "limit", { x: 690, y: 145 }, columns),
       makeGraphNode("output", "output", { x: 910, y: 130 }, columns),
     ].map((n) => ({ ...n, data: { ...n.data, label: normalizeGraphNodeLabel(n, columns) } }));
+    markGraphDefinitionChanged("reset-graph");
     setNodes(baseNodes);
     setEdges([
       { id: "source-select", source: "source", target: "select-1", animated: true, reconnectable: true, markerEnd: RFMarkerType ? { type: RFMarkerType.ArrowClosed } : undefined },
@@ -7258,6 +7269,7 @@ function GraphQueryEditor({ columns, datasets=[], manifest=null, nodes, setNodes
     if (!node) return;
     if (action === "delete") {
       if (["source", "output"].includes(id) || node.data?.kind === "subquery") return;
+      markGraphDefinitionChanged("delete-node");
       setNodes((prev) => prev.filter((n) => n.id !== id));
       setEdges((prev) => prev.filter((e) => e.source !== id && e.target !== id));
       setSelectedId("source");
@@ -7266,15 +7278,18 @@ function GraphQueryEditor({ columns, datasets=[], manifest=null, nodes, setNodes
     if (action === "toggle") { updateNodeData(id, { disabled: !node.data?.disabled }); return; }
     if (action === "duplicate") {
       const next = { ...node, id: `${node.data?.kind || "node"}-${Date.now().toString(36)}`, position: { x: node.position.x + 40, y: node.position.y + 40 }, selected: false, parentId: node.parentId, extent: node.extent, data: { ...(node.data || {}) } };
+      markGraphDefinitionChanged("duplicate-node");
       setNodes((prev) => [...prev, next]); setSelectedId(next.id); return;
     }
     if (action === "intoSubquery") {
       const subId = firstSubqueryId();
       if (!subId || ["source", "output"].includes(id) || node.data?.kind === "subquery") return;
+      markGraphDefinitionChanged("move-into-subquery");
       setNodes((prev) => prev.map((n) => n.id === id ? { ...n, parentId: subId, extent: "parent", position: { x: 30, y: 80 + Math.random()*120 } } : n));
       return;
     }
     if (action === "outSubquery") {
+      markGraphDefinitionChanged("move-out-subquery");
       setNodes((prev) => prev.map((n) => n.id === id ? { ...n, parentId: undefined, extent: undefined, position: { x: 250 + Math.random()*160, y: 280 + Math.random()*120 } } : n));
       return;
     }
@@ -7283,12 +7298,13 @@ function GraphQueryEditor({ columns, datasets=[], manifest=null, nodes, setNodes
   const handleEdgeAction = (action, id) => {
     const edge = edges.find((e) => e.id === id);
     if (!edge) return;
-    if (action === "delete") { setEdges((prev) => prev.filter((e) => e.id !== id)); return; }
-    if (action === "reverse") { setEdges((prev) => prev.map((e) => e.id === id ? { ...e, source: e.target, target: e.source } : e)); return; }
+    if (action === "delete") { markGraphDefinitionChanged("delete-edge"); setEdges((prev) => prev.filter((e) => e.id !== id)); return; }
+    if (action === "reverse") { markGraphDefinitionChanged("reverse-edge"); setEdges((prev) => prev.map((e) => e.id === id ? { ...e, source: e.target, target: e.source } : e)); return; }
     if (action === "insertFilter") {
       const nodeId = `filter-${Date.now().toString(36)}`;
       const node = makeGraphNode(nodeId, "filter", { x: (nodes.find(n=>n.id===edge.source)?.position?.x || 200) + 120, y: (nodes.find(n=>n.id===edge.source)?.position?.y || 100) + 45 }, columns);
       node.data.label = normalizeGraphNodeLabel(node, columns, datasets);
+      markGraphDefinitionChanged("insert-filter-edge");
       setNodes((prev) => [...prev, node]);
       setEdges((prev) => prev.filter((e) => e.id !== id).concat([
         { id: `${edge.source}-${nodeId}`, source: edge.source, target: nodeId, animated: true, reconnectable: true, markerEnd: RFMarkerType ? { type: RFMarkerType.ArrowClosed } : undefined },
@@ -7299,6 +7315,7 @@ function GraphQueryEditor({ columns, datasets=[], manifest=null, nodes, setNodes
   };
 
   const handleReconnect = (oldEdge, newConnection) => {
+    markGraphDefinitionChanged("reconnect-edge");
     setEdges((eds) => {
       const nextConnection = {
         ...newConnection,
@@ -7390,9 +7407,15 @@ function GraphQueryEditor({ columns, datasets=[], manifest=null, nodes, setNodes
                 edges={renderedEdges}
                 nodeTypes={nodeTypes}
                 edgeTypes={edgeTypes}
-                onNodesChange={(changes) => setNodes((nds) => rfApplyNodeChanges ? rfApplyNodeChanges(changes, nds) : nds)}
-                onEdgesChange={(changes) => setEdges((eds) => rfApplyEdgeChanges ? rfApplyEdgeChanges(changes, eds) : eds)}
-                onConnect={(params) => setEdges((eds) => rfAddEdge ? rfAddEdge({ ...params, type: "queryEdge", animated: true, reconnectable: true, markerEnd: RFMarkerType ? { type: RFMarkerType.ArrowClosed } : undefined }, eds) : eds)}
+                onNodesChange={(changes) => {
+                  if ((changes || []).some((ch) => ["add", "remove", "replace"].includes(ch.type))) markGraphDefinitionChanged("nodes-change");
+                  setNodes((nds) => rfApplyNodeChanges ? rfApplyNodeChanges(changes, nds) : nds);
+                }}
+                onEdgesChange={(changes) => {
+                  if ((changes || []).some((ch) => ["add", "remove", "replace"].includes(ch.type))) markGraphDefinitionChanged("edges-change");
+                  setEdges((eds) => rfApplyEdgeChanges ? rfApplyEdgeChanges(changes, eds) : eds);
+                }}
+                onConnect={(params) => { markGraphDefinitionChanged("connect-edge"); setEdges((eds) => rfAddEdge ? rfAddEdge({ ...params, type: "queryEdge", animated: true, reconnectable: true, markerEnd: RFMarkerType ? { type: RFMarkerType.ArrowClosed } : undefined }, eds) : eds); }}
                 onReconnect={handleReconnect}
                 edgesReconnectable={true}
                 onNodeClick={(e, node) => setSelectedId(node.id)}
@@ -7525,6 +7548,7 @@ function GraphQueryEditor({ columns, datasets=[], manifest=null, nodes, setNodes
           <Button size="small" onClick={() => { safeSetSqlMode(false); safeSetSqlText(plan.sql || ""); setSqlErrors([]); }}>グラフから同期</Button>
         </Stack>
         <TextField multiline minRows={7} fullWidth value={sqlMode ? sqlText : (plan.sql || "")} onChange={(e) => { safeSetSqlMode(true); safeSetSqlText(e.target.value); }} InputProps={{ readOnly: !sqlMode }} sx={{ '& textarea': { fontFamily: 'Roboto Mono, Consolas, monospace', fontSize: 12 } }} />
+        {sqlMode && <Alert severity="info" sx={{ mt: 0.75, py: 0.25 }}>SQL編集モードです。ノード条件を変更すると自動でSQLプレビューに戻り、最新のグラフ条件を反映します。</Alert>}
         {sqlErrors.length > 0 && <Alert severity="warning" sx={{ mt: 0.75 }}>{sqlErrors.join(" / ")}</Alert>}
         <Typography variant="caption" color="text.secondary">対応SQL: SELECT（列選択） / FROM（入力元） / WHERE（条件抽出） / ORDER BY（並び替え） / LIMIT（件数制限）。比較: EQ/NE/LT/GT/LE/GE または =, &lt;&gt;, &lt;, &gt;, &lt;=, &gt;=。文字列: LIKE, NOT LIKE, CONTAINS, STARTS WITH, ENDS WITH, REGEXP/RLIKE。WITHはPreview出力対応、JOINはGraph実行で対応済みです。</Typography>
       </Paper>
@@ -8798,8 +8822,8 @@ function App() {
       name,
       nodes,
       edges,
-      sqlText:graphSqlText,
-      sqlMode:graphSqlMode,
+      sqlText: graphSqlMode ? graphSqlText : compileGraphQuery(graphNodes, graphEdges, columns, datasets).sql,
+      sqlMode: graphSqlMode,
       datasets:graphSessionDatasetRefs(nodes),
       createdAt: graphSessions.find((s) => s.id === activeGraphSessionId)?.createdAt,
       updatedAt:new Date().toISOString(),
