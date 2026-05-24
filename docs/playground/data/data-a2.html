@@ -7640,6 +7640,7 @@ function App() {
   const searchPageRef = useRef(1);
   const pageRef = useRef(1);
   const graphExecutionRef = useRef({ active:false, mode:"data", readMode:"dataQuery", derivedColumns:[] });
+  const graphPendingRunRef = useRef(null);
   const graphDerivedApplySeqRef = useRef(0);
   const initialSettingsRef = useRef(loadSettings());
   const initialSettings = initialSettingsRef.current;
@@ -8522,6 +8523,7 @@ function App() {
       MERGE_SAVED: "保存済みデータセットマージ",
       OPFS_OPEN_VIRTUAL: "Storage-backed Virtual Dataset作成",
       OPFS_OPEN_MEMORY: "複数TableをMemory Acceleratorにロード",
+      OPFS_LOAD: "Storage Dataset読込",
       RUN_DATA_QUERY: "全件フィルター/ソート",
       RUN_SEARCH: "検索",
       BUILD_PIVOT: "Pivot集計",
@@ -8530,6 +8532,8 @@ function App() {
       EXTERNAL_STORAGE_LIST: "External Storage一覧取得",
       EXTERNAL_STORAGE_SYNC: "External Storage同期",
       EXTERNAL_STORAGE_OPEN: "External Storage Dataset読込",
+      RUN_GRAPH_JOIN_QUERY: "Graph JOIN実行",
+      EXPORT_GRAPH_QUERY_CSV: "Graph Query CSV出力",
       RUN_GRAPH_RESULT_SEARCH: "Graph Query結果内検索",
       BUILD_GRAPH_RESULT_PIVOT: "Graph Query結果Pivot",
       BUILD_GRAPH_RESULT_TIME: "Graph Query結果Time",
@@ -8663,7 +8667,18 @@ function App() {
     }));
   }, [columns.map((c) => `${c.index}:${c.name}:${c.type}`).join("|"), datasets.map((d)=>`${d.id}:${d.columns}`).join("|")]);
 
+  useEffect(() => {
+    const pending = graphPendingRunRef.current;
+    if (!pending?.plan || !pending.datasetId) return;
+    if (String(manifest?.id || "") !== String(pending.datasetId)) return;
+    graphPendingRunRef.current = null;
+    appendLog(`Graph Query pending run resumed after Dataset standby: ${pending.datasetId}`);
+    setGraphResultStatus("Datasetスタンバイ完了。Graph Queryを自動実行します...");
+    setTimeout(() => runGraphQueryPlan(pending.plan, { skipStandbyCheck: true, resumedAfterStandby: true }), 0);
+  }, [manifest?.id]);
+
   function clearGraphQueryResult(message="Graph Query結果をクリアしました。") {
+    graphPendingRunRef.current = null;
     graphExecutionRef.current = { active:false, mode:"data", readMode:"dataQuery", derivedColumns:[] };
     graphDerivedApplySeqRef.current++;
     setGraphResultTable(null);
@@ -8810,8 +8825,79 @@ function App() {
     appendLog(`Graph Session duplicated: ${copy.name}`);
   }
 
-  function runGraphQueryPlan(plan) {
-    if (!manifest && !(plan?.mode === "join")) return;
+  function graphDatasetRecordById(id){
+    return (datasets || []).find((d) => String(d.id) === String(id)) || null;
+  }
+
+  function graphPlanNeedsSingleDatasetStandby(plan){
+    if (!plan || plan.mode === "join") return null;
+    const sources = Array.isArray(plan.sources) ? plan.sources : [];
+    const first = sources[0] || null;
+    const datasetId = String(first?.datasetId || "__active__");
+    return datasetId && datasetId !== "__active__" ? datasetId : null;
+  }
+
+  function ensureGraphQueryCanRun(plan, options={}){
+    if (!plan) {
+      setGraphResultStatus("Graph Queryを実行できません: プランがありません。");
+      appendLog("Graph Query blocked: missing plan");
+      return false;
+    }
+
+    if (!options.skipStandbyCheck) {
+      const standbyDatasetId = graphPlanNeedsSingleDatasetStandby(plan);
+      if (standbyDatasetId && String(manifestRef.current?.id || "") !== String(standbyDatasetId)) {
+        const ds = graphDatasetRecordById(standbyDatasetId);
+        if (!ds) {
+          setGraphResultStatus(`Graph Query待機: Dataset ${standbyDatasetId} が一覧にないため、Storage一覧を更新しています。更新後にもう一度実行してください。`);
+          appendLog(`Graph Query blocked: selected Dataset is not listed yet: ${standbyDatasetId}`);
+          post({ type:"OPFS_LIST" });
+          return false;
+        }
+        graphPendingRunRef.current = { plan, datasetId:standbyDatasetId, ts:Date.now() };
+        setGraphResultMode("data");
+        setGraphResultTable(null);
+        setGraphResultCount(0);
+        setGraphResultPage(1);
+        setGraphResultStatus(`Datasetをスタンバイ中です。完了後にGraph Queryを自動実行します: ${ds.tableName || ds.name || standbyDatasetId}`);
+        setGraphResultTime("");
+        appendLog(`Graph Query deferred until Dataset standby: ${standbyDatasetId}`);
+        post({ type:"OPFS_LOAD", id:standbyDatasetId });
+        return false;
+      }
+    }
+
+    if (plan.mode === "join") {
+      const sources = Array.isArray(plan.sources) ? plan.sources : [];
+      const missingActive = sources.some((s) => (!s.datasetId || s.datasetId === "__active__") && !manifestRef.current?.id);
+      if (missingActive) {
+        setGraphResultStatus("Graph JOINを実行できません: __active__ Sourceがありますが、Active Datasetが開かれていません。");
+        appendLog("Graph JOIN blocked: __active__ source without active manifest");
+        return false;
+      }
+      const missingSaved = sources
+        .map((s) => String(s.datasetId || ""))
+        .filter((id) => id && id !== "__active__")
+        .filter((id) => !graphDatasetRecordById(id));
+      if (missingSaved.length) {
+        setGraphResultStatus(`Graph JOIN待機: Dataset一覧にないSourceがあります: ${missingSaved.join(", ")}。Storage一覧を更新しています。`);
+        appendLog(`Graph JOIN blocked: missing dataset records ${missingSaved.join(",")}`);
+        post({ type:"OPFS_LIST" });
+        return false;
+      }
+      return true;
+    }
+
+    if (!manifestRef.current) {
+      setGraphResultStatus("Graph Queryを実行できません: Active Datasetがありません。StorageからDatasetを開くか、Sourceノードで保存済みDatasetを選んでください。");
+      appendLog("Graph Query blocked: no active manifest");
+      return false;
+    }
+    return true;
+  }
+
+  function runGraphQueryPlan(plan, options={}) {
+    if (!ensureGraphQueryCanRun(plan, options)) return;
     clearGraphResultAnalysis();
     const derivedColumns = normalizeGraphDerivedColumns(plan?.derivedColumns || []);
     const projection = Array.isArray(plan?.projection) ? plan.projection.map(Number).filter((v) => Number.isFinite(v)) : [];
