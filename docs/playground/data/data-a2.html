@@ -846,6 +846,7 @@ function normalizeQueryPredicate(raw){
   if (!Number.isFinite(columnIndex) || columnIndex < 0 || !col) return null;
   const op=normalizeQueryOp(raw?.op, col.type);
   return {
+    id:raw?.id || "",
     columnIndex,
     columnName:col.name,
     type:col.type,
@@ -857,10 +858,30 @@ function normalizeQueryPredicate(raw){
   };
 }
 
-function buildQueryPlan({name="query", predicates=[], projection=[], sort=null, limit=0, pushdown=true}={}){
+function normalizeQueryFilterGroups(groups){
+  return (Array.isArray(groups) ? groups : [])
+    .map((g, gi) => {
+      const conditions = (Array.isArray(g?.conditions) ? g.conditions : Array.isArray(g?.filters) ? g.filters : [])
+        .map(normalizeQueryPredicate)
+        .filter(Boolean);
+      if (!conditions.length) return null;
+      const mode = String(g?.mode || g?.matchMode || "any").toLowerCase() === "all" ? "all" : "any";
+      return {
+        id:g?.id || `group_${gi + 1}`,
+        mode,
+        conditions,
+        rowLevel:g?.rowLevel !== false,
+        pushdown:false
+      };
+    })
+    .filter(Boolean);
+}
+
+function buildQueryPlan({name="query", predicates=[], filterGroups=[], projection=[], sort=null, limit=0, pushdown=true}={}){
   const compiledPredicates=(Array.isArray(predicates) ? predicates : [])
     .map(normalizeQueryPredicate)
     .filter(Boolean);
+  const compiledFilterGroups=normalizeQueryFilterGroups(filterGroups);
 
   let sortSpec=null;
   const sortColumn = sort && sort.columnIndex !== "" && sort.columnIndex != null ? Number(sort.columnIndex) : -1;
@@ -876,12 +897,14 @@ function buildQueryPlan({name="query", predicates=[], projection=[], sort=null, 
 
   const required=new Set(normalizeProjection(projection));
   for (const p of compiledPredicates) required.add(p.columnIndex);
+  for (const g of compiledFilterGroups) for (const p of g.conditions || []) required.add(p.columnIndex);
   if (sortSpec) required.add(sortSpec.columnIndex);
 
   return {
     version:QUERY_PLAN_VERSION,
     name,
     predicates:compiledPredicates,
+    filterGroups:compiledFilterGroups,
     projection:normalizeProjection(projection),
     sort:sortSpec,
     requiredColumns:[...required].sort((a,b)=>a-b),
@@ -901,12 +924,27 @@ function canSkipChunkByQueryPlan(chunkIndex, plan){
   return false;
 }
 
+function queryPredicateMatches(chunk, localRow, predicate){
+  if (!predicate?.rowLevel) return true;
+  const v=valueFromColumn(chunk.columns.get(predicate.columnIndex), localRow);
+  return compareValue(v, predicate.op, predicate.value, predicate.type);
+}
+
 function rowMatchesQueryPlan(chunk, localRow, plan){
-  if (!Array.isArray(plan?.predicates) || !plan.predicates.length) return true;
-  for (const p of plan.predicates){
-    if (!p.rowLevel) continue;
-    const v=valueFromColumn(chunk.columns.get(p.columnIndex), localRow);
-    if (!compareValue(v, p.op, p.value, p.type)) return false;
+  const predicates = Array.isArray(plan?.predicates) ? plan.predicates : [];
+  const groups = Array.isArray(plan?.filterGroups) ? plan.filterGroups : [];
+  if (!predicates.length && !groups.length) return true;
+  for (const p of predicates){
+    if (!queryPredicateMatches(chunk, localRow, p)) return false;
+  }
+  for (const g of groups){
+    if (g?.rowLevel === false) continue;
+    const conditions = Array.isArray(g?.conditions) ? g.conditions : [];
+    if (!conditions.length) continue;
+    const matched = String(g.mode || "any").toLowerCase() === "all"
+      ? conditions.every((p) => queryPredicateMatches(chunk, localRow, p))
+      : conditions.some((p) => queryPredicateMatches(chunk, localRow, p));
+    if (!matched) return false;
   }
   return true;
 }
@@ -3059,27 +3097,43 @@ function normalizeGlobalFilters(filters){
     .map(f => {
       const columnIndex=Number(f.columnIndex);
       const col=state.manifest.columns[columnIndex];
-      return { columnIndex, op:normalizeQueryOp(f.op || "contains", col?.type), value:f.value ?? "", source:"globalFilter" };
+      return { id:f?.id || "", columnIndex, op:normalizeQueryOp(f.op || "contains", col?.type), value:f.value ?? "", source:f?.source || "globalFilter" };
     })
     .filter(f => Number.isFinite(f.columnIndex) && f.columnIndex >= 0 && state.manifest.columns[f.columnIndex]);
 }
 
-async function runDataQuery({filters, sort, maxRows, projection}){
+function normalizeGlobalFilterGroups(groups){
+  return (Array.isArray(groups) ? groups : [])
+    .map((g, gi) => {
+      const conditions = normalizeGlobalFilters(Array.isArray(g?.conditions) ? g.conditions : Array.isArray(g?.filters) ? g.filters : []);
+      if (!conditions.length) return null;
+      return {
+        id:g?.id || `group_${gi + 1}`,
+        mode:String(g?.mode || g?.matchMode || "any").toLowerCase() === "all" ? "all" : "any",
+        conditions
+      };
+    })
+    .filter(Boolean);
+}
+
+async function runDataQuery({filters, filterGroups, sort, maxRows, projection}){
   const normalizedFilters = normalizeGlobalFilters(filters);
+  const normalizedFilterGroups = normalizeGlobalFilterGroups(filterGroups);
   const requestedLimit = normalizePlanLimit(maxRows);
   const normalizedProjection = normalizeProjection(projection);
   const plan=buildQueryPlan({
     name:"dataQuery",
     predicates:normalizedFilters,
+    filterGroups:normalizedFilterGroups,
     projection:normalizedProjection,
     sort,
     limit:requestedLimit,
     pushdown:true
   });
   const hasSort=!!plan.sort;
-  if (!plan.predicates.length && !hasSort) {
+  if (!plan.predicates.length && !(plan.filterGroups || []).length && !hasSort) {
     state.dataQueryMatches = null;
-    state.dataQueryMeta = { filters:normalizedFilters, sort:null, capped:false, queryPlan:queryPlanSummary(plan), projection:normalizedProjection };
+    state.dataQueryMeta = { filters:normalizedFilters, filterGroups:normalizedFilterGroups, sort:null, capped:false, queryPlan:queryPlanSummary(plan), projection:normalizedProjection };
     return {matches:state.manifest.totalRows, active:false, capped:false, projection:normalizedProjection, ms:0, queryPlan:queryPlanSummary(plan)};
   }
 
@@ -3112,6 +3166,7 @@ async function runDataQuery({filters, sort, maxRows, projection}){
 
   state.dataQueryMeta = {
     filters:normalizedFilters,
+    filterGroups:normalizedFilterGroups,
     sort:plan.sort ? {columnIndex:plan.sort.columnIndex,direction:plan.sort.direction} : null,
     capped,
     queryPlan:exec.queryPlan,
@@ -6500,6 +6555,7 @@ function normalizeGraphNodeLabel(node, columns, datasets=[]) {
   if (data.kind === "join") return `Join: ${data.joinType || "inner"}`;
   if (data.kind === "select") return `Select: ${(data.selectedFields || data.selectedColumns || []).length || "all"} cols`;
   if (data.kind === "filter") return `Filter: ${col?.name || "column"} ${graphOperatorShortLabel(data.op || "contains")}`;
+  if (data.kind === "filterGroup") return `Filter Group: ${String(data.matchMode || "any").toUpperCase()} / ${(data.conditions || []).length || 0}`;
   if (data.kind === "sort") return `Sort: ${col?.name || "column"} ${(data.direction || "asc").toUpperCase()}`;
   if (data.kind === "limit") return `Limit: ${Number(data.maxRows || 0) || "all"}`;
   if (data.kind === "derived") return `Derived: ${data.newColumnName || "new_column"}`;
@@ -6513,6 +6569,7 @@ const GRAPH_KIND_META = {
   source:   { jp:"データ入力", category:"データ", bg:"#eff6ff", border:"#60a5fa", accent:"#2563eb", text:"#0f172a", description:"分析対象のActive Datasetです" },
   select:   { jp:"列選択", category:"データ", bg:"#f0fdfa", border:"#2dd4bf", accent:"#0f766e", text:"#0f172a", description:"出力するカラムを選びます" },
   filter:   { jp:"条件抽出", category:"処理", bg:"#fff7ed", border:"#fb923c", accent:"#ea580c", text:"#111827", description:"WHERE条件で行を絞り込みます" },
+  filterGroup:{ jp:"条件グループ", category:"処理", bg:"#fff1f2", border:"#fb7185", accent:"#e11d48", text:"#111827", description:"複数条件をALL(AND)またはANY(OR)でまとめます" },
   join:     { jp:"テーブル結合", category:"処理", bg:"#eef2ff", border:"#818cf8", accent:"#4f46e5", text:"#111827", description:"複数DatasetをキーでJOINします" },
   sort:     { jp:"並び替え", category:"処理", bg:"#faf5ff", border:"#c084fc", accent:"#7e22ce", text:"#111827", description:"ORDER BYを指定します" },
   limit:    { jp:"件数制限", category:"制御", bg:"#fefce8", border:"#eab308", accent:"#a16207", text:"#111827", description:"取得する最大行数を指定します" },
@@ -6548,6 +6605,7 @@ function makeGraphNode(id, kind, position, columns, extra={}) {
   if (kind === "join") return { ...base, data: { kind, label: "Join", leftSourceId: "source", rightSourceId: "", leftColumnIndex: firstCol, rightColumnIndex: firstCol, joinType: "inner" } };
   if (kind === "select") return { ...base, data: { kind, label: "Select", selectedColumns: defaultProjection(columns), selectedFields: [] } };
   if (kind === "filter") return { ...base, data: { kind, label: "Filter", columnIndex: firstCol, op: "contains", value: "" } };
+  if (kind === "filterGroup") return { ...base, data: { kind, label: "Filter Group", matchMode: "any", conditions: [{ id: `cond_${Date.now().toString(36)}`, columnIndex: firstCol, op: "contains", value: "" }] } };
   if (kind === "sort") return { ...base, data: { kind, label: "Sort", columnIndex: firstCol, direction: "asc" } };
   if (kind === "limit") return { ...base, data: { kind, label: "Limit", maxRows: "0" } };
   if (kind === "derived") return { ...base, data: { kind, label: "Derived", newColumnName: "new_column", valueMode: "constant", constantValue: "", formulaExpression: "" } };
@@ -6580,6 +6638,41 @@ function opToSql(op, value, colType="string") {
 function filterToSql(filter, columns) {
   const col = columnByIndex(columns, filter.columnIndex);
   return `${sqlIdentifier(col?.name || `Column${Number(filter.columnIndex)+1}`)} ${opToSql(filter.op, filter.value, col?.type)}`;
+}
+
+function normalizeGraphFilterCondition(raw, columns, fallbackId="cond") {
+  const columnIndex = Number(raw?.columnIndex);
+  const col = columnByIndex(columns, columnIndex);
+  if (!Number.isFinite(columnIndex) || !col) return null;
+  return {
+    id:String(raw?.id || `${fallbackId}_${columnIndex}`),
+    columnIndex,
+    op:normalizeGraphOperatorForColumn(raw?.op || "contains", col),
+    value:raw?.value ?? ""
+  };
+}
+
+function normalizeGraphFilterGroups(groups, columns) {
+  return (Array.isArray(groups) ? groups : [])
+    .map((g, gi) => {
+      const conditions = (Array.isArray(g?.conditions) ? g.conditions : Array.isArray(g?.filters) ? g.filters : [])
+        .map((c, ci) => normalizeGraphFilterCondition(c, columns, `g${gi + 1}_c${ci + 1}`))
+        .filter(Boolean);
+      if (!conditions.length) return null;
+      return {
+        id:String(g?.id || `filter_group_${gi + 1}`),
+        mode:String(g?.mode || g?.matchMode || "any").toLowerCase() === "all" ? "all" : "any",
+        conditions
+      };
+    })
+    .filter(Boolean);
+}
+
+function filterGroupToSql(group, columns) {
+  const conditions = (group?.conditions || []).map((f) => filterToSql(f, columns)).filter(Boolean);
+  if (!conditions.length) return "";
+  const glue = String(group?.mode || "any").toLowerCase() === "all" ? " AND " : " OR ";
+  return `(${conditions.join(glue)}) /* ${String(group?.mode || "any").toUpperCase()} 条件グループ */`;
 }
 
 function graphSourceSqlName(source){ return sqlIdentifier(graphSourceAlias(source)); }
@@ -6806,7 +6899,10 @@ WHERE ${s.filters.map((f) => filterToSql(f, columns)).join(" AND ")}`);
     lines.push(`${String(join.joinType || "inner").toUpperCase()} JOIN ${sqlIdentifier(right.alias)} /* ${graphDatasetLabel(right.datasetId, datasets)} */`);
     lines.push(sqlCommandComment("ON"));
     lines.push(`  ON ${sqlIdentifier(left.alias)}.${sqlIdentifier(leftCol?.name || "key")} = ${sqlIdentifier(right.alias)}.${sqlIdentifier(rightCol?.name || "key")}`);
-    const whereSql = (plan.filters || []).map((f) => filterToSql(f, columns));
+    const whereSql = [
+      ...(plan.filters || []).map((f) => filterToSql(f, columns)),
+      ...(plan.filterGroups || []).map((g) => filterGroupToSql(g, columns)).filter(Boolean)
+    ];
     const sortCol = plan.sort ? columnByIndex(columns, plan.sort.columnIndex) : null;
     if (whereSql.length) { lines.push(sqlCommandComment("WHERE")); lines.push(`WHERE ${whereSql.join(" AND ")}`); }
     if (sortCol) { lines.push(sqlCommandComment("ORDER BY")); lines.push(`ORDER BY ${sqlIdentifier(sortCol.name)} ${(plan.sort.direction || "asc").toUpperCase()}`); }
@@ -6821,7 +6917,10 @@ WHERE ${s.filters.map((f) => filterToSql(f, columns)).join(" AND ")}`);
     : ["*"];
   const selectList = [...baseSelects, ...derivedSelects].join(", ");
   const fromName = plan.sourceAlias || GRAPH_SQL_DATASET_NAME;
-  const whereSql = (plan.filters || []).map((f) => filterToSql(f, columns));
+  const whereSql = [
+    ...(plan.filters || []).map((f) => filterToSql(f, columns)),
+    ...(plan.filterGroups || []).map((g) => filterGroupToSql(g, columns)).filter(Boolean)
+  ];
   const sortCol = plan.sort ? columnByIndex(columns, plan.sort.columnIndex) : null;
   lines.push(sqlCommandComment("SELECT"));
   lines.push(`SELECT ${selectList}`);
@@ -6835,6 +6934,7 @@ WHERE ${s.filters.map((f) => filterToSql(f, columns)).join(" AND ")}`);
 
 function compileGraphQuery(nodes, edges, columns, datasets=[]) {
   const filters = [];
+  const filterGroups = [];
   let sort = null;
   let maxRows = 0;
   let projection = [];
@@ -6865,6 +6965,10 @@ function compileGraphQuery(nodes, edges, columns, datasets=[]) {
     if (d.kind === "filter") {
       filters.push({ id: n.id, columnIndex: Number(d.columnIndex), op: d.op || "contains", value: d.value ?? "", parentId: n.parentId || null });
     }
+    if (d.kind === "filterGroup") {
+      const normalizedGroup = normalizeGraphFilterGroups([{ id:n.id, mode:d.matchMode || d.mode || "any", conditions:d.conditions || d.filters || [] }], columns)[0];
+      if (normalizedGroup) filterGroups.push(normalizedGroup);
+    }
     if (d.kind === "sort") sort = { columnIndex: Number(d.columnIndex), direction: d.direction === "desc" ? "desc" : "asc" };
     if (d.kind === "limit") maxRows = Math.max(0, Number(d.maxRows || 0));
     if (d.kind === "derived") {
@@ -6888,7 +6992,7 @@ function compileGraphQuery(nodes, edges, columns, datasets=[]) {
     }
   }
   const mode = sources.length >= 2 && joins.length ? "join" : "single";
-  const plan = { mode, sources, joins, filters, sort, maxRows, projection, selectedFields, derivedColumns: normalizeGraphDerivedColumns(derivedColumns), subqueries, edges: (edges || []).map((e) => ({ id:e.id, source:e.source, target:e.target })) };
+  const plan = { mode, sources, joins, filters, filterGroups, sort, maxRows, projection, selectedFields, derivedColumns: normalizeGraphDerivedColumns(derivedColumns), subqueries, edges: (edges || []).map((e) => ({ id:e.id, source:e.source, target:e.target })) };
   plan.sql = graphToSqlPreview(plan, columns, datasets);
   return plan;
 }
@@ -6972,8 +7076,8 @@ function graphEdgeColor(edge, nodes){
   return targetMeta?.accent || sourceMeta?.accent || "#64748b";
 }
 function autoArrangeGraphNodesNoOverlap(nodes){
-  const widths = { subquery: 480, source: 220, join: 230, select: 220, filter: 220, sort: 220, limit: 190, derived: 240, aggregate: 230, output: 210 };
-  const heights = { subquery: 340, source: 100, join: 115, select: 105, filter: 120, sort: 105, limit: 95, derived: 130, aggregate: 115, output: 95 };
+  const widths = { subquery: 480, source: 220, join: 230, select: 220, filter: 220, filterGroup: 250, sort: 220, limit: 190, derived: 240, aggregate: 230, output: 210 };
+  const heights = { subquery: 340, source: 100, join: 115, select: 105, filter: 120, filterGroup: 145, sort: 105, limit: 95, derived: 130, aggregate: 115, output: 95 };
   const gapX = 48, gapY = 34;
   const placed = [];
   const intersects = (a, b) => !(a.x + a.w + gapX < b.x || b.x + b.w + gapX < a.x || a.y + a.h + gapY < b.y || b.y + b.h + gapY < a.y);
@@ -7279,7 +7383,7 @@ function GraphQueryEditor({ columns, datasets=[], manifest=null, nodes, setNodes
   const addNode = (kind, extra={}) => {
     const id = `${kind}-${Date.now().toString(36)}`;
     const x = kind === "subquery" ? 130 : kind === "source" ? 30 + graphSourceNodes(nodes).length * 220 : 190 + Math.max(0, nodes.length - 2) * 130;
-    const y = kind === "source" ? 360 : kind === "join" ? 260 : kind === "filter" ? 105 : kind === "sort" ? 210 : kind === "select" ? 40 : kind === "derived" ? 300 : kind === "aggregate" ? 330 : kind === "subquery" ? 355 : 380;
+    const y = kind === "source" ? 360 : kind === "join" ? 260 : kind === "filter" ? 105 : kind === "filterGroup" ? 145 : kind === "sort" ? 210 : kind === "select" ? 40 : kind === "derived" ? 300 : kind === "aggregate" ? 330 : kind === "subquery" ? 355 : 380;
     const node = makeGraphNode(id, kind, { x, y }, columns, extra);
     node.data.label = normalizeGraphNodeLabel(node, columns, datasets);
     markGraphDefinitionChanged("add-node");
@@ -7455,7 +7559,8 @@ function GraphQueryEditor({ columns, datasets=[], manifest=null, nodes, setNodes
             <Tooltip title="JOIN用のDataset Sourceノードを追加"><span><Button size="small" variant="outlined" onClick={() => addNode("source", { data: { datasetId: datasets[0]?.id || "__active__", alias: `t${graphSourceNodes(nodes).length + 1}` } })}>+ データソース</Button></span></Tooltip>
             <Tooltip title="複数Datasetをキーで結合するJOINノードを追加"><span><Button size="small" variant="outlined" onClick={() => addNode("join")} disabled={graphSourceNodes(nodes).length < 2}>+ JOIN</Button></span></Tooltip>
             <Tooltip title="出力する列を選ぶノードを追加"><span><Button size="small" variant="outlined" onClick={() => addNode("select")} disabled={!columns.length && !datasets.length}>+ 列選択</Button></span></Tooltip>
-            <Tooltip title="WHERE条件で行を絞るノードを追加"><span><Button size="small" variant="outlined" onClick={() => addNode("filter")} disabled={!columns.length}>+ 条件抽出</Button></span></Tooltip>
+            <Tooltip title="単一条件で行を絞るノードを追加"><span><Button size="small" variant="outlined" onClick={() => addNode("filter")} disabled={!columns.length}>+ 条件抽出</Button></span></Tooltip>
+            <Tooltip title="複数条件をALL(AND)またはANY(OR)でまとめるノードを追加"><span><Button size="small" variant="outlined" onClick={() => addNode("filterGroup")} disabled={!columns.length}>+ 条件グループ</Button></span></Tooltip>
             <Tooltip title="ORDER BYで並び替えるノードを追加"><span><Button size="small" variant="outlined" onClick={() => addNode("sort")} disabled={!columns.length}>+ 並び替え</Button></span></Tooltip>
             <Tooltip title="取得件数を制限するノードを追加"><Button size="small" variant="outlined" onClick={() => addNode("limit")}>+ 件数制限</Button></Tooltip>
             <Tooltip title="固定値または数式で新しい列を作るノードを追加"><span><Button size="small" variant="outlined" onClick={() => addNode("derived")} disabled={!columns.length && !datasets.length}>+ 計算列</Button></span></Tooltip>
@@ -7570,6 +7675,58 @@ function GraphQueryEditor({ columns, datasets=[], manifest=null, nodes, setNodes
                   <Alert severity="info" sx={{ py: 0.25 }}>比較演算子: EQ（等しい）, NE（等しくない）, LT（より小さい）, GT（より大きい）, LE（以下）, GE（以上）。文字列: CONTAINS（含む）, NOT CONTAINS（含まない）, STARTS WITH（前方一致）, ENDS WITH（後方一致）, REGEX（正規表現）。</Alert>
                 </>
               )}
+              {selectedNode.data?.kind === "filterGroup" && (() => {
+                const conditions = Array.isArray(selectedNode.data.conditions) && selectedNode.data.conditions.length
+                  ? selectedNode.data.conditions
+                  : [{ id:"cond_1", columnIndex: columns[0]?.index ?? 0, op:"contains", value:"" }];
+                const updateCondition = (condId, patch) => {
+                  updateNodeData(selectedNode.id, {
+                    conditions: conditions.map((cond) => String(cond.id) === String(condId) ? { ...cond, ...patch } : cond)
+                  });
+                };
+                const addCondition = () => {
+                  updateNodeData(selectedNode.id, {
+                    conditions: [...conditions, { id:`cond_${Date.now().toString(36)}_${Math.random().toString(36).slice(2,6)}`, columnIndex: columns[0]?.index ?? 0, op:"contains", value:"" }]
+                  });
+                };
+                const removeCondition = (condId) => {
+                  updateNodeData(selectedNode.id, { conditions: conditions.filter((cond) => String(cond.id) !== String(condId)) });
+                };
+                return (
+                  <>
+                    <TextField select label="グループ条件" size="small" value={selectedNode.data.matchMode || "any"} onChange={(e) => updateNodeData(selectedNode.id, { matchMode: e.target.value })} fullWidth helperText="ANY = OR、ALL = AND">
+                      <MenuItem value="any">ANY / OR（いずれかに一致）</MenuItem>
+                      <MenuItem value="all">ALL / AND（すべてに一致）</MenuItem>
+                    </TextField>
+                    <Stack spacing={0.8}>
+                      {conditions.map((cond, idx) => {
+                        const col = columnByIndex(columns, cond.columnIndex);
+                        return (
+                          <Paper key={cond.id || idx} elevation={0} sx={{ p: 0.8, border:"1px solid", borderColor:"divider", borderRadius: 1.5, bgcolor:"background.paper" }}>
+                            <Stack spacing={0.7}>
+                              <Stack direction="row" spacing={0.75} alignItems="center">
+                                <Chip size="small" label={`${idx + 1}`} />
+                                <Typography variant="caption" sx={{ fontWeight: 900 }}>{selectedNode.data.matchMode === "all" ? "AND条件" : "OR条件"}</Typography>
+                                <Box sx={{ flex: 1 }} />
+                                <Button size="small" color="error" onClick={() => removeCondition(cond.id)} disabled={conditions.length <= 1}>削除</Button>
+                              </Stack>
+                              <TextField select label="対象カラム" size="small" value={String(cond.columnIndex ?? columns[0]?.index ?? 0)} onChange={(e) => { const nextIndex = Number(e.target.value); const nextCol = columnByIndex(columns, nextIndex); updateCondition(cond.id, { columnIndex: nextIndex, op: normalizeGraphOperatorForColumn(cond.op || "contains", nextCol) }); }} fullWidth>
+                                {columns.map((c) => <MenuItem key={c.index} value={String(c.index)}>{c.name} ({c.type})</MenuItem>)}
+                              </TextField>
+                              <TextField select label="比較演算子" size="small" value={cond.op || "contains"} onChange={(e) => updateCondition(cond.id, { op: e.target.value })} fullWidth>
+                                {graphOperatorOptionsForColumn(col).map((x) => <MenuItem key={x.op} value={x.op}>{x.code}（{x.jp}） — {x.symbol}</MenuItem>)}
+                              </TextField>
+                              <TextField label="値" size="small" value={cond.value || ""} onChange={(e) => updateCondition(cond.id, { value: e.target.value })} fullWidth disabled={!graphOperatorNeedsValue(cond.op || "contains")} />
+                            </Stack>
+                          </Paper>
+                        );
+                      })}
+                    </Stack>
+                    <Button size="small" variant="outlined" onClick={addCondition}>条件を追加</Button>
+                    <Alert severity="info" sx={{ py: 0.25 }}>ANY/ORなら、ここに並べた条件のいずれかに一致した行を残します。複数の条件グループや単独FilterノードとはANDで結合されます。</Alert>
+                  </>
+                );
+              })()}
               {selectedNode.data?.kind === "sort" && (
                 <>
                   <TextField select label="並び替えカラム" size="small" value={String(selectedNode.data.columnIndex ?? columns[0]?.index ?? 0)} onChange={(e) => updateNodeData(selectedNode.id, { columnIndex: Number(e.target.value) })} fullWidth>
@@ -7604,7 +7761,7 @@ function GraphQueryEditor({ columns, datasets=[], manifest=null, nodes, setNodes
               {selectedNode.data?.kind === "output" && <Alert severity="info">このノードは結果出力です。JOIN/条件抽出/並び替え/件数制限/列選択を追加して条件を作成します。</Alert>}
               <Divider />
               <Typography variant="subtitle2" sx={{ fontWeight: 900 }}>コンパイル済みプラン</Typography>
-              <Typography component="pre" variant="caption" sx={{ p: 1, bgcolor: "background.paper", borderRadius: 1, overflow: "auto", maxHeight: 180 }}>{JSON.stringify({ mode: plan.mode, sources: plan.sources, joins: plan.joins, filters: plan.filters, sort: plan.sort, maxRows: plan.maxRows, projection: plan.projection, selectedFields: plan.selectedFields, derivedColumns: plan.derivedColumns, subqueries: plan.subqueries }, null, 2)}</Typography>
+              <Typography component="pre" variant="caption" sx={{ p: 1, bgcolor: "background.paper", borderRadius: 1, overflow: "auto", maxHeight: 180 }}>{JSON.stringify({ mode: plan.mode, sources: plan.sources, joins: plan.joins, filters: plan.filters, filterGroups: plan.filterGroups, sort: plan.sort, maxRows: plan.maxRows, projection: plan.projection, selectedFields: plan.selectedFields, derivedColumns: plan.derivedColumns, subqueries: plan.subqueries }, null, 2)}</Typography>
             </Stack>
           )}
         </Paper>
@@ -9099,7 +9256,7 @@ function App() {
     const outputColumnNames = graphOutputColumnNamesForPlan(plan);
     const readColumns = plan?.mode === "join" ? [] : graphPlanReadColumnsForPost(plan, derivedColumns);
     graphDerivedApplySeqRef.current++;
-    appendLog(`Graph Query run: ${JSON.stringify({ mode: plan?.mode || "single", filters: plan?.filters?.length || 0, sort: plan?.sort || null, projection: projection.length, readColumns: readColumns.length ? readColumns.length : "all", outputColumns: outputColumnNames?.length || "all", derivedColumns: derivedColumns.map(d => d.newColumnName), refs: graphDerivedReferencedColumnNames(derivedColumns), maxRows: plan?.maxRows || 0 })}`);
+    appendLog(`Graph Query run: ${JSON.stringify({ mode: plan?.mode || "single", filters: plan?.filters?.length || 0, filterGroups: plan?.filterGroups?.length || 0, sort: plan?.sort || null, projection: projection.length, readColumns: readColumns.length ? readColumns.length : "all", outputColumns: outputColumnNames?.length || "all", derivedColumns: derivedColumns.map(d => d.newColumnName), refs: graphDerivedReferencedColumnNames(derivedColumns), maxRows: plan?.maxRows || 0 })}`);
     graphExecutionRef.current = { active:true, mode:plan?.mode === "join" ? "join" : "data", readMode:"dataQuery", derivedColumns, projection, readColumns, outputColumnNames };
     if (plan?.mode === "join") {
       setGraphResultMode("join");
@@ -9118,6 +9275,12 @@ function App() {
     setGraphResultStatus(`Graph Queryを実行中... 旧結果をクリアしました。${derivedColumns.length ? ` / 計算列 ${fmt(derivedColumns.length)}列` : ""}`);
     setGraphResultTime("");
     const filters = (plan?.filters || []).map((f) => ({ ...f, id: f.id || `${Date.now()}-${Math.random()}` }));
+    const filterGroups = (plan?.filterGroups || []).map((g, gi) => ({
+      ...g,
+      id:g.id || `group_${gi + 1}`,
+      mode:String(g.mode || "any").toLowerCase() === "all" ? "all" : "any",
+      conditions:(g.conditions || []).map((f, fi) => ({ ...f, id:f.id || `${g.id || `group_${gi + 1}`}_${fi + 1}` }))
+    }));
     const sort = plan?.sort || null;
     const maxRows = Number(plan?.maxRows || 0);
     setDataQueryFilters(filters);
@@ -9129,6 +9292,7 @@ function App() {
       type: "RUN_DATA_QUERY",
       origin: "graph",
       filters,
+      filterGroups,
       sort,
       maxRows,
       projection,
