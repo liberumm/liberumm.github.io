@@ -4831,6 +4831,32 @@ const TILE_TABLE_READ_THROTTLE_MS = 90;
 const TILE_TABLE_READ_DEBOUNCE_MS = 90;
 const GRAPH_RESULT_PANEL_TILE_ROWS = 1000;
 
+function normalizeGraphResultPageSize(value, fallback = GRAPH_RESULT_PANEL_TILE_ROWS) {
+  const n = Number(value);
+  const base = Number.isFinite(n) && n > 0 ? n : Number(fallback || GRAPH_RESULT_PANEL_TILE_ROWS) || GRAPH_RESULT_PANEL_TILE_ROWS;
+  return Math.max(50, Math.min(50000, Math.floor(base)));
+}
+
+function calculateTileTableLazyPageSize({ requestedPageSize = "auto", totalRows = 0, columnCount = 1, rowHeight = 34, height = 420 } = {}) {
+  const explicit = Number(requestedPageSize);
+  if (Number.isFinite(explicit) && explicit > 0) {
+    return Math.max(1, Math.min(50000, Math.floor(explicit)));
+  }
+
+  // パネル表示は固定1000行ではなく、列数と表示高さから自動決定する。
+  // 目的は「見えている範囲+十分な余白」を確保しつつ、超多列データで1tileが重くなりすぎるのを防ぐこと。
+  const cols = Math.max(1, Math.floor(Number(columnCount || 1) || 1));
+  const visibleRows = Math.max(8, Math.ceil(Math.max(160, Number(height || 420) || 420) / Math.max(18, Number(rowHeight || 34) || 34)));
+  const targetCells = 120000;
+  const minRows = Math.max(100, visibleRows * 8);
+  const maxRows = cols <= 12 ? 20000 : cols <= 32 ? 12000 : cols <= 96 ? 6000 : cols <= 256 ? 3000 : cols <= 768 ? 1500 : 800;
+  const byCells = Math.floor(targetCells / cols);
+  const raw = Math.max(minRows, Math.min(maxRows, byCells));
+  const rounded = raw >= 1000 ? Math.round(raw / 500) * 500 : Math.round(raw / 100) * 100;
+  const total = Math.max(0, Number(totalRows || 0) || 0);
+  return Math.max(1, total > 0 ? Math.min(total, Math.max(minRows, rounded)) : Math.max(minRows, rounded));
+}
+
 function defaultTileColumnWidth(index, minColumnWidth = 150) {
   if (index === 0) return Math.max(96, Number(minColumnWidth || 150));
   return Math.max(72, Number(minColumnWidth || 150));
@@ -5019,7 +5045,7 @@ function CommonTileTableView({
 
   const lazyResetKey = useMemo(() => {
     if (!externalLazy) return "";
-    return `${tableId}|${headerKey}|${Number(totalRows || 0)}|${Math.max(1, Number(pageSize || 1000) || 1000)}|${resetKey || ""}`;
+    return `${tableId}|${headerKey}|${Number(totalRows || 0)}|${String(pageSize || "auto")}|${resetKey || ""}`;
   }, [externalLazy, tableId, headerKey, totalRows, pageSize, resetKey]);
 
   useEffect(() => {
@@ -5038,9 +5064,6 @@ function CommonTileTableView({
     }
   }, [externalLazy, lazyResetKey]);
 
-  useEffect(() => {
-    requestRef.current = { ...requestRef.current, page: Number(page || 1), pageSize: safePageSize };
-  }, [page, safePageSize]);
 
   useEffect(() => () => {
     if (rafRef.current) cancelAnimationFrame(rafRef.current);
@@ -5079,9 +5102,15 @@ function CommonTileTableView({
   }, [decoratedRows, externalLazy, filters, sort]);
 
   const safeTotal = Math.max(0, Number(totalRows == null ? processedRows.length : totalRows) || 0, externalLazy ? baseRows.length : 0);
-  const safePageSize = Math.max(1, Number(pageSize || 1000) || 1000);
+  const safePageSize = externalLazy
+    ? calculateTileTableLazyPageSize({ requestedPageSize: pageSize, totalRows: safeTotal, columnCount: displayHeader.length, rowHeight, height })
+    : Math.max(1, Number(pageSize || 1000) || 1000);
   const totalPages = Math.max(1, Math.ceil(Math.max(1, safeTotal) / safePageSize));
   const safeLoadedStart = externalLazy ? Math.max(0, Number(loadedStart || 0) || 0) : 0;
+
+  useEffect(() => {
+    requestRef.current = { ...requestRef.current, page: Number(page || 1), pageSize: safePageSize };
+  }, [page, safePageSize]);
 
   const widths = useMemo(() => displayHeader.map((_, i) => getColumnWidth(i)), [displayHeader, getColumnWidth, columnWidths]);
   const prefix = useMemo(() => {
@@ -7330,14 +7359,14 @@ function FormulaRecipePanel({ onPick, fieldOptions=[] }) {
 function GraphQueryVirtualTable({ table, totalRows=0, page=1, pageSize=GRAPH_RESULT_PANEL_TILE_ROWS, onReadPage=()=>{}, height=420, resetKey="" }) {
   const header = table?.header || [];
   const rows = table?.rows || [];
+  const safeTotal = Math.max(Number(totalRows || 0), rows.length);
+  const safePageSize = normalizeGraphResultPageSize(pageSize, GRAPH_RESULT_PANEL_TILE_ROWS);
   const safePage = Math.max(1, Number(page || 1));
-  const safePageSize = Math.max(1, Number(pageSize || 1000));
   const tablePage = Math.max(1, Number(table?.page || safePage || 1));
   const tablePageSize = Math.max(1, Number(table?.pageSize || safePageSize || 1000));
   const tableStartRow = Number.isFinite(Number(table?.startRow))
     ? Math.max(0, Number(table.startRow || 0))
     : (tablePage - 1) * tablePageSize;
-  const safeTotal = Math.max(Number(totalRows || 0), rows.length);
 
   return (
     <CommonTileTableView
@@ -7367,7 +7396,7 @@ function GraphQueryEditor({ columns, datasets=[], manifest=null, nodes, setNodes
   const [selectedId, setSelectedId] = useState(nodes?.[0]?.id || "source");
   const [sqlErrors, setSqlErrors] = useState([]);
   const [showMiniMap, setShowMiniMap] = useState(false);
-  const [resultRowsDraft, setResultRowsDraft] = useState(String(resultRowsPerTile || "1000"));
+  const [resultRowsDraft, setResultRowsDraft] = useState(String(normalizeGraphResultPageSize(resultRowsPerTile, GRAPH_RESULT_PANEL_TILE_ROWS)));
   const [resultAnalysisTab, setResultAnalysisTab] = useState("search");
   const [resultSearchColumn, setResultSearchColumn] = useState("0");
   const [resultSearchOp, setResultSearchOp] = useState("contains");
@@ -7404,23 +7433,25 @@ function GraphQueryEditor({ columns, datasets=[], manifest=null, nodes, setNodes
   }, [safeSetSqlMode]);
 
   useEffect(() => {
-    setResultRowsDraft(String(resultRowsPerTile || "1000"));
+    setResultRowsDraft(String(normalizeGraphResultPageSize(resultRowsPerTile, GRAPH_RESULT_PANEL_TILE_ROWS)));
   }, [resultRowsPerTile]);
 
   const applyResultRowsPerTile = () => {
-    const nextNumber = Math.max(50, Math.floor(Number(resultRowsDraft || resultRowsPerTile || 100) || 100));
+    const nextNumber = normalizeGraphResultPageSize(resultRowsDraft || resultRowsPerTile, GRAPH_RESULT_PANEL_TILE_ROWS);
     const next = String(nextNumber);
+    setResultRowsDraft(next);
     setResultRowsPerTile(next);
     setTimeout(() => onReadPage(1, nextNumber), 0);
   };
 
   const switchGraphResultToTile = () => {
-    // パネル表示はページ表示の件数設定から切り離し、固定tile単位でlazyに読む。
-    // ページ表示で1000件などへ変更した直後に戻っても、古いpage/table範囲を使わない。
-    const tileRows = GRAPH_RESULT_PANEL_TILE_ROWS;
+    // パネル表示のlazy tile行数はページネーション設定と同期する。
+    // これにより「ページ表示で1000件に変更 → パネル表示へ戻る」時も同じ1000行単位で読む。
+    const tileRows = normalizeGraphResultPageSize(resultRowsDraft || resultRowsPerTile, GRAPH_RESULT_PANEL_TILE_ROWS);
+    const next = String(tileRows);
     setResultViewMode("tile");
-    setResultRowsDraft(String(tileRows));
-    setResultRowsPerTile(String(tileRows));
+    setResultRowsDraft(next);
+    setResultRowsPerTile(next);
     setTimeout(() => onReadPage(1, tileRows), 0);
   };
 
@@ -7852,12 +7883,12 @@ function GraphQueryEditor({ columns, datasets=[], manifest=null, nodes, setNodes
           <Button size="small" variant="contained" startIcon={<Download />} onClick={onExportCsv} disabled={!Number(dataQueryCount || 0)}>CSV全件出力</Button>
           <Button size="small" variant={resultViewMode === "tile" ? "contained" : "outlined"} onClick={switchGraphResultToTile}>全件パネル表示</Button>
           <Button size="small" variant={resultViewMode === "page" ? "contained" : "outlined"} onClick={switchGraphResultToPage}>ページ表示（100件）</Button>
-          {resultViewMode === "page" && <SmallNumberField label="ページ行数" value={resultRowsDraft} onChange={setResultRowsDraft} min="50" step="50" sx={{ width: 130 }} />}
-          {resultViewMode === "page" && <Button size="small" variant="outlined" onClick={applyResultRowsPerTile}>件数を適用</Button>}
-          {resultViewMode === "page" && <Button size="small" onClick={() => onReadPage(Math.max(1, Number(resultPage || 1) - 1))}>Prev</Button>}
+          <SmallNumberField label={resultViewMode === "tile" ? "tile/ページ行数" : "ページ行数"} value={resultRowsDraft} onChange={setResultRowsDraft} min="50" step="50" sx={{ width: 150 }} />
+          <Button size="small" variant="outlined" onClick={applyResultRowsPerTile}>件数を適用</Button>
+          {resultViewMode === "page" && <Button size="small" onClick={() => onReadPage(Math.max(1, Number(resultPage || 1) - 1), normalizeGraphResultPageSize(resultRowsPerTile, GRAPH_RESULT_PANEL_TILE_ROWS))}>Prev</Button>}
           {resultViewMode === "page" && <Typography variant="caption">Page {Number(resultPage || 1).toLocaleString()} / {Number(resultPageMax || 0).toLocaleString()}</Typography>}
-          {resultViewMode === "page" && <Button size="small" onClick={() => onReadPage(Math.min(Number(resultPageMax || 1), Number(resultPage || 1) + 1))}>Next</Button>}
-          {resultViewMode === "tile" && <Chip size="small" color="primary" label={`lazy全件パネル / 読込中 ${Number(resultTable?.rows?.length || 0).toLocaleString()} / 全 ${Number(dataQueryCount || 0).toLocaleString()}`} />}
+          {resultViewMode === "page" && <Button size="small" onClick={() => onReadPage(Math.min(Number(resultPageMax || 1), Number(resultPage || 1) + 1), normalizeGraphResultPageSize(resultRowsPerTile, GRAPH_RESULT_PANEL_TILE_ROWS))}>Next</Button>}
+          {resultViewMode === "tile" && <Chip size="small" color="primary" label={`lazy全件パネル / tile ${normalizeGraphResultPageSize(resultRowsPerTile, GRAPH_RESULT_PANEL_TILE_ROWS).toLocaleString()}行 / 読込中 ${Number(resultTable?.rows?.length || 0).toLocaleString()} / 全 ${Number(dataQueryCount || 0).toLocaleString()}`} />}
           <Chip size="small" label={`${Number(dataQueryCount || 0).toLocaleString()} rows`} />
         </Stack>
         {resultViewMode === "tile" ? (
@@ -7865,10 +7896,10 @@ function GraphQueryEditor({ columns, datasets=[], manifest=null, nodes, setNodes
             table={resultTable}
             totalRows={Number(dataQueryCount || 0)}
             page={Number(resultPage || 1)}
-            pageSize={GRAPH_RESULT_PANEL_TILE_ROWS}
+            pageSize={resultRowsPerTile}
             onReadPage={onReadPage}
             height={420}
-            resetKey={`graph-result-panel:${Number(dataQueryCount || 0)}:${resultHeader.join("\u001f")}`}
+            resetKey={`graph-result-panel:${Number(dataQueryCount || 0)}:${resultHeader.join("\u001f")}:${normalizeGraphResultPageSize(resultRowsPerTile, GRAPH_RESULT_PANEL_TILE_ROWS)}`}
           />
         ) : (
           <DataTable table={resultTable} tableId="graphQueryResult" height={360} />
@@ -8154,7 +8185,11 @@ function App() {
   const searchPageMax = searchCount ? Math.ceil(searchCount / Number(pageSize || 500)) : 0;
 
   useEffect(() => { pageSizeRef.current = Number(pageSize || 500); }, [pageSize]);
-  useEffect(() => { graphResultPageSizeRef.current = Number(graphResultPageSize || 1000); }, [graphResultPageSize]);
+  useEffect(() => {
+    const normalized = normalizeGraphResultPageSize(graphResultPageSize, GRAPH_RESULT_PANEL_TILE_ROWS);
+    graphResultPageSizeRef.current = normalized;
+    if (String(graphResultPageSize) !== String(normalized)) setGraphResultPageSize(String(normalized));
+  }, [graphResultPageSize]);
   useEffect(() => { visibleColsRef.current = visibleCols; }, [visibleCols]);
   useEffect(() => { manifestRef.current = manifest; }, [manifest]);
   useEffect(() => { searchPageRef.current = searchPage; }, [searchPage]);
@@ -10329,7 +10364,7 @@ function App() {
                   resultStatus={graphResultStatus}
                   resultTime={graphResultTime}
                   resultPage={graphResultMode === "join" ? graphResultPage : graphResultPage}
-                  resultPageMax={Math.max(1, Math.ceil((graphResultCount || 0) / Number(graphResultPageSize || 1000)))}
+                  resultPageMax={Math.max(1, Math.ceil((graphResultCount || 0) / normalizeGraphResultPageSize(graphResultPageSize, GRAPH_RESULT_PANEL_TILE_ROWS)))}
                   resultViewMode={graphResultViewMode}
                   setResultViewMode={setGraphResultViewMode}
                   resultRowsPerTile={graphResultPageSize}
