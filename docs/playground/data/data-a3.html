@@ -67,6 +67,7 @@ storage boundary, query boundary, or graph boundary changes.
   <script id="worker-code" type="text/plain">
 
 
+
 /*
  * =========================================================
  * WORKER CODE MAP
@@ -3894,14 +3895,17 @@ async function readCachedColumn(target, col){
 
 const HYBRID_SURFACE_BUS_VERSION = 1;
 const EXECUTION_PLANE_VERSION = 3;
+const ROW_SURFACE_BUS_VERSION = 1;
 const hybridSurfaceRuntime = {
   hot:new Map(),
   warm:new Map(),
   bitsets:new Map(),
+  rowSlabs:new Map(),
   hotBytes:0,
   warmBytes:0,
   bitsetBytes:0,
-  metrics:{requests:0,hotHits:0,warmHits:0,opfsReads:0,memoryReads:0,promotions:0,evictions:0,prefetches:0,bitsetHits:0,bitsetWrites:0,distributedDispatches:0,scaleUpDispatches:0,scaleOutDispatches:0}
+  rowSlabBytes:0,
+  metrics:{requests:0,hotHits:0,warmHits:0,opfsReads:0,memoryReads:0,promotions:0,evictions:0,prefetches:0,bitsetHits:0,bitsetWrites:0,distributedDispatches:0,scaleUpDispatches:0,scaleOutDispatches:0,rowRequests:0,rowSlabHits:0,rowSlabMisses:0,rowSlabWrites:0,rowSlabEvictions:0,rowPrefetches:0,rowMaterialized:0,rowBatchReads:0}
 };
 
 function surfaceDefaultConfig(){
@@ -3914,6 +3918,13 @@ function surfaceDefaultConfig(){
     hotBudgetBytes:256 * 1024 * 1024,
     warmBudgetBytes:256 * 1024 * 1024,
     bitsetBudgetBytes:128 * 1024 * 1024,
+    rowSurface:true,
+    rowSlabCache:true,
+    rowPagePrefetch:true,
+    rowSlabBudgetBytes:256 * 1024 * 1024,
+    rowSlabMaxRows:4096,
+    rowPrefetchPages:2,
+    fullRowProjectionThreshold:0.6,
     promotionReadThreshold:2,
     representationBudget:true
   };
@@ -4021,10 +4032,12 @@ function surfaceClear(){
   hybridSurfaceRuntime.hot.clear();
   hybridSurfaceRuntime.warm.clear();
   hybridSurfaceRuntime.bitsets.clear();
+  hybridSurfaceRuntime.rowSlabs.clear();
   hybridSurfaceRuntime.hotBytes=0;
   hybridSurfaceRuntime.warmBytes=0;
   hybridSurfaceRuntime.bitsetBytes=0;
-  hybridSurfaceRuntime.metrics={requests:0,hotHits:0,warmHits:0,opfsReads:0,memoryReads:0,promotions:0,evictions:0,prefetches:0,bitsetHits:0,bitsetWrites:0,distributedDispatches:0,scaleUpDispatches:0,scaleOutDispatches:0};
+  hybridSurfaceRuntime.rowSlabBytes=0;
+  hybridSurfaceRuntime.metrics={requests:0,hotHits:0,warmHits:0,opfsReads:0,memoryReads:0,promotions:0,evictions:0,prefetches:0,bitsetHits:0,bitsetWrites:0,distributedDispatches:0,scaleUpDispatches:0,scaleOutDispatches:0,rowRequests:0,rowSlabHits:0,rowSlabMisses:0,rowSlabWrites:0,rowSlabEvictions:0,rowPrefetches:0,rowMaterialized:0,rowBatchReads:0};
   clearChunkCache();
   return hybridSurfaceStatus({cleared:true});
 }
@@ -4051,9 +4064,15 @@ function hybridSurfaceStatus(extra={}){
     hotEntries:hybridSurfaceRuntime.hot.size,
     warmEntries:hybridSurfaceRuntime.warm.size,
     bitsetEntries:hybridSurfaceRuntime.bitsets.size,
+    rowSurfaceBusVersion:ROW_SURFACE_BUS_VERSION,
+    rowSurface:cfg.rowSurface !== false,
+    rowSlabCache:cfg.rowSlabCache !== false,
+    rowPagePrefetch:cfg.rowPagePrefetch !== false,
+    rowSlabEntries:hybridSurfaceRuntime.rowSlabs.size,
     hotMB:Math.round(hybridSurfaceRuntime.hotBytes / 1024 / 1024),
     warmMB:Math.round(hybridSurfaceRuntime.warmBytes / 1024 / 1024),
     bitsetMB:Math.round(hybridSurfaceRuntime.bitsetBytes / 1024 / 1024),
+    rowSlabMB:Math.round(hybridSurfaceRuntime.rowSlabBytes / 1024 / 1024),
     metrics:{...hybridSurfaceRuntime.metrics},
     chunkCache:chunkCacheSnapshot(),
     ...extra
@@ -4337,35 +4356,278 @@ function normalizeCols(cols){
   return cols.map(Number).filter(i=>Number.isFinite(i) && i>=0 && i<state.manifest.columns.length);
 }
 
-async function readPage(page,pageSize,cols){
-  const selected=normalizeCols(cols);
-  const total=state.manifest.totalRows;
-  let start=Math.max(0,(page-1)*pageSize);
-  const rows=[];
-  while(rows.length < pageSize && start + rows.length < total){
-    const global=start + rows.length;
-    const addr=rowAddress(global);
-    const chunk=await readChunkColumns(addr.chunkIndex, selected);
-    for (let r=addr.localRow; r<chunk.rowCount && rows.length<pageSize && start+rows.length<total; r++){
-      rows.push(selected.map(i=>valueFromColumn(chunk.columns.get(i),r)));
+function rowSurfaceProjectionMode(selected){
+  const total=Math.max(1, Number(state.manifest?.columns?.length || selected?.length || 1));
+  const ratio=(Array.isArray(selected) ? selected.length : 0) / total;
+  const cfg=surfaceConfig();
+  return ratio >= Number(cfg.fullRowProjectionThreshold ?? 0.6) ? "full-row" : "projection-row";
+}
+
+function rowSurfaceProjectionKey(selected, mode="projection-row"){
+  const projection=Array.isArray(selected) ? selected.map(Number).filter(Number.isFinite) : [];
+  return hashText32(`${mode}|${projection.join(",")}`);
+}
+
+function rowSlabKey(datasetId, chunkIndex, rowStart, rowEnd, selected, mode="projection-row"){
+  return `${datasetId || activeSurfaceDatasetId()}\u001f${Number(chunkIndex)}\u001f${Number(rowStart)}\u001f${Number(rowEnd)}\u001f${rowSurfaceProjectionKey(selected,mode)}\u001frow-slab`;
+}
+
+function estimateRowSlabBytes(slab){
+  if (!slab) return 0;
+  const rows=Array.isArray(slab.rows) ? slab.rows : [];
+  let bytes=64;
+  for (let r=0; r<rows.length; r++){
+    const row=Array.isArray(rows[r]) ? rows[r] : [];
+    bytes += 16 + row.length * 8;
+    for (let c=0; c<row.length; c++){
+      const v=row[c];
+      if (typeof v === "string") bytes += v.length * 2;
+      else if (typeof v === "number") bytes += 8;
+      else if (v != null) bytes += String(v).length * 2;
     }
   }
-  return {header:selected.map(i=>state.manifest.columns[i].name), rows, startRow:start};
+  return bytes;
+}
+
+function rowSlabTouch(key){
+  const entry=hybridSurfaceRuntime.rowSlabs.get(key);
+  if (!entry) return null;
+  hybridSurfaceRuntime.rowSlabs.delete(key);
+  entry.lastUsed=now();
+  entry.hits=Number(entry.hits || 0)+1;
+  hybridSurfaceRuntime.rowSlabs.set(key,entry);
+  hybridSurfaceRuntime.metrics.rowSlabHits++;
+  return entry.value;
+}
+
+function rowSlabEvict(){
+  const cfg=surfaceConfig();
+  const budget=Number(cfg.rowSlabBudgetBytes || 256 * 1024 * 1024);
+  const map=hybridSurfaceRuntime.rowSlabs;
+  while(hybridSurfaceRuntime.rowSlabBytes > budget && map.size){
+    let victimKey=null, victimScore=Infinity;
+    for (const [k,e] of map.entries()){
+      const age=Math.max(1, now() - Number(e.lastUsed || 0));
+      const rows=Number(e.value?.rows?.length || 1);
+      const score=(Number(e.hits || 0)+1) / Math.max(1, age * Math.log2(rows + 1));
+      if (score < victimScore){ victimScore=score; victimKey=k; }
+    }
+    if (!victimKey) break;
+    const old=map.get(victimKey);
+    hybridSurfaceRuntime.rowSlabBytes -= Number(old?.bytes || 0);
+    map.delete(victimKey);
+    hybridSurfaceRuntime.metrics.rowSlabEvictions++;
+  }
+}
+
+function rowSlabRemember(key, slab){
+  const cfg=surfaceConfig();
+  if (cfg.enabled === false || cfg.rowSlabCache === false || !key || !slab) return slab;
+  const bytes=estimateRowSlabBytes(slab);
+  if (bytes > Number(cfg.rowSlabBudgetBytes || 256 * 1024 * 1024)) return slab;
+  if (hybridSurfaceRuntime.rowSlabs.has(key)){
+    const old=hybridSurfaceRuntime.rowSlabs.get(key);
+    hybridSurfaceRuntime.rowSlabBytes -= Number(old?.bytes || 0);
+    hybridSurfaceRuntime.rowSlabs.delete(key);
+  }
+  hybridSurfaceRuntime.rowSlabs.set(key,{value:slab,bytes,lastUsed:now(),createdAt:now(),hits:0,representation:"row-slab"});
+  hybridSurfaceRuntime.rowSlabBytes += bytes;
+  hybridSurfaceRuntime.metrics.rowSlabWrites++;
+  rowSlabEvict();
+  return slab;
+}
+
+function sliceRowsFromSlab(slab, rowStart, rowEnd){
+  if (!slab || !Array.isArray(slab.rows)) return null;
+  const from=Math.max(0, Number(rowStart) - Number(slab.rowStart || 0));
+  const to=Math.max(from, Number(rowEnd) - Number(slab.rowStart || 0));
+  return slab.rows.slice(from,to);
+}
+
+function findCoveringRowSlab(datasetId, chunkIndex, rowStart, rowEnd, selected, mode){
+  const key=rowSlabKey(datasetId, chunkIndex, rowStart, rowEnd, selected, mode);
+  const exact=rowSlabTouch(key);
+  if (exact) return {slab:exact, key, exact:true};
+  // Try a covering slab with the same dataset, chunk, and projection. This makes page prefetch usable.
+  const suffix=`\u001f${rowSurfaceProjectionKey(selected,mode)}\u001frow-slab`;
+  const prefix=`${datasetId || activeSurfaceDatasetId()}\u001f${Number(chunkIndex)}\u001f`;
+  for (const [k,e] of hybridSurfaceRuntime.rowSlabs.entries()){
+    if (!k.startsWith(prefix) || !k.endsWith(suffix)) continue;
+    const slab=e.value;
+    if (Number(slab.rowStart) <= Number(rowStart) && Number(slab.rowEnd) >= Number(rowEnd)){
+      hybridSurfaceRuntime.rowSlabs.delete(k);
+      e.lastUsed=now(); e.hits=Number(e.hits || 0)+1;
+      hybridSurfaceRuntime.rowSlabs.set(k,e);
+      hybridSurfaceRuntime.metrics.rowSlabHits++;
+      return {slab:{...slab,rows:sliceRowsFromSlab(slab,rowStart,rowEnd),rowStart,rowEnd}, key:k, exact:false};
+    }
+  }
+  hybridSurfaceRuntime.metrics.rowSlabMisses++;
+  return null;
+}
+
+function buildRowSurfacePlan({page=1,pageSize=500,startRow=null,rowIds=null,cols=[]}={}){
+  const selected=normalizeCols(cols);
+  const mode=rowSurfaceProjectionMode(selected);
+  const total=Number(state.manifest?.totalRows || 0);
+  const start=startRow == null ? Math.max(0,(Number(page || 1)-1)*Number(pageSize || 500)) : Math.max(0,Number(startRow || 0));
+  const end=Math.min(total,start + Math.max(0,Number(pageSize || 500)));
+  return {
+    version:ROW_SURFACE_BUS_VERSION,
+    surface:"chunk-row-slab",
+    datasetId:activeSurfaceDatasetId(),
+    mode,
+    projection:selected,
+    projectionHash:rowSurfaceProjectionKey(selected,mode),
+    startRow:start,
+    endRow:end,
+    page:Number(page || 1),
+    pageSize:Number(pageSize || 500),
+    rowCount:Array.isArray(rowIds) ? rowIds.length : Math.max(0,end-start),
+    rowIds:Array.isArray(rowIds) ? rowIds.length : null,
+    fullRowMode:mode === "full-row"
+  };
+}
+
+function bucketRowIdsByChunk(rowIds){
+  const buckets=new Map();
+  const ids=Array.isArray(rowIds) ? rowIds : [];
+  for (let order=0; order<ids.length; order++){
+    const global=Number(ids[order]);
+    if (!Number.isFinite(global)) continue;
+    const addr=rowAddress(global);
+    let bucket=buckets.get(addr.chunkIndex);
+    if (!bucket){ bucket=[]; buckets.set(addr.chunkIndex,bucket); }
+    bucket.push({order,global,localRow:addr.localRow});
+  }
+  return buckets;
+}
+
+function contiguousRangesFromLocals(locals, maxRows=null){
+  const sorted=[...new Set((Array.isArray(locals) ? locals : []).map(Number).filter(Number.isFinite))].sort((a,b)=>a-b);
+  const ranges=[];
+  let start=null, prev=null;
+  const limit=maxRows == null ? Number(surfaceConfig().rowSlabMaxRows || 4096) : Number(maxRows || 4096);
+  for (const local of sorted){
+    if (start == null){ start=local; prev=local; continue; }
+    if (local === prev + 1 && (local - start + 1) <= limit){ prev=local; continue; }
+    ranges.push({start,end:prev+1});
+    start=local; prev=local;
+  }
+  if (start != null) ranges.push({start,end:prev+1});
+  return ranges;
+}
+
+function findRangeForLocalRow(ranges, localRow){
+  for (const r of ranges) if (localRow >= r.start && localRow < r.end) return r;
+  return null;
+}
+
+async function materializeRowSlab(chunkIndex, rowStart, rowEnd, selected, options={}){
+  const cfg=surfaceConfig();
+  const datasetId=options.datasetId || activeSurfaceDatasetId();
+  const mode=options.mode || rowSurfaceProjectionMode(selected);
+  const safeStart=Math.max(0,Number(rowStart || 0));
+  const safeEnd=Math.max(safeStart,Number(rowEnd || safeStart));
+  const key=rowSlabKey(datasetId, chunkIndex, safeStart, safeEnd, selected, mode);
+  hybridSurfaceRuntime.metrics.rowRequests++;
+  if (cfg.enabled !== false && cfg.rowSurface !== false && cfg.rowSlabCache !== false){
+    const cached=findCoveringRowSlab(datasetId,chunkIndex,safeStart,safeEnd,selected,mode);
+    if (cached?.slab) return cached.slab;
+  }
+  const surfacePlan={version:ROW_SURFACE_BUS_VERSION,surface:"row-slab-materialization",requiredColumns:selected,warmColumns:selected,hotColumns:mode === "full-row" ? selected : []};
+  const chunk=await readChunkColumns(chunkIndex, selected, {surfacePlan});
+  const end=Math.min(safeEnd,Number(chunk.rowCount || safeEnd));
+  const rows=[];
+  for (let r=safeStart; r<end; r++) rows.push(selected.map(i=>valueFromColumn(chunk.columns.get(i),r)));
+  const slab={datasetId,chunkIndex,rowStart:safeStart,rowEnd:end,projection:selected,projectionHash:rowSurfaceProjectionKey(selected,mode),mode,rows,rowCount:rows.length,createdAt:new Date().toISOString()};
+  hybridSurfaceRuntime.metrics.rowMaterialized += rows.length;
+  hybridSurfaceRuntime.metrics.rowBatchReads++;
+  if (cfg.enabled !== false && cfg.rowSurface !== false && cfg.rowSlabCache !== false) rowSlabRemember(key,slab);
+  return slab;
+}
+
+async function materializeRowIdsSurface(rowIds, cols, options={}){
+  const selected=normalizeCols(cols);
+  const mode=options.mode || rowSurfaceProjectionMode(selected);
+  const buckets=bucketRowIdsByChunk(rowIds);
+  const rows=new Array((Array.isArray(rowIds) ? rowIds : []).length);
+  const details=[];
+  for (const [chunkIndex, refs] of buckets.entries()){
+    refs.sort((a,b)=>a.localRow-b.localRow);
+    const ranges=contiguousRangesFromLocals(refs.map(x=>x.localRow));
+    const slabByRange=new Map();
+    for (const range of ranges){
+      const slab=await materializeRowSlab(chunkIndex,range.start,range.end,selected,{...options,mode});
+      slabByRange.set(`${range.start}|${range.end}`,slab);
+      details.push({chunkIndex,rowStart:range.start,rowEnd:range.end,rows:slab.rows.length,mode});
+    }
+    for (const ref of refs){
+      const range=findRangeForLocalRow(ranges,ref.localRow);
+      const slab=range ? slabByRange.get(`${range.start}|${range.end}`) : null;
+      rows[ref.order]=slab?.rows?.[ref.localRow - range.start] || selected.map(()=>"");
+    }
+    if (state.cancelled) throw new Error("Cancelled");
+  }
+  return {header:selected.map(i=>state.manifest.columns[i].name), rows:rows.filter(r=>Array.isArray(r)), rowSurface:{plan:buildRowSurfacePlan({rowIds,cols:selected}), details, status:hybridSurfaceStatus()}};
+}
+
+async function prefetchRowPageSurface(startRow, pageSize, selected, options={}){
+  const cfg=surfaceConfig();
+  if (cfg.rowPagePrefetch === false || cfg.rowSurface === false) return {prefetched:0,reason:"row prefetch disabled"};
+  const pages=Math.max(0,Number(cfg.rowPrefetchPages || 2));
+  if (!pages) return {prefetched:0,reason:"no row prefetch pages"};
+  const total=Number(state.manifest?.totalRows || 0);
+  let cursor=Math.max(0,Number(startRow || 0)) + Number(pageSize || 0);
+  let prefetched=0;
+  const slabs=[];
+  for (let p=0; p<pages && cursor<total; p++){
+    const end=Math.min(total,cursor+Number(pageSize || 0));
+    let global=cursor;
+    while(global<end){
+      const addr=rowAddress(global);
+      const base=chunkBaseRow(addr.chunkIndex);
+      const chunkMeta=chunkMetaForIndex(addr.chunkIndex);
+      const chunkRows=Number(chunkMeta?.rowCount || 0);
+      const localEnd=Math.min(chunkRows, addr.localRow + (end-global));
+      materializeRowSlab(addr.chunkIndex,addr.localRow,localEnd,selected,{...options,prefetch:true}).catch(()=>{});
+      slabs.push({chunkIndex:addr.chunkIndex,rowStart:addr.localRow,rowEnd:localEnd});
+      prefetched += Math.max(0,localEnd-addr.localRow);
+      global=base+localEnd;
+      if (global <= cursor) break;
+    }
+    cursor=end;
+  }
+  hybridSurfaceRuntime.metrics.rowPrefetches += prefetched;
+  return {prefetched,slabs};
+}
+
+async function readPage(page,pageSize,cols){
+  const selected=normalizeCols(cols);
+  const total=Number(state.manifest.totalRows || 0);
+  const start=Math.max(0,(Number(page || 1)-1)*Number(pageSize || 500));
+  const end=Math.min(total,start+Number(pageSize || 500));
+  const rows=[];
+  const slabs=[];
+  let global=start;
+  while(global<end){
+    const addr=rowAddress(global);
+    const base=chunkBaseRow(addr.chunkIndex);
+    const chunkMeta=chunkMetaForIndex(addr.chunkIndex);
+    const chunkRows=Number(chunkMeta?.rowCount || 0);
+    const localEnd=Math.min(chunkRows, addr.localRow + (end-global));
+    const slab=await materializeRowSlab(addr.chunkIndex,addr.localRow,localEnd,selected,{mode:rowSurfaceProjectionMode(selected)});
+    rows.push(...slab.rows);
+    slabs.push({chunkIndex:addr.chunkIndex,rowStart:addr.localRow,rowEnd:localEnd,rows:slab.rows.length,mode:slab.mode});
+    global=base+localEnd;
+    if (global <= start || state.cancelled) break;
+  }
+  const prefetch=prefetchRowPageSurface(start,Number(pageSize || 500),selected).catch(()=>null);
+  return {header:selected.map(i=>state.manifest.columns[i].name), rows, startRow:start, rowSurface:{plan:buildRowSurfacePlan({page,pageSize,startRow:start,cols:selected}), slabs, status:hybridSurfaceStatus(), prefetchScheduled:!!prefetch}};
 }
 
 async function readRowsByGlobal(rowIds, cols){
-  const selected=normalizeCols(cols);
-  const rows=[];
-  let currentChunk=-1, chunk=null;
-  for (const global of rowIds){
-    const addr=rowAddress(global);
-    if (addr.chunkIndex !== currentChunk){
-      currentChunk=addr.chunkIndex;
-      chunk=await readChunkColumns(currentChunk, selected);
-    }
-    rows.push(selected.map(i=>valueFromColumn(chunk.columns.get(i),addr.localRow)));
-  }
-  return {header:selected.map(i=>state.manifest.columns[i].name), rows};
+  return await materializeRowIdsSurface(rowIds, cols);
 }
 
 function compareValue(v, op, target, type){
@@ -5624,6 +5886,26 @@ self.onmessage=async(e)=>{
       return;
     }
 
+    if (msg.type==="ROW_SURFACE_STATUS"){
+      post("ROW_SURFACE_STATUS", hybridSurfaceStatus({rowSurfaceOnly:true}));
+      return;
+    }
+
+    if (msg.type==="ROW_SURFACE_CLEAR"){
+      hybridSurfaceRuntime.rowSlabs.clear();
+      hybridSurfaceRuntime.rowSlabBytes=0;
+      post("ROW_SURFACE_STATUS", hybridSurfaceStatus({rowSurfaceCleared:true}));
+      return;
+    }
+
+    if (msg.type==="ROW_SURFACE_PREFETCH"){
+      const selected=normalizeCols(msg.columns || []);
+      const start=Math.max(0,Number(msg.startRow ?? ((Number(msg.page || 1)-1) * Number(msg.pageSize || 500))));
+      const result=await prefetchRowPageSurface(start,Number(msg.pageSize || 500),selected,{manual:true});
+      post("ROW_SURFACE_PREFETCH_DONE",{...result,status:hybridSurfaceStatus()});
+      return;
+    }
+
     if (msg.type==="EXECUTION_PLANE_CONFIG"){
       post("EXECUTION_PLANE_STATUS", configureExecutionPlane(msg.config || msg));
       return;
@@ -5982,6 +6264,8 @@ self.onmessage=async(e)=>{
     postProgress(0,`Error: ${err?.message || String(err)}`);
   }
 };
+  
+
   
 </script>
 
