@@ -2,7 +2,7 @@
 <html lang="ja">
 <head>
   <meta charset="UTF-8" />
-  <title>Quantum CSV Grid - HyperTensor Adaptive Kernel Full Build</title>
+  <title>Quantum CSV Grid - Hybrid Surface Distributed HyperTensor Full Build</title>
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Roboto:wght@300;400;600;700&display=swap" />
   <link rel="stylesheet" href="https://fonts.googleapis.com/icon?family=Material+Icons" />
@@ -28,7 +28,7 @@ Single HTML is the product boundary.
 
 Core Identity:
 - CDN / Babel / React / MUI are the dynamic runtime foundation.
-- Worker owns heavy CSV, OPFS, columnar storage, query, pivot, time, graph execution, Observation Engine v1, and HyperTensor Adaptive Kernel v2.
+- Worker owns heavy CSV, OPFS, columnar storage, query, pivot, time, graph execution, Observation Engine v1, HyperTensor Adaptive Kernel v2, Hybrid Surface Bus, and Distributed Execution Plane.
 - App owns orchestration, state projection, and user interaction.
 - UI is projection; heavy domain logic must stay in Worker-side runtime domains.
 - Storage is columnar cache, not raw CSV preservation.
@@ -1281,7 +1281,7 @@ function evaluateQueryPlanBitset(chunk, oplan){
   const rowCount=Number(chunk?.rowCount || 0);
   let current=makeFullBitset(rowCount);
   for (const p of oplan.predicates || []){
-    bitsetAndInto(current, evaluatePredicateBitset(chunk, p));
+    bitsetAndInto(current, evaluatePredicateBitsetSurfaceCached(chunk, p));
   }
   for (const g of oplan.filterGroups || []){
     if (g.rowLevel === false) continue;
@@ -1289,7 +1289,7 @@ function evaluateQueryPlanBitset(chunk, oplan){
     if (!conditions.length) continue;
     let groupBits = g.mode === "all" ? makeFullBitset(rowCount) : makeEmptyBitset(rowCount);
     for (const p of conditions){
-      const pb=evaluatePredicateBitset(chunk, p);
+      const pb=evaluatePredicateBitsetSurfaceCached(chunk, p);
       if (g.mode === "all") bitsetAndInto(groupBits, pb);
       else bitsetOrInto(groupBits, pb);
     }
@@ -1391,6 +1391,8 @@ async function executeObservationPlan(plan, options={}){
   const progressLabel=options.progressLabel || oplan.name || "Observing chunks";
   const progressEvery=Math.max(1, Number(options.progressEvery || 5));
   const progress=options.progress !== false;
+  const surfacePlan=buildSurfaceReadPlan(oplan, state.adaptiveKernel?.lastStrategy || {});
+  const prefetch=await prefetchSurfaceForPlan(chunks, oplan, state.adaptiveKernel?.lastStrategy || {}).catch(err=>({prefetched:0,error:err?.message || String(err)}));
   const refs=[];
   const sortable=[];
   const topK=[];
@@ -1412,7 +1414,7 @@ async function executeObservationPlan(plan, options={}){
       continue;
     }
 
-    const chunk=await readChunkColumns(chunkIndex, oplan.requiredColumns);
+    const chunk=await readChunkColumns(chunkIndex, oplan.requiredColumns, {surfacePlan});
     const base=chunkBaseRow(chunkIndex);
     const bitset=evaluateQueryPlanBitset(chunk, oplan);
     const chunkMatched=countBits(bitset);
@@ -1481,7 +1483,10 @@ async function executeObservationPlan(plan, options={}){
     skippedChunks,
     capped:stoppedByLimit || (!collectSort && collectRows && Number.isFinite(limit) && matched > refs.length),
     ms:now()-t0,
-    queryPlan:{...queryPlanSummary(plan), executionEngine:"observation-v1", observationPlan:observationPlanSummary(oplan)}
+    hybridSurface:hybridSurfaceStatus(),
+    surfaceReadPlan:surfacePlan,
+    prefetch,
+    queryPlan:{...queryPlanSummary(plan), executionEngine:"observation-v1", observationPlan:observationPlanSummary(oplan), hybridSurface:hybridSurfaceStatus(), surfaceReadPlan:surfacePlan, prefetch}
   };
 }
 
@@ -1560,6 +1565,8 @@ function adaptiveStatus(extra={}){
     cacheEntries:adaptiveRowIdResultCache.size,
     lastStrategy:cfg.lastStrategy || null,
     lastBench:cfg.lastBench || null,
+    executionPlane:executionPlaneStatus ? executionPlaneStatus({surface:null}) : null,
+    surface:hybridSurfaceStatus ? hybridSurfaceStatus() : null,
     ...extra
   };
 }
@@ -1664,10 +1671,11 @@ function buildOperatorGraph(queryPlan){
   const graph={
     version:HYPERTENSOR_KERNEL_VERSION,
     source:state.manifest?.id || state.dataset?.id || "activeDataset",
-    axes:["chunk","row","column","dictId","timeBucket","graphNode","graphEdge","queryState"],
+    axes:["chunk","row","column","dictId","timeBucket","graphNode","graphEdge","queryState","storageTier","executionLane","distributionShard"],
     sparse:true,
     operators,
     measurement:{projection:queryPlan?.projection || [], limit:normalizePlanLimit(queryPlan?.limit), sort:queryPlan?.sort || null},
+    surfaceReadPlan:buildSurfaceReadPlan(buildObservationPlan(queryPlan || {})),
     createdAt:new Date().toISOString()
   };
   state.hyperTensor={...(state.hyperTensor || {}),enabled:true,version:HYPERTENSOR_KERNEL_VERSION,lastPlan:graph};
@@ -1681,7 +1689,8 @@ function operatorGraphSummary(graph){
     axes:graph?.axes || [],
     sparse:!!graph?.sparse,
     operators:(graph?.operators || []).map(o=>({kind:o.kind, mode:o.mode || null, columnIndex:o.predicate?.columnIndex ?? null, aggregate:o.aggregate?.type || null})),
-    measurement:graph?.measurement || null
+    measurement:graph?.measurement || null,
+    surfaceReadPlan:graph?.surfaceReadPlan || null
   };
 }
 
@@ -1777,6 +1786,8 @@ function chooseAdaptiveStrategy(queryPlan, oplan, cost, options={}){
     aggregateMode,
     materializeMode,
     cacheMode:cfg.cache === false ? "off" : "hot-rowid-cache",
+    surfaceMode:"hybrid-surface-bus-v1",
+    scaleReady:true,
     estimatedRows:cost?.estimatedRows || 0,
     totalRows:cost?.totalRows || 0,
     reason:[
@@ -1812,14 +1823,53 @@ async function executeHyperTensorAdaptivePlan(plan, options={}){
   const oplan=buildObservationPlan(plan);
   const operatorGraph=buildOperatorGraph(plan);
   const cost=estimatePlanCost(plan, oplan);
-  const strategy=chooseAdaptiveStrategy(plan, oplan, cost, options);
+  let strategy=chooseAdaptiveStrategy(plan, oplan, cost, options);
+  const plane=chooseExecutionPlane(plan, options, strategy, cost);
+  const surfacePlan=buildSurfaceReadPlan(oplan,strategy);
+  strategy={...strategy,executionPlane:plane,surfaceReadPlan:surfacePlan};
   state.adaptiveKernel={...(state.adaptiveKernel || {}),lastStrategy:strategy};
+
+  const chunks=Array.isArray(options.chunks) ? options.chunks : selectChunksForPlan(plan);
+  const remoteCfg=state.remoteExecution || {};
+  if (plane.mode === "scale-out-remote"){
+    try{
+      hybridSurfaceRuntime.metrics.scaleOutDispatches++;
+      const remoteExec=await executeChunkExecutionPlanRemote(plan, options, chunks);
+      remoteExec.adaptiveExecutionKernelVersion=ADAPTIVE_EXECUTION_KERNEL_VERSION;
+      remoteExec.hyperTensorKernelVersion=HYPERTENSOR_KERNEL_VERSION;
+      remoteExec.executionMode="hypertensor-adaptive-v2-remote-scaleout";
+      remoteExec.adaptiveStrategy=strategy;
+      remoteExec.operatorGraph=operatorGraphSummary(operatorGraph);
+      remoteExec.costModel=cost;
+      return decorateExecutionWithPlane(remoteExec, plane, surfacePlan);
+    }catch(err){
+      if (remoteCfg.mode === "remote-only") throw err;
+      post("PROGRESS",{value:0,text:`Scale-out remote fallback: ${err?.message || err}`});
+    }
+  }
+
+  if (plane.mode === "scale-up-worker-pool"){
+    try{
+      hybridSurfaceRuntime.metrics.scaleUpDispatches++;
+      const poolExec=await executeChunkExecutionPlanLocalMaybeParallel(plan,{...options,adaptive:false,observation:false,parallel:true});
+      poolExec.adaptiveExecutionKernelVersion=ADAPTIVE_EXECUTION_KERNEL_VERSION;
+      poolExec.hyperTensorKernelVersion=HYPERTENSOR_KERNEL_VERSION;
+      poolExec.executionMode=poolExec.executionMode === "worker-pool" ? "hypertensor-adaptive-v2-local-scaleup" : poolExec.executionMode;
+      poolExec.adaptiveStrategy=strategy;
+      poolExec.operatorGraph=operatorGraphSummary(operatorGraph);
+      poolExec.costModel=cost;
+      hybridSurfaceRuntime.metrics.distributedDispatches++;
+      return decorateExecutionWithPlane(poolExec, plane, surfacePlan);
+    }catch(err){
+      post("PROGRESS",{value:0,text:`Scale-up worker pool fallback: ${err?.message || err}`});
+    }
+  }
 
   const cacheable=canUseAdaptiveRowIdCache(plan, options);
   const cacheKey=cacheable ? adaptivePlanHash(plan, options) : null;
   const cached=cacheKey ? getAdaptiveCache(cacheKey) : null;
   if (cached){
-    return {
+    const exec={
       taskId:executionTaskId(`${plan?.name || "query"}_adaptive_cache`),
       engineVersion:CHUNK_EXECUTION_ENGINE_VERSION,
       observationEngineVersion:OBSERVATION_ENGINE_VERSION,
@@ -1838,9 +1888,10 @@ async function executeHyperTensorAdaptivePlan(plan, options={}){
       cacheHit:true,
       queryPlan:{...queryPlanSummary(plan),executionEngine:"hypertensor-adaptive-v2-cache",operatorGraph:operatorGraphSummary(operatorGraph),adaptiveStrategy:strategy,costModel:cost}
     };
+    return decorateExecutionWithPlane(exec, plane, surfacePlan);
   }
 
-  const exec=await executeObservationPlan(plan, options);
+  const exec=await executeObservationPlan(plan, {...options,surfacePlan});
   exec.adaptiveExecutionKernelVersion=ADAPTIVE_EXECUTION_KERNEL_VERSION;
   exec.hyperTensorKernelVersion=HYPERTENSOR_KERNEL_VERSION;
   exec.executionMode=strategy.engineMode === "observation" ? "observation-v1" : "hypertensor-adaptive-v2";
@@ -1848,6 +1899,7 @@ async function executeHyperTensorAdaptivePlan(plan, options={}){
   exec.operatorGraph=operatorGraphSummary(operatorGraph);
   exec.costModel=cost;
   exec.queryPlan={...(exec.queryPlan || queryPlanSummary(plan)),executionEngine:exec.executionMode,operatorGraph:exec.operatorGraph,adaptiveStrategy:strategy,costModel:cost};
+  decorateExecutionWithPlane(exec, plane, surfacePlan);
 
   if (cacheKey && Array.isArray(exec.refs)) rememberAdaptiveCache(cacheKey,{refs:[...exec.refs],capped:!!exec.capped,createdAt:new Date().toISOString(),strategy});
   return exec;
@@ -3825,27 +3877,416 @@ async function readCachedColumn(target, col){
   return putChunkCacheEntry(key, value, estimateColumnDataBytes(value));
 }
 
-async function readChunkColumns(chunkIndex, colIndices){
+
+/* =========================================================
+ * HYBRID SURFACE BUS v1 + EXECUTION PLANE v3
+ * ---------------------------------------------------------
+ * The runtime uses Tile = dataset x chunk x column x representation
+ * as the common unit across OPFS, Memory, Cache, local workers and
+ * remote execution. OPFS is the cold durable surface, warm cache is
+ * decoded column residency, and hot memory is promoted high-value tiles.
+ *
+ * Scale-up: local Worker Pool across chunk surfaces.
+ * Scale-out: Remote Execution Adapter when configured.
+ * Distributed: aggregate partials and sortable row references are reduced
+ *              back into the main Worker.
+ * ========================================================= */
+
+const HYBRID_SURFACE_BUS_VERSION = 1;
+const EXECUTION_PLANE_VERSION = 3;
+const hybridSurfaceRuntime = {
+  hot:new Map(),
+  warm:new Map(),
+  bitsets:new Map(),
+  hotBytes:0,
+  warmBytes:0,
+  bitsetBytes:0,
+  metrics:{requests:0,hotHits:0,warmHits:0,opfsReads:0,memoryReads:0,promotions:0,evictions:0,prefetches:0,bitsetHits:0,bitsetWrites:0,distributedDispatches:0,scaleUpDispatches:0,scaleOutDispatches:0}
+};
+
+function surfaceDefaultConfig(){
+  return {
+    enabled:true,
+    tiering:true,
+    autoPromote:true,
+    prefetch:true,
+    bitsetCache:true,
+    hotBudgetBytes:256 * 1024 * 1024,
+    warmBudgetBytes:256 * 1024 * 1024,
+    bitsetBudgetBytes:128 * 1024 * 1024,
+    promotionReadThreshold:2,
+    representationBudget:true
+  };
+}
+
+function executionPlaneDefaultConfig(){
+  return {
+    enabled:true,
+    scaleUp:true,
+    scaleOut:true,
+    distributedReduce:true,
+    preferRemote:false,
+    workerPoolThresholdChunks:8,
+    remoteThresholdRows:2_000_000,
+    surfaceAware:true,
+    mode:"adaptive"
+  };
+}
+
+function surfaceConfig(){
+  if (!state.hybridSurfaceBus) state.hybridSurfaceBus=surfaceDefaultConfig();
+  state.hybridSurfaceBus={...surfaceDefaultConfig(),...(state.hybridSurfaceBus || {})};
+  return state.hybridSurfaceBus;
+}
+
+function executionPlaneConfig(){
+  if (!state.executionPlane) state.executionPlane=executionPlaneDefaultConfig();
+  state.executionPlane={...executionPlaneDefaultConfig(),...(state.executionPlane || {})};
+  return state.executionPlane;
+}
+
+function activeSurfaceDatasetId(){
+  if (activeIsMemory()) return state.memory?.id || state.dataset?.id || state.manifest?.id || "memory";
+  if (activeIsExternalStorage()) return state.externalDataset?.id || state.dataset?.id || state.manifest?.id || "external";
+  if (activeIsVirtual()) return state.manifest?.id || `virtual:${(state.virtual?.sources || []).map(s=>s.id).join("+")}`;
+  return state.dataset?.id || state.manifest?.id || "active";
+}
+
+function surfaceTileKey(datasetId, chunkIndex, columnIndex, representation="column"){
+  return `${datasetId || activeSurfaceDatasetId()}\u001f${Number(chunkIndex)}\u001f${Number(columnIndex)}\u001f${representation || "column"}`;
+}
+
+function estimateTileBytes(value, representation="column"){
+  if (!value) return 0;
+  if (representation === "predicate-bitset" || value instanceof Uint32Array) return Number(value.byteLength || 0);
+  if (representation === "time-bucket") return Number(value.byteLength || 0) || estimateColumnDataBytes(value);
+  return estimateColumnDataBytes(value);
+}
+
+function surfaceTouch(map, key, tier){
+  const entry=map.get(key);
+  if (!entry) return null;
+  map.delete(key);
+  entry.lastUsed=now();
+  entry.hits=Number(entry.hits || 0)+1;
+  map.set(key,entry);
+  if (tier === "hot") hybridSurfaceRuntime.metrics.hotHits++;
+  if (tier === "warm") hybridSurfaceRuntime.metrics.warmHits++;
+  if (tier === "bitset") hybridSurfaceRuntime.metrics.bitsetHits++;
+  return entry.value;
+}
+
+function surfaceEvictTier(tier){
+  const cfg=surfaceConfig();
+  const map=tier === "hot" ? hybridSurfaceRuntime.hot : tier === "bitset" ? hybridSurfaceRuntime.bitsets : hybridSurfaceRuntime.warm;
+  const budget=tier === "hot" ? cfg.hotBudgetBytes : tier === "bitset" ? cfg.bitsetBudgetBytes : cfg.warmBudgetBytes;
+  const bytesProp=tier === "hot" ? "hotBytes" : tier === "bitset" ? "bitsetBytes" : "warmBytes";
+  while(hybridSurfaceRuntime[bytesProp] > budget && map.size){
+    let victimKey=null, victimScore=Infinity;
+    for (const [k,e] of map.entries()){
+      const age=Math.max(1, now() - Number(e.lastUsed || 0));
+      const score=(Number(e.hits || 0)+1) / age;
+      if (score < victimScore){ victimScore=score; victimKey=k; }
+    }
+    if (!victimKey) break;
+    const old=map.get(victimKey);
+    hybridSurfaceRuntime[bytesProp] -= Number(old?.bytes || 0);
+    map.delete(victimKey);
+    hybridSurfaceRuntime.metrics.evictions++;
+  }
+}
+
+function surfaceRemember(tier, key, value, bytes, meta={}){
+  const cfg=surfaceConfig();
+  if (cfg.enabled === false || !key || !value) return value;
+  const map=tier === "hot" ? hybridSurfaceRuntime.hot : tier === "bitset" ? hybridSurfaceRuntime.bitsets : hybridSurfaceRuntime.warm;
+  const bytesProp=tier === "hot" ? "hotBytes" : tier === "bitset" ? "bitsetBytes" : "warmBytes";
+  const safeBytes=Math.max(0, Number(bytes || estimateTileBytes(value, meta.representation)));
+  if (tier === "hot" && safeBytes > cfg.hotBudgetBytes) return value;
+  if (tier === "warm" && safeBytes > cfg.warmBudgetBytes) return value;
+  if (tier === "bitset" && safeBytes > cfg.bitsetBudgetBytes) return value;
+  if (map.has(key)){
+    const old=map.get(key);
+    hybridSurfaceRuntime[bytesProp] -= Number(old.bytes || 0);
+    map.delete(key);
+  }
+  map.set(key,{value,bytes:safeBytes,lastUsed:now(),createdAt:now(),hits:0,...meta});
+  hybridSurfaceRuntime[bytesProp] += safeBytes;
+  if (tier === "bitset") hybridSurfaceRuntime.metrics.bitsetWrites++;
+  surfaceEvictTier(tier);
+  return value;
+}
+
+function surfaceClear(){
+  hybridSurfaceRuntime.hot.clear();
+  hybridSurfaceRuntime.warm.clear();
+  hybridSurfaceRuntime.bitsets.clear();
+  hybridSurfaceRuntime.hotBytes=0;
+  hybridSurfaceRuntime.warmBytes=0;
+  hybridSurfaceRuntime.bitsetBytes=0;
+  hybridSurfaceRuntime.metrics={requests:0,hotHits:0,warmHits:0,opfsReads:0,memoryReads:0,promotions:0,evictions:0,prefetches:0,bitsetHits:0,bitsetWrites:0,distributedDispatches:0,scaleUpDispatches:0,scaleOutDispatches:0};
+  clearChunkCache();
+  return hybridSurfaceStatus({cleared:true});
+}
+
+function configureHybridSurfaceBus(config={}){
+  state.hybridSurfaceBus={...surfaceDefaultConfig(),...(state.hybridSurfaceBus || {}),...config};
+  return hybridSurfaceStatus();
+}
+
+function configureExecutionPlane(config={}){
+  state.executionPlane={...executionPlaneDefaultConfig(),...(state.executionPlane || {}),...config};
+  return executionPlaneStatus();
+}
+
+function hybridSurfaceStatus(extra={}){
+  const cfg=surfaceConfig();
+  return {
+    hybridSurfaceBusVersion:HYBRID_SURFACE_BUS_VERSION,
+    enabled:cfg.enabled !== false,
+    tiering:cfg.tiering !== false,
+    autoPromote:cfg.autoPromote !== false,
+    prefetch:cfg.prefetch !== false,
+    bitsetCache:cfg.bitsetCache !== false,
+    hotEntries:hybridSurfaceRuntime.hot.size,
+    warmEntries:hybridSurfaceRuntime.warm.size,
+    bitsetEntries:hybridSurfaceRuntime.bitsets.size,
+    hotMB:Math.round(hybridSurfaceRuntime.hotBytes / 1024 / 1024),
+    warmMB:Math.round(hybridSurfaceRuntime.warmBytes / 1024 / 1024),
+    bitsetMB:Math.round(hybridSurfaceRuntime.bitsetBytes / 1024 / 1024),
+    metrics:{...hybridSurfaceRuntime.metrics},
+    chunkCache:chunkCacheSnapshot(),
+    ...extra
+  };
+}
+
+function executionPlaneStatus(extra={}){
+  const cfg=executionPlaneConfig();
+  return {
+    executionPlaneVersion:EXECUTION_PLANE_VERSION,
+    enabled:cfg.enabled !== false,
+    scaleUp:cfg.scaleUp !== false,
+    scaleOut:cfg.scaleOut !== false,
+    distributedReduce:cfg.distributedReduce !== false,
+    preferRemote:!!cfg.preferRemote,
+    workerPoolThresholdChunks:Number(cfg.workerPoolThresholdChunks || 8),
+    remoteThresholdRows:Number(cfg.remoteThresholdRows || 2_000_000),
+    surfaceAware:cfg.surfaceAware !== false,
+    mode:cfg.mode || "adaptive",
+    surface:hybridSurfaceStatus(),
+    ...extra
+  };
+}
+
+function shouldPromoteSurfaceTile(req, value, options={}){
+  const cfg=surfaceConfig();
+  if (cfg.autoPromote === false) return false;
+  if (req.hot === true || options.hot === true) return true;
+  const hotColumns=options.surfacePlan?.hotColumns || options.hotColumns || [];
+  if (hotColumns.includes(Number(req.columnIndex))) return true;
+  const key=req.key;
+  const warm=key ? hybridSurfaceRuntime.warm.get(key) : null;
+  return Number(warm?.hits || 0) + 1 >= Number(cfg.promotionReadThreshold || 2);
+}
+
+function memoryColumnTile(chunkIndex, columnIndex){
+  const memChunk=state.memory?.chunks?.[Number(chunkIndex)];
+  if (!memChunk) return null;
+  return memChunk.columns?.get(Number(columnIndex)) || null;
+}
+
+async function readSurfaceTiles(tileRequests, options={}){
+  const cfg=surfaceConfig();
+  const requests=Array.isArray(tileRequests) ? tileRequests : [];
+  const tiles=new Map();
+  const stats={fromHot:0,fromWarm:0,fromOPFS:0,fromMemory:0,promoted:0,bytes:0,requests:requests.length};
+  if (!requests.length) return {tiles,stats,status:hybridSurfaceStatus()};
+
+  for (const raw of requests){
+    if (state.cancelled) throw new Error("Cancelled");
+    const req={representation:"column",...raw};
+    const datasetId=req.datasetId || activeSurfaceDatasetId();
+    const key=req.key || surfaceTileKey(datasetId, req.chunkIndex, req.columnIndex, req.representation);
+    req.key=key;
+    hybridSurfaceRuntime.metrics.requests++;
+
+    if (cfg.enabled !== false){
+      const hot=surfaceTouch(hybridSurfaceRuntime.hot,key,"hot");
+      if (hot){ tiles.set(key,hot); stats.fromHot++; stats.bytes += estimateTileBytes(hot,req.representation); continue; }
+      const warm=surfaceTouch(hybridSurfaceRuntime.warm,key,"warm");
+      if (warm){
+        tiles.set(key,warm); stats.fromWarm++; stats.bytes += estimateTileBytes(warm,req.representation);
+        if (shouldPromoteSurfaceTile(req,warm,options)){
+          surfaceRemember("hot",key,warm,estimateTileBytes(warm,req.representation),{representation:req.representation,datasetId,chunkIndex:req.chunkIndex,columnIndex:req.columnIndex,promoted:true});
+          hybridSurfaceRuntime.metrics.promotions++; stats.promoted++;
+        }
+        continue;
+      }
+    }
+
+    let value=null;
+    if (activeIsMemory()){
+      value=memoryColumnTile(req.chunkIndex, req.columnIndex);
+      if (!value) continue;
+      hybridSurfaceRuntime.metrics.memoryReads++;
+      stats.fromMemory++;
+    } else {
+      const target=options.target && Number(options.target.physicalChunkIndex) === Number(req.physicalChunkIndex ?? options.target.physicalChunkIndex) ? options.target : await resolveChunkReadTarget(req.chunkIndex);
+      const cols=options.cols || target.sourceManifest?.columns || state.manifest?.columns || [];
+      const col=cols[Number(req.columnIndex)];
+      if (!col) continue;
+      value=await readCachedColumn(target,col);
+      hybridSurfaceRuntime.metrics.opfsReads++;
+      stats.fromOPFS++;
+    }
+    const bytes=estimateTileBytes(value,req.representation);
+    stats.bytes += bytes;
+    if (cfg.enabled !== false){
+      const tier=shouldPromoteSurfaceTile(req,value,options) ? "hot" : "warm";
+      surfaceRemember(tier,key,value,bytes,{representation:req.representation,datasetId,chunkIndex:req.chunkIndex,columnIndex:req.columnIndex});
+      if (tier === "hot"){ hybridSurfaceRuntime.metrics.promotions++; stats.promoted++; }
+    }
+    tiles.set(key,value);
+  }
+  return {tiles,stats,status:hybridSurfaceStatus()};
+}
+
+function buildSurfaceReadPlan(planOrObservationPlan, strategy={}){
+  const hot=new Set();
+  const warm=new Set();
+  const required=new Set(Array.isArray(planOrObservationPlan?.requiredColumns) ? planOrObservationPlan.requiredColumns.map(Number) : []);
+  for (const p of planOrObservationPlan?.predicates || []){ hot.add(Number(p.columnIndex)); required.add(Number(p.columnIndex)); }
+  for (const g of planOrObservationPlan?.filterGroups || []) for (const p of g.conditions || []){ hot.add(Number(p.columnIndex)); required.add(Number(p.columnIndex)); }
+  if (planOrObservationPlan?.sort){ hot.add(Number(planOrObservationPlan.sort.columnIndex)); required.add(Number(planOrObservationPlan.sort.columnIndex)); }
+  const a=planOrObservationPlan?.aggregate;
+  if (a){
+    for (const idx of [...(a.rowIdx || []), ...(a.colIdx || []), a.timeIdx, a.groupIdx, a.valIdx]){
+      const n=Number(idx); if (Number.isFinite(n) && n >= 0){ required.add(n); hot.add(n); }
+    }
+  }
+  for (const idx of required) if (!hot.has(idx)) warm.add(idx);
+  return {
+    version:HYBRID_SURFACE_BUS_VERSION,
+    surface:"chunk-column-tile",
+    hotColumns:[...hot].filter(Number.isFinite).sort((a,b)=>a-b),
+    warmColumns:[...warm].filter(Number.isFinite).sort((a,b)=>a-b),
+    requiredColumns:[...required].filter(Number.isFinite).sort((a,b)=>a-b),
+    strategy:strategy?.predicateMode || null
+  };
+}
+
+function predicateBitsetSurfaceKey(chunk, predicate){
+  const s=chunk?.surface || {};
+  const datasetId=s.datasetId || activeSurfaceDatasetId();
+  const physicalChunkIndex=s.physicalChunkIndex ?? s.chunkIndex ?? 0;
+  const raw=`${predicate?.columnIndex}|${predicate?.op}|${predicate?.targetRaw ?? predicate?.value ?? ""}|${predicate?.type}|${predicate?.rowLevel !== false}`;
+  return surfaceTileKey(datasetId, physicalChunkIndex, hashText32(raw), "predicate-bitset");
+}
+
+function evaluatePredicateBitsetSurfaceCached(chunk, predicate){
+  const cfg=surfaceConfig();
+  if (cfg.bitsetCache !== false && chunk?.surface && predicate?.rowLevel !== false){
+    const key=predicateBitsetSurfaceKey(chunk,predicate);
+    const cached=surfaceTouch(hybridSurfaceRuntime.bitsets,key,"bitset");
+    if (cached && Number(cached.rowCount || chunk.rowCount) === Number(chunk.rowCount || 0)) return cached.bitset || cached;
+    const bs=evaluatePredicateBitset(chunk,predicate);
+    surfaceRemember("bitset",key,{bitset:bs,rowCount:chunk.rowCount},Number(bs.byteLength || 0),{representation:"predicate-bitset",predicate:{columnIndex:predicate.columnIndex,op:predicate.op}});
+    return bs;
+  }
+  return evaluatePredicateBitset(chunk,predicate);
+}
+
+async function prefetchSurfaceForPlan(chunks, oplan, strategy={}){
+  const cfg=surfaceConfig();
+  if (cfg.prefetch === false) return {prefetched:0,reason:"prefetch disabled"};
+  const surfacePlan=buildSurfaceReadPlan(oplan,strategy);
+  const cols=surfacePlan.hotColumns.slice(0,8);
+  if (!cols.length) return {prefetched:0,reason:"no hot columns"};
+  const maxChunks=Math.min(Number(chunks?.length || 0), 4);
+  const requests=[];
+  for (let i=0;i<maxChunks;i++) for (const columnIndex of cols) requests.push({chunkIndex:chunks[i],columnIndex,representation:"column",hot:true});
+  if (!requests.length) return {prefetched:0};
+  hybridSurfaceRuntime.metrics.prefetches += requests.length;
+  await readSurfaceTiles(requests,{surfacePlan,hot:true});
+  return {prefetched:requests.length,surfacePlan};
+}
+
+function chooseExecutionPlane(plan, options={}, strategy={}, cost={}){
+  const cfg=executionPlaneConfig();
+  const chunks=Array.isArray(options.chunks) ? options.chunks : selectChunksForPlan(plan);
+  const totalRows=Number(cost?.totalRows || state.manifest?.totalRows || 0);
+  const remoteCfg=state.remoteExecution || {};
+  const remoteEligible=cfg.scaleOut !== false && canUseRemoteExecution(plan, options, chunks);
+  const remotePreferred=remoteEligible && (cfg.preferRemote || remoteCfg.mode === "remote-first" || remoteCfg.mode === "remote-only" || totalRows >= Number(cfg.remoteThresholdRows || 2_000_000));
+  const poolOptions={...options,adaptive:false,observation:false};
+  const workerPoolEligible=cfg.scaleUp !== false && chunks.length >= Number(cfg.workerPoolThresholdChunks || 8) && canUseChunkWorkerPool(plan,poolOptions,chunks);
+  let mode="single-surface-worker";
+  let scale="single";
+  let reason="surface-aware single worker";
+  if (remotePreferred){ mode="scale-out-remote"; scale="scale-out"; reason="remote execution adapter is eligible/preferred"; }
+  else if (workerPoolEligible){ mode="scale-up-worker-pool"; scale="scale-up"; reason="chunk surface can be sharded across local workers"; }
+  else if (activeIsMemory()){ mode="memory-surface"; scale="scale-up-memory"; reason="active dataset is already memory-resident"; }
+  return {
+    version:EXECUTION_PLANE_VERSION,
+    enabled:cfg.enabled !== false,
+    mode,
+    scale,
+    reason,
+    chunks:chunks.length,
+    totalRows,
+    remoteEligible,
+    workerPoolEligible,
+    distributedReduce:cfg.distributedReduce !== false,
+    surfaceAware:cfg.surfaceAware !== false,
+    busVersion:HYBRID_SURFACE_BUS_VERSION
+  };
+}
+
+function decorateExecutionWithPlane(exec, plane, surfacePlan=null){
+  exec.executionPlane=plane;
+  exec.hybridSurface=hybridSurfaceStatus();
+  exec.surfaceReadPlan=surfacePlan;
+  exec.queryPlan={...(exec.queryPlan || {}),executionPlane:plane,hybridSurface:hybridSurfaceStatus(),surfaceReadPlan:surfacePlan};
+  return exec;
+}
+
+async function readChunkColumns(chunkIndex, colIndices, options={}){
+  const unique=[...new Set((Array.isArray(colIndices) ? colIndices : []).map(Number).filter(i=>Number.isFinite(i)))];
   if (activeIsMemory()){
     const memChunk=state.memory.chunks[chunkIndex];
     if (!memChunk) throw new Error(`In-memory chunk is out of range: ${chunkIndex}`);
-    const result={rowCount:memChunk.rowCount, columns:new Map(), cache:chunkCacheSnapshot()};
-    for (const idx of colIndices){
-      const stored=memChunk.columns.get(Number(idx));
-      if (stored) result.columns.set(Number(idx), stored);
+    const result={rowCount:memChunk.rowCount, columns:new Map(), cache:chunkCacheSnapshot(), surface:{datasetId:activeSurfaceDatasetId(),chunkIndex,physicalChunkIndex:chunkIndex,mode:"memory"}};
+    const requests=unique.map(columnIndex=>({chunkIndex,columnIndex,representation:"column",datasetId:result.surface.datasetId,hot:options?.surfacePlan?.hotColumns?.includes(columnIndex)}));
+    const surface=await readSurfaceTiles(requests,{...options,surfacePlan:options.surfacePlan});
+    for (const req of requests){
+      const key=surfaceTileKey(result.surface.datasetId,chunkIndex,req.columnIndex,"column");
+      const stored=surface.tiles.get(key) || memChunk.columns.get(Number(req.columnIndex));
+      if (stored) result.columns.set(Number(req.columnIndex), stored);
     }
+    result.surface.stats=surface.stats;
+    result.surface.status=surface.status;
     return result;
   }
 
   const target=await resolveChunkReadTarget(chunkIndex);
-  const result={rowCount:target.rowCount, columns:new Map(), cache:chunkCacheSnapshot()};
   const cols=(target.sourceManifest.columns || state.manifest.columns || []);
-  const unique=[...new Set((Array.isArray(colIndices) ? colIndices : []).map(Number).filter(i=>Number.isFinite(i)))];
+  const surfacePlan=options.surfacePlan || null;
+  const requests=unique.map(columnIndex=>({
+    datasetId:target.datasetId,
+    chunkIndex,
+    physicalChunkIndex:target.physicalChunkIndex,
+    columnIndex,
+    representation:"column",
+    hot:surfacePlan?.hotColumns?.includes(Number(columnIndex))
+  }));
+  const surface=await readSurfaceTiles(requests,{...options,target,cols,surfacePlan});
+  const result={rowCount:target.rowCount, columns:new Map(), cache:chunkCacheSnapshot(), surface:{datasetId:target.datasetId,chunkIndex,physicalChunkIndex:target.physicalChunkIndex,mode:target.external ? "external" : activeIsVirtual() ? "virtual" : "opfs",stats:surface.stats,status:surface.status}};
 
-  for (const idx of unique){
-    const col=cols[idx];
-    if (!col) continue;
-    result.columns.set(idx, await readCachedColumn(target, col));
+  for (const req of requests){
+    const key=surfaceTileKey(target.datasetId,req.physicalChunkIndex,req.columnIndex,"column");
+    const key2=surfaceTileKey(target.datasetId,chunkIndex,req.columnIndex,"column");
+    const value=surface.tiles.get(key) || surface.tiles.get(key2);
+    if (value) result.columns.set(Number(req.columnIndex), value);
   }
   result.cache=chunkCacheSnapshot();
   return result;
@@ -5168,6 +5609,31 @@ self.onmessage=async(e)=>{
       return;
     }
 
+    if (msg.type==="HYBRID_SURFACE_CONFIG"){
+      post("HYBRID_SURFACE_STATUS", configureHybridSurfaceBus(msg.config || msg));
+      return;
+    }
+
+    if (msg.type==="HYBRID_SURFACE_STATUS"){
+      post("HYBRID_SURFACE_STATUS", hybridSurfaceStatus());
+      return;
+    }
+
+    if (msg.type==="HYBRID_SURFACE_CLEAR"){
+      post("HYBRID_SURFACE_STATUS", surfaceClear());
+      return;
+    }
+
+    if (msg.type==="EXECUTION_PLANE_CONFIG"){
+      post("EXECUTION_PLANE_STATUS", configureExecutionPlane(msg.config || msg));
+      return;
+    }
+
+    if (msg.type==="EXECUTION_PLANE_STATUS"){
+      post("EXECUTION_PLANE_STATUS", executionPlaneStatus());
+      return;
+    }
+
     if (msg.type==="ADAPTIVE_KERNEL_CONFIG"){
       post("ADAPTIVE_KERNEL_STATUS", configureAdaptiveKernel(msg.config || msg));
       return;
@@ -5189,7 +5655,7 @@ self.onmessage=async(e)=>{
       const oplan=buildObservationPlan(previewPlan);
       const cost=estimatePlanCost(previewPlan, oplan);
       const strategy=chooseAdaptiveStrategy(previewPlan, oplan, cost, msg.options || {});
-      post("HYPERTENSOR_PLAN_PREVIEW_DONE", {operatorGraph:operatorGraphSummary(graph), observationPlan:observationPlanSummary(oplan), costModel:cost, adaptiveStrategy:strategy});
+      post("HYPERTENSOR_PLAN_PREVIEW_DONE", {operatorGraph:operatorGraphSummary(graph), observationPlan:observationPlanSummary(oplan), costModel:cost, adaptiveStrategy:strategy, executionPlane:chooseExecutionPlane(previewPlan,msg.options || {},strategy,cost), hybridSurface:hybridSurfaceStatus(), surfaceReadPlan:buildSurfaceReadPlan(oplan,strategy)});
       return;
     }
 
@@ -9595,6 +10061,18 @@ function App() {
         setBusy(false);
         return;
       }
+      if (msg.type === "HYBRID_SURFACE_STATUS") {
+        appendLog(`Hybrid Surface Bus: ${JSON.stringify(msg)}`);
+        setStatus(`Hybrid Surface ${msg.enabled ? "enabled" : "disabled"} / hot ${fmt(msg.hotEntries || 0)} / warm ${fmt(msg.warmEntries || 0)} / bitsets ${fmt(msg.bitsetEntries || 0)}`);
+        setBusy(false);
+        return;
+      }
+      if (msg.type === "EXECUTION_PLANE_STATUS") {
+        appendLog(`Execution Plane: ${JSON.stringify(msg)}`);
+        setStatus(`Execution Plane ${msg.enabled ? "enabled" : "disabled"} / scale-up ${msg.scaleUp ? "on" : "off"} / scale-out ${msg.scaleOut ? "on" : "off"}`);
+        setBusy(false);
+        return;
+      }
       if (msg.type === "ADAPTIVE_KERNEL_STATUS") {
         appendLog(`Adaptive Kernel: ${JSON.stringify(msg)}`);
         setStatus(`Adaptive Kernel ${msg.enabled ? "enabled" : "disabled"} / ${msg.mode || "adaptive"}`);
@@ -9980,6 +10458,11 @@ function App() {
       ADAPTIVE_KERNEL_STATUS: "Adaptive状態確認",
       ADAPTIVE_KERNEL_CONFIG: "Adaptive設定",
       ADAPTIVE_CACHE_CLEAR: "Adaptiveキャッシュ削除",
+      HYBRID_SURFACE_STATUS: "Hybrid Surface状態確認",
+      HYBRID_SURFACE_CONFIG: "Hybrid Surface設定",
+      HYBRID_SURFACE_CLEAR: "Hybrid Surfaceキャッシュ削除",
+      EXECUTION_PLANE_STATUS: "Execution Plane状態確認",
+      EXECUTION_PLANE_CONFIG: "Execution Plane設定",
       HYPERTENSOR_PLAN_PREVIEW: "HyperTensor計画プレビュー",
       EXTERNAL_STORAGE_TEST: "External Storage接続確認",
       EXTERNAL_STORAGE_LIST: "External Storage一覧取得",
