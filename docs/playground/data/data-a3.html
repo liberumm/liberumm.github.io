@@ -7181,6 +7181,7 @@ function visualRowsFingerprint(rows){
   return `${list.length}|${a}|${z}`;
 }
 
+
 function VisualHyperTensorTableView({
   tableId = "visualTable",
   header = [],
@@ -7206,8 +7207,10 @@ function VisualHyperTensorTableView({
   const baseHeader = Array.isArray(header) ? header : [];
   const baseRows = Array.isArray(rows) ? rows : [];
   const rowHeight = dense ? 26 : 32;
-  const headerHeight = dense ? 32 : 38;
-  const toolbarHeight = 38;
+  const labelHeaderHeight = dense ? 32 : 38;
+  const filterRowHeight = filterable && !externalLazy ? (dense ? 31 : 35) : 0;
+  const headerHeight = labelHeaderHeight + filterRowHeight;
+  const toolbarHeight = dense ? 34 : 38;
   const canvasHeight = Math.max(120, Number(height || 520) - toolbarHeight);
   const bodyViewportHeight = Math.max(80, canvasHeight - headerHeight);
   const displayHeader = useMemo(() => showRowNumber ? ["#", ...baseHeader] : baseHeader, [baseHeader, showRowNumber]);
@@ -7219,20 +7222,46 @@ function VisualHyperTensorTableView({
   const readTimerRef = useRef(0);
   const requestRef = useRef({page:Number(page || 1), pageSize:Number(pageSize || 1000), at:0});
   const resizeDragRef = useRef(null);
+  const lazyPageCacheRef = useRef(new Map());
+  const lastGoodWindowRef = useRef(null);
   const metricsRef = useRef({frames:0, lastMetricAt:visualNow(), lastPaintMs:0, avgPaintMs:0, dropped:0, fps:0, mode:"canvas"});
   const [selected, setSelected] = useState({row:-1, col:-1});
   const [sort, setSort] = useState({index:-1, direction:"asc"});
   const [globalFilter, setGlobalFilter] = useState("");
+  const [columnFilters, setColumnFilters] = useState({});
   const [pendingPage, setPendingPage] = useState(null);
   const [renderStats, setRenderStats] = useState({fps:0, avgPaintMs:0, lastPaintMs:0, dropped:0, visibleRows:0, visibleCols:0, cacheMode:"viewport-canvas"});
 
   const { columnWidths, getColumnWidth, setColumnWidth, resetColumnWidth, clearColumnWidths } = useTileColumnWidths(displayHeader, tableId, minColumnWidth);
+  const columnFilterKey = useMemo(() => JSON.stringify(columnFilters || {}), [columnFilters]);
+
+  const lazyResetKey = useMemo(() => {
+    if (!externalLazy) return "";
+    return `${tableId}|${headerKey}|${Number(totalRows || 0)}|${String(pageSize || "auto")}|${resetKey || ""}`;
+  }, [externalLazy, tableId, headerKey, totalRows, pageSize, resetKey]);
 
   useEffect(() => {
     setSort({index:-1, direction:"asc"});
     setGlobalFilter("");
+    setColumnFilters({});
     setSelected({row:-1, col:-1});
+    lastGoodWindowRef.current = null;
+    lazyPageCacheRef.current.clear();
   }, [headerKey, tableId, resetKey]);
+
+  useEffect(() => {
+    if (!externalLazy) return;
+    lazyPageCacheRef.current.clear();
+    lastGoodWindowRef.current = null;
+    requestRef.current = {page:0, pageSize:Number(pageSize || 1000), at:0};
+    setPendingPage(null);
+    if (scrollRef.current) {
+      scrollRef.current.scrollTop = 0;
+      scrollRef.current.scrollLeft = 0;
+    }
+    stateRef.current.scrollTop = 0;
+    stateRef.current.scrollLeft = 0;
+  }, [externalLazy, lazyResetKey]);
 
   const decoratedRows = useMemo(() => {
     if (!showRowNumber) return baseRows;
@@ -7248,6 +7277,13 @@ function VisualHyperTensorTableView({
     if (filterable && q) {
       next = next.filter((row) => (Array.isArray(row) ? row : []).some((cell) => normalizeTileCell(cell).toLowerCase().includes(q)));
     }
+    const activeColumnFilters = Object.entries(columnFilters || {}).filter(([, value]) => String(value || "").trim() !== "");
+    if (filterable && activeColumnFilters.length) {
+      next = next.filter((row) => activeColumnFilters.every(([index, value]) => {
+        const cell = normalizeTileCell(row?.[Number(index)]).toLowerCase();
+        return cell.includes(String(value || "").trim().toLowerCase());
+      }));
+    }
     if (sortable && sort.index >= 0) {
       const dir = sort.direction === "desc" ? -1 : 1;
       next = [...next].sort((a,b) => {
@@ -7260,7 +7296,7 @@ function VisualHyperTensorTableView({
       });
     }
     return next;
-  }, [decoratedRows, externalLazy, filterable, globalFilter, sortable, sort]);
+  }, [decoratedRows, externalLazy, filterable, globalFilter, columnFilterKey, sortable, sort]);
 
   const safeTotal = Math.max(0, Number(totalRows == null ? processedRows.length : totalRows) || 0, externalLazy ? baseRows.length : 0);
   const safePageSize = externalLazy
@@ -7310,6 +7346,25 @@ function VisualHyperTensorTableView({
     }
   }, [externalLazy, onReadPage, safePageSize, safeTotal, totalPages]);
 
+  const findCachedLazyRows = useCallback((start, end) => {
+    const pages = [...lazyPageCacheRef.current.values()].sort((a,b) => Number(a.start || 0) - Number(b.start || 0));
+    let best = null;
+    let bestOverlap = -1;
+    for (const item of pages) {
+      const rows = Array.isArray(item.rows) ? item.rows : [];
+      const itemStart = Number(item.start || 0);
+      const itemEnd = itemStart + rows.length;
+      const overlapStart = Math.max(start, itemStart);
+      const overlapEnd = Math.min(end, itemEnd);
+      const overlap = Math.max(0, overlapEnd - overlapStart);
+      if (overlap > bestOverlap) {
+        bestOverlap = overlap;
+        best = {...item, overlapStart, overlapEnd, overlap};
+      }
+    }
+    return best;
+  }, []);
+
   const readRenderWindow = useCallback(() => {
     const scrollTop = stateRef.current.scrollTop || scrollRef.current?.scrollTop || 0;
     const scrollLeft = stateRef.current.scrollLeft || scrollRef.current?.scrollLeft || 0;
@@ -7320,29 +7375,49 @@ function VisualHyperTensorTableView({
     let renderRows = [];
     let renderAbsStart = start;
     let loading = false;
+    let stale = false;
     let loadedRangeText = `${fmt(1)} - ${fmt(processedRows.length)}`;
+
     if (externalLazy) {
-      const loadedAbsStart = safeLoadedStart;
-      const loadedAbsEnd = loadedAbsStart + decoratedRows.length;
-      const overlapStart = Math.max(start, loadedAbsStart);
-      const overlapEnd = Math.min(end, loadedAbsEnd);
-      if (!decoratedRows.length || overlapEnd <= overlapStart) {
-        loading = safeTotal > 0;
-        renderRows = [];
-        renderAbsStart = start;
-      } else {
-        const localStart = Math.max(0, overlapStart - loadedAbsStart);
-        const localEnd = Math.min(decoratedRows.length, Math.max(localStart, overlapEnd - loadedAbsStart));
-        renderRows = decoratedRows.slice(localStart, localEnd);
-        renderAbsStart = overlapStart;
+      if (decoratedRows.length) {
+        const key = String(safeLoadedStart);
+        lazyPageCacheRef.current.set(key, {start:safeLoadedStart, rows:decoratedRows, at:visualNow()});
+        if (lazyPageCacheRef.current.size > 10) {
+          const oldest = [...lazyPageCacheRef.current.entries()].sort((a,b) => Number(a[1].at || 0) - Number(b[1].at || 0))[0];
+          if (oldest) lazyPageCacheRef.current.delete(oldest[0]);
+        }
       }
-      loadedRangeText = decoratedRows.length ? `${fmt(loadedAbsStart + 1)} - ${fmt(Math.min(loadedAbsEnd, safeTotal))}` : "未読込";
+      const best = findCachedLazyRows(start, end);
+      if (best && best.overlap > 0) {
+        const localStart = Math.max(0, best.overlapStart - Number(best.start || 0));
+        const localEnd = Math.min(best.rows.length, Math.max(localStart, best.overlapEnd - Number(best.start || 0)));
+        renderRows = best.rows.slice(localStart, localEnd);
+        renderAbsStart = best.overlapStart;
+        lastGoodWindowRef.current = {rows:renderRows, absStart:renderAbsStart, start, end, at:visualNow()};
+      } else {
+        loading = safeTotal > 0;
+        const last = lastGoodWindowRef.current;
+        if (last?.rows?.length) {
+          renderRows = last.rows;
+          renderAbsStart = start;
+          stale = true;
+        } else if (decoratedRows.length) {
+          renderRows = decoratedRows.slice(0, Math.min(decoratedRows.length, viewportRows + VISUAL_RENDER_OVERSCAN_ROWS));
+          renderAbsStart = start;
+          stale = true;
+        }
+      }
+      const activeRows = decoratedRows.length;
+      const loadedAbsStart = safeLoadedStart;
+      const loadedAbsEnd = loadedAbsStart + activeRows;
+      loadedRangeText = activeRows ? `${fmt(loadedAbsStart + 1)} - ${fmt(Math.min(loadedAbsEnd, safeTotal))}` : "未読込";
     } else {
       renderRows = processedRows.slice(start, end);
       renderAbsStart = start;
+      if (renderRows.length) lastGoodWindowRef.current = {rows:renderRows, absStart:renderAbsStart, start, end, at:visualNow()};
     }
-    return {scrollTop, scrollLeft, viewport, start, end, columns, renderRows, renderAbsStart, loading, loadedRangeText};
-  }, [canvasHeight, decoratedRows, externalLazy, prefix, processedRows, safeLoadedStart, safeTotal, virtualRowFromBodyTop, viewportRows, widths]);
+    return {scrollTop, scrollLeft, viewport, start, end, columns, renderRows, renderAbsStart, loading, stale, loadedRangeText};
+  }, [canvasHeight, decoratedRows, externalLazy, findCachedLazyRows, prefix, processedRows, safeLoadedStart, safeTotal, virtualRowFromBodyTop, viewportRows, widths]);
 
   const paintVisualFrame = useCallback((reason = "paint") => {
     const canvas = canvasRef.current;
@@ -7376,39 +7451,11 @@ function VisualHyperTensorTableView({
 
     ctx.save();
     ctx.beginPath();
-    ctx.rect(0, 0, viewportWidth, headerHeight);
-    ctx.clip();
-    ctx.fillStyle = subtle;
-    ctx.fillRect(0, 0, viewportWidth, headerHeight);
-    ctx.font = `${dense ? 700 : 800} ${dense ? 11 : 12}px Roboto, Meiryo, Arial, sans-serif`;
-    ctx.textBaseline = "middle";
-    for (const ci of visibleCols){
-      const x = Number(prefix[ci] || 0) - win.scrollLeft;
-      const w = Number(widths[ci] || 0);
-      if (x > viewportWidth || x + w < 0) continue;
-      ctx.fillStyle = gridColor;
-      ctx.fillRect(Math.round(x + w) - 0.5, 0, 1, headerHeight);
-      ctx.fillStyle = textColor;
-      const label = normalizeTileCell(displayHeader[ci]);
-      const suffix = sort.index === ci ? (sort.direction === "desc" ? " ↓" : " ↑") : "";
-      ctx.save();
-      ctx.beginPath();
-      ctx.rect(x + 6, 0, Math.max(1, w - 14), headerHeight);
-      ctx.clip();
-      ctx.fillText(label + suffix, x + 8, headerHeight / 2);
-      ctx.restore();
-    }
-    ctx.fillStyle = gridColor;
-    ctx.fillRect(0, headerHeight - 1, viewportWidth, 1);
-    ctx.restore();
-
-    ctx.save();
-    ctx.beginPath();
     ctx.rect(0, headerHeight, viewportWidth, bodyViewportHeight);
     ctx.clip();
     ctx.font = `${dense ? 11 : 12}px Roboto, Meiryo, Arial, sans-serif`;
     ctx.textBaseline = "middle";
-    if (win.loading) {
+    if (win.loading && !win.renderRows.length) {
       ctx.fillStyle = textColor;
       ctx.fillText("表示範囲のRow Surfaceを読み込み中...", 16, headerHeight + 30);
     } else if (!win.renderRows.length && !safeTotal) {
@@ -7434,7 +7481,7 @@ function VisualHyperTensorTableView({
         ctx.fillStyle = gridColor;
         ctx.fillRect(Math.round(x + w) - 0.5, y, 1, rowHeight);
         const text = normalizeTileCell(row?.[ci]);
-        ctx.fillStyle = textColor;
+        ctx.fillStyle = win.stale ? "rgba(100,116,139,.75)" : textColor;
         ctx.save();
         ctx.beginPath();
         ctx.rect(x + 6, y, Math.max(1, w - 12), rowHeight);
@@ -7444,6 +7491,13 @@ function VisualHyperTensorTableView({
       }
       ctx.fillStyle = gridColor;
       ctx.fillRect(0, Math.round(y + rowHeight) - 0.5, viewportWidth, 1);
+    }
+    if (win.loading && win.renderRows.length) {
+      ctx.fillStyle = "rgba(245,158,11,.90)";
+      ctx.fillRect(12, headerHeight + 8, Math.min(360, viewportWidth - 24), 24);
+      ctx.fillStyle = "#111827";
+      ctx.font = `${dense ? 10 : 11}px Roboto, Meiryo, Arial, sans-serif`;
+      ctx.fillText("読み込み中: 直前のRow Surfaceを保持表示しています", 20, headerHeight + 20);
     }
     if (selected.row >= 0 && selected.col >= 0 && selected.row >= win.start && selected.row < win.end) {
       const x = Number(prefix[selected.col] || 0) - win.scrollLeft;
@@ -7475,10 +7529,10 @@ function VisualHyperTensorTableView({
         dropped:m.dropped,
         visibleRows:win.renderRows.length,
         visibleCols:visibleCols.length,
-        cacheMode:`${reason} / ${externalLazy ? "row-slab-lazy" : "row-slab-local"}`,
+        cacheMode:`${reason} / ${externalLazy ? "row-slab-lazy" : "row-slab-local"}${win.stale ? " / stale-retained" : ""}`,
       });
     }
-  }, [bodyViewportHeight, canvasHeight, dense, displayHeader, emptyMessage, externalLazy, headerHeight, prefix, readRenderWindow, rowHeight, safeTotal, selected, sort, widths]);
+  }, [bodyViewportHeight, canvasHeight, dense, displayHeader, emptyMessage, externalLazy, headerHeight, prefix, readRenderWindow, rowHeight, safeTotal, selected, widths]);
 
   const schedulePaint = useCallback((reason = "schedule") => {
     if (rafRef.current) return;
@@ -7507,7 +7561,7 @@ function VisualHyperTensorTableView({
 
   useEffect(() => {
     schedulePaint("data");
-  }, [headerKey, visualRowsFingerprint(processedRows), visualRowsFingerprint(decoratedRows), widths.join("|"), safeTotal, canvasHeight, selected.row, selected.col, sort.index, sort.direction, globalFilter, schedulePaint]);
+  }, [headerKey, visualRowsFingerprint(processedRows), visualRowsFingerprint(decoratedRows), widths.join("|"), safeTotal, canvasHeight, selected.row, selected.col, sort.index, sort.direction, globalFilter, columnFilterKey, schedulePaint]);
 
   useEffect(() => () => {
     if (rafRef.current) cancelAnimationFrame(rafRef.current);
@@ -7518,6 +7572,13 @@ function VisualHyperTensorTableView({
     if (!externalLazy || !displayHeader.length || !safeTotal || baseRows.length) return;
     scheduleLazyReadPage(Math.max(1, Number(page || 1)), {force:true});
   }, [externalLazy, displayHeader.length, safeTotal, baseRows.length, page, scheduleLazyReadPage]);
+
+  useEffect(() => {
+    if (!externalLazy || !decoratedRows.length) return;
+    const key = String(safeLoadedStart);
+    lazyPageCacheRef.current.set(key, {start:safeLoadedStart, rows:decoratedRows, at:visualNow()});
+    schedulePaint("lazy-page-arrived");
+  }, [decoratedRows, externalLazy, safeLoadedStart, schedulePaint]);
 
   useEffect(() => {
     if (!externalLazy || pendingPage == null) return;
@@ -7539,10 +7600,12 @@ function VisualHyperTensorTableView({
       const nextPage = Math.min(Math.max(1, Math.floor(virtualStart / safePageSize) + 1), totalPages);
       const loadedAbsStart = safeLoadedStart;
       const loadedAbsEnd = loadedAbsStart + baseRows.length;
+      const cached = findCachedLazyRows(virtualStart, Math.min(safeTotal, virtualStart + viewportRows));
       const needsRead = baseRows.length === 0 || virtualStart < loadedAbsStart || virtualStart >= loadedAbsEnd;
-      if (needsRead || nextPage !== requestRef.current.page) scheduleLazyReadPage(nextPage, {force:needsRead});
+      if (needsRead && !(cached && cached.overlap > 0)) scheduleLazyReadPage(nextPage, {force:true});
+      else if (nextPage !== requestRef.current.page) scheduleLazyReadPage(nextPage, {force:false});
     }
-  }, [baseRows.length, externalLazy, safeLoadedStart, safePageSize, safeTotal, scheduleLazyReadPage, schedulePaint, totalPages, virtualRowFromBodyTop]);
+  }, [baseRows.length, externalLazy, findCachedLazyRows, safeLoadedStart, safePageSize, safeTotal, scheduleLazyReadPage, schedulePaint, totalPages, virtualRowFromBodyTop, viewportRows]);
 
   const toggleSort = useCallback((index) => {
     if (!sortable || externalLazy || index < 0) return;
@@ -7553,44 +7616,40 @@ function VisualHyperTensorTableView({
     });
   }, [externalLazy, sortable]);
 
+  const setColumnFilterValue = useCallback((index, value) => {
+    setColumnFilters((prev) => {
+      const next = {...prev};
+      const v = String(value || "");
+      if (v) next[index] = v;
+      else delete next[index];
+      return next;
+    });
+  }, []);
+
   const eventPoint = (event) => {
     const rect = canvasRef.current?.getBoundingClientRect?.();
     return {x:(event.clientX || 0) - (rect?.left || 0), y:(event.clientY || 0) - (rect?.top || 0)};
   };
 
-  const handleCanvasMouseDown = useCallback((event) => {
-    const p = eventPoint(event);
-    const scrollLeft = stateRef.current.scrollLeft || 0;
-    if (p.y <= headerHeight) {
-      const col = visualFindColumnAtX(prefix, widths, p.x + scrollLeft);
-      if (col >= 0) {
-        const right = Number(prefix[col] || 0) + Number(widths[col] || 0) - scrollLeft;
-        if (Math.abs(p.x - right) <= 8) {
-          event.preventDefault();
-          resizeDragRef.current = {col, startX:event.clientX || 0, startWidth:Number(widths[col] || 0)};
-          document.body.style.cursor = "col-resize";
-          document.body.style.userSelect = "none";
-          return;
-        }
-      }
-    }
-  }, [headerHeight, prefix, widths]);
-
   const handleCanvasClick = useCallback((event) => {
     if (resizeDragRef.current) return;
     const p = eventPoint(event);
     const meta = stateRef.current.lastPaintMeta;
-    if (!meta) return;
+    if (!meta || p.y <= headerHeight) return;
     const absX = p.x + (stateRef.current.scrollLeft || 0);
     const col = visualFindColumnAtX(prefix, widths, absX);
-    if (p.y <= headerHeight) {
-      toggleSort(col);
-      return;
-    }
     const local = Math.floor((p.y - headerHeight) / rowHeight);
     const row = Number(meta.start || 0) + local;
     if (row >= 0 && row < safeTotal && col >= 0) setSelected({row, col});
-  }, [headerHeight, prefix, rowHeight, safeTotal, toggleSort, widths]);
+  }, [headerHeight, prefix, rowHeight, safeTotal, widths]);
+
+  const startDomColumnResize = useCallback((event, col) => {
+    event.preventDefault();
+    event.stopPropagation();
+    resizeDragRef.current = {col, startX:event.clientX || 0, startWidth:Number(widths[col] || 0)};
+    document.body.style.cursor = "col-resize";
+    document.body.style.userSelect = "none";
+  }, [widths]);
 
   useEffect(() => {
     const onMove = (event) => {
@@ -7628,6 +7687,7 @@ function VisualHyperTensorTableView({
     ? (decoratedRows.length ? `${fmt(safeLoadedStart + 1)} - ${fmt(Math.min(safeLoadedStart + decoratedRows.length, safeTotal))}` : "未読込")
     : `${fmt(processedRows.length)} / ${fmt(decoratedRows.length)}`;
   const hasColumnWidths = Object.keys(columnWidths).length > 0;
+  const hasColumnFilters = Object.values(columnFilters || {}).some((v) => String(v || "").trim() !== "");
 
   return (
     <Box sx={{ width:"100%", maxWidth:"100%", minWidth:0, overflow:"hidden" }}>
@@ -7635,7 +7695,7 @@ function VisualHyperTensorTableView({
         <Stack direction="row" spacing={0.75} useFlexGap flexWrap="wrap" alignItems="center" sx={{ minHeight:toolbarHeight, px:1, py:0.55, bgcolor:"action.hover", borderBottom:"1px solid", borderColor:"divider" }}>
           <Chip size="small" color="primary" variant="outlined" label={sourceLabel} />
           <Chip size="small" label={`Visual HyperTensor v${VISUAL_HYPERTENSOR_RENDERER_VERSION}`} />
-          <Chip size="small" label="Canvas measured cells" />
+          <Chip size="small" label="Canvas body + DOM header" />
           <Chip size="small" label={`rows ${fmt(safeTotal)}`} />
           <Chip size="small" label={`cols ${fmt(displayHeader.length)}`} />
           {externalLazy && <Chip size="small" label={`loaded ${loadedRangeText}`} />}
@@ -7647,7 +7707,7 @@ function VisualHyperTensorTableView({
               size="small"
               value={globalFilter}
               onChange={(e) => setGlobalFilter(e.target.value)}
-              placeholder="viewport filter"
+              placeholder="全列検索"
               sx={{ width: 180, ml: 0.5 }}
               inputProps={{ style:{fontSize:12, padding:"5px 7px"} }}
             />
@@ -7657,15 +7717,53 @@ function VisualHyperTensorTableView({
         <Box
           ref={scrollRef}
           onScroll={handleScroll}
-          sx={{ height: canvasHeight, overflow:"auto", position:"relative", overscrollBehavior:"contain", bgcolor:"background.paper", contain:"layout paint size", contentVisibility:"auto" }}
+          sx={{ height: canvasHeight, overflow:"auto", position:"relative", overscrollBehavior:"contain", bgcolor:"background.paper", contain:"layout paint size" }}
         >
           <Box sx={{ position:"relative", width: totalWidth, height: headerHeight + contentHeight, minWidth:"100%" }}>
-            <Box sx={{ position:"sticky", top:0, left:0, width:0, height:0, zIndex:5 }}>
+            <Box sx={{ position:"sticky", top:0, zIndex:8, width:totalWidth, height:headerHeight, bgcolor:"background.paper", borderBottom:"1px solid", borderColor:"divider", display:"flex", boxShadow:"0 1px 0 rgba(148,163,184,.25)" }}>
+              {displayHeader.map((name, ci) => {
+                const w = Number(widths[ci] || minColumnWidth);
+                const activeSort = sort.index === ci;
+                const filterValue = columnFilters?.[ci] || "";
+                return (
+                  <Box key={`${tableId}-h-${ci}`} sx={{ width:w, minWidth:w, maxWidth:w, height:headerHeight, position:"relative", borderRight:"1px solid", borderColor:"divider", overflow:"hidden", bgcolor:activeSort ? "action.selected" : "background.paper" }}>
+                    <Button
+                      size="small"
+                      disabled={!sortable || externalLazy}
+                      onClick={() => toggleSort(ci)}
+                      title={externalLazy ? "大規模lazy表示では上部のGlobal filter / sortを使ってください" : "クリックで並び替え"}
+                      sx={{ justifyContent:"flex-start", width:"100%", minWidth:0, height:labelHeaderHeight, px:0.8, borderRadius:0, textTransform:"none", color:"text.primary", fontWeight:800, fontSize:dense ? 11 : 12 }}
+                    >
+                      <Box component="span" sx={{ overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap", display:"block", width:"100%", textAlign:"left" }}>
+                        {normalizeTileCell(name)}{activeSort ? (sort.direction === "desc" ? " ↓" : " ↑") : ""}
+                      </Box>
+                    </Button>
+                    {filterable && !externalLazy && (
+                      <Box sx={{ height:filterRowHeight, px:0.5, pb:0.35 }}>
+                        <input
+                          value={filterValue}
+                          onChange={(event) => setColumnFilterValue(ci, event.target.value)}
+                          placeholder="列フィルタ"
+                          aria-label={`${normalizeTileCell(name)} column filter`}
+                          style={{ width:"100%", height:Math.max(22, filterRowHeight - 7), boxSizing:"border-box", border:"1px solid rgba(148,163,184,.45)", borderRadius:6, padding:"2px 6px", fontSize:11, background:"rgba(255,255,255,.72)", color:"inherit", outline:"none" }}
+                        />
+                      </Box>
+                    )}
+                    <Box
+                      onMouseDown={(event) => startDomColumnResize(event, ci)}
+                      onDoubleClick={(event) => { event.preventDefault(); event.stopPropagation(); resetColumnWidth(ci); schedulePaint("resize-reset"); }}
+                      title="ドラッグで列幅調整 / ダブルクリックでリセット"
+                      sx={{ position:"absolute", top:0, right:-3, width:8, height:"100%", cursor:"col-resize", zIndex:2, "&:hover":{ bgcolor:"primary.main", opacity:0.35 } }}
+                    />
+                  </Box>
+                );
+              })}
+            </Box>
+            <Box sx={{ position:"sticky", top:0, left:0, width:0, height:0, zIndex:5, pointerEvents:"none" }}>
               <canvas
                 ref={canvasRef}
-                onMouseDown={handleCanvasMouseDown}
                 onClick={handleCanvasClick}
-                style={{ position:"absolute", left:0, top:0, cursor:"default", touchAction:"pan-x pan-y" }}
+                style={{ position:"absolute", left:0, top:0, cursor:"default", touchAction:"pan-x pan-y", pointerEvents:"auto" }}
               />
             </Box>
           </Box>
@@ -7673,12 +7771,12 @@ function VisualHyperTensorTableView({
       </Box>
       <Stack direction="row" justifyContent="space-between" alignItems="center" spacing={1} sx={{ mt:0.75, flexWrap:"wrap" }}>
         <Typography variant="caption" color="text.secondary">
-          GUI Surface Renderer: 再描画範囲はviewportだけ。Reactは外枠、Canvasは可視セル、Worker/Row Surfaceは必要slabだけを供給します。{` visible ${fmt(renderStats.visibleRows)}×${fmt(renderStats.visibleCols)} / dropped ${fmt(renderStats.dropped)}`}
+          GUI Surface Renderer: 本文はCanvas、ヘッダー操作はDOM overlay。{` visible ${fmt(renderStats.visibleRows)}×${fmt(renderStats.visibleCols)} / dropped ${fmt(renderStats.dropped)} / ${renderStats.cacheMode}`}
         </Typography>
         <Stack direction="row" spacing={0.5} sx={{ flexWrap:"wrap" }}>
           {hasColumnWidths && <Button size="small" onClick={clearColumnWidths}>Reset column widths</Button>}
           {selected.col >= 0 && <Button size="small" onClick={() => resetColumnWidth(selected.col)}>Reset selected column</Button>}
-          {(globalFilter || sort.index >= 0) && !externalLazy && <Button size="small" onClick={() => { setGlobalFilter(""); setSort({index:-1,direction:"asc"}); }}>Clear visual filters</Button>}
+          {(globalFilter || hasColumnFilters || sort.index >= 0) && !externalLazy && <Button size="small" onClick={() => { setGlobalFilter(""); setColumnFilters({}); setSort({index:-1,direction:"asc"}); }}>Clear filters/sort</Button>}
         </Stack>
       </Stack>
     </Box>
