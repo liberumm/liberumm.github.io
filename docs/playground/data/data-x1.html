@@ -2,7 +2,7 @@
 <html lang="ja">
 <head>
   <meta charset="UTF-8" />
-  <title>Quantum CSV Grid - Fast Path + D3 Visualization Build</title>
+  <title>Quantum CSV Grid - Fast Path + D3 Infinite Visualization Build</title>
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Roboto:wght@300;400;600;700&display=swap" />
   <link rel="stylesheet" href="https://fonts.googleapis.com/icon?family=Material+Icons" />
@@ -6067,11 +6067,374 @@ function registerRuntimeCommand(type, command){
 }
 
 
+
+/*
+ * D3 Visualization Surface v2
+ * UI does not receive raw rows. Worker reads columnar tiles, reduces them into a bounded
+ * visualization surface, and D3 only paints the compact projection.
+ */
+const D3_VIZ_SURFACE_VERSION = 2;
+const D3_VIZ_MAX_BUCKETS = 2400;
+const D3_VIZ_MAX_TOP_N = 1000;
+const D3_VIZ_MAX_CATEGORY_KEYS = 200000;
+
+function d3VizSafeInt(value, min, max, fallback){
+  const n = Number(value);
+  if (!Number.isFinite(n)) return fallback;
+  return Math.max(min, Math.min(max, Math.floor(n)));
+}
+
+function d3VizColumnIndex(value){
+  const n = Number(value);
+  return Number.isFinite(n) ? Math.floor(n) : -1;
+}
+
+function d3VizColumn(index){
+  const idx = d3VizColumnIndex(index);
+  return state.manifest?.columns?.[idx] || null;
+}
+
+function d3VizColumnName(index){
+  return d3VizColumn(index)?.name || `Column ${Number(index) + 1}`;
+}
+
+function d3VizNormalizeChartType(value){
+  const type = String(value || "bar").toLowerCase();
+  return ["bar","line","scatter","histogram"].includes(type) ? type : "bar";
+}
+
+function d3VizNormalizeAggregation(value){
+  const raw = String(value || "Count").toLowerCase();
+  if (raw === "sum") return "Sum";
+  if (raw === "avg" || raw === "average" || raw === "mean") return "Avg";
+  if (raw === "min") return "Min";
+  if (raw === "max") return "Max";
+  return "Count";
+}
+
+function d3VizParseNumber(value){
+  if (value == null || value === "") return null;
+  if (typeof value === "number") return Number.isFinite(value) ? value : null;
+  const candidate = numberCandidate(value, { numericSymbols:true });
+  return candidate.ok ? candidate.value : null;
+}
+
+function d3VizCategory(value){
+  const s = value == null || value === "" ? "(empty)" : String(value);
+  return s.length > 180 ? `${s.slice(0,177)}...` : s;
+}
+
+function d3VizAggInit(){
+  return { count:0, valid:0, sum:0, min:Infinity, max:-Infinity };
+}
+
+function d3VizAggAdd(acc, rawValue, countMode){
+  acc.count++;
+  if (countMode) return acc;
+  const n = d3VizParseNumber(rawValue);
+  if (n == null) return acc;
+  acc.valid++;
+  acc.sum += n;
+  if (n < acc.min) acc.min = n;
+  if (n > acc.max) acc.max = n;
+  return acc;
+}
+
+function d3VizAggValue(acc, mode){
+  if (!acc) return 0;
+  if (mode === "Count") return Number(acc.count || 0);
+  if (mode === "Avg") return acc.valid ? acc.sum / acc.valid : 0;
+  if (mode === "Min") return acc.valid ? acc.min : 0;
+  if (mode === "Max") return acc.valid ? acc.max : 0;
+  return Number(acc.sum || 0);
+}
+
+function d3VizActiveChunkCount(){
+  if (activeIsMemory()) return state.memory?.chunks?.length || state.dataset?.chunks?.length || 0;
+  if (activeIsVirtual()) return state.virtual?.globalChunks?.length || 0;
+  return state.dataset?.chunks?.length || 0;
+}
+
+function d3VizTotalRows(){
+  return Number(state.manifest?.totalRows || state.dataset?.totalRows || 0);
+}
+
+function d3VizUniqueColumns(indices){
+  return [...new Set((Array.isArray(indices) ? indices : [])
+    .map(d3VizColumnIndex)
+    .filter((idx) => idx >= 0 && !!d3VizColumn(idx)))];
+}
+
+function d3VizDomainFromStats(columnIndex){
+  let min = Infinity;
+  let max = -Infinity;
+  let found = false;
+  const chunks = d3VizActiveChunkCount();
+  for (let chunkIndex = 0; chunkIndex < chunks; chunkIndex++){
+    const stat = columnStatFromChunkMeta(chunkMetaForIndex(chunkIndex), columnIndex);
+    if (!stat || stat.type !== "number") return null;
+    if (Number.isFinite(stat.min) && Number.isFinite(stat.max)){
+      min = Math.min(min, Number(stat.min));
+      max = Math.max(max, Number(stat.max));
+      found = true;
+    }
+  }
+  if (!found) return null;
+  if (min === max) {
+    min -= 0.5;
+    max += 0.5;
+  }
+  return { min, max, source:"chunk-stats" };
+}
+
+function d3VizBucketIndex(value, min, max, buckets){
+  if (!Number.isFinite(value)) return -1;
+  if (max <= min) return 0;
+  const ratio = (value - min) / (max - min);
+  return Math.max(0, Math.min(buckets - 1, Math.floor(ratio * buckets)));
+}
+
+async function d3VizScanDomains(requiredColumns, label){
+  const domains = new Map();
+  for (const idx of requiredColumns) domains.set(idx, { min:Infinity, max:-Infinity, found:false, source:"scan" });
+
+  const chunks = d3VizActiveChunkCount();
+  let scanned = 0;
+  for (let chunkIndex = 0; chunkIndex < chunks; chunkIndex++){
+    if (state.cancelled) throw new Error("Cancelled");
+    const chunk = await readChunkColumns(chunkIndex, requiredColumns, {
+      surfacePlan:{ surface:"d3-viz-domain-scan", requiredColumns, warmColumns:requiredColumns, hotColumns:[] }
+    });
+    const rowCount = Number(chunk?.rowCount || 0);
+    for (let localRow = 0; localRow < rowCount; localRow++){
+      for (const idx of requiredColumns){
+        const n = d3VizParseNumber(valueFromColumn(chunk.columns.get(idx), localRow));
+        if (n == null) continue;
+        const domain = domains.get(idx);
+        domain.min = Math.min(domain.min, n);
+        domain.max = Math.max(domain.max, n);
+        domain.found = true;
+      }
+    }
+    scanned += rowCount;
+    postProgress(Math.min(92, Math.floor(((chunkIndex + 1) / Math.max(1, chunks)) * 42)), `${label}: numeric domain scan ${fmt(chunkIndex + 1)}/${fmt(chunks)} / rows ${fmt(scanned)}`);
+  }
+
+  const out = new Map();
+  for (const [idx, domain] of domains.entries()){
+    if (!domain.found) continue;
+    if (domain.min === domain.max) {
+      domain.min -= 0.5;
+      domain.max += 0.5;
+    }
+    out.set(idx, domain);
+  }
+  return out;
+}
+
+async function d3VizResolveDomains(indices, label){
+  const unique = d3VizUniqueColumns(indices);
+  const resolved = new Map();
+  const needScan = [];
+  for (const idx of unique){
+    const fromStats = d3VizDomainFromStats(idx);
+    if (fromStats) resolved.set(idx, fromStats);
+    else needScan.push(idx);
+  }
+  if (needScan.length){
+    const scanned = await d3VizScanDomains(needScan, label);
+    for (const [idx, domain] of scanned.entries()) resolved.set(idx, domain);
+  }
+  return resolved;
+}
+
+async function d3VizForEachRow(requiredColumns, label, visit){
+  const chunks = d3VizActiveChunkCount();
+  let scanned = 0;
+  for (let chunkIndex = 0; chunkIndex < chunks; chunkIndex++){
+    if (state.cancelled) throw new Error("Cancelled");
+    const chunk = await readChunkColumns(chunkIndex, requiredColumns, {
+      surfacePlan:{ surface:"d3-viz-aggregate", requiredColumns, warmColumns:requiredColumns, hotColumns:requiredColumns }
+    });
+    const rowCount = Number(chunk?.rowCount || 0);
+    for (let localRow = 0; localRow < rowCount; localRow++){
+      visit(chunk.columns, localRow, chunkIndex);
+    }
+    scanned += rowCount;
+    postProgress(Math.min(99, 45 + Math.floor(((chunkIndex + 1) / Math.max(1, chunks)) * 54)), `${label}: tile reduce ${fmt(chunkIndex + 1)}/${fmt(chunks)} / rows ${fmt(scanned)}`);
+  }
+  return { scanned, chunks };
+}
+
+async function buildD3VisualizationSurface(msg){
+  if (!state.manifest || !d3VizActiveChunkCount()) throw new Error("Open a Storage dataset before building D3 visualization.");
+  const startedAt = now();
+  const chartType = d3VizNormalizeChartType(msg.chartType);
+  const xIdx = d3VizColumnIndex(msg.xColumnIndex);
+  const yIdx = d3VizColumnIndex(msg.yColumnIndex);
+  const aggregation = d3VizNormalizeAggregation(msg.aggregation);
+  const topN = d3VizSafeInt(msg.topN, 1, D3_VIZ_MAX_TOP_N, 80);
+  const buckets = d3VizSafeInt(msg.buckets, 8, D3_VIZ_MAX_BUCKETS, 240);
+  const categoryLimit = d3VizSafeInt(msg.categoryLimit, topN, D3_VIZ_MAX_CATEGORY_KEYS, 50000);
+  const countMode = chartType === "scatter" ? false : (aggregation === "Count" || yIdx < 0 || !d3VizColumn(yIdx));
+  const yLabel = countMode ? "Count" : `${aggregation}(${d3VizColumnName(yIdx)})`;
+  const xLabel = d3VizColumnName(xIdx);
+  const totalRows = d3VizTotalRows();
+  const metadata = {
+    version:D3_VIZ_SURFACE_VERSION,
+    strategy:"worker-columnar-tile-reduce",
+    chartType,
+    aggregation,
+    xColumnIndex:xIdx,
+    xColumnName:xLabel,
+    yColumnIndex:countMode ? -1 : yIdx,
+    yColumnName:countMode ? "Rows" : d3VizColumnName(yIdx),
+    xLabel,
+    yLabel,
+    totalRows,
+    bucketCount:buckets,
+    topN,
+    categoryLimit,
+    builtAt:new Date().toISOString()
+  };
+
+  if (!d3VizColumn(xIdx)) throw new Error("Select a valid X column.");
+  if ((chartType === "line" || chartType === "scatter") && !countMode && !d3VizColumn(yIdx)) throw new Error("Select a valid Y column.");
+  if (chartType === "scatter" && (countMode || !d3VizColumn(yIdx))) throw new Error("Scatter requires numeric X and numeric Y columns.");
+
+  postProgress(1, `D3 Surface Plan: ${chartType} / ${fmt(totalRows)} rows / ${xLabel}`);
+
+  if (chartType === "bar"){
+    const required = d3VizUniqueColumns([xIdx, ...(countMode ? [] : [yIdx])]);
+    const groups = new Map();
+    const overflow = d3VizAggInit();
+    let overflowed = false;
+    const exec = await d3VizForEachRow(required, "D3 bar surface", (columns, localRow) => {
+      const key = d3VizCategory(valueFromColumn(columns.get(xIdx), localRow));
+      let acc = groups.get(key);
+      if (!acc) {
+        if (groups.size >= categoryLimit) {
+          overflowed = true;
+          d3VizAggAdd(overflow, countMode ? null : valueFromColumn(columns.get(yIdx), localRow), countMode);
+          return;
+        }
+        acc = d3VizAggInit();
+        groups.set(key, acc);
+      }
+      d3VizAggAdd(acc, countMode ? null : valueFromColumn(columns.get(yIdx), localRow), countMode);
+    });
+
+    let rows = [...groups.entries()].map(([key, acc]) => ({
+      key,
+      value:d3VizAggValue(acc, aggregation),
+      count:acc.count,
+      valid:acc.valid
+    }));
+    if (overflowed) rows.push({ key:"(other categories)", value:d3VizAggValue(overflow, aggregation), count:overflow.count, valid:overflow.valid, overflow:true });
+    rows.sort((a,b) => Math.abs(Number(b.value || 0)) - Math.abs(Number(a.value || 0)));
+    rows = rows.slice(0, topN);
+
+    return {
+      surface:{ ...metadata, kind:"bar", rows, reducedRows:rows.length, categoriesTracked:groups.size, overflowed, scanned:exec.scanned, chunks:exec.chunks },
+      ms:now() - startedAt
+    };
+  }
+
+  if (chartType === "histogram"){
+    const domains = await d3VizResolveDomains([xIdx], "D3 histogram surface");
+    const domain = domains.get(xIdx);
+    if (!domain) throw new Error("Histogram requires a numeric X column.");
+    const bins = Array.from({ length:buckets }, (_, i) => ({
+      x0:domain.min + (domain.max - domain.min) * (i / buckets),
+      x1:domain.min + (domain.max - domain.min) * ((i + 1) / buckets),
+      count:0
+    }));
+    const exec = await d3VizForEachRow([xIdx], "D3 histogram surface", (columns, localRow) => {
+      const n = d3VizParseNumber(valueFromColumn(columns.get(xIdx), localRow));
+      if (n == null) return;
+      bins[d3VizBucketIndex(n, domain.min, domain.max, buckets)].count++;
+    });
+
+    return {
+      surface:{ ...metadata, kind:"histogram", bins, domain, reducedRows:bins.length, scanned:exec.scanned, chunks:exec.chunks },
+      ms:now() - startedAt
+    };
+  }
+
+  if (chartType === "line"){
+    const domains = await d3VizResolveDomains([xIdx], "D3 line surface");
+    const domain = domains.get(xIdx);
+    if (!domain) throw new Error("Line chart requires a numeric X column.");
+    const required = d3VizUniqueColumns([xIdx, ...(countMode ? [] : [yIdx])]);
+    const bins = Array.from({ length:buckets }, (_, i) => ({
+      x0:domain.min + (domain.max - domain.min) * (i / buckets),
+      x1:domain.min + (domain.max - domain.min) * ((i + 1) / buckets),
+      agg:d3VizAggInit()
+    }));
+    const exec = await d3VizForEachRow(required, "D3 line surface", (columns, localRow) => {
+      const x = d3VizParseNumber(valueFromColumn(columns.get(xIdx), localRow));
+      if (x == null) return;
+      const bin = bins[d3VizBucketIndex(x, domain.min, domain.max, buckets)];
+      d3VizAggAdd(bin.agg, countMode ? null : valueFromColumn(columns.get(yIdx), localRow), countMode);
+    });
+    const points = bins
+      .map((bin) => ({ x:(bin.x0 + bin.x1) / 2, y:d3VizAggValue(bin.agg, aggregation), count:bin.agg.count, x0:bin.x0, x1:bin.x1 }))
+      .filter((point) => point.count > 0);
+
+    return {
+      surface:{ ...metadata, kind:"line", points, domain, reducedRows:points.length, scanned:exec.scanned, chunks:exec.chunks },
+      ms:now() - startedAt
+    };
+  }
+
+  const domains = await d3VizResolveDomains([xIdx, yIdx], "D3 scatter density surface");
+  const xDomain = domains.get(xIdx);
+  const yDomain = domains.get(yIdx);
+  if (!xDomain || !yDomain) throw new Error("Scatter requires numeric X and numeric Y columns.");
+  const grid = Math.max(4, Math.min(160, Math.ceil(Math.sqrt(buckets))));
+  const cells = new Map();
+  const exec = await d3VizForEachRow(d3VizUniqueColumns([xIdx, yIdx]), "D3 scatter density surface", (columns, localRow) => {
+    const x = d3VizParseNumber(valueFromColumn(columns.get(xIdx), localRow));
+    const y = d3VizParseNumber(valueFromColumn(columns.get(yIdx), localRow));
+    if (x == null || y == null) return;
+    const xi = d3VizBucketIndex(x, xDomain.min, xDomain.max, grid);
+    const yi = d3VizBucketIndex(y, yDomain.min, yDomain.max, grid);
+    const key = `${xi}\u001f${yi}`;
+    let cell = cells.get(key);
+    if (!cell) {
+      cell = { count:0, xSum:0, ySum:0, xi, yi };
+      cells.set(key, cell);
+    }
+    cell.count++;
+    cell.xSum += x;
+    cell.ySum += y;
+  });
+
+  const points = [...cells.values()]
+    .map((cell) => ({ x:cell.xSum / cell.count, y:cell.ySum / cell.count, count:cell.count, xi:cell.xi, yi:cell.yi }))
+    .sort((a,b) => b.count - a.count)
+    .slice(0, buckets);
+
+  return {
+    surface:{ ...metadata, kind:"scatter", points, xDomain, yDomain, grid, reducedRows:points.length, scanned:exec.scanned, chunks:exec.chunks },
+    ms:now() - startedAt
+  };
+}
+
+
 async function legacyWorkerMessageRouter(e){
   const msg=e.data||{};
   state.__lastRouterError = null;
   state.__lastCommandType = msg.type || "";
   try{
+    if (msg.type==="BUILD_D3_VIZ_SURFACE"){
+      state.cancelled=false;
+      const result=await buildD3VisualizationSurface(msg);
+      post("D3_VIZ_SURFACE_DONE", result);
+      postProgress(100, `D3 Surface ready: ${result.surface?.kind || "surface"} / ${fmt(result.surface?.reducedRows || 0)} marks / scanned ${fmt(result.surface?.scanned || 0)} rows`);
+      return;
+    }
+
     if (msg.type==="EXECUTE_CHUNK_BATCH"){
       state.cancelled=false;
       await hydrateChunkExecutionContext(msg.context);
@@ -8123,39 +8486,8 @@ function DataTable({ table, tableId, height = 520, dense: denseProp, filterable 
 }
 
 
-const D3_VIZ_EMPTY_TABLE = { header: [], rows: [] };
 
-function normalizeD3VizHeader(table) {
-  const header = Array.isArray(table?.header) ? table.header : [];
-  return header.map((column, index) => {
-    if (typeof column === "string") return column;
-    if (column && typeof column === "object") return String(column.name ?? column.label ?? column.key ?? `Column ${index + 1}`);
-    return `Column ${index + 1}`;
-  });
-}
-
-function normalizeD3VizRows(table, header) {
-  const rows = Array.isArray(table?.rows) ? table.rows : [];
-  return rows.map((row) => {
-    if (Array.isArray(row)) return row;
-    if (row && typeof row === "object") {
-      return header.map((name, index) => row[name] ?? row[index] ?? "");
-    }
-    return [row];
-  });
-}
-
-function parseD3VizNumber(value) {
-  if (value === null || value === undefined || value === "") return null;
-  if (typeof value === "number") return Number.isFinite(value) ? value : null;
-  const raw = String(value).trim();
-  if (!raw) return null;
-  const normalized = raw
-    .replace(/[,\s￥¥$€£%]/g, "")
-    .replace(/[０-９]/g, (s) => String.fromCharCode(s.charCodeAt(0) - 0xFEE0));
-  const n = Number(normalized);
-  return Number.isFinite(n) ? n : null;
-}
+const D3_VIZ_EMPTY_SURFACE = { kind:"empty", rows:[], points:[], bins:[] };
 
 function formatD3VizNumber(value) {
   const n = Number(value);
@@ -8169,116 +8501,16 @@ function clampD3VizNumber(value, min, max, fallback) {
   return Math.max(min, Math.min(max, Math.floor(n)));
 }
 
-function measureD3VizProfile(table, maxRows) {
-  const header = normalizeD3VizHeader(table);
-  const rows = normalizeD3VizRows(table, header);
-  const sampledRows = rows.slice(0, clampD3VizNumber(maxRows, 100, 50000, 5000));
-  const profile = header.map((name, index) => {
-    let numericCount = 0;
-    let nonEmptyCount = 0;
-    const distinct = new Set();
-
-    for (const row of sampledRows) {
-      const value = row?.[index];
-      if (value !== null && value !== undefined && String(value).trim() !== "") {
-        nonEmptyCount += 1;
-        if (distinct.size <= 300) distinct.add(String(value));
-        if (parseD3VizNumber(value) !== null) numericCount += 1;
-      }
-    }
-
-    const numericRatio = nonEmptyCount ? numericCount / nonEmptyCount : 0;
-    return {
-      index,
-      name,
-      numericRatio,
-      numericCount,
-      nonEmptyCount,
-      distinctCount: distinct.size,
-      type: numericRatio >= 0.72 && numericCount >= 2 ? "number" : "category",
-    };
-  });
-
-  return {
-    header,
-    rows,
-    sampledRows,
-    profile,
-    numericColumns: profile.filter((column) => column.type === "number"),
-    categoryColumns: profile.filter((column) => column.type !== "number"),
-  };
+function d3VizColumnOptions(columns) {
+  return (Array.isArray(columns) ? columns : []).map((column, fallbackIndex) => ({
+    index: Number(column?.index ?? fallbackIndex),
+    name: String(column?.name || `Column ${fallbackIndex + 1}`),
+    type: String(column?.type || "string"),
+  }));
 }
 
-function aggregateD3VizRows(rows, xIndex, yIndex, aggregation, topN) {
-  const groups = new Map();
-
-  for (const row of rows) {
-    const rawKey = row?.[xIndex];
-    const key = rawKey === null || rawKey === undefined || String(rawKey).trim() === "" ? "(empty)" : String(rawKey);
-    const y = yIndex >= 0 ? parseD3VizNumber(row?.[yIndex]) : 1;
-    const current = groups.get(key) || { key, count: 0, sum: 0, min: Infinity, max: -Infinity };
-
-    current.count += 1;
-    if (y !== null) {
-      current.sum += y;
-      current.min = Math.min(current.min, y);
-      current.max = Math.max(current.max, y);
-    }
-
-    groups.set(key, current);
-  }
-
-  const values = Array.from(groups.values()).map((group) => {
-    let value = group.count;
-    if (aggregation === "sum") value = group.sum;
-    if (aggregation === "avg") value = group.count ? group.sum / group.count : 0;
-    if (aggregation === "min") value = group.min === Infinity ? 0 : group.min;
-    if (aggregation === "max") value = group.max === -Infinity ? 0 : group.max;
-    if (aggregation === "count") value = group.count;
-    return { key: group.key, value, count: group.count };
-  });
-
-  return values
-    .filter((item) => Number.isFinite(item.value))
-    .sort((a, b) => Math.abs(b.value) - Math.abs(a.value))
-    .slice(0, clampD3VizNumber(topN, 5, 120, 30));
-}
-
-function buildD3VizSeries(rows, xIndex, yIndex, maxPoints) {
-  const limit = clampD3VizNumber(maxPoints, 100, 50000, 5000);
-  const points = [];
-
-  for (const row of rows) {
-    const y = parseD3VizNumber(row?.[yIndex]);
-    if (y === null) continue;
-
-    const rawX = row?.[xIndex];
-    const xNumber = parseD3VizNumber(rawX);
-    const xDate = rawX ? Date.parse(String(rawX)) : NaN;
-
-    points.push({
-      xLabel: rawX === null || rawX === undefined || rawX === "" ? "(empty)" : String(rawX),
-      xNumber,
-      xDate: Number.isFinite(xDate) ? xDate : null,
-      y,
-    });
-
-    if (points.length >= limit) break;
-  }
-
-  const xMode = points.filter((p) => p.xNumber !== null).length >= Math.max(2, points.length * 0.6)
-    ? "number"
-    : points.filter((p) => p.xDate !== null).length >= Math.max(2, points.length * 0.6)
-      ? "date"
-      : "category";
-
-  return points
-    .map((point, index) => ({ ...point, x: xMode === "number" ? point.xNumber : xMode === "date" ? point.xDate : index }))
-    .filter((point) => Number.isFinite(point.x) && Number.isFinite(point.y))
-    .sort((a, b) => a.x - b.x);
-}
-
-function renderD3Empty(svg, width, height, message) {
+function clearD3Svg(svg, width, height, message) {
+  svg.selectAll("*").remove();
   svg.attr("viewBox", `0 0 ${width} ${height}`).attr("role", "img");
   svg.append("text")
     .attr("x", width / 2)
@@ -8286,314 +8518,275 @@ function renderD3Empty(svg, width, height, message) {
     .attr("text-anchor", "middle")
     .attr("font-size", 14)
     .attr("fill", "currentColor")
-    .text(message);
+    .attr("opacity", 0.7)
+    .text(message || "No visualization surface");
 }
 
-function renderD3BarChart(svg, data, options) {
-  const { width, height, xLabel, yLabel } = options;
-  const margin = { top: 24, right: 24, bottom: 86, left: 72 };
-  svg.attr("viewBox", `0 0 ${width} ${height}`).attr("role", "img");
+function d3VizExtent(values, accessor) {
+  const nums = values.map(accessor).filter((v) => Number.isFinite(v));
+  if (!nums.length) return [0, 1];
+  const min = Math.min(...nums);
+  const max = Math.max(...nums);
+  if (min === max) return [min - 0.5, max + 0.5];
+  return [min, max];
+}
 
+function renderD3WorkerBar(svg, surface, options) {
+  const { width, height } = options;
+  const rows = Array.isArray(surface.rows) ? surface.rows : [];
+  if (!rows.length) return clearD3Svg(svg, width, height, "集約結果がありません");
+  const margin = { top: 24, right: 24, bottom: 96, left: 78 };
   const chartWidth = Math.max(1, width - margin.left - margin.right);
   const chartHeight = Math.max(1, height - margin.top - margin.bottom);
-  const x = d3.scaleBand().domain(data.map((d) => d.key)).range([0, chartWidth]).padding(0.18);
-  const yMin = Math.min(0, d3.min(data, (d) => d.value) || 0);
-  const yMax = Math.max(0, d3.max(data, (d) => d.value) || 1);
+  svg.attr("viewBox", `0 0 ${width} ${height}`).attr("role", "img");
+  const x = d3.scaleBand().domain(rows.map((d) => String(d.key))).range([0, chartWidth]).padding(0.18);
+  const yMin = Math.min(0, d3.min(rows, (d) => Number(d.value)) || 0);
+  const yMax = Math.max(0, d3.max(rows, (d) => Number(d.value)) || 1);
   const y = d3.scaleLinear().domain([yMin, yMax]).nice().range([chartHeight, 0]);
-
   const g = svg.append("g").attr("transform", `translate(${margin.left},${margin.top})`);
-  g.append("g").attr("opacity", 0.24).call(d3.axisLeft(y).ticks(6).tickSize(-chartWidth).tickFormat(""));
-  g.append("g").attr("transform", `translate(0,${chartHeight})`).call(d3.axisBottom(x).tickFormat((d) => String(d).slice(0, 18)))
+  g.append("g").attr("opacity", 0.22).call(d3.axisLeft(y).ticks(6).tickSize(-chartWidth).tickFormat(""));
+  g.append("g").attr("transform", `translate(0,${chartHeight})`)
+    .call(d3.axisBottom(x).tickFormat((d) => String(d).slice(0, 20)))
     .selectAll("text").attr("transform", "rotate(-38)").attr("text-anchor", "end");
   g.append("g").call(d3.axisLeft(y).ticks(6));
-
   g.selectAll("rect")
-    .data(data)
+    .data(rows)
     .join("rect")
-    .attr("x", (d) => x(d.key))
-    .attr("y", (d) => y(Math.max(0, d.value)))
+    .attr("x", (d) => x(String(d.key)))
+    .attr("y", (d) => y(Math.max(0, Number(d.value || 0))))
     .attr("width", x.bandwidth())
-    .attr("height", (d) => Math.abs(y(d.value) - y(0)))
+    .attr("height", (d) => Math.abs(y(Number(d.value || 0)) - y(0)))
     .attr("rx", 4)
     .attr("fill", "currentColor")
     .attr("opacity", 0.78)
     .append("title")
-    .text((d) => `${d.key}\n${formatD3VizNumber(d.value)} / ${formatD3VizNumber(d.count)} rows`);
-
-  svg.append("text").attr("x", margin.left).attr("y", height - 18).attr("font-size", 12).attr("fill", "currentColor").text(xLabel);
-  svg.append("text").attr("x", 16).attr("y", 18).attr("font-size", 12).attr("fill", "currentColor").text(yLabel);
+    .text((d) => `${d.key}\nvalue ${formatD3VizNumber(d.value)}\ncount ${formatD3VizNumber(d.count)}`);
+  svg.append("text").attr("x", margin.left).attr("y", height - 18).attr("font-size", 12).attr("fill", "currentColor").text(surface.xLabel || "Category");
+  svg.append("text").attr("x", 16).attr("y", 18).attr("font-size", 12).attr("fill", "currentColor").text(surface.yLabel || "Value");
 }
 
-function renderD3LineChart(svg, points, options) {
-  const { width, height, xLabel, yLabel } = options;
-  const margin = { top: 24, right: 24, bottom: 58, left: 72 };
-  svg.attr("viewBox", `0 0 ${width} ${height}`).attr("role", "img");
-
+function renderD3WorkerHistogram(svg, surface, options) {
+  const { width, height } = options;
+  const bins = Array.isArray(surface.bins) ? surface.bins : [];
+  if (!bins.length) return clearD3Svg(svg, width, height, "集約結果がありません");
+  const margin = { top: 24, right: 24, bottom: 58, left: 78 };
   const chartWidth = Math.max(1, width - margin.left - margin.right);
   const chartHeight = Math.max(1, height - margin.top - margin.bottom);
-  const x = d3.scaleLinear().domain(d3.extent(points, (d) => d.x)).nice().range([0, chartWidth]);
-  const y = d3.scaleLinear().domain(d3.extent(points, (d) => d.y)).nice().range([chartHeight, 0]);
-  const line = d3.line().defined((d) => Number.isFinite(d.x) && Number.isFinite(d.y)).x((d) => x(d.x)).y((d) => y(d.y));
-
-  const g = svg.append("g").attr("transform", `translate(${margin.left},${margin.top})`);
-  g.append("g").attr("opacity", 0.24).call(d3.axisLeft(y).ticks(6).tickSize(-chartWidth).tickFormat(""));
-  g.append("g").attr("transform", `translate(0,${chartHeight})`).call(d3.axisBottom(x).ticks(6));
-  g.append("g").call(d3.axisLeft(y).ticks(6));
-  g.append("path").datum(points).attr("fill", "none").attr("stroke", "currentColor").attr("stroke-width", 2.2).attr("d", line);
-  g.selectAll("circle")
-    .data(points.length > 400 ? points.filter((_, index) => index % Math.ceil(points.length / 400) === 0) : points)
-    .join("circle")
-    .attr("cx", (d) => x(d.x))
-    .attr("cy", (d) => y(d.y))
-    .attr("r", 2.2)
-    .attr("fill", "currentColor")
-    .attr("opacity", 0.68)
-    .append("title")
-    .text((d) => `${d.xLabel}\n${formatD3VizNumber(d.y)}`);
-
-  svg.append("text").attr("x", margin.left).attr("y", height - 18).attr("font-size", 12).attr("fill", "currentColor").text(xLabel);
-  svg.append("text").attr("x", 16).attr("y", 18).attr("font-size", 12).attr("fill", "currentColor").text(yLabel);
-}
-
-function renderD3ScatterPlot(svg, points, options) {
-  const { width, height, xLabel, yLabel } = options;
-  const margin = { top: 24, right: 24, bottom: 58, left: 72 };
   svg.attr("viewBox", `0 0 ${width} ${height}`).attr("role", "img");
-
-  const chartWidth = Math.max(1, width - margin.left - margin.right);
-  const chartHeight = Math.max(1, height - margin.top - margin.bottom);
-  const x = d3.scaleLinear().domain(d3.extent(points, (d) => d.x)).nice().range([0, chartWidth]);
-  const y = d3.scaleLinear().domain(d3.extent(points, (d) => d.y)).nice().range([chartHeight, 0]);
-
+  const x = d3.scaleLinear().domain([bins[0].x0, bins[bins.length - 1].x1]).nice().range([0, chartWidth]);
+  const y = d3.scaleLinear().domain([0, d3.max(bins, (d) => Number(d.count)) || 1]).nice().range([chartHeight, 0]);
   const g = svg.append("g").attr("transform", `translate(${margin.left},${margin.top})`);
-  g.append("g").attr("opacity", 0.24).call(d3.axisLeft(y).ticks(6).tickSize(-chartWidth).tickFormat(""));
-  g.append("g").attr("transform", `translate(0,${chartHeight})`).call(d3.axisBottom(x).ticks(6));
+  g.append("g").attr("opacity", 0.22).call(d3.axisLeft(y).ticks(6).tickSize(-chartWidth).tickFormat(""));
+  g.append("g").attr("transform", `translate(0,${chartHeight})`).call(d3.axisBottom(x).ticks(8));
   g.append("g").call(d3.axisLeft(y).ticks(6));
-  g.selectAll("circle")
-    .data(points)
-    .join("circle")
-    .attr("cx", (d) => x(d.x))
-    .attr("cy", (d) => y(d.y))
-    .attr("r", 3)
-    .attr("fill", "currentColor")
-    .attr("opacity", 0.5)
-    .append("title")
-    .text((d) => `${d.xLabel}\n${formatD3VizNumber(d.y)}`);
-
-  svg.append("text").attr("x", margin.left).attr("y", height - 18).attr("font-size", 12).attr("fill", "currentColor").text(xLabel);
-  svg.append("text").attr("x", 16).attr("y", 18).attr("font-size", 12).attr("fill", "currentColor").text(yLabel);
-}
-
-function renderD3Histogram(svg, rows, columnIndex, options) {
-  const { width, height, xLabel } = options;
-  const values = rows.map((row) => parseD3VizNumber(row?.[columnIndex])).filter((value) => value !== null);
-  if (values.length < 2) {
-    renderD3Empty(svg, width, height, "数値データが足りません");
-    return;
-  }
-
-  const margin = { top: 24, right: 24, bottom: 58, left: 72 };
-  svg.attr("viewBox", `0 0 ${width} ${height}`).attr("role", "img");
-
-  const chartWidth = Math.max(1, width - margin.left - margin.right);
-  const chartHeight = Math.max(1, height - margin.top - margin.bottom);
-  const x = d3.scaleLinear().domain(d3.extent(values)).nice().range([0, chartWidth]);
-  const bins = d3.bin().domain(x.domain()).thresholds(32)(values);
-  const y = d3.scaleLinear().domain([0, d3.max(bins, (bin) => bin.length) || 1]).nice().range([chartHeight, 0]);
-
-  const g = svg.append("g").attr("transform", `translate(${margin.left},${margin.top})`);
-  g.append("g").attr("opacity", 0.24).call(d3.axisLeft(y).ticks(6).tickSize(-chartWidth).tickFormat(""));
-  g.append("g").attr("transform", `translate(0,${chartHeight})`).call(d3.axisBottom(x).ticks(6));
-  g.append("g").call(d3.axisLeft(y).ticks(6));
-
   g.selectAll("rect")
     .data(bins)
     .join("rect")
-    .attr("x", (bin) => x(bin.x0) + 1)
-    .attr("y", (bin) => y(bin.length))
-    .attr("width", (bin) => Math.max(0, x(bin.x1) - x(bin.x0) - 1))
-    .attr("height", (bin) => chartHeight - y(bin.length))
+    .attr("x", (bin) => x(Number(bin.x0)) + 1)
+    .attr("y", (bin) => y(Number(bin.count || 0)))
+    .attr("width", (bin) => Math.max(0, x(Number(bin.x1)) - x(Number(bin.x0)) - 1))
+    .attr("height", (bin) => chartHeight - y(Number(bin.count || 0)))
     .attr("rx", 3)
     .attr("fill", "currentColor")
     .attr("opacity", 0.76)
     .append("title")
-    .text((bin) => `${formatD3VizNumber(bin.x0)} - ${formatD3VizNumber(bin.x1)}\n${formatD3VizNumber(bin.length)} rows`);
-
-  svg.append("text").attr("x", margin.left).attr("y", height - 18).attr("font-size", 12).attr("fill", "currentColor").text(xLabel);
+    .text((bin) => `${formatD3VizNumber(bin.x0)} - ${formatD3VizNumber(bin.x1)}\n${formatD3VizNumber(bin.count)} rows`);
+  svg.append("text").attr("x", margin.left).attr("y", height - 18).attr("font-size", 12).attr("fill", "currentColor").text(surface.xLabel || "Value");
   svg.append("text").attr("x", 16).attr("y", 18).attr("font-size", 12).attr("fill", "currentColor").text("Count");
 }
 
-function D3VisualizationPanel({ sources }) {
+function renderD3WorkerLine(svg, surface, options) {
+  const { width, height } = options;
+  const points = Array.isArray(surface.points) ? surface.points : [];
+  if (points.length < 2) return clearD3Svg(svg, width, height, "描画できる点が足りません");
+  const margin = { top: 24, right: 24, bottom: 58, left: 78 };
+  const chartWidth = Math.max(1, width - margin.left - margin.right);
+  const chartHeight = Math.max(1, height - margin.top - margin.bottom);
+  svg.attr("viewBox", `0 0 ${width} ${height}`).attr("role", "img");
+  const x = d3.scaleLinear().domain(d3VizExtent(points, (d) => Number(d.x))).nice().range([0, chartWidth]);
+  const y = d3.scaleLinear().domain(d3VizExtent(points, (d) => Number(d.y))).nice().range([chartHeight, 0]);
+  const line = d3.line().defined((d) => Number.isFinite(Number(d.x)) && Number.isFinite(Number(d.y))).x((d) => x(Number(d.x))).y((d) => y(Number(d.y)));
+  const g = svg.append("g").attr("transform", `translate(${margin.left},${margin.top})`);
+  g.append("g").attr("opacity", 0.22).call(d3.axisLeft(y).ticks(6).tickSize(-chartWidth).tickFormat(""));
+  g.append("g").attr("transform", `translate(0,${chartHeight})`).call(d3.axisBottom(x).ticks(8));
+  g.append("g").call(d3.axisLeft(y).ticks(6));
+  g.append("path").datum(points).attr("fill", "none").attr("stroke", "currentColor").attr("stroke-width", 2.2).attr("opacity", 0.9).attr("d", line);
+  g.selectAll("circle").data(points).join("circle").attr("cx", (d) => x(Number(d.x))).attr("cy", (d) => y(Number(d.y))).attr("r", 2.6).attr("fill", "currentColor").attr("opacity", 0.72)
+    .append("title").text((d) => `x ${formatD3VizNumber(d.x)}\ny ${formatD3VizNumber(d.y)}\nrows ${formatD3VizNumber(d.count)}`);
+  svg.append("text").attr("x", margin.left).attr("y", height - 18).attr("font-size", 12).attr("fill", "currentColor").text(surface.xLabel || "X");
+  svg.append("text").attr("x", 16).attr("y", 18).attr("font-size", 12).attr("fill", "currentColor").text(surface.yLabel || "Y");
+}
+
+function renderD3WorkerScatter(svg, surface, options) {
+  const { width, height } = options;
+  const points = Array.isArray(surface.points) ? surface.points : [];
+  if (!points.length) return clearD3Svg(svg, width, height, "描画できる点がありません");
+  const margin = { top: 24, right: 24, bottom: 58, left: 78 };
+  const chartWidth = Math.max(1, width - margin.left - margin.right);
+  const chartHeight = Math.max(1, height - margin.top - margin.bottom);
+  svg.attr("viewBox", `0 0 ${width} ${height}`).attr("role", "img");
+  const x = d3.scaleLinear().domain(d3VizExtent(points, (d) => Number(d.x))).nice().range([0, chartWidth]);
+  const y = d3.scaleLinear().domain(d3VizExtent(points, (d) => Number(d.y))).nice().range([chartHeight, 0]);
+  const r = d3.scaleSqrt().domain([0, d3.max(points, (d) => Number(d.count)) || 1]).range([2, 14]);
+  const g = svg.append("g").attr("transform", `translate(${margin.left},${margin.top})`);
+  g.append("g").attr("opacity", 0.22).call(d3.axisLeft(y).ticks(6).tickSize(-chartWidth).tickFormat(""));
+  g.append("g").attr("transform", `translate(0,${chartHeight})`).call(d3.axisBottom(x).ticks(8));
+  g.append("g").call(d3.axisLeft(y).ticks(6));
+  g.selectAll("circle").data(points).join("circle")
+    .attr("cx", (d) => x(Number(d.x)))
+    .attr("cy", (d) => y(Number(d.y)))
+    .attr("r", (d) => r(Number(d.count || 1)))
+    .attr("fill", "currentColor")
+    .attr("opacity", 0.44)
+    .append("title")
+    .text((d) => `x ${formatD3VizNumber(d.x)}\ny ${formatD3VizNumber(d.y)}\nrows ${formatD3VizNumber(d.count)}`);
+  svg.append("text").attr("x", margin.left).attr("y", height - 18).attr("font-size", 12).attr("fill", "currentColor").text(surface.xLabel || "X");
+  svg.append("text").attr("x", 16).attr("y", 18).attr("font-size", 12).attr("fill", "currentColor").text(surface.yLabel || "Y");
+}
+
+function renderD3WorkerSurface(svgNode, surface) {
+  const svg = d3.select(svgNode);
+  svg.selectAll("*").remove();
+  const width = 1080;
+  const height = 560;
+  const s = surface || D3_VIZ_EMPTY_SURFACE;
+  if (!s.kind || s.kind === "empty") return clearD3Svg(svg, width, height, "Build a visualization surface first");
+  if (s.kind === "bar") return renderD3WorkerBar(svg, s, { width, height });
+  if (s.kind === "histogram") return renderD3WorkerHistogram(svg, s, { width, height });
+  if (s.kind === "line") return renderD3WorkerLine(svg, s, { width, height });
+  if (s.kind === "scatter") return renderD3WorkerScatter(svg, s, { width, height });
+  return clearD3Svg(svg, width, height, "Unsupported D3 surface");
+}
+
+function D3VisualizationPanel({ manifest, columns, result, status, time, onRun, onClear }) {
   const svgRef = useRef(null);
-  const [sourceId, setSourceId] = useState("data");
+  const columnOptions = useMemo(() => d3VizColumnOptions(columns), [columns]);
+  const numericOptions = useMemo(() => {
+    const nums = columnOptions.filter((column) => String(column.type).toLowerCase() === "number");
+    return nums.length ? nums : columnOptions;
+  }, [columnOptions]);
+
   const [chartType, setChartType] = useState("bar");
   const [xColumn, setXColumn] = useState("");
-  const [yColumn, setYColumn] = useState("");
-  const [aggregation, setAggregation] = useState("sum");
-  const [maxRows, setMaxRows] = useState("5000");
-  const [topN, setTopN] = useState("30");
-
-  const usableSources = useMemo(() => (sources || []).filter((source) => source?.table?.rows?.length), [sources]);
-  const activeSource = useMemo(() => {
-    return usableSources.find((source) => source.id === sourceId) || usableSources[0] || { id: "empty", label: "No table", table: D3_VIZ_EMPTY_TABLE };
-  }, [usableSources, sourceId]);
-
-  const profile = useMemo(() => measureD3VizProfile(activeSource.table, maxRows), [activeSource, maxRows]);
+  const [yColumn, setYColumn] = useState("-1");
+  const [aggregation, setAggregation] = useState("Count");
+  const [topN, setTopN] = useState("80");
+  const [buckets, setBuckets] = useState("240");
+  const [categoryLimit, setCategoryLimit] = useState("50000");
 
   useEffect(() => {
-    if (!usableSources.find((source) => source.id === sourceId) && usableSources[0]) {
-      setSourceId(usableSources[0].id);
-    }
-  }, [usableSources, sourceId]);
-
-  useEffect(() => {
-    if (!profile.header.length) {
+    if (!columnOptions.length) {
       setXColumn("");
-      setYColumn("");
+      setYColumn("-1");
       return;
     }
-
-    const currentXIndex = Number(xColumn);
-    const currentYIndex = Number(yColumn);
-    const currentXValid = xColumn !== "" && profile.header[currentXIndex] !== undefined;
-    const currentYValid = yColumn !== "" && profile.header[currentYIndex] !== undefined;
-
-    if (!currentXValid) {
-      const preferredX = profile.categoryColumns[0] || profile.profile[0];
-      setXColumn(preferredX ? String(preferredX.index) : "");
-    }
-
-    if (!currentYValid || (currentXValid && currentYIndex === currentXIndex && profile.numericColumns.length > 1)) {
-      const preferredY = profile.numericColumns.find((column) => column.index !== currentXIndex) || profile.numericColumns[0] || profile.profile.find((column) => column.index !== currentXIndex) || profile.profile[0];
-      setYColumn(preferredY ? String(preferredY.index) : "");
-    }
-  }, [profile, xColumn, yColumn]);
+    setXColumn((current) => current && columnOptions.some((column) => String(column.index) === String(current)) ? current : String(columnOptions[0].index));
+    setYColumn((current) => current === "-1" || columnOptions.some((column) => String(column.index) === String(current)) ? current : "-1");
+  }, [columnOptions.map((column) => `${column.index}:${column.name}:${column.type}`).join("|")]);
 
   useEffect(() => {
     if (!svgRef.current) return;
+    renderD3WorkerSurface(svgRef.current, result);
+  }, [result]);
 
-    const svg = d3.select(svgRef.current);
-    svg.selectAll("*").remove();
+  function runSurfacePlan() {
+    if (!manifest) return;
+    onRun?.({
+      chartType,
+      xColumnIndex:Number(xColumn),
+      yColumnIndex:yColumn === "-1" ? -1 : Number(yColumn),
+      aggregation,
+      topN:clampD3VizNumber(topN, 1, 1000, 80),
+      buckets:clampD3VizNumber(buckets, 8, 2400, 240),
+      categoryLimit:clampD3VizNumber(categoryLimit, 100, 200000, 50000),
+    });
+  }
 
-    const width = 1080;
-    const height = 520;
-    const xIndex = Number(xColumn);
-    const yIndex = Number(yColumn);
-    const xLabel = profile.header[xIndex] || "X";
-    const yLabel = chartType === "histogram" ? "Count" : profile.header[yIndex] || "Y";
-
-    if (!d3 || !profile.sampledRows.length || !profile.header.length) {
-      renderD3Empty(svg, width, height, "可視化できるテーブルがありません");
-      return;
-    }
-
-    if (chartType === "histogram") {
-      renderD3Histogram(svg, profile.sampledRows, yIndex, { width, height, xLabel: profile.header[yIndex] || "Value" });
-      return;
-    }
-
-    if (chartType === "bar") {
-      const data = aggregateD3VizRows(profile.sampledRows, xIndex, yIndex, aggregation, topN);
-      if (!data.length) {
-        renderD3Empty(svg, width, height, "集計できるデータがありません");
-        return;
-      }
-      renderD3BarChart(svg, data, { width, height, xLabel, yLabel: `${aggregation.toUpperCase()} ${yLabel}` });
-      return;
-    }
-
-    const points = buildD3VizSeries(profile.sampledRows, xIndex, yIndex, maxRows);
-    if (points.length < 2) {
-      renderD3Empty(svg, width, height, "描画できる点が足りません");
-      return;
-    }
-
-    if (chartType === "scatter") {
-      renderD3ScatterPlot(svg, points, { width, height, xLabel, yLabel });
-      return;
-    }
-
-    renderD3LineChart(svg, points, { width, height, xLabel, yLabel });
-  }, [profile, chartType, xColumn, yColumn, aggregation, maxRows, topN]);
-
-  const hasRows = Boolean(activeSource?.table?.rows?.length);
-  const numericOptions = profile.numericColumns.length ? profile.numericColumns : profile.profile;
+  const canRun = Boolean(manifest && columnOptions.length && xColumn !== "");
+  const markCount = result?.reducedRows || result?.rows?.length || result?.points?.length || result?.bins?.length || 0;
+  const scanned = result?.scanned || 0;
 
   return (
-    <Box sx={{ display: "grid", gridTemplateColumns: { xs: "1fr", lg: "360px minmax(0, 1fr)" }, gap: 1 }}>
-      <Section title="D3 Visualization Plan" icon={<Analytics />} hint="既存のData/Search/Pivot/Time/Graph結果を再利用し、UI Projectionだけで描画します。Workerのデータ処理面には触れません。">
+    <Box sx={{ display: "grid", gridTemplateColumns: { xs: "1fr", lg: "380px minmax(0, 1fr)" }, gap: 1 }}>
+      <Section title="D3 Infinite Surface Plan" icon={<Analytics />} hint="D3は全行を受け取らず、WorkerがColumnar Tileを全件走査して、描画に必要な集約Surfaceだけを返します。">
         <Stack spacing={1}>
-          <TextField select label="Source surface" size="small" fullWidth value={activeSource.id} onChange={(e) => setSourceId(e.target.value)}>
-            {usableSources.length ? usableSources.map((source) => (
-              <MenuItem key={source.id} value={source.id}>{source.label} / {fmt(source.table?.rows?.length || 0)} rows</MenuItem>
-            )) : <MenuItem value="empty">No result table</MenuItem>}
-          </TextField>
+          <Alert severity="info">
+            大規模データでは「全件をD3へ渡す」のではなく、全件をWorkerで集約し、D3には最大数百〜数千markだけ渡します。
+          </Alert>
 
-          <TextField select label="Chart type" size="small" fullWidth value={chartType} onChange={(e) => setChartType(e.target.value)}>
-            <MenuItem value="bar">Bar / category aggregation</MenuItem>
-            <MenuItem value="line">Line / ordered series</MenuItem>
-            <MenuItem value="scatter">Scatter / numeric relation</MenuItem>
+          <TextField select label="Chart type" size="small" fullWidth value={chartType} onChange={(e) => setChartType(e.target.value)} disabled={!manifest}>
+            <MenuItem value="bar">Bar / category aggregate</MenuItem>
+            <MenuItem value="line">Line / numeric binned series</MenuItem>
+            <MenuItem value="scatter">Scatter / density surface</MenuItem>
             <MenuItem value="histogram">Histogram / numeric distribution</MenuItem>
           </TextField>
 
-          <TextField select label={chartType === "histogram" ? "Bucket value" : "X / Category"} size="small" fullWidth value={chartType === "histogram" ? yColumn : xColumn} onChange={(e) => chartType === "histogram" ? setYColumn(e.target.value) : setXColumn(e.target.value)} disabled={!hasRows}>
-            {profile.profile.map((column) => (
-              <MenuItem key={column.index} value={String(column.index)}>
-                {column.name} / {column.type} / non-empty {fmt(column.nonEmptyCount)}
-              </MenuItem>
+          <TextField select label={chartType === "histogram" ? "Value column" : "X / Category column"} size="small" fullWidth value={xColumn} onChange={(e) => setXColumn(e.target.value)} disabled={!canRun}>
+            {(chartType === "histogram" || chartType === "line" || chartType === "scatter" ? numericOptions : columnOptions).map((column) => (
+              <MenuItem key={column.index} value={String(column.index)}>{column.name} / {column.type}</MenuItem>
             ))}
           </TextField>
 
           {chartType !== "histogram" && (
-            <TextField select label="Y / Value" size="small" fullWidth value={yColumn} onChange={(e) => setYColumn(e.target.value)} disabled={!hasRows}>
+            <TextField select label="Y / Value column" size="small" fullWidth value={yColumn} onChange={(e) => setYColumn(e.target.value)} disabled={!canRun || (aggregation === "Count" && chartType !== "scatter")}>
+              <MenuItem value="-1">Rows / Count</MenuItem>
               {numericOptions.map((column) => (
-                <MenuItem key={column.index} value={String(column.index)}>
-                  {column.name} / {column.type} / numeric {Math.round((column.numericRatio || 0) * 100)}%
-                </MenuItem>
+                <MenuItem key={column.index} value={String(column.index)}>{column.name} / {column.type}</MenuItem>
               ))}
             </TextField>
           )}
 
-          {chartType === "bar" && (
-            <>
-              <TextField select label="Aggregation" size="small" fullWidth value={aggregation} onChange={(e) => setAggregation(e.target.value)}>
-                <MenuItem value="sum">Sum</MenuItem>
-                <MenuItem value="avg">Average</MenuItem>
-                <MenuItem value="count">Count</MenuItem>
-                <MenuItem value="min">Min</MenuItem>
-                <MenuItem value="max">Max</MenuItem>
-              </TextField>
-              <SmallNumberField label="Top N groups" value={topN} onChange={setTopN} min="5" step="5" sx={{ width: "100%" }} />
-            </>
+          {chartType !== "scatter" && (
+            <TextField select label="Aggregation" size="small" fullWidth value={aggregation} onChange={(e) => setAggregation(e.target.value)} disabled={!canRun}>
+              <MenuItem value="Count">Count</MenuItem>
+              <MenuItem value="Sum">Sum</MenuItem>
+              <MenuItem value="Avg">Avg</MenuItem>
+              <MenuItem value="Min">Min</MenuItem>
+              <MenuItem value="Max">Max</MenuItem>
+            </TextField>
           )}
 
-          <SmallNumberField label="Projection sample rows" value={maxRows} onChange={setMaxRows} min="100" step="1000" sx={{ width: "100%" }} />
+          {chartType === "bar" ? (
+            <>
+              <TextField label="Top N marks" size="small" value={topN} onChange={(e) => setTopN(e.target.value)} disabled={!canRun} />
+              <TextField label="Category tracking limit" size="small" value={categoryLimit} onChange={(e) => setCategoryLimit(e.target.value)} disabled={!canRun} />
+            </>
+          ) : (
+            <TextField label="Buckets / max marks" size="small" value={buckets} onChange={(e) => setBuckets(e.target.value)} disabled={!canRun} />
+          )}
 
-          <Alert severity="info">
-            D3描画は最大{fmt(clampD3VizNumber(maxRows, 100, 50000, 5000))}行のProjectionサンプルだけを使います。全件集計は既存のPivot/Time/Graph Queryで作成してから、このタブで可視化してください。
-          </Alert>
+          <Stack direction="row" spacing={1}>
+            <Button variant="contained" startIcon={<Timeline />} onClick={runSurfacePlan} disabled={!canRun}>Build Surface</Button>
+            <Button onClick={onClear} disabled={!result}>Clear</Button>
+          </Stack>
 
           <KeyValue rows={[
-            ["Source", activeSource.label || "-"],
-            ["Columns", fmt(profile.header.length)],
-            ["Rows observed", fmt(profile.sampledRows.length)],
-            ["Numeric columns", fmt(profile.numericColumns.length)],
-            ["Category columns", fmt(profile.categoryColumns.length)],
+            ["Source rows", manifest ? fmt(manifest.totalRows || 0) : "No active dataset"],
+            ["D3 marks", fmt(markCount)],
+            ["Scanned rows", fmt(scanned)],
+            ["Strategy", result?.strategy || "worker-columnar-tile-reduce"],
+            ["Elapsed", time || ""],
+            ["Status", status || ""],
           ]} />
         </Stack>
       </Section>
 
-      <Section title="D3 Render Surface" icon={<Timeline />} actions={<Chip label={`${chartType} / ${activeSource.label || "none"}`} />}>
-        <Box sx={{ width: "100%", overflow: "auto", color: "primary.main", bgcolor: "background.default", borderRadius: 1.5, border: "1px solid", borderColor: "divider" }}>
-          <svg ref={svgRef} style={{ width: "100%", minWidth: 720, height: 520, display: "block" }} />
+      <Section title="D3 Projection" icon={<Timeline />} hint="SVGは集約済みSurfaceだけを描画します。raw rowsはUIへ渡しません。">
+        <Box sx={{ overflow: "auto", border: "1px solid", borderColor: "divider", borderRadius: 1.5, p: 1, bgcolor: "background.paper" }}>
+          <svg ref={svgRef} style={{ width: "100%", minWidth: 760, height: 560, display: "block" }} />
         </Box>
-        <Typography variant="caption" color="text.secondary">
-          Fast Path維持: Worker処理なし / 既存結果テーブルのProjectionのみ / 描画失敗時は他タブの表表示に戻れます。
-        </Typography>
+        <Stack direction="row" spacing={0.75} useFlexGap flexWrap="wrap" sx={{ mt: 1 }}>
+          <Chip size="small" label={`surface ${result?.kind || "none"}`} />
+          <Chip size="small" label={`rows ${fmt(result?.totalRows || manifest?.totalRows || 0)}`} />
+          <Chip size="small" label={`marks ${fmt(markCount)}`} />
+          {result?.overflowed && <Chip size="small" color="warning" label="category overflow grouped" />}
+          {result?.bucketCount && <Chip size="small" label={`buckets ${fmt(result.bucketCount)}`} />}
+        </Stack>
       </Section>
     </Box>
   );
 }
+
 
 function columnsFromTableHeader(header) {
   return (Array.isArray(header) ? header : []).map((name, index) => ({
@@ -11451,6 +11644,10 @@ function App() {
   const [timeStatus, setTimeStatus] = useState("Columnar cacheを開いてください。");
   const [timeTime, setTimeTime] = useState("");
 
+  const [d3VizResult, setD3VizResult] = useState(null);
+  const [d3VizStatus, setD3VizStatus] = useState("Storage Datasetを開くと、D3用の全件集約Surfaceを作れます。");
+  const [d3VizTime, setD3VizTime] = useState("");
+
   const [datasets, setDatasets] = useState([]);
   const [selectedDataset, setSelectedDataset] = useState("");
   const [opfsStatus, setOpfsStatus] = useState("Refreshで保存済みデータセットを確認します。");
@@ -11659,6 +11856,9 @@ function App() {
     setSearchTable(null);
     setPivotTable(null);
     setTimeTable(null);
+    setD3VizResult(null);
+    setD3VizStatus("Storage Datasetを開くと、D3用の全件集約Surfaceを作れます。");
+    setD3VizTime("");
     resetColumnState([]);
     if (list.length) {
       const defaultName = list.length > 1 ? `merged_${list.length}_csv` : list[0].name.replace(/\.[^.]+$/, "");
@@ -11820,6 +12020,9 @@ function App() {
     setPage(1);
     setDataQueryActive(false);
     setDataQueryCount(0);
+    setD3VizResult(null);
+    setD3VizStatus("Datasetを開きました。Visualizeタブで全件集約Surfaceを作成できます。");
+    setD3VizTime("");
 
     if (status) setStatus(status);
     if (logMessage) appendLog(logMessage);
@@ -12099,6 +12302,9 @@ function App() {
         setPivotTileView(null);
         setTimeTable(null);
         setSearchTable(null);
+        setD3VizResult(null);
+        setD3VizStatus("Storage Datasetを開くと、D3用の全件集約Surfaceを作れます。");
+        setD3VizTime("");
         setVisibleCols([]);
         setPurgeConfirm("");
         setStatus("現在セッションを破棄しました。OPFS内の保存済みデータセットは残っています。");
@@ -12270,6 +12476,16 @@ function App() {
         return;
       },
 
+      "D3_VIZ_SURFACE_DONE"(msg) {
+        const surface = msg.surface || null;
+        setD3VizResult(surface);
+        setD3VizStatus(`D3 Surface ready: ${surface?.kind || "surface"} / marks ${fmt(surface?.reducedRows || 0)} / scanned ${fmt(surface?.scanned || 0)} rows`);
+        setD3VizTime(ms(msg.ms));
+        setBusy(false);
+        setBusyLabel("");
+        return;
+      },
+
       "DATA_QUERY_CLEARED"(msg) {
         setDataQueryActive(false);
         setDataQueryCount(0);
@@ -12383,6 +12599,7 @@ function App() {
       RUN_SEARCH: "検索",
       BUILD_PIVOT: "Pivot集計",
       BUILD_TIME: "時間軸集計",
+      BUILD_D3_VIZ_SURFACE: "D3全件集約Surface作成",
       PERF_BENCH: "性能ベンチマーク",
       ADAPTIVE_PERF_BENCH: "Adaptive性能ベンチマーク",
       ADAPTIVE_KERNEL_STATUS: "Adaptive状態確認",
@@ -12509,6 +12726,17 @@ function App() {
     const row = Math.max(1, Number(jumpRow || 1));
     const next = Math.ceil(row / Number(pageSize || 500));
     readPage(next);
+  }
+
+  function runD3Visualization(plan) {
+    if (!manifest) {
+      setD3VizStatus("先にStorage Datasetを開いてください。");
+      return;
+    }
+    setD3VizResult(null);
+    setD3VizStatus("WorkerでColumnar Tileを全件走査し、D3用Surfaceを集約しています...");
+    setD3VizTime("");
+    post({ type: "BUILD_D3_VIZ_SURFACE", ...plan });
   }
 
   function addDataQueryFilter() {
@@ -13819,17 +14047,17 @@ function App() {
 
           {tab === "visualize" && (
             <D3VisualizationPanel
-              sources={[
-                { id: "data", label: "Data / current page", table: dataTable },
-                { id: "search", label: "Search result", table: searchTable },
-                { id: "time", label: "Time result", table: timeTable },
-                { id: "pivot", label: "Pivot result", table: pivotTable },
-                { id: "graph", label: "Graph Query result", table: graphResultTable },
-                { id: "graphSearch", label: "Graph Search result", table: graphResultSearchTable },
-                { id: "graphPivot", label: "Graph Pivot result", table: graphResultPivotTable },
-                { id: "graphTime", label: "Graph Time result", table: graphResultTimeTable },
-                { id: "cleanPreview", label: "Clean preview", table: cleanTable },
-              ]}
+              manifest={manifest}
+              columns={columns}
+              result={d3VizResult}
+              status={d3VizStatus}
+              time={d3VizTime}
+              onRun={runD3Visualization}
+              onClear={() => {
+                setD3VizResult(null);
+                setD3VizStatus("D3 Surfaceをクリアしました。");
+                setD3VizTime("");
+              }}
             />
           )}
 
