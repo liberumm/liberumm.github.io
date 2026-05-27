@@ -2,7 +2,7 @@
 <html lang="ja">
 <head>
   <meta charset="UTF-8" />
-  <title>Quantum CSV Grid - Fast Path + D3 Infinite Visualization Build</title>
+  <title>Quantum CSV Grid - D3 Infinite Surface DataSource Build</title>
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Roboto:wght@300;400;600;700&display=swap" />
   <link rel="stylesheet" href="https://fonts.googleapis.com/icon?family=Material+Icons" />
@@ -6266,7 +6266,289 @@ async function d3VizForEachRow(requiredColumns, label, visit){
   return { scanned, chunks };
 }
 
+
+function d3VizNormalizeDataSource(value){
+  const source = String(value || "active").toLowerCase();
+  return source === "graph" ? "graph" : "active";
+}
+
+function d3VizNormalizeGraphMode(value){
+  return String(value || "data").toLowerCase() === "join" ? "join" : "data";
+}
+
+function d3VizSourceColumnList(columns){
+  return (Array.isArray(columns) ? columns : [])
+    .map((column, fallbackIndex) => ({
+      index:d3VizColumnIndex(column?.index ?? fallbackIndex),
+      name:String(column?.name || `Column ${fallbackIndex + 1}`),
+      type:String(column?.type || "string")
+    }))
+    .filter((column) => column.index >= 0);
+}
+
+function d3VizGraphColumn(columns, index){
+  const idx = d3VizColumnIndex(index);
+  return d3VizSourceColumnList(columns).find((column) => Number(column.index) === idx) || null;
+}
+
+function d3VizGraphColumnName(columns, index){
+  return d3VizGraphColumn(columns, index)?.name || `Column ${Number(index) + 1}`;
+}
+
+function d3VizGraphUniqueColumns(columns, indices){
+  const list = d3VizSourceColumnList(columns);
+  const valid = new Set(list.map((column) => Number(column.index)));
+  return [...new Set((Array.isArray(indices) ? indices : [])
+    .map(d3VizColumnIndex)
+    .filter((idx) => idx >= 0 && valid.has(idx)))];
+}
+
+function d3VizGraphValue(row, index){
+  const idx = d3VizColumnIndex(index);
+  return Array.isArray(row) && idx >= 0 ? row[idx] : undefined;
+}
+
+async function d3VizForEachGraphResultRow({ mode="data", chunkRows=10000, label="D3 graph-result surface", visit } = {}){
+  const sourceMode = d3VizNormalizeGraphMode(mode);
+  const safeChunkRows = d3VizSafeInt(chunkRows, 500, 50000, 10000);
+  const total = graphResultTotalRows(sourceMode);
+  if (!total) throw new Error("Graph Query Result is empty. Run Graph Query first.");
+  let scanned = 0;
+  let header = [];
+  for (let start = 0; start < total; start += safeChunkRows){
+    if (state.cancelled) throw new Error("Cancelled");
+    const page = Math.floor(start / safeChunkRows) + 1;
+    const table = await readGraphResultWindow({ mode:sourceMode, page, pageSize:Math.min(safeChunkRows, total - start) });
+    if (!header.length) header = Array.isArray(table.header) ? table.header : [];
+    const rows = Array.isArray(table.rows) ? table.rows : [];
+    for (let i = 0; i < rows.length; i++){
+      visit(rows[i] || [], start + i, header);
+    }
+    scanned += rows.length;
+    postProgress(Math.min(99, 45 + Math.floor((scanned / Math.max(1, total)) * 54)), `${label}: graph result reduce ${fmt(scanned)}/${fmt(total)}`);
+    if (start % (safeChunkRows * 4) === 0) await workerYield();
+  }
+  return { scanned, chunks:Math.ceil(total / Math.max(1, safeChunkRows)), total, header };
+}
+
+async function d3VizResolveGraphDomains({ columns, indices, mode, chunkRows, label }){
+  const domains = new Map();
+  for (const idx of d3VizGraphUniqueColumns(columns, indices)) {
+    if (!d3VizGraphColumn(columns, idx)) continue;
+    domains.set(idx, { min:Infinity, max:-Infinity, found:false, source:"graph-result-scan" });
+  }
+  if (!domains.size) return domains;
+
+  await d3VizForEachGraphResultRow({
+    mode,
+    chunkRows,
+    label,
+    visit:(row) => {
+      for (const idx of domains.keys()){
+        const n = d3VizParseNumber(d3VizGraphValue(row, idx));
+        if (n == null) continue;
+        const domain = domains.get(idx);
+        domain.min = Math.min(domain.min, n);
+        domain.max = Math.max(domain.max, n);
+        domain.found = true;
+      }
+    }
+  });
+
+  for (const [idx, domain] of [...domains.entries()]){
+    if (!domain.found) {
+      domains.delete(idx);
+      continue;
+    }
+    if (domain.min === domain.max) {
+      domain.min -= 0.5;
+      domain.max += 0.5;
+    }
+  }
+  return domains;
+}
+
+async function buildD3GraphResultVisualizationSurface(msg){
+  const startedAt = now();
+  const chartType = d3VizNormalizeChartType(msg.chartType);
+  const sourceMode = d3VizNormalizeGraphMode(msg.sourceMode || msg.graphMode);
+  const sourceColumns = d3VizSourceColumnList(msg.sourceColumns);
+  const xIdx = d3VizColumnIndex(msg.xColumnIndex);
+  const yIdx = d3VizColumnIndex(msg.yColumnIndex);
+  const aggregation = d3VizNormalizeAggregation(msg.aggregation);
+  const topN = d3VizSafeInt(msg.topN, 1, D3_VIZ_MAX_TOP_N, 80);
+  const buckets = d3VizSafeInt(msg.buckets, 8, D3_VIZ_MAX_BUCKETS, 240);
+  const categoryLimit = d3VizSafeInt(msg.categoryLimit, topN, D3_VIZ_MAX_CATEGORY_KEYS, 50000);
+  const chunkRows = d3VizSafeInt(msg.chunkRows, 500, 50000, 10000);
+  const countMode = chartType === "scatter" ? false : (aggregation === "Count" || yIdx < 0 || !d3VizGraphColumn(sourceColumns, yIdx));
+  const totalRows = graphResultTotalRows(sourceMode);
+  const xLabel = d3VizGraphColumnName(sourceColumns, xIdx);
+  const yLabel = countMode ? "Count" : `${aggregation}(${d3VizGraphColumnName(sourceColumns, yIdx)})`;
+  const metadata = {
+    version:D3_VIZ_SURFACE_VERSION,
+    strategy:"worker-graph-result-window-reduce",
+    dataSource:"graph",
+    dataSourceLabel:`Graph Query Result / ${sourceMode}`,
+    sourceMode,
+    chartType,
+    aggregation,
+    xColumnIndex:xIdx,
+    xColumnName:xLabel,
+    yColumnIndex:countMode ? -1 : yIdx,
+    yColumnName:countMode ? "Rows" : d3VizGraphColumnName(sourceColumns, yIdx),
+    xLabel,
+    yLabel,
+    totalRows,
+    bucketCount:buckets,
+    topN,
+    categoryLimit,
+    builtAt:new Date().toISOString()
+  };
+
+  if (!d3VizGraphColumn(sourceColumns, xIdx)) throw new Error("Select a valid Graph Result X column.");
+  if (chartType === "scatter" && (countMode || !d3VizGraphColumn(sourceColumns, yIdx))) throw new Error("Scatter requires numeric X and numeric Y columns.");
+  if (!totalRows) throw new Error("Graph Query Result is empty. Run Graph Query first.");
+
+  postProgress(1, `D3 Surface Plan: Graph Result / ${chartType} / ${fmt(totalRows)} rows / ${xLabel}`);
+
+  if (chartType === "bar"){
+    const groups = new Map();
+    const overflow = d3VizAggInit();
+    let overflowed = false;
+    const exec = await d3VizForEachGraphResultRow({
+      mode:sourceMode,
+      chunkRows,
+      label:"D3 graph bar surface",
+      visit:(row) => {
+        const key = d3VizCategory(d3VizGraphValue(row, xIdx));
+        let acc = groups.get(key);
+        if (!acc) {
+          if (groups.size >= categoryLimit) {
+            overflowed = true;
+            d3VizAggAdd(overflow, countMode ? null : d3VizGraphValue(row, yIdx), countMode);
+            return;
+          }
+          acc = d3VizAggInit();
+          groups.set(key, acc);
+        }
+        d3VizAggAdd(acc, countMode ? null : d3VizGraphValue(row, yIdx), countMode);
+      }
+    });
+
+    let rows = [...groups.entries()].map(([key, acc]) => ({
+      key,
+      value:d3VizAggValue(acc, aggregation),
+      count:acc.count,
+      valid:acc.valid
+    }));
+    if (overflowed) rows.push({ key:"(other categories)", value:d3VizAggValue(overflow, aggregation), count:overflow.count, valid:overflow.valid, overflow:true });
+    rows.sort((a,b) => Math.abs(Number(b.value || 0)) - Math.abs(Number(a.value || 0)));
+    rows = rows.slice(0, topN);
+
+    return {
+      surface:{ ...metadata, kind:"bar", rows, reducedRows:rows.length, categoriesTracked:groups.size, overflowed, scanned:exec.scanned, chunks:exec.chunks },
+      ms:now() - startedAt
+    };
+  }
+
+  if (chartType === "histogram"){
+    const domains = await d3VizResolveGraphDomains({ columns:sourceColumns, indices:[xIdx], mode:sourceMode, chunkRows, label:"D3 graph histogram surface" });
+    const domain = domains.get(xIdx);
+    if (!domain) throw new Error("Histogram requires a numeric X column.");
+    const bins = Array.from({ length:buckets }, (_, i) => ({
+      x0:domain.min + (domain.max - domain.min) * (i / buckets),
+      x1:domain.min + (domain.max - domain.min) * ((i + 1) / buckets),
+      count:0
+    }));
+    const exec = await d3VizForEachGraphResultRow({
+      mode:sourceMode,
+      chunkRows,
+      label:"D3 graph histogram surface",
+      visit:(row) => {
+        const n = d3VizParseNumber(d3VizGraphValue(row, xIdx));
+        if (n == null) return;
+        bins[d3VizBucketIndex(n, domain.min, domain.max, buckets)].count++;
+      }
+    });
+
+    return {
+      surface:{ ...metadata, kind:"histogram", bins, domain, reducedRows:bins.length, scanned:exec.scanned, chunks:exec.chunks },
+      ms:now() - startedAt
+    };
+  }
+
+  if (chartType === "line"){
+    const domains = await d3VizResolveGraphDomains({ columns:sourceColumns, indices:[xIdx], mode:sourceMode, chunkRows, label:"D3 graph line surface" });
+    const domain = domains.get(xIdx);
+    if (!domain) throw new Error("Line chart requires a numeric X column.");
+    const bins = Array.from({ length:buckets }, (_, i) => ({
+      x0:domain.min + (domain.max - domain.min) * (i / buckets),
+      x1:domain.min + (domain.max - domain.min) * ((i + 1) / buckets),
+      agg:d3VizAggInit()
+    }));
+    const exec = await d3VizForEachGraphResultRow({
+      mode:sourceMode,
+      chunkRows,
+      label:"D3 graph line surface",
+      visit:(row) => {
+        const x = d3VizParseNumber(d3VizGraphValue(row, xIdx));
+        if (x == null) return;
+        const bin = bins[d3VizBucketIndex(x, domain.min, domain.max, buckets)];
+        d3VizAggAdd(bin.agg, countMode ? null : d3VizGraphValue(row, yIdx), countMode);
+      }
+    });
+    const points = bins
+      .map((bin) => ({ x:(bin.x0 + bin.x1) / 2, y:d3VizAggValue(bin.agg, aggregation), count:bin.agg.count, x0:bin.x0, x1:bin.x1 }))
+      .filter((point) => point.count > 0);
+
+    return {
+      surface:{ ...metadata, kind:"line", points, domain, reducedRows:points.length, scanned:exec.scanned, chunks:exec.chunks },
+      ms:now() - startedAt
+    };
+  }
+
+  const domains = await d3VizResolveGraphDomains({ columns:sourceColumns, indices:[xIdx, yIdx], mode:sourceMode, chunkRows, label:"D3 graph scatter density surface" });
+  const xDomain = domains.get(xIdx);
+  const yDomain = domains.get(yIdx);
+  if (!xDomain || !yDomain) throw new Error("Scatter requires numeric X and numeric Y columns.");
+  const grid = Math.max(4, Math.min(160, Math.ceil(Math.sqrt(buckets))));
+  const cells = new Map();
+  const exec = await d3VizForEachGraphResultRow({
+    mode:sourceMode,
+    chunkRows,
+    label:"D3 graph scatter density surface",
+    visit:(row) => {
+      const x = d3VizParseNumber(d3VizGraphValue(row, xIdx));
+      const y = d3VizParseNumber(d3VizGraphValue(row, yIdx));
+      if (x == null || y == null) return;
+      const xi = d3VizBucketIndex(x, xDomain.min, xDomain.max, grid);
+      const yi = d3VizBucketIndex(y, yDomain.min, yDomain.max, grid);
+      const key = `${xi}\u001f${yi}`;
+      let cell = cells.get(key);
+      if (!cell) {
+        cell = { count:0, xSum:0, ySum:0, xi, yi };
+        cells.set(key, cell);
+      }
+      cell.count++;
+      cell.xSum += x;
+      cell.ySum += y;
+    }
+  });
+
+  const points = [...cells.values()]
+    .map((cell) => ({ x:cell.xSum / cell.count, y:cell.ySum / cell.count, count:cell.count, xi:cell.xi, yi:cell.yi }))
+    .sort((a,b) => b.count - a.count)
+    .slice(0, buckets);
+
+  return {
+    surface:{ ...metadata, kind:"scatter", points, xDomain, yDomain, grid, reducedRows:points.length, scanned:exec.scanned, chunks:exec.chunks },
+    ms:now() - startedAt
+  };
+}
+
 async function buildD3VisualizationSurface(msg){
+  const dataSource = d3VizNormalizeDataSource(msg.dataSource);
+  if (dataSource === "graph") return await buildD3GraphResultVisualizationSurface(msg);
   if (!state.manifest || !d3VizActiveChunkCount()) throw new Error("Open a Storage dataset before building D3 visualization.");
   const startedAt = now();
   const chartType = d3VizNormalizeChartType(msg.chartType);
@@ -6283,6 +6565,9 @@ async function buildD3VisualizationSurface(msg){
   const metadata = {
     version:D3_VIZ_SURFACE_VERSION,
     strategy:"worker-columnar-tile-reduce",
+    dataSource:"active",
+    dataSourceLabel:"Active Dataset",
+    sourceMode:"columnar",
     chartType,
     aggregation,
     xColumnIndex:xIdx,
@@ -8658,9 +8943,20 @@ function renderD3WorkerSurface(svgNode, surface) {
   return clearD3Svg(svg, width, height, "Unsupported D3 surface");
 }
 
-function D3VisualizationPanel({ manifest, columns, result, status, time, onRun, onClear }) {
+function D3VisualizationPanel({ manifest, columns, graphColumns = [], graphResultCount = 0, graphResultMode = "data", result, status, time, onRun, onClear }) {
   const svgRef = useRef(null);
-  const columnOptions = useMemo(() => d3VizColumnOptions(columns), [columns]);
+  const activeColumnOptions = useMemo(() => d3VizColumnOptions(columns), [columns]);
+  const graphColumnOptions = useMemo(() => d3VizColumnOptions(graphColumns), [graphColumns]);
+  const canUseActiveSource = Boolean(manifest && activeColumnOptions.length);
+  const canUseGraphSource = Boolean(graphResultCount > 0 && graphColumnOptions.length);
+
+  const [dataSource, setDataSource] = useState("active");
+  const sourceColumns = dataSource === "graph" ? graphColumnOptions : activeColumnOptions;
+  const sourceRows = dataSource === "graph" ? graphResultCount : Number(manifest?.totalRows || 0);
+  const sourceMode = dataSource === "graph" ? graphResultMode : "columnar";
+  const sourceLabel = dataSource === "graph" ? `Graph Query Result / ${graphResultMode}` : "Active Dataset / Columnar Tile";
+
+  const columnOptions = useMemo(() => sourceColumns, [sourceColumns]);
   const numericOptions = useMemo(() => {
     const nums = columnOptions.filter((column) => String(column.type).toLowerCase() === "number");
     return nums.length ? nums : columnOptions;
@@ -8673,6 +8969,11 @@ function D3VisualizationPanel({ manifest, columns, result, status, time, onRun, 
   const [topN, setTopN] = useState("80");
   const [buckets, setBuckets] = useState("240");
   const [categoryLimit, setCategoryLimit] = useState("50000");
+  const [chunkRows, setChunkRows] = useState("10000");
+
+  useEffect(() => {
+    if (dataSource === "graph" && !canUseGraphSource) setDataSource("active");
+  }, [dataSource, canUseGraphSource]);
 
   useEffect(() => {
     if (!columnOptions.length) {
@@ -8682,7 +8983,13 @@ function D3VisualizationPanel({ manifest, columns, result, status, time, onRun, 
     }
     setXColumn((current) => current && columnOptions.some((column) => String(column.index) === String(current)) ? current : String(columnOptions[0].index));
     setYColumn((current) => current === "-1" || columnOptions.some((column) => String(column.index) === String(current)) ? current : "-1");
-  }, [columnOptions.map((column) => `${column.index}:${column.name}:${column.type}`).join("|")]);
+  }, [dataSource, columnOptions.map((column) => `${column.index}:${column.name}:${column.type}`).join("|")]);
+
+  useEffect(() => {
+    if (chartType === "scatter" && yColumn === "-1" && numericOptions.length) {
+      setYColumn(String(numericOptions[0].index));
+    }
+  }, [chartType, yColumn, numericOptions.map((column) => `${column.index}:${column.name}`).join("|")]);
 
   useEffect(() => {
     if (!svgRef.current) return;
@@ -8690,8 +8997,12 @@ function D3VisualizationPanel({ manifest, columns, result, status, time, onRun, 
   }, [result]);
 
   function runSurfacePlan() {
-    if (!manifest) return;
+    const sourceAvailable = dataSource === "graph" ? canUseGraphSource : canUseActiveSource;
+    if (!sourceAvailable) return;
     onRun?.({
+      dataSource,
+      sourceMode,
+      sourceColumns:columnOptions.map((column) => ({ index:Number(column.index), name:column.name, type:column.type || "string" })),
       chartType,
       xColumnIndex:Number(xColumn),
       yColumnIndex:yColumn === "-1" ? -1 : Number(yColumn),
@@ -8699,22 +9010,28 @@ function D3VisualizationPanel({ manifest, columns, result, status, time, onRun, 
       topN:clampD3VizNumber(topN, 1, 1000, 80),
       buckets:clampD3VizNumber(buckets, 8, 2400, 240),
       categoryLimit:clampD3VizNumber(categoryLimit, 100, 200000, 50000),
+      chunkRows:clampD3VizNumber(chunkRows, 500, 50000, 10000),
     });
   }
 
-  const canRun = Boolean(manifest && columnOptions.length && xColumn !== "");
+  const canRun = Boolean((dataSource === "graph" ? canUseGraphSource : canUseActiveSource) && columnOptions.length && xColumn !== "");
   const markCount = result?.reducedRows || result?.rows?.length || result?.points?.length || result?.bins?.length || 0;
   const scanned = result?.scanned || 0;
 
   return (
     <Box sx={{ display: "grid", gridTemplateColumns: { xs: "1fr", lg: "380px minmax(0, 1fr)" }, gap: 1 }}>
-      <Section title="D3 Infinite Surface Plan" icon={<Analytics />} hint="D3は全行を受け取らず、WorkerがColumnar Tileを全件走査して、描画に必要な集約Surfaceだけを返します。">
+      <Section title="D3 Infinite Surface Plan" icon={<Analytics />} hint="DataSourceを選び、対象面だけをWorkerで集約します。D3は集約済みSurfaceだけを描画します。">
         <Stack spacing={1}>
           <Alert severity="info">
-            大規模データでは「全件をD3へ渡す」のではなく、全件をWorkerで集約し、D3には最大数百〜数千markだけ渡します。
+            DataSourceは観測面です。Active DatasetはColumnar Tileを直接走査し、Graph Query Resultは結果Windowをチャンク走査します。
           </Alert>
 
-          <TextField select label="Chart type" size="small" fullWidth value={chartType} onChange={(e) => setChartType(e.target.value)} disabled={!manifest}>
+          <TextField select label="DataSource" size="small" fullWidth value={dataSource} onChange={(e) => { setDataSource(e.target.value); onClear?.(); }} disabled={!canUseActiveSource && !canUseGraphSource}>
+            <MenuItem value="active" disabled={!canUseActiveSource}>Active Dataset / Columnar Tile</MenuItem>
+            <MenuItem value="graph" disabled={!canUseGraphSource}>Graph Query Result / Current Result Surface</MenuItem>
+          </TextField>
+
+          <TextField select label="Chart type" size="small" fullWidth value={chartType} onChange={(e) => setChartType(e.target.value)} disabled={!canRun}>
             <MenuItem value="bar">Bar / category aggregate</MenuItem>
             <MenuItem value="line">Line / numeric binned series</MenuItem>
             <MenuItem value="scatter">Scatter / density surface</MenuItem>
@@ -8729,7 +9046,7 @@ function D3VisualizationPanel({ manifest, columns, result, status, time, onRun, 
 
           {chartType !== "histogram" && (
             <TextField select label="Y / Value column" size="small" fullWidth value={yColumn} onChange={(e) => setYColumn(e.target.value)} disabled={!canRun || (aggregation === "Count" && chartType !== "scatter")}>
-              <MenuItem value="-1">Rows / Count</MenuItem>
+              <MenuItem value="-1" disabled={chartType === "scatter"}>Rows / Count</MenuItem>
               {numericOptions.map((column) => (
                 <MenuItem key={column.index} value={String(column.index)}>{column.name} / {column.type}</MenuItem>
               ))}
@@ -8755,16 +9072,21 @@ function D3VisualizationPanel({ manifest, columns, result, status, time, onRun, 
             <TextField label="Buckets / max marks" size="small" value={buckets} onChange={(e) => setBuckets(e.target.value)} disabled={!canRun} />
           )}
 
+          {dataSource === "graph" && (
+            <TextField label="Graph chunk rows" size="small" value={chunkRows} onChange={(e) => setChunkRows(e.target.value)} disabled={!canRun} />
+          )}
+
           <Stack direction="row" spacing={1}>
             <Button variant="contained" startIcon={<Timeline />} onClick={runSurfacePlan} disabled={!canRun}>Build Surface</Button>
             <Button onClick={onClear} disabled={!result}>Clear</Button>
           </Stack>
 
           <KeyValue rows={[
-            ["Source rows", manifest ? fmt(manifest.totalRows || 0) : "No active dataset"],
+            ["DataSource", sourceLabel],
+            ["Source rows", fmt(sourceRows)],
             ["D3 marks", fmt(markCount)],
             ["Scanned rows", fmt(scanned)],
-            ["Strategy", result?.strategy || "worker-columnar-tile-reduce"],
+            ["Strategy", result?.strategy || (dataSource === "graph" ? "worker-graph-result-window-reduce" : "worker-columnar-tile-reduce")],
             ["Elapsed", time || ""],
             ["Status", status || ""],
           ]} />
@@ -8776,8 +9098,9 @@ function D3VisualizationPanel({ manifest, columns, result, status, time, onRun, 
           <svg ref={svgRef} style={{ width: "100%", minWidth: 760, height: 560, display: "block" }} />
         </Box>
         <Stack direction="row" spacing={0.75} useFlexGap flexWrap="wrap" sx={{ mt: 1 }}>
+          <Chip size="small" label={`source ${result?.dataSourceLabel || sourceLabel}`} />
           <Chip size="small" label={`surface ${result?.kind || "none"}`} />
-          <Chip size="small" label={`rows ${fmt(result?.totalRows || manifest?.totalRows || 0)}`} />
+          <Chip size="small" label={`rows ${fmt(result?.totalRows || sourceRows)}`} />
           <Chip size="small" label={`marks ${fmt(markCount)}`} />
           {result?.overflowed && <Chip size="small" color="warning" label="category overflow grouped" />}
           {result?.bucketCount && <Chip size="small" label={`buckets ${fmt(result.bucketCount)}`} />}
@@ -12729,12 +13052,20 @@ function App() {
   }
 
   function runD3Visualization(plan) {
-    if (!manifest) {
+    const source = String(plan?.dataSource || "active");
+    if (source === "graph") {
+      if (!graphResultCount || !graphResultColumns.length) {
+        setD3VizStatus("Graph Query Resultがありません。先にGraph Queryを実行してください。");
+        return;
+      }
+    } else if (!manifest) {
       setD3VizStatus("先にStorage Datasetを開いてください。");
       return;
     }
     setD3VizResult(null);
-    setD3VizStatus("WorkerでColumnar Tileを全件走査し、D3用Surfaceを集約しています...");
+    setD3VizStatus(source === "graph"
+      ? "WorkerでGraph Query Result Windowをチャンク走査し、D3用Surfaceを集約しています..."
+      : "WorkerでColumnar Tileを全件走査し、D3用Surfaceを集約しています...");
     setD3VizTime("");
     post({ type: "BUILD_D3_VIZ_SURFACE", ...plan });
   }
@@ -14049,6 +14380,9 @@ function App() {
             <D3VisualizationPanel
               manifest={manifest}
               columns={columns}
+              graphColumns={graphResultColumns}
+              graphResultCount={graphResultCount}
+              graphResultMode={graphResultMode}
               result={d3VizResult}
               status={d3VizStatus}
               time={d3VizTime}
