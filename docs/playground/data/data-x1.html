@@ -2,7 +2,7 @@
 <html lang="ja">
 <head>
   <meta charset="UTF-8" />
-  <title>Quantum CSV Grid - Hybrid Surface Distributed HyperTensor Full Build</title>
+  <title>Quantum CSV Grid - Runtime Kernel Refactored Full Build</title>
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Roboto:wght@300;400;600;700&display=swap" />
   <link rel="stylesheet" href="https://fonts.googleapis.com/icon?family=Material+Icons" />
@@ -81,7 +81,7 @@ storage boundary, query boundary, or graph boundary changes.
  * 07. Worker pool, remote execution, external storage adapter
  * 08. Search, data query, pivot, time series
  * 09. Graph query execution and graph result projections
- * 10. Message router: self.onmessage
+ * 10. Runtime Kernel v2: command boundary / measurement / legacy-safe fallback
  *
  * Maintenance invariant:
  * Heavy data-domain logic stays here, off the UI thread.
@@ -115,6 +115,16 @@ let state = {
   adaptiveKernel:{enabled:true,version:2,mode:"adaptive",cache:true,selfTuning:true,lastStrategy:null,lastBench:null},
   hyperTensor:{enabled:true,version:2,lastPlan:null},
   externalDataset:null,
+  runtime:{
+    kernelVersion:2,
+    bootedAt:new Date().toISOString(),
+    commandCount:0,
+    failureCount:0,
+    fallbackCount:0,
+    lastCommandType:"",
+    lastStrategy:"legacy",
+    lastError:null
+  },
   cancelled:false
 };
 
@@ -5804,8 +5814,263 @@ async function buildGraphResultTime(msg={}){
   return state.graphResultTime;
 }
 
-self.onmessage=async(e)=>{
+
+
+/*
+ * =========================================================
+ * Runtime Kernel v2
+ * =========================================================
+ * Purpose:
+ * - Worker入口を巨大if routerから切り離し、Command / Plan / Execution /
+ *   Measurement / Fallback の実行面へ寄せる。
+ * - 既存の巨大routerは legacyWorkerMessageRouter として温存し、
+ *   互換性を崩さず段階的にCommand化できる。
+ * - 新機能は registerRuntimeCommand(type, command) で追加し、
+ *   self.onmessageへ直接ifを足さない。
+ */
+
+function createRuntimeMeasurement(){
+  const entries = [];
+  const maxEntries = 300;
+
+  function record(entry){
+    const normalized = {
+      at: new Date().toISOString(),
+      type: String(entry?.type || "UNKNOWN"),
+      ok: entry?.ok !== false,
+      durationMs: Math.round(Number(entry?.durationMs || 0)),
+      strategy: entry?.strategy || "legacy",
+      rows: Number.isFinite(Number(entry?.rows)) ? Number(entry.rows) : null,
+      bytes: Number.isFinite(Number(entry?.bytes)) ? Number(entry.bytes) : null,
+      fallback: Boolean(entry?.fallback),
+      errorCode: entry?.errorCode || null,
+    };
+    entries.push(normalized);
+    if (entries.length > maxEntries) entries.shift();
+    return normalized;
+  }
+
+  function snapshot(){
+    const recent = entries.slice(-50);
+    const failures = entries.filter((x)=>!x.ok).length;
+    const fallback = entries.filter((x)=>x.fallback).length;
+    const totalDuration = entries.reduce((sum,x)=>sum + Number(x.durationMs || 0), 0);
+    return {
+      count: entries.length,
+      failures,
+      fallback,
+      averageDurationMs: entries.length ? Math.round(totalDuration / entries.length) : 0,
+      recent,
+    };
+  }
+
+  return { record, snapshot };
+}
+
+function normalizeCommandMessage(raw){
+  const msg = raw && typeof raw === "object" ? raw : {};
+  const type = String(msg.type || "");
+  const requestId = msg.requestId || `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  return { ...msg, type, requestId };
+}
+
+function normalizeCommandError(error){
+  return {
+    code: error?.code || "WORKER_RUNTIME_ERROR",
+    message: error?.message || String(error || "Worker runtime error"),
+    stack: error?.stack || "",
+  };
+}
+
+function defineRuntimeCommand(command){
+  if (!command || typeof command.execute !== "function") {
+    throw new Error("Runtime command requires execute(plan, state, tools)");
+  }
+  return {
+    validate: command.validate || ((msg)=>msg),
+    plan: command.plan || ((input)=>({kind:"direct", strategy:"classic", input})),
+    execute: command.execute,
+    project: command.project || ((result)=>result || {}),
+    doneType: command.doneType || null,
+  };
+}
+
+function createRuntimeCommandRegistry(initialDefinitions = {}){
+  const table = new Map();
+  for (const [type, command] of Object.entries(initialDefinitions)) {
+    table.set(String(type), defineRuntimeCommand(command));
+  }
+  return {
+    get(type){ return table.get(String(type || "")); },
+    set(type, command){ table.set(String(type), defineRuntimeCommand(command)); return this; },
+    has(type){ return table.has(String(type || "")); },
+    keys(){ return [...table.keys()]; },
+  };
+}
+
+function createRuntimeStateSnapshot(runtimeState){
+  return {
+    kernelVersion: runtimeState.runtime?.kernelVersion || 2,
+    commandCount: runtimeState.runtime?.commandCount || 0,
+    failureCount: runtimeState.runtime?.failureCount || 0,
+    fallbackCount: runtimeState.runtime?.fallbackCount || 0,
+    lastCommandType: runtimeState.runtime?.lastCommandType || "",
+    lastStrategy: runtimeState.runtime?.lastStrategy || "",
+    lastError: runtimeState.runtime?.lastError || null,
+    hasFile: Boolean(runtimeState.file),
+    hasManifest: Boolean(runtimeState.manifest),
+    hasDataset: Boolean(runtimeState.dataset),
+    hasVirtualDataset: Boolean(runtimeState.virtual),
+    cache: {
+      entries: chunkColumnCache.map.size,
+      bytes: chunkColumnCache.bytes,
+      hits: chunkColumnCache.hits,
+      misses: chunkColumnCache.misses,
+      evictions: chunkColumnCache.evictions,
+    },
+  };
+}
+
+function createRuntimeKernel({ runtimeState, post, commands, measurement, legacyHandler }){
+  async function executeRegisteredCommand(command, msg, startedAt){
+    const input = command.validate(msg, runtimeState);
+    const plan = await command.plan(input, runtimeState);
+    const result = await command.execute(plan, runtimeState, {
+      post,
+      progress: postProgress,
+      isCancelled: ()=>Boolean(runtimeState.cancelled),
+      now,
+    });
+    const output = command.project(result, runtimeState) || {};
+    const doneType = command.doneType || `${msg.type}_DONE`;
+    post(doneType, { requestId: msg.requestId, ...output });
+
+    runtimeState.runtime.commandCount += 1;
+    runtimeState.runtime.lastCommandType = msg.type;
+    runtimeState.runtime.lastStrategy = plan?.strategy || "classic";
+
+    measurement.record({
+      type: msg.type,
+      ok: true,
+      durationMs: now() - startedAt,
+      strategy: plan?.strategy || "classic",
+      rows: plan?.estimatedRows || result?.rows || null,
+      bytes: plan?.estimatedBytes || null,
+      fallback: false,
+    });
+  }
+
+  async function executeLegacyFallback(msg, startedAt){
+    runtimeState.__lastRouterError = null;
+    runtimeState.__lastCommandType = msg.type;
+    await legacyHandler({ data: msg });
+
+    const routedError = runtimeState.__lastRouterError;
+    runtimeState.runtime.commandCount += 1;
+    runtimeState.runtime.fallbackCount += 1;
+    runtimeState.runtime.lastCommandType = msg.type;
+    runtimeState.runtime.lastStrategy = "legacy";
+
+    if (routedError) {
+      runtimeState.runtime.failureCount += 1;
+      runtimeState.runtime.lastError = routedError;
+    }
+
+    measurement.record({
+      type: msg.type,
+      ok: !routedError,
+      durationMs: now() - startedAt,
+      strategy: "legacy",
+      fallback: true,
+      errorCode: routedError?.code || null,
+    });
+  }
+
+  return {
+    async handle(event){
+      const msg = normalizeCommandMessage(event?.data || event);
+      const startedAt = now();
+
+      try {
+        if (!msg.type) {
+          throw Object.assign(new Error("Worker command type is required"), { code:"INVALID_COMMAND" });
+        }
+
+        if (msg.type === "CANCEL") {
+          runtimeState.cancelled = true;
+          runtimeState.runtime.lastCommandType = "CANCEL";
+          post("CANCELLED", { requestId: msg.requestId });
+          measurement.record({ type:"CANCEL", ok:true, durationMs:now() - startedAt, strategy:"kernel" });
+          return;
+        }
+
+        if (msg.type === "RUNTIME_HEALTH") {
+          post("RUNTIME_HEALTH_DONE", {
+            requestId: msg.requestId,
+            state: createRuntimeStateSnapshot(runtimeState),
+            measurement: measurement.snapshot(),
+            commands: commands.keys(),
+          });
+          measurement.record({ type:"RUNTIME_HEALTH", ok:true, durationMs:now() - startedAt, strategy:"kernel" });
+          return;
+        }
+
+        if (msg.type === "RUNTIME_MEASUREMENTS") {
+          post("RUNTIME_MEASUREMENTS_DONE", {
+            requestId: msg.requestId,
+            measurement: measurement.snapshot(),
+          });
+          measurement.record({ type:"RUNTIME_MEASUREMENTS", ok:true, durationMs:now() - startedAt, strategy:"kernel" });
+          return;
+        }
+
+        const command = commands.get(msg.type);
+        if (command) {
+          await executeRegisteredCommand(command, msg, startedAt);
+          return;
+        }
+
+        await executeLegacyFallback(msg, startedAt);
+      } catch (error) {
+        const safeError = normalizeCommandError(error);
+        runtimeState.runtime.commandCount += 1;
+        runtimeState.runtime.failureCount += 1;
+        runtimeState.runtime.lastCommandType = msg.type || "";
+        runtimeState.runtime.lastError = safeError;
+
+        post("ERROR", {
+          requestId: msg.requestId,
+          requestType: msg.type || "",
+          code: safeError.code,
+          message: safeError.message,
+          stack: safeError.stack,
+        });
+
+        measurement.record({
+          type: msg.type || "UNKNOWN",
+          ok: false,
+          durationMs: now() - startedAt,
+          strategy: "kernel",
+          errorCode: safeError.code,
+        });
+      }
+    },
+  };
+}
+
+const runtimeMeasurements = createRuntimeMeasurement();
+const runtimeCommands = createRuntimeCommandRegistry();
+
+function registerRuntimeCommand(type, command){
+  runtimeCommands.set(type, command);
+  return runtimeCommands;
+}
+
+
+async function legacyWorkerMessageRouter(e){
   const msg=e.data||{};
+  state.__lastRouterError = null;
+  state.__lastCommandType = msg.type || "";
   try{
     if (msg.type==="EXECUTE_CHUNK_BATCH"){
       state.cancelled=false;
@@ -6254,6 +6519,7 @@ self.onmessage=async(e)=>{
     }
 
   }catch(err){
+    state.__lastRouterError = { code:"LEGACY_ROUTER_ERROR", message:err?.message || String(err), requestType:msg?.type || "" };
     post("ERROR",{
       message:err?.message || String(err),
       stack:err?.stack || "",
@@ -6263,7 +6529,21 @@ self.onmessage=async(e)=>{
     });
     postProgress(0,`Error: ${err?.message || String(err)}`);
   }
+}
+
+
+const runtimeKernel = createRuntimeKernel({
+  runtimeState: state,
+  post,
+  commands: runtimeCommands,
+  measurement: runtimeMeasurements,
+  legacyHandler: legacyWorkerMessageRouter,
+});
+
+self.onmessage = (event) => {
+  runtimeKernel.handle(event);
 };
+
   
 
   
@@ -6293,7 +6573,7 @@ self.onmessage=async(e)=>{
 
 
 
-const { useCallback, useEffect, useMemo, useRef, useState } = React;
+const { useCallback, useEffect, useMemo, useRef, useState, useReducer } = React;
 
 const {
   ThemeProvider,
@@ -10458,6 +10738,55 @@ function createRuntimeMetrics() {
 }
 
 
+function createInitialAppRuntimeSurface() {
+  return {
+    progress: 0,
+    progressText: "Ready",
+    busy: false,
+    busyLabel: "",
+    logs: [],
+    status: "CSVを選択してAnalyze Schemaを実行してください。",
+  };
+}
+
+function appRuntimeSurfaceReducer(state, action) {
+  if (!action || !action.type) return state;
+
+  if (action.type === "runtime/set") {
+    const key = action.key;
+    if (!Object.prototype.hasOwnProperty.call(state, key)) return state;
+    const nextValue = typeof action.valueOrUpdater === "function"
+      ? action.valueOrUpdater(state[key])
+      : action.valueOrUpdater;
+    if (Object.is(state[key], nextValue)) return state;
+    return { ...state, [key]: nextValue };
+  }
+
+  if (action.type === "runtime/batch") {
+    const patch = action.patch || {};
+    let changed = false;
+    const next = { ...state };
+    for (const key of Object.keys(patch)) {
+      if (!Object.prototype.hasOwnProperty.call(state, key)) continue;
+      const value = patch[key];
+      if (!Object.is(next[key], value)) {
+        next[key] = value;
+        changed = true;
+      }
+    }
+    return changed ? next : state;
+  }
+
+  return state;
+}
+
+function createRuntimeSurfaceSetter(dispatch, key) {
+  return function setRuntimeSurfaceValue(valueOrUpdater) {
+    dispatch({ type: "runtime/set", key, valueOrUpdater });
+  };
+}
+
+
 
 function App() {
   const workerRef = useRef(null);
@@ -10506,12 +10835,18 @@ function App() {
 
   const [mainPanel, setMainPanel] = useState(({ import: "management", workspace: "work" }[initialSettings.mainPanel] || initialSettings.mainPanel || "management"));
   const [tab, setTab] = useState(initialSettings.tab || "clean");
-  const [progress, setProgress] = useState(0);
-  const [progressText, setProgressText] = useState("Ready");
-  const [busy, setBusy] = useState(false);
-  const [busyLabel, setBusyLabel] = useState("");
-  const [logs, setLogs] = useState([]);
-  const [status, setStatus] = useState("CSVを選択してAnalyze Schemaを実行してください。");
+  const [runtimeSurface, dispatchRuntimeSurface] = useReducer(
+    appRuntimeSurfaceReducer,
+    null,
+    createInitialAppRuntimeSurface
+  );
+  const { progress, progressText, busy, busyLabel, logs, status } = runtimeSurface;
+  const setProgress = useMemo(() => createRuntimeSurfaceSetter(dispatchRuntimeSurface, "progress"), []);
+  const setProgressText = useMemo(() => createRuntimeSurfaceSetter(dispatchRuntimeSurface, "progressText"), []);
+  const setBusy = useMemo(() => createRuntimeSurfaceSetter(dispatchRuntimeSurface, "busy"), []);
+  const setBusyLabel = useMemo(() => createRuntimeSurfaceSetter(dispatchRuntimeSurface, "busyLabel"), []);
+  const setLogs = useMemo(() => createRuntimeSurfaceSetter(dispatchRuntimeSurface, "logs"), []);
+  const setStatus = useMemo(() => createRuntimeSurfaceSetter(dispatchRuntimeSurface, "status"), []);
 
   const [schema, setSchema] = useState(null);
   const [manifest, setManifest] = useState(null);
