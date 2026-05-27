@@ -2,7 +2,7 @@
 <html lang="ja">
 <head>
   <meta charset="UTF-8" />
-  <title>Quantum CSV Grid - Runtime Kernel Refactored Full Build</title>
+  <title>Quantum CSV Grid - Runtime Fast Path Refactored Build</title>
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Roboto:wght@300;400;600;700&display=swap" />
   <link rel="stylesheet" href="https://fonts.googleapis.com/icon?family=Material+Icons" />
@@ -6540,8 +6540,43 @@ const runtimeKernel = createRuntimeKernel({
   legacyHandler: legacyWorkerMessageRouter,
 });
 
+/*
+ * Runtime Fast Path
+ * ---------------------------------------------------------
+ * Data processing commands are the hot path. They must not pay the
+ * control-plane cost of normalize / plan wrapper / measurement / fallback
+ * accounting on every message.
+ *
+ * Rule:
+ * - Control-plane commands and newly registered runtime commands go through
+ *   Runtime Kernel.
+ * - Existing data-plane commands go directly to legacyWorkerMessageRouter.
+ *
+ * This keeps the structural boundary while restoring the original execution
+ * speed for ANALYZE / BUILD_COLUMNAR / RUN_DATA_QUERY / READ_PAGE /
+ * graph / pivot / chunk operations.
+ */
+const RUNTIME_CONTROL_COMMANDS = new Set([
+  "CANCEL",
+  "RUNTIME_HEALTH",
+  "RUNTIME_MEASUREMENTS",
+]);
+
+function shouldUseRuntimeKernel(rawMessage){
+  if (!rawMessage || typeof rawMessage !== "object") return true;
+  const type = String(rawMessage.type || "");
+  if (!type) return true;
+  return RUNTIME_CONTROL_COMMANDS.has(type) || runtimeCommands.has(type);
+}
+
 self.onmessage = (event) => {
-  runtimeKernel.handle(event);
+  const rawMessage = event?.data || {};
+  if (shouldUseRuntimeKernel(rawMessage)) {
+    runtimeKernel.handle(event);
+    return;
+  }
+
+  legacyWorkerMessageRouter(event);
 };
 
   
