@@ -6964,7 +6964,45 @@ function graphResultTotalRows(mode, surfaceId=null){
   return Number(state.manifest?.totalRows || 0);
 }
 
-async function readGraphResultWindow({mode="data", surfaceId=null, page=1, pageSize=1000, columns=[], derivedColumns=[], outputColumnNames=null}={}){
+
+function normalizeGraphResultTableFilters(input={}){
+  const rawGlobal = String(input.globalFilter || "").trim().slice(0, 500);
+  const rawColumns = input.columnFilters && typeof input.columnFilters === "object" ? input.columnFilters : {};
+  const columnFilters = [];
+  for (const [key, value] of Object.entries(rawColumns)){
+    const index = Number(key);
+    const text = String(value || "").trim().slice(0, 500);
+    if (Number.isFinite(index) && index >= 0 && text) columnFilters.push({index:Math.floor(index), value:text.toLowerCase()});
+  }
+  return {globalFilter:rawGlobal.toLowerCase(), columnFilters};
+}
+
+function hasGraphResultTableFilters(filters){
+  return !!(filters && (String(filters.globalFilter || "").trim() || (Array.isArray(filters.columnFilters) && filters.columnFilters.length)));
+}
+
+function graphResultFilterCellText(value){
+  if (value == null) return "";
+  if (typeof value === "number") return Number.isFinite(value) ? String(value) : "";
+  if (typeof value === "boolean") return value ? "true" : "false";
+  return String(value);
+}
+
+function graphResultOutputRowMatches(row, filters){
+  if (!hasGraphResultTableFilters(filters)) return true;
+  const cells = Array.isArray(row) ? row : [];
+  if (filters.globalFilter) {
+    const hit = cells.some((cell) => graphResultFilterCellText(cell).toLowerCase().includes(filters.globalFilter));
+    if (!hit) return false;
+  }
+  for (const f of filters.columnFilters || []){
+    const cell = graphResultFilterCellText(cells[f.index]).toLowerCase();
+    if (!cell.includes(f.value)) return false;
+  }
+  return true;
+}
+
+async function readGraphResultWindow({mode="data", surfaceId=null, page=1, pageSize=1000, columns=[], derivedColumns=[], outputColumnNames=null, tableFilters=null}={}){
   const surface = getGraphResultSurface({mode, surfaceId});
   if (!surface) throw new Error("Graph Query Result surface is not active");
 
@@ -6976,29 +7014,66 @@ async function readGraphResultWindow({mode="data", surfaceId=null, page=1, pageS
   const selected = Array.isArray(columns) && columns.length
     ? graphResultSurfaceRequiredSourceIndices(surface, columns)
     : allIndices;
+  const header = graphResultSurfaceHeader(surface, selected);
+  const filters = normalizeGraphResultTableFilters(tableFilters || {});
+  const filtered = hasGraphResultTableFilters(filters);
+
+  if (!filtered) {
+    const rows = [];
+    let skipped = 0;
+    await forEachGraphResultSurfaceRow(surface, selected, {
+      label:"GraphResultSurface page",
+      progressBase:0,
+      progressSpan:1,
+      rowLimit:start + limit,
+      chunkYieldEvery:8,
+      visit:(value) => {
+        if (skipped < start) { skipped++; return; }
+        if (rows.length < limit) rows.push(graphResultSurfaceMaterializeValueArray(value, selected));
+      }
+    });
+
+    const applied = graphApplyDerivedRows(header, rows, derivedColumns, outputColumnNames);
+    return {
+      ...applied,
+      surface:graphResultSurfaceSummary(surface),
+      surfaceId:surface.id,
+      startRow:start,
+      totalMatches:Number(surface.rowCount || surface.totalRows || 0),
+      filtered:false,
+      page:safePage,
+      pageSize:safePageSize
+    };
+  }
 
   const rows = [];
-  let skipped = 0;
+  let matched = 0;
   await forEachGraphResultSurfaceRow(surface, selected, {
-    label:"GraphResultSurface page",
+    label:"GraphResultSurface filtered page",
     progressBase:0,
-    progressSpan:1,
-    rowLimit:start + limit,
-    chunkYieldEvery:8,
+    progressSpan:99,
+    rowLimit:Number.POSITIVE_INFINITY,
+    chunkYieldEvery:4,
     visit:(value) => {
-      if (skipped < start) { skipped++; return; }
-      if (rows.length < limit) rows.push(graphResultSurfaceMaterializeValueArray(value, selected));
+      const baseRow = graphResultSurfaceMaterializeValueArray(value, selected);
+      const appliedOne = graphApplyDerivedRows(header, [baseRow], derivedColumns, outputColumnNames);
+      const outRow = appliedOne.rows?.[0] || baseRow;
+      if (!graphResultOutputRowMatches(outRow, filters)) return true;
+      if (matched >= start && rows.length < limit) rows.push(outRow);
+      matched++;
+      return true;
     }
   });
 
-  const header = graphResultSurfaceHeader(surface, selected);
-  const applied = graphApplyDerivedRows(header, rows, derivedColumns, outputColumnNames);
+  const appliedHeader = graphApplyDerivedRows(header, [], derivedColumns, outputColumnNames);
   return {
-    ...applied,
+    header:appliedHeader.header || header,
+    rows,
     surface:graphResultSurfaceSummary(surface),
     surfaceId:surface.id,
     startRow:start,
-    totalMatches:Number(surface.rowCount || surface.totalRows || 0),
+    totalMatches:matched,
+    filtered:true,
     page:safePage,
     pageSize:safePageSize
   };
@@ -8985,6 +9060,14 @@ async function legacyWorkerMessageRouter(e){
     }
 
 
+    if (msg.type==="READ_GRAPH_RESULT_WINDOW"){
+      state.cancelled=false;
+      const t0=now();
+      const result=await readGraphResultWindow(msg);
+      post("GRAPH_RESULT_PAGE_RESULT",{...result,page:Number(msg.page||1),ms:now()-t0,origin:msg.origin || "graph"});
+      return;
+    }
+
     if (msg.type==="RUN_GRAPH_RESULT_SEARCH"){
       state.cancelled=false;
       post("PROGRESS",{value:0,text:"Searching Graph Query Result..."});
@@ -10200,12 +10283,17 @@ function VisualHyperTensorTableView({
   statusLabel = "",
   sourceLabel = "Visual HyperTensor",
   resetKey = "",
+  externalGlobalFilter = "",
+  externalColumnFilters = {},
+  onExternalGlobalFilterChange = null,
+  onExternalColumnFiltersChange = null,
+  onExternalClearFilters = null,
 }) {
   const baseHeader = Array.isArray(header) ? header : [];
   const baseRows = Array.isArray(rows) ? rows : [];
   const rowHeight = dense ? 26 : 32;
   const labelHeaderHeight = dense ? 32 : 38;
-  const filterRowHeight = filterable && !externalLazy ? (dense ? 31 : 35) : 0;
+  const filterRowHeight = filterable ? (dense ? 31 : 35) : 0;
   const headerHeight = labelHeaderHeight + filterRowHeight;
   const toolbarHeight = dense ? 34 : 38;
   const canvasHeight = Math.max(120, Number(height || 520) - toolbarHeight);
@@ -10229,8 +10317,12 @@ function VisualHyperTensorTableView({
   const [pendingPage, setPendingPage] = useState(null);
   const [renderStats, setRenderStats] = useState({fps:0, avgPaintMs:0, lastPaintMs:0, dropped:0, visibleRows:0, visibleCols:0, cacheMode:"viewport-canvas"});
 
+  const effectiveGlobalFilter = externalLazy ? String(externalGlobalFilter || "") : globalFilter;
+  const effectiveColumnFilters = externalLazy && externalColumnFilters && typeof externalColumnFilters === "object" ? externalColumnFilters : columnFilters;
+  const hasRemoteFilterBridge = externalLazy && (typeof onExternalGlobalFilterChange === "function" || typeof onExternalColumnFiltersChange === "function");
+
   const { columnWidths, getColumnWidth, setColumnWidth, resetColumnWidth, clearColumnWidths } = useTileColumnWidths(displayHeader, tableId, minColumnWidth);
-  const columnFilterKey = useMemo(() => JSON.stringify(columnFilters || {}), [columnFilters]);
+  const columnFilterKey = useMemo(() => JSON.stringify(effectiveColumnFilters || {}), [effectiveColumnFilters]);
 
   const lazyResetKey = useMemo(() => {
     if (!externalLazy) return "";
@@ -10270,11 +10362,11 @@ function VisualHyperTensorTableView({
   const processedRows = useMemo(() => {
     if (externalLazy) return decoratedRows;
     let next = decoratedRows;
-    const q = String(globalFilter || "").trim().toLowerCase();
+    const q = String(effectiveGlobalFilter || "").trim().toLowerCase();
     if (filterable && q) {
       next = next.filter((row) => (Array.isArray(row) ? row : []).some((cell) => normalizeTileCell(cell).toLowerCase().includes(q)));
     }
-    const activeColumnFilters = Object.entries(columnFilters || {}).filter(([, value]) => String(value || "").trim() !== "");
+    const activeColumnFilters = Object.entries(effectiveColumnFilters || {}).filter(([, value]) => String(value || "").trim() !== "");
     if (filterable && activeColumnFilters.length) {
       next = next.filter((row) => activeColumnFilters.every(([index, value]) => {
         const cell = normalizeTileCell(row?.[Number(index)]).toLowerCase();
@@ -10293,7 +10385,7 @@ function VisualHyperTensorTableView({
       });
     }
     return next;
-  }, [decoratedRows, externalLazy, filterable, globalFilter, columnFilterKey, sortable, sort]);
+  }, [decoratedRows, externalLazy, filterable, effectiveGlobalFilter, columnFilterKey, sortable, sort]);
 
   const safeTotal = Math.max(0, Number(totalRows == null ? processedRows.length : totalRows) || 0, externalLazy ? baseRows.length : 0);
   const safePageSize = externalLazy
@@ -10559,7 +10651,7 @@ function VisualHyperTensorTableView({
 
   useEffect(() => {
     schedulePaint("data");
-  }, [headerKey, visualRowsFingerprint(processedRows), visualRowsFingerprint(decoratedRows), widths.join("|"), safeTotal, canvasHeight, selected.row, selected.col, sort.index, sort.direction, globalFilter, columnFilterKey, schedulePaint]);
+  }, [headerKey, visualRowsFingerprint(processedRows), visualRowsFingerprint(decoratedRows), widths.join("|"), safeTotal, canvasHeight, selected.row, selected.col, sort.index, sort.direction, effectiveGlobalFilter, columnFilterKey, schedulePaint]);
 
   useEffect(() => () => {
     if (rafRef.current) cancelAnimationFrame(rafRef.current);
@@ -10615,14 +10707,21 @@ function VisualHyperTensorTableView({
   }, [externalLazy, sortable]);
 
   const setColumnFilterValue = useCallback((index, value) => {
+    const v = String(value || "");
+    if (externalLazy && typeof onExternalColumnFiltersChange === "function") {
+      const next = {...(effectiveColumnFilters || {})};
+      if (v) next[index] = v;
+      else delete next[index];
+      onExternalColumnFiltersChange(next);
+      return;
+    }
     setColumnFilters((prev) => {
       const next = {...prev};
-      const v = String(value || "");
       if (v) next[index] = v;
       else delete next[index];
       return next;
     });
-  }, []);
+  }, [effectiveColumnFilters, externalLazy, onExternalColumnFiltersChange]);
 
   const eventPoint = (event) => {
     const rect = canvasRef.current?.getBoundingClientRect?.();
@@ -10685,7 +10784,7 @@ function VisualHyperTensorTableView({
     ? (decoratedRows.length ? `${fmt(safeLoadedStart + 1)} - ${fmt(Math.min(safeLoadedStart + decoratedRows.length, safeTotal))}` : "未読込")
     : `${fmt(processedRows.length)} / ${fmt(decoratedRows.length)}`;
   const hasColumnWidths = Object.keys(columnWidths).length > 0;
-  const hasColumnFilters = Object.values(columnFilters || {}).some((v) => String(v || "").trim() !== "");
+  const hasColumnFilters = Object.values(effectiveColumnFilters || {}).some((v) => String(v || "").trim() !== "");
 
   return (
     <Box sx={{ width:"100%", maxWidth:"100%", minWidth:0, overflow:"hidden" }}>
@@ -10700,13 +10799,17 @@ function VisualHyperTensorTableView({
           {externalLazy && pendingPage != null && <Chip size="small" color="warning" variant="outlined" label={`reading page ${fmt(pendingPage)}`} />}
           {selected.row >= 0 && <Chip size="small" color="success" label={`selected r${fmt(selected.row + 1)} c${fmt(selected.col + 1)}`} />}
           <Chip size="small" variant="outlined" label={`fps ${fmt(renderStats.fps)} / paint ${renderStats.avgPaintMs.toFixed(1)}ms`} />
-          {filterable && !externalLazy && (
+          {filterable && (
             <TextField
               size="small"
-              value={globalFilter}
-              onChange={(e) => setGlobalFilter(e.target.value)}
-              placeholder="全列検索"
-              sx={{ width: 180, ml: 0.5 }}
+              value={effectiveGlobalFilter}
+              onChange={(e) => {
+                const value = e.target.value;
+                if (externalLazy && typeof onExternalGlobalFilterChange === "function") onExternalGlobalFilterChange(value);
+                else setGlobalFilter(value);
+              }}
+              placeholder={externalLazy ? "全列検索（結果Surface）" : "全列検索"}
+              sx={{ width: 210, ml: 0.5 }}
               inputProps={{ style:{fontSize:12, padding:"5px 7px"} }}
             />
           )}
@@ -10729,7 +10832,7 @@ function VisualHyperTensorTableView({
               {displayHeader.map((name, ci) => {
                 const w = Number(widths[ci] || minColumnWidth);
                 const activeSort = sort.index === ci;
-                const filterValue = columnFilters?.[ci] || "";
+                const filterValue = effectiveColumnFilters?.[ci] || "";
                 return (
                   <Box key={`${tableId}-h-${ci}`} sx={{ width:w, minWidth:w, maxWidth:w, height:headerHeight, position:"relative", borderRight:"1px solid", borderColor:"divider", overflow:"hidden", bgcolor:activeSort ? "action.selected" : "background.paper" }}>
                     <Button
@@ -10743,7 +10846,7 @@ function VisualHyperTensorTableView({
                         {normalizeTileCell(name)}{activeSort ? (sort.direction === "desc" ? " ↓" : " ↑") : ""}
                       </Box>
                     </Button>
-                    {filterable && !externalLazy && (
+                    {filterable && (
                       <Box sx={{ height:filterRowHeight, px:0.5, pb:0.35 }}>
                         <input
                           value={filterValue}
@@ -10774,7 +10877,19 @@ function VisualHyperTensorTableView({
         <Stack direction="row" spacing={0.5} sx={{ flexWrap:"wrap" }}>
           {hasColumnWidths && <Button size="small" onClick={clearColumnWidths}>Reset column widths</Button>}
           {selected.col >= 0 && <Button size="small" onClick={() => resetColumnWidth(selected.col)}>Reset selected column</Button>}
-          {(globalFilter || hasColumnFilters || sort.index >= 0) && !externalLazy && <Button size="small" onClick={() => { setGlobalFilter(""); setColumnFilters({}); setSort({index:-1,direction:"asc"}); }}>Clear filters/sort</Button>}
+          {(effectiveGlobalFilter || hasColumnFilters || sort.index >= 0) && (
+            <Button size="small" onClick={() => {
+              if (externalLazy) {
+                onExternalClearFilters?.();
+              } else {
+                setGlobalFilter("");
+                setColumnFilters({});
+                setSort({index:-1,direction:"asc"});
+              }
+            }}>
+              Clear filters/sort
+            </Button>
+          )}
         </Stack>
       </Stack>
     </Box>
@@ -14426,7 +14541,7 @@ function FormulaRecipePanel({ onPick, fieldOptions=[] }) {
 }
 
 
-function GraphQueryVirtualTable({ table, totalRows=0, page=1, pageSize=GRAPH_RESULT_PANEL_TILE_ROWS, onReadPage=()=>{}, height=420, resetKey="" }) {
+function GraphQueryVirtualTable({ table, totalRows=0, page=1, pageSize=GRAPH_RESULT_PANEL_TILE_ROWS, onReadPage=()=>{}, height=420, resetKey="", globalFilter="", columnFilters={}, onGlobalFilterChange=()=>{}, onColumnFiltersChange=()=>{}, onClearFilters=()=>{} }) {
   const header = table?.header || [];
   const rows = table?.rows || [];
   const safeTotal = Math.max(Number(totalRows || 0), rows.length);
@@ -14445,7 +14560,7 @@ function GraphQueryVirtualTable({ table, totalRows=0, page=1, pageSize=GRAPH_RES
       rows={rows}
       height={height}
       dense={false}
-      filterable={false}
+      filterable
       sortable={false}
       minColumnWidth={160}
       externalLazy
@@ -14454,6 +14569,11 @@ function GraphQueryVirtualTable({ table, totalRows=0, page=1, pageSize=GRAPH_RES
       page={safePage}
       pageSize={safePageSize}
       onReadPage={onReadPage}
+      externalGlobalFilter={globalFilter}
+      externalColumnFilters={columnFilters}
+      onExternalGlobalFilterChange={onGlobalFilterChange}
+      onExternalColumnFiltersChange={onColumnFiltersChange}
+      onExternalClearFilters={onClearFilters}
       emptyMessage="Graph Queryを実行すると、ここに結果パネルが表示されます。"
       sourceLabel="Graph Query Result"
       statusLabel={`全${fmt(safeTotal)}行 / page ${fmt(safePage)} / tile ${fmt(safePageSize)} rows`}
@@ -14468,6 +14588,9 @@ function GraphQueryEditor({ columns, datasets=[], manifest=null, nodes, setNodes
   const [showMiniMap, setShowMiniMap] = useState(false);
   const [resultRowsDraft, setResultRowsDraft] = useState(String(normalizeGraphResultPageSize(resultRowsPerTile, GRAPH_RESULT_PANEL_TILE_ROWS)));
   const [resultAnalysisTab, setResultAnalysisTab] = useState("search");
+  const [resultGlobalFilter, setResultGlobalFilter] = useState("");
+  const [resultColumnFilters, setResultColumnFilters] = useState({});
+  const resultFilterTimerRef = useRef(0);
   const [resultSearchColumn, setResultSearchColumn] = useState("0");
   const [resultSearchOp, setResultSearchOp] = useState("contains");
   const [resultSearchValue, setResultSearchValue] = useState("");
@@ -14492,6 +14615,57 @@ function GraphQueryEditor({ columns, datasets=[], manifest=null, nodes, setNodes
     if (Number(resultTimeField) >= resultHeader.length) setResultTimeField("0");
   }, [resultHeader.length]);
   const safeSetSqlText = typeof setSqlText === "function" ? setSqlText : () => {};
+  const normalizeResultColumnFilters = useCallback((filters = {}) => {
+    const out = {};
+    for (const [key, value] of Object.entries(filters || {})) {
+      const index = Number(key);
+      const text = String(value || "").trim();
+      if (Number.isFinite(index) && index >= 0 && text) out[Math.floor(index)] = text;
+    }
+    return out;
+  }, []);
+
+  const readResultPageWithFilters = useCallback((nextPage = 1, nextPageSize = null, override = {}) => {
+    const safePageSize = normalizeGraphResultPageSize(nextPageSize || resultRowsPerTile, GRAPH_RESULT_PANEL_TILE_ROWS);
+    const globalFilter = Object.prototype.hasOwnProperty.call(override, "globalFilter")
+      ? String(override.globalFilter || "")
+      : resultGlobalFilter;
+    const columnFilters = Object.prototype.hasOwnProperty.call(override, "columnFilters")
+      ? normalizeResultColumnFilters(override.columnFilters)
+      : resultColumnFilters;
+    onReadPage(nextPage, safePageSize, { globalFilter, columnFilters });
+  }, [onReadPage, resultRowsPerTile, resultGlobalFilter, resultColumnFilters, normalizeResultColumnFilters]);
+
+  const scheduleResultFilterRead = useCallback((globalFilter, columnFilters) => {
+    if (resultFilterTimerRef.current) clearTimeout(resultFilterTimerRef.current);
+    resultFilterTimerRef.current = setTimeout(() => {
+      resultFilterTimerRef.current = 0;
+      readResultPageWithFilters(1, normalizeGraphResultPageSize(resultRowsPerTile, GRAPH_RESULT_PANEL_TILE_ROWS), { globalFilter, columnFilters });
+    }, 320);
+  }, [readResultPageWithFilters, resultRowsPerTile]);
+
+  const updateResultGlobalFilter = useCallback((value) => {
+    const next = String(value || "");
+    setResultGlobalFilter(next);
+    scheduleResultFilterRead(next, resultColumnFilters);
+  }, [resultColumnFilters, scheduleResultFilterRead]);
+
+  const updateResultColumnFilters = useCallback((filters) => {
+    const next = normalizeResultColumnFilters(filters);
+    setResultColumnFilters(next);
+    scheduleResultFilterRead(resultGlobalFilter, next);
+  }, [normalizeResultColumnFilters, resultGlobalFilter, scheduleResultFilterRead]);
+
+  const clearResultTableFilters = useCallback(() => {
+    setResultGlobalFilter("");
+    setResultColumnFilters({});
+    readResultPageWithFilters(1, normalizeGraphResultPageSize(resultRowsPerTile, GRAPH_RESULT_PANEL_TILE_ROWS), { globalFilter: "", columnFilters: {} });
+  }, [readResultPageWithFilters, resultRowsPerTile]);
+
+  useEffect(() => () => {
+    if (resultFilterTimerRef.current) clearTimeout(resultFilterTimerRef.current);
+  }, []);
+
   const safeSetSqlMode = typeof setSqlMode === "function" ? setSqlMode : () => {};
 
   const markGraphDefinitionChanged = useCallback((reason = "graph") => {
@@ -14511,7 +14685,7 @@ function GraphQueryEditor({ columns, datasets=[], manifest=null, nodes, setNodes
     const next = String(nextNumber);
     setResultRowsDraft(next);
     setResultRowsPerTile(next);
-    setTimeout(() => onReadPage(1, nextNumber), 0);
+    setTimeout(() => readResultPageWithFilters(1, nextNumber), 0);
   };
 
   const switchGraphResultToTile = () => {
@@ -14522,14 +14696,14 @@ function GraphQueryEditor({ columns, datasets=[], manifest=null, nodes, setNodes
     setResultViewMode("tile");
     setResultRowsDraft(next);
     setResultRowsPerTile(next);
-    setTimeout(() => onReadPage(1, tileRows), 0);
+    setTimeout(() => readResultPageWithFilters(1, tileRows), 0);
   };
 
   const switchGraphResultToPage = () => {
     setResultViewMode("page");
     setResultRowsDraft("100");
     setResultRowsPerTile("100");
-    setTimeout(() => onReadPage(1, 100), 0);
+    setTimeout(() => readResultPageWithFilters(1, 100), 0);
   };
 
   useEffect(() => {
@@ -14965,9 +15139,9 @@ function GraphQueryEditor({ columns, datasets=[], manifest=null, nodes, setNodes
           <Button size="small" variant={resultViewMode === "page" ? "contained" : "outlined"} onClick={switchGraphResultToPage}>ページ表示（100件）</Button>
           <SmallNumberField label={resultViewMode === "tile" ? "tile/ページ行数" : "ページ行数"} value={resultRowsDraft} onChange={setResultRowsDraft} min="50" step="50" sx={{ width: 150 }} />
           <Button size="small" variant="outlined" onClick={applyResultRowsPerTile}>件数を適用</Button>
-          {resultViewMode === "page" && <Button size="small" onClick={() => onReadPage(Math.max(1, Number(resultPage || 1) - 1), normalizeGraphResultPageSize(resultRowsPerTile, GRAPH_RESULT_PANEL_TILE_ROWS))}>Prev</Button>}
+          {resultViewMode === "page" && <Button size="small" onClick={() => readResultPageWithFilters(Math.max(1, Number(resultPage || 1) - 1), normalizeGraphResultPageSize(resultRowsPerTile, GRAPH_RESULT_PANEL_TILE_ROWS))}>Prev</Button>}
           {resultViewMode === "page" && <Typography variant="caption">Page {Number(resultPage || 1).toLocaleString()} / {Number(resultPageMax || 0).toLocaleString()}</Typography>}
-          {resultViewMode === "page" && <Button size="small" onClick={() => onReadPage(Math.min(Number(resultPageMax || 1), Number(resultPage || 1) + 1), normalizeGraphResultPageSize(resultRowsPerTile, GRAPH_RESULT_PANEL_TILE_ROWS))}>Next</Button>}
+          {resultViewMode === "page" && <Button size="small" onClick={() => readResultPageWithFilters(Math.min(Number(resultPageMax || 1), Number(resultPage || 1) + 1), normalizeGraphResultPageSize(resultRowsPerTile, GRAPH_RESULT_PANEL_TILE_ROWS))}>Next</Button>}
           {resultViewMode === "tile" && <Chip size="small" color="primary" label={`lazy全件パネル / tile ${normalizeGraphResultPageSize(resultRowsPerTile, GRAPH_RESULT_PANEL_TILE_ROWS).toLocaleString()}行 / 読込中 ${Number(resultTable?.rows?.length || 0).toLocaleString()} / 全 ${Number(dataQueryCount || 0).toLocaleString()}`} />}
           <Chip size="small" label={`${Number(dataQueryCount || 0).toLocaleString()} rows`} />
         </Stack>
@@ -14977,8 +15151,13 @@ function GraphQueryEditor({ columns, datasets=[], manifest=null, nodes, setNodes
             totalRows={Number(dataQueryCount || 0)}
             page={Number(resultPage || 1)}
             pageSize={resultRowsPerTile}
-            onReadPage={onReadPage}
+            onReadPage={readResultPageWithFilters}
             height={420}
+            globalFilter={resultGlobalFilter}
+            columnFilters={resultColumnFilters}
+            onGlobalFilterChange={updateResultGlobalFilter}
+            onColumnFiltersChange={updateResultColumnFilters}
+            onClearFilters={clearResultTableFilters}
             resetKey={`graph-result-panel:${Number(dataQueryCount || 0)}:${resultHeader.join("\u001f")}:${normalizeGraphResultPageSize(resultRowsPerTile, GRAPH_RESULT_PANEL_TILE_ROWS)}`}
           />
         ) : (
@@ -16415,6 +16594,19 @@ function App() {
         return;
       },
 
+      "GRAPH_RESULT_PAGE_RESULT"(msg) {
+        const table = { header: msg.header, rows: msg.rows, page: msg.page || 1, pageSize: msg.pageSize || graphResultPageSizeRef.current, startRow: Number(msg.startRow || 0), totalMatches: msg.totalMatches || 0 };
+        const derived = graphExecutionRef.current?.derivedColumns || [];
+        setGraphResultMode(msg.surface?.mode === "join" ? "join" : "data");
+        setGraphResultTable(table);
+        setGraphResultCount(msg.totalMatches || 0);
+        setGraphResultPage(msg.page || 1);
+        setGraphResultSurface(msg.surface || graphResultSurface || null);
+        setGraphResultStatus(`Graph filtered rows ${fmt(msg.startRow + 1)} - ${fmt(msg.startRow + msg.rows.length)} / ${fmt(msg.totalMatches)} / page ${fmt(msg.page)}${derived.length ? ` / 計算列 ${fmt(derived.length)}列` : ""}`);
+        setGraphResultTime(ms(msg.ms));
+        return;
+      },
+
       "GRAPH_JOIN_DONE"(msg) {
         const derived = graphExecutionRef.current?.derivedColumns || [];
         setGraphResultMode("join");
@@ -17185,17 +17377,49 @@ function App() {
     });
   }
 
-  function readGraphQueryPage(next = graphResultPage, pageSizeOverride = null) {
+  function normalizeGraphResultUiFilters(input = {}) {
+    const globalFilter = String(input.globalFilter || "").trim();
+    const rawColumns = input.columnFilters && typeof input.columnFilters === "object" ? input.columnFilters : {};
+    const columnFilters = {};
+    for (const [key, value] of Object.entries(rawColumns)) {
+      const index = Number(key);
+      const text = String(value || "").trim();
+      if (Number.isFinite(index) && index >= 0 && text) columnFilters[Math.floor(index)] = text;
+    }
+    return { globalFilter, columnFilters };
+  }
+
+  function hasGraphResultUiFilters(filters = {}) {
+    return Boolean(String(filters.globalFilter || "").trim() || Object.values(filters.columnFilters || {}).some((v) => String(v || "").trim()));
+  }
+
+  function readGraphQueryPage(next = graphResultPage, pageSizeOverride = null, filterOptions = {}) {
     const safe = Math.max(1, Number(next || 1));
     const requestedPageSize = Math.max(1, Number(pageSizeOverride || graphResultPageSizeRef.current || 1000));
+    const tableFilters = normalizeGraphResultUiFilters(filterOptions);
     graphResultPageSizeRef.current = requestedPageSize;
     if (pageSizeOverride != null) setGraphResultPageSize(String(requestedPageSize));
+    setGraphResultPage(safe);
+
+    if (hasGraphResultUiFilters(tableFilters)) {
+      setGraphResultStatus("Graph Query Resultを列フィルターで絞り込み中...");
+      post({
+        type: "READ_GRAPH_RESULT_WINDOW",
+        origin: "graph",
+        ...graphResultPayload({
+          page: safe,
+          pageSize: requestedPageSize,
+          tableFilters,
+        }),
+      });
+      return;
+    }
+
     if (graphResultMode === "join") {
-      setGraphResultPage(safe);
       post({ type: "READ_GRAPH_JOIN_PAGE", page: safe, pageSize: requestedPageSize });
       return;
     }
-    setGraphResultPage(safe);
+
     const readMode = graphExecutionRef.current?.readMode || "dataQuery";
     if (readMode === "page") {
       post({ type: "READ_PAGE", origin: "graph", page: safe, pageSize: requestedPageSize, columns: graphExecutionRef.current?.readColumns || [] });
