@@ -2,7 +2,7 @@
 <html lang="ja">
 <head>
   <meta charset="UTF-8" />
-  <title>Quantum CSV Grid - v12 Simulation What-if Build</title>
+  <title>Quantum CSV Grid - Data Work Studio Build</title>
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Roboto:wght@300;400;600;700&display=swap" />
   <link rel="stylesheet" href="https://fonts.googleapis.com/icon?family=Material+Icons" />
@@ -20771,6 +20771,297 @@ function SimulationWhatIfPanel({
 }
 
 
+
+
+const STUDIO_COLUMN_TYPE_OPTIONS = [
+  { value: "text", label: "Text（テキスト）" },
+  { value: "number", label: "Number（数値）" },
+  { value: "date", label: "Date / Time（日付・時刻）" },
+  { value: "boolean", label: "Boolean（真偽値）" },
+  { value: "category", label: "Category（カテゴリ）" },
+];
+
+function makeStudioColumn(name = "column", type = "text", semantic = "text", defaultValue = "") {
+  return {
+    id: `studio_col_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`,
+    name,
+    type,
+    semantic,
+    required: false,
+    defaultValue,
+  };
+}
+
+function normalizeStudioColumnName(name, index = 0) {
+  const raw = String(name || "").trim();
+  return raw || `column_${index + 1}`;
+}
+
+function sanitizeStudioFileName(name) {
+  const cleaned = String(name || "studio_dataset")
+    .trim()
+    .replace(/[\\/:*?"<>|]+/g, "_")
+    .replace(/\s+/g, "_")
+    .slice(0, 80);
+  return cleaned || "studio_dataset";
+}
+
+function inferStudioColumnSemantic(name, type, values = []) {
+  const n = String(name || "").toLowerCase();
+  if (/(mail|email|e-mail)/.test(n)) return "email";
+  if (/(url|uri|link|href|website|site)/.test(n)) return "url";
+  if (/(date|time|timestamp|created|updated|日時|日付)/.test(n)) return "date";
+  if (/(status|state|状態|ステータス)/.test(n)) return "status";
+  if (/(id|uuid|guid|key|code|no|番号|識別)/.test(n)) return "id";
+  if (/(amount|price|revenue|sales|cost|total|qty|quantity|score|value|金額|売上|価格|数量|点数)/.test(n)) return "measure";
+  if (type === "number") return "measure";
+  if (type === "date") return "date";
+  if (type === "boolean") return "boolean";
+  if (type === "category") return "category";
+  const unique = new Set(values.map((v) => String(v ?? "").trim()).filter(Boolean));
+  if (unique.size > 0 && unique.size <= Math.max(20, Math.ceil(values.length * 0.25))) return "category";
+  return "text";
+}
+
+function inferStudioColumnType(name, values = []) {
+  const n = String(name || "").toLowerCase();
+  const sample = values.map((v) => String(v ?? "").trim()).filter(Boolean).slice(0, 80);
+  if (/(date|time|timestamp|日時|日付)/.test(n)) return "date";
+  if (/(status|state|category|type|区分|分類|状態)/.test(n)) return "category";
+  if (sample.length) {
+    const numeric = sample.filter((v) => /^-?\d+(?:\.\d+)?$/.test(v.replace(/,/g, ""))).length / sample.length;
+    const dates = sample.filter((v) => !Number.isNaN(Date.parse(v))).length / sample.length;
+    const bools = sample.filter((v) => /^(true|false|yes|no|0|1|はい|いいえ)$/i.test(v)).length / sample.length;
+    if (numeric >= 0.85 && !/(id|code|no|番号)/i.test(n)) return "number";
+    if (dates >= 0.85) return "date";
+    if (bools >= 0.85) return "boolean";
+  }
+  return "text";
+}
+
+function parseStudioDelimitedText(text) {
+  const raw = String(text || "").trim();
+  if (!raw) return { header: [], rows: [] };
+  const lines = raw.split(/\r?\n/).filter((line) => line.length > 0);
+  const delimiter = raw.includes("\t") ? "\t" : ",";
+  const parseLine = (line) => {
+    if (delimiter === "\t") return line.split("\t");
+    const out = [];
+    let cur = "";
+    let quoted = false;
+    for (let i = 0; i < line.length; i++) {
+      const ch = line[i];
+      if (ch === '"') {
+        if (quoted && line[i + 1] === '"') { cur += '"'; i++; }
+        else quoted = !quoted;
+      } else if (ch === "," && !quoted) {
+        out.push(cur);
+        cur = "";
+      } else {
+        cur += ch;
+      }
+    }
+    out.push(cur);
+    return out;
+  };
+  const parsed = lines.map(parseLine);
+  const header = parsed[0] || [];
+  const rows = parsed.slice(1);
+  return { header, rows };
+}
+
+function DataWorkStudioPanel({
+  busy,
+  studioTableName,
+  setStudioTableName,
+  studioDescription,
+  setStudioDescription,
+  studioColumns,
+  studioRows,
+  studioPasteText,
+  setStudioPasteText,
+  studioStatus,
+  studioPreviewTable,
+  onAddColumn,
+  onRemoveColumn,
+  onUpdateColumn,
+  onAddRow,
+  onRemoveRow,
+  onUpdateCell,
+  onLoadSample,
+  onLoadPasted,
+  onPreview,
+  onSaveDataset,
+  storageWorkspace,
+  storageCollection,
+  setStorageWorkspace,
+  setStorageCollection,
+}) {
+  const visibleRows = studioRows.slice(0, 80);
+  const nonEmptyRows = studioRows.filter((row) => row.some((v) => String(v ?? "").trim() !== "")).length;
+
+  return (
+    <Section
+      title="Data Work Studio Setting"
+      icon={<TableChart />}
+      hint="CSV Importなしで新規テーブルを作成し、Storage Datasetとして登録します。登録後はv8〜v12、Graph Query、Visualizeで同じDatasetとして扱えます。"
+    >
+      <Stack spacing={1}>
+        <Alert severity="info">
+          Studioは元CSVを必要としません。列定義と行データから一時CSVを生成し、既存のStorage保存経路へ流すため、保存後は通常のDatasetと同じ分析対象になります。
+        </Alert>
+
+        <Box sx={{ display: "grid", gridTemplateColumns: { xs: "1fr", lg: "360px minmax(0, 1fr)" }, gap: 1, minWidth: 0 }}>
+          <Stack spacing={1}>
+            <Paper variant="outlined" sx={{ p: 1 }}>
+              <Typography variant="subtitle1" sx={{ fontWeight: 900, mb: 0.75 }}>Studio Setting</Typography>
+              <TextField label="Dataset / Table name" value={studioTableName} onChange={(e) => setStudioTableName(e.target.value)} fullWidth />
+              <TextField label="Description" value={studioDescription} onChange={(e) => setStudioDescription(e.target.value)} multiline minRows={3} fullWidth />
+              <Stack direction="row" spacing={1}>
+                <TextField label="Workspace" value={storageWorkspace} onChange={(e) => setStorageWorkspace(e.target.value)} fullWidth />
+                <TextField label="Collection" value={storageCollection} onChange={(e) => setStorageCollection(e.target.value)} fullWidth />
+              </Stack>
+              <Stack direction="row" spacing={0.75} useFlexGap flexWrap="wrap" sx={{ mt: 0.75 }}>
+                <Button onClick={onLoadSample}>Load sample</Button>
+                <Button onClick={onPreview}>Preview</Button>
+                <Button variant="contained" color="success" disabled={busy} onClick={onSaveDataset}>Register Dataset</Button>
+              </Stack>
+              <Alert severity={studioStatus.startsWith("Error") ? "error" : "success"} sx={{ mt: 0.75 }}>
+                {studioStatus}
+              </Alert>
+            </Paper>
+
+            <Paper variant="outlined" sx={{ p: 1 }}>
+              <Typography variant="subtitle1" sx={{ fontWeight: 900, mb: 0.75 }}>Paste TSV / CSV</Typography>
+              <TextField
+                value={studioPasteText}
+                onChange={(e) => setStudioPasteText(e.target.value)}
+                placeholder={"id\tdate\tcategory\tamount\n1\t2025-01-01\tA\t1200"}
+                multiline
+                minRows={7}
+                fullWidth
+              />
+              <Button sx={{ mt: 0.75 }} onClick={onLoadPasted}>Load pasted data</Button>
+            </Paper>
+          </Stack>
+
+          <Stack spacing={1} sx={{ minWidth: 0 }}>
+            <Paper variant="outlined" sx={{ p: 1, minWidth: 0 }}>
+              <Stack direction="row" justifyContent="space-between" alignItems="center" sx={{ mb: 0.75 }}>
+                <Typography variant="subtitle1" sx={{ fontWeight: 900 }}>Schema Builder</Typography>
+                <Button onClick={onAddColumn}>Add column</Button>
+              </Stack>
+              <TableContainer sx={{ maxHeight: 320 }}>
+                <Table size="small" stickyHeader>
+                  <TableHead>
+                    <TableRow>
+                      <TableCell sx={{ minWidth: 160 }}>Column</TableCell>
+                      <TableCell sx={{ minWidth: 130 }}>Type</TableCell>
+                      <TableCell sx={{ minWidth: 190 }}>Semantic</TableCell>
+                      <TableCell sx={{ minWidth: 90 }}>Required</TableCell>
+                      <TableCell sx={{ minWidth: 150 }}>Default</TableCell>
+                      <TableCell sx={{ width: 80 }}>Action</TableCell>
+                    </TableRow>
+                  </TableHead>
+                  <TableBody>
+                    {studioColumns.map((column, index) => (
+                      <TableRow key={column.id || index}>
+                        <TableCell>
+                          <TextField value={column.name} onChange={(e) => onUpdateColumn(index, { name: e.target.value })} fullWidth />
+                        </TableCell>
+                        <TableCell>
+                          <TextField select value={column.type || "text"} onChange={(e) => onUpdateColumn(index, { type: e.target.value })} fullWidth>
+                            {STUDIO_COLUMN_TYPE_OPTIONS.map((option) => (
+                              <MenuItem key={option.value} value={option.value}>{option.label}</MenuItem>
+                            ))}
+                          </TextField>
+                        </TableCell>
+                        <TableCell>
+                          <TextField select value={column.semantic || "text"} onChange={(e) => onUpdateColumn(index, { semantic: e.target.value })} fullWidth>
+                            {SEMANTIC_OVERRIDE_OPTIONS.filter((option) => option.value !== "auto").map((option) => (
+                              <MenuItem key={option.value} value={option.value}>{option.label}</MenuItem>
+                            ))}
+                          </TextField>
+                        </TableCell>
+                        <TableCell>
+                          <Checkbox checked={!!column.required} onChange={(e) => onUpdateColumn(index, { required: e.target.checked })} />
+                        </TableCell>
+                        <TableCell>
+                          <TextField value={column.defaultValue || ""} onChange={(e) => onUpdateColumn(index, { defaultValue: e.target.value })} fullWidth />
+                        </TableCell>
+                        <TableCell>
+                          <Button color="error" disabled={studioColumns.length <= 1} onClick={() => onRemoveColumn(index)}>Delete</Button>
+                        </TableCell>
+                      </TableRow>
+                    ))}
+                  </TableBody>
+                </Table>
+              </TableContainer>
+            </Paper>
+
+            <Paper variant="outlined" sx={{ p: 1, minWidth: 0 }}>
+              <Stack direction="row" justifyContent="space-between" alignItems="center" sx={{ mb: 0.75 }}>
+                <Box>
+                  <Typography variant="subtitle1" sx={{ fontWeight: 900 }}>Editable Data Grid</Typography>
+                  <Typography variant="caption" color="text.secondary">
+                    rows {studioRows.length} / non-empty {nonEmptyRows} / showing first {visibleRows.length}
+                  </Typography>
+                </Box>
+                <Button onClick={onAddRow}>Add row</Button>
+              </Stack>
+              <TableContainer sx={{ maxHeight: 420, overflow: "auto" }}>
+                <Table size="small" stickyHeader>
+                  <TableHead>
+                    <TableRow>
+                      <TableCell sx={{ width: 54 }}>#</TableCell>
+                      {studioColumns.map((column, colIndex) => (
+                        <TableCell key={column.id || colIndex} sx={{ minWidth: 150 }}>
+                          {normalizeStudioColumnName(column.name, colIndex)}
+                        </TableCell>
+                      ))}
+                      <TableCell sx={{ width: 80 }}>Action</TableCell>
+                    </TableRow>
+                  </TableHead>
+                  <TableBody>
+                    {visibleRows.map((row, rowIndex) => (
+                      <TableRow key={rowIndex}>
+                        <TableCell>{rowIndex + 1}</TableCell>
+                        {studioColumns.map((column, colIndex) => (
+                          <TableCell key={`${rowIndex}-${column.id || colIndex}`}>
+                            <TextField
+                              value={row?.[colIndex] ?? ""}
+                              onChange={(e) => onUpdateCell(rowIndex, colIndex, e.target.value)}
+                              placeholder={column.defaultValue || ""}
+                              fullWidth
+                            />
+                          </TableCell>
+                        ))}
+                        <TableCell>
+                          <Button color="error" disabled={studioRows.length <= 1} onClick={() => onRemoveRow(rowIndex)}>Delete</Button>
+                        </TableCell>
+                      </TableRow>
+                    ))}
+                  </TableBody>
+                </Table>
+              </TableContainer>
+            </Paper>
+          </Stack>
+        </Box>
+
+        <Paper variant="outlined" sx={{ p: 1, minWidth: 0 }}>
+          <Typography variant="subtitle1" sx={{ fontWeight: 900, mb: 0.75 }}>Studio Preview</Typography>
+          {studioPreviewTable ? (
+            <DataTable table={studioPreviewTable} tableId="studio-preview" height={360} />
+          ) : (
+            <Typography color="text.secondary">Previewを押すと登録予定のテーブルを確認できます。</Typography>
+          )}
+        </Paper>
+      </Stack>
+    </Section>
+  );
+}
+
+
 function ReliabilityDiagnosticsPanel({
   manifest,
   autonomousInsights,
@@ -20882,6 +21173,7 @@ function App() {
   const graphExecutionRef = useRef({ active:false, mode:"data", readMode:"dataQuery", derivedColumns:[] });
   const graphPendingRunRef = useRef(null);
   const graphDerivedApplySeqRef = useRef(0);
+  const studioPendingSemanticRef = useRef(null);
   const initialSettingsRef = useRef(loadSettings());
   const initialSettings = initialSettingsRef.current;
 
@@ -21049,6 +21341,26 @@ function App() {
   const [simulationStatus, setSimulationStatus] = useState("Storage Datasetを開くと、v12 Simulation / What-ifを実行できます。");
   const [simulationTime, setSimulationTime] = useState("");
 
+  const initialStudioDraft = initialSettings.studioDraft && typeof initialSettings.studioDraft === "object" ? initialSettings.studioDraft : {};
+  const [studioTableName, setStudioTableName] = useState(initialStudioDraft.tableName || "studio_dataset");
+  const [studioDescription, setStudioDescription] = useState(initialStudioDraft.description || "");
+  const [studioColumns, setStudioColumns] = useState(() => Array.isArray(initialStudioDraft.columns) && initialStudioDraft.columns.length
+    ? initialStudioDraft.columns.map((c, i) => ({ ...makeStudioColumn(normalizeStudioColumnName(c.name, i), c.type || "text", c.semantic || "text", c.defaultValue || ""), required: !!c.required, id: c.id || `studio_col_${i}` }))
+    : [
+      makeStudioColumn("id", "text", "id"),
+      makeStudioColumn("date", "date", "date"),
+      makeStudioColumn("category", "category", "category"),
+      makeStudioColumn("amount", "number", "measure"),
+      makeStudioColumn("status", "category", "status"),
+    ]);
+  const [studioRows, setStudioRows] = useState(() => Array.isArray(initialStudioDraft.rows) && initialStudioDraft.rows.length
+    ? initialStudioDraft.rows.slice(0, 500).map((row) => Array.isArray(row) ? row.map((v) => String(v ?? "")) : [])
+    : [["1", "2025-01-01", "A", "1200", "ok"], ["2", "2025-01-02", "B", "900", "ok"], ["3", "2025-01-03", "A", "9800", "failed"]]);
+  const [studioPasteText, setStudioPasteText] = useState("");
+  const [studioStatus, setStudioStatus] = useState("Studioで新規テーブルを作成し、Register DatasetでStorageへ登録できます。");
+  const [studioPreviewTable, setStudioPreviewTable] = useState(null);
+
+
 
   const [syntheticPreviewTable, setSyntheticPreviewTable] = useState(null);
   const [syntheticReport, setSyntheticReport] = useState([]);
@@ -21172,9 +21484,15 @@ function App() {
       tab,
       agentGoal,
       simulationGoal,
+      studioDraft: {
+        tableName: studioTableName,
+        description: studioDescription,
+        columns: studioColumns,
+        rows: studioRows.slice(0, 200),
+      },
       rules,
     });
-  }, [themeMode, tableDensity, previewRows, encoding, csvExportEncoding, delimiter, chunkSize, sampleRows, pageSize, graphResultPageSize, storageWorkspace, storageCollection, memoryMaxMB, memoryMaxRows, externalProvider, externalEndpoint, externalPrefix, externalAuthMode, s3Region, s3Bucket, mainPanel, tab, agentGoal, simulationGoal, rules]);
+  }, [themeMode, tableDensity, previewRows, encoding, csvExportEncoding, delimiter, chunkSize, sampleRows, pageSize, graphResultPageSize, storageWorkspace, storageCollection, memoryMaxMB, memoryMaxRows, externalProvider, externalEndpoint, externalPrefix, externalAuthMode, s3Region, s3Bucket, mainPanel, tab, agentGoal, simulationGoal, studioTableName, studioDescription, studioColumns, studioRows, rules]);
 
   function appendLog(text) {
     const line = `[${new Date().toLocaleTimeString()}] ${text}`;
@@ -21657,6 +21975,22 @@ function App() {
           status: `Storage保存完了: ${fmt(msg.manifest.totalRows)} rows / ${fmt(msg.manifest.chunks)} chunks。以後はStorageタブから再オープンできます。`,
           logMessage: `Columnar cache built: ${msg.manifest.id}`,
         });
+        const pendingStudioSemantic = studioPendingSemanticRef.current;
+        if (pendingStudioSemantic && msg.manifest?.columns?.length) {
+          const overrideMap = {};
+          for (const savedColumn of msg.manifest.columns || []) {
+            const match = pendingStudioSemantic.columns.find((c) => Number(c.index) === Number(savedColumn.index) || c.name === savedColumn.name);
+            const semantic = normalizeSemanticOverrideValue(match?.semantic);
+            if (semantic) {
+              overrideMap[String(savedColumn.index)] = semantic;
+              overrideMap[`name:${savedColumn.name}`] = semantic;
+            }
+          }
+          saveSemanticOverridesForDataset(msg.manifest, null, overrideMap);
+          setSemanticOverrides(overrideMap);
+          studioPendingSemanticRef.current = null;
+          setStudioStatus(`Dataset registered with Studio semantics: ${msg.manifest.name || pendingStudioSemantic.tableName}`);
+        }
         setCleanReport([
           ["Source rows", fmt(msg.manifest.cleanReport?.sourceRows)],
           ["Output rows", fmt(msg.manifest.cleanReport?.totalRows)],
@@ -22632,6 +22966,225 @@ function App() {
       semanticOverrides:compactSemanticOverrides(semanticOverrides),
     });
   }
+
+
+  function buildStudioTableModel() {
+    const normalizedColumns = studioColumns.map((column, index) => ({
+      ...column,
+      name: normalizeStudioColumnName(column.name, index),
+      type: column.type || "text",
+      semantic: column.semantic || inferStudioColumnSemantic(column.name, column.type || "text"),
+      defaultValue: column.defaultValue || "",
+      required: !!column.required,
+    }));
+
+    const seen = new Map();
+    const duplicate = normalizedColumns.find((column) => {
+      const key = column.name.toLowerCase();
+      const exists = seen.has(key);
+      seen.set(key, true);
+      return exists;
+    });
+    if (duplicate) {
+      throw new Error(`Duplicate column name: ${duplicate.name}`);
+    }
+
+    const rows = studioRows
+      .map((row) => normalizedColumns.map((column, index) => {
+        const raw = row?.[index] ?? "";
+        return String(raw).trim() === "" && column.defaultValue !== "" ? column.defaultValue : raw;
+      }))
+      .filter((row) => row.some((v) => String(v ?? "").trim() !== ""));
+
+    if (!normalizedColumns.length) throw new Error("At least one column is required");
+    if (!rows.length) throw new Error("At least one non-empty row is required");
+
+    const missingRequired = [];
+    rows.forEach((row, rowIndex) => {
+      normalizedColumns.forEach((column, colIndex) => {
+        if (column.required && String(row[colIndex] ?? "").trim() === "") {
+          missingRequired.push(`${column.name} row ${rowIndex + 1}`);
+        }
+      });
+    });
+    if (missingRequired.length) {
+      throw new Error(`Required values are missing: ${missingRequired.slice(0, 5).join(", ")}`);
+    }
+
+    return { columns: normalizedColumns, rows };
+  }
+
+  function buildStudioCsv() {
+    const { columns, rows } = buildStudioTableModel();
+    const lines = [
+      columns.map((column) => csvEscape(column.name)).join(","),
+      ...rows.map((row) => row.map((value) => csvEscape(value)).join(",")),
+    ];
+    return {
+      columns,
+      rows,
+      csv: `${lines.join("\r\n")}\r\n`,
+    };
+  }
+
+  function updateStudioPreview() {
+    try {
+      const { columns, rows } = buildStudioTableModel();
+      const preview = rows.slice(0, 500);
+      setStudioPreviewTable({
+        header: columns.map((column) => `${column.name} / ${column.semantic || column.type}`),
+        rows: preview,
+        page: 1,
+        pageSize: preview.length || 1,
+        startRow: 0,
+        totalMatches: rows.length,
+      });
+      setStudioStatus(`Preview ready: ${fmt(rows.length)} rows / ${fmt(columns.length)} columns`);
+    } catch (error) {
+      setStudioPreviewTable(null);
+      setStudioStatus(`Error: ${error?.message || "Studio preview failed"}`);
+    }
+  }
+
+  function addStudioColumn() {
+    setStudioColumns((prev) => [...prev, makeStudioColumn(`column_${prev.length + 1}`, "text", "text")]);
+    setStudioRows((prev) => prev.map((row) => [...row, ""]));
+  }
+
+  function removeStudioColumn(index) {
+    setStudioColumns((prev) => prev.filter((_, i) => i !== index));
+    setStudioRows((prev) => prev.map((row) => row.filter((_, i) => i !== index)));
+  }
+
+  function updateStudioColumn(index, patch) {
+    setStudioColumns((prev) => prev.map((column, i) => {
+      if (i !== index) return column;
+      const next = { ...column, ...patch };
+      if (Object.prototype.hasOwnProperty.call(patch, "type") && (!patch.semantic || patch.semantic === column.semantic)) {
+        next.semantic = inferStudioColumnSemantic(next.name, next.type);
+      }
+      return next;
+    }));
+  }
+
+  function addStudioRow() {
+    setStudioRows((prev) => [...prev, studioColumns.map(() => "")]);
+  }
+
+  function removeStudioRow(index) {
+    setStudioRows((prev) => prev.filter((_, i) => i !== index));
+  }
+
+  function updateStudioCell(rowIndex, colIndex, value) {
+    setStudioRows((prev) => {
+      const next = prev.map((row) => row.slice());
+      while (next.length <= rowIndex) next.push(studioColumns.map(() => ""));
+      while (next[rowIndex].length < studioColumns.length) next[rowIndex].push("");
+      next[rowIndex][colIndex] = value;
+      return next;
+    });
+  }
+
+  function loadStudioSample() {
+    setStudioTableName("studio_sales_sample");
+    setStudioDescription("Studioで作成したサンプル売上データ");
+    setStorageWorkspace((current) => current || "Studio");
+    setStorageCollection((current) => current || "Manual");
+    setStudioColumns([
+      makeStudioColumn("id", "text", "id"),
+      makeStudioColumn("date", "date", "date"),
+      makeStudioColumn("category", "category", "category"),
+      makeStudioColumn("region", "category", "dimension"),
+      makeStudioColumn("amount", "number", "measure"),
+      makeStudioColumn("status", "category", "status"),
+    ]);
+    setStudioRows([
+      ["1", "2025-01-01", "A", "Tokyo", "1200", "ok"],
+      ["2", "2025-01-02", "B", "Osaka", "900", "ok"],
+      ["3", "2025-01-03", "A", "Tokyo", "9800", "ok"],
+      ["4", "2025-01-04", "C", "Nagoya", "400", "failed"],
+      ["5", "2025-01-05", "B", "Osaka", "1100", "ok"],
+      ["6", "2025-01-06", "A", "Tokyo", "15000", "failed"],
+      ["7", "2025-01-07", "C", "Nagoya", "700", "ok"],
+    ]);
+    setStudioStatus("Sample loaded. PreviewまたはRegister Datasetを実行できます。");
+  }
+
+  function loadStudioPastedData() {
+    try {
+      const parsed = parseStudioDelimitedText(studioPasteText);
+      if (!parsed.header.length) throw new Error("Paste data is empty");
+      const width = Math.max(...parsed.rows.map((row) => row.length), parsed.header.length);
+      const columns = Array.from({ length: width }, (_, index) => {
+        const name = normalizeStudioColumnName(parsed.header[index], index);
+        const values = parsed.rows.map((row) => row[index] ?? "");
+        const type = inferStudioColumnType(name, values);
+        return makeStudioColumn(name, type, inferStudioColumnSemantic(name, type, values));
+      });
+      const rows = parsed.rows.length ? parsed.rows.map((row) => Array.from({ length: width }, (_, index) => row[index] ?? "")) : [Array.from({ length: width }, () => "")];
+      setStudioColumns(columns);
+      setStudioRows(rows);
+      if (!studioTableName || studioTableName === "studio_dataset") setStudioTableName("pasted_studio_dataset");
+      setStudioStatus(`Pasted data loaded: ${fmt(rows.length)} rows / ${fmt(columns.length)} columns`);
+    } catch (error) {
+      setStudioStatus(`Error: ${error?.message || "Paste failed"}`);
+    }
+  }
+
+  function saveStudioDataset() {
+    try {
+      const name = sanitizeStudioFileName(studioTableName || tableName || "studio_dataset");
+      const { columns, rows, csv } = buildStudioCsv();
+      const createdFile = new File([csv], `${name}.csv`, { type: "text/csv;charset=utf-8", lastModified: Date.now() });
+      setFiles([createdFile]);
+      setCandidateFiles([]);
+      setCandidateSelectedKeys([]);
+      setActiveFileIndex(0);
+      setDatasetName(name);
+      setTableName(name);
+      setCleanTable({
+        header: columns.map((column) => column.name),
+        rows: rows.slice(0, 500),
+        page: 1,
+        pageSize: Math.min(rows.length, 500) || 1,
+        startRow: 0,
+        totalMatches: rows.length,
+      });
+      setStudioPreviewTable({
+        header: columns.map((column) => `${column.name} / ${column.semantic || column.type}`),
+        rows: rows.slice(0, 500),
+        page: 1,
+        pageSize: Math.min(rows.length, 500) || 1,
+        startRow: 0,
+        totalMatches: rows.length,
+      });
+      studioPendingSemanticRef.current = {
+        tableName: name,
+        columns: columns.map((column, index) => ({
+          index,
+          name: column.name,
+          semantic: normalizeSemanticOverrideValue(column.semantic) || inferStudioColumnSemantic(column.name, column.type, rows.map((row) => row[index])),
+        })),
+      };
+      setStudioStatus(`Registering Dataset: ${name} / ${fmt(rows.length)} rows / ${fmt(columns.length)} columns`);
+
+      post({
+        type: "BUILD_COLUMNAR",
+        ...csvPayload(createdFile, [createdFile]),
+        file: createdFile,
+        files: [createdFile],
+        encoding: "utf-8",
+        delimiter: ",",
+        datasetName: name,
+        tableName: name,
+        storageWorkspace: storageWorkspace || "Studio",
+        storageCollection: storageCollection || "Manual",
+      });
+    } catch (error) {
+      setStudioStatus(`Error: ${error?.message || "Register Dataset failed"}`);
+    }
+  }
+
 
   function exportSimulationReport() {
     const text = String(simulationWhatIf?.reportDraft || "");
@@ -23945,6 +24498,7 @@ function App() {
             <Tabs value={tab} onChange={(e, v) => setTab(v)} variant="scrollable" scrollButtons="auto">
               <Tab value="clean" icon={<CleaningServices />} iconPosition="start" label="Clean" />
               <Tab value="data" icon={<Article />} iconPosition="start" label="Data" />
+              <Tab value="studio" icon={<TableChart />} iconPosition="start" label="Studio" />
               <Tab value="graph" icon={<Analytics />} iconPosition="start" label="Graph Query" />
               <Tab value="visualize" icon={<Timeline />} iconPosition="start" label="Visualize" />
               <Tab value="insights" icon={<Analytics />} iconPosition="start" label="Insights" />
@@ -24010,6 +24564,36 @@ function App() {
                 <Box sx={{ mt: 0.9 }}><KeyValue rows={cleanReport} /></Box>
               </Section>
             </Box>
+          )}
+
+          {tab === "studio" && (
+            <DataWorkStudioPanel
+              busy={busy}
+              studioTableName={studioTableName}
+              setStudioTableName={setStudioTableName}
+              studioDescription={studioDescription}
+              setStudioDescription={setStudioDescription}
+              studioColumns={studioColumns}
+              studioRows={studioRows}
+              studioPasteText={studioPasteText}
+              setStudioPasteText={setStudioPasteText}
+              studioStatus={studioStatus}
+              studioPreviewTable={studioPreviewTable}
+              onAddColumn={addStudioColumn}
+              onRemoveColumn={removeStudioColumn}
+              onUpdateColumn={updateStudioColumn}
+              onAddRow={addStudioRow}
+              onRemoveRow={removeStudioRow}
+              onUpdateCell={updateStudioCell}
+              onLoadSample={loadStudioSample}
+              onLoadPasted={loadStudioPastedData}
+              onPreview={updateStudioPreview}
+              onSaveDataset={saveStudioDataset}
+              storageWorkspace={storageWorkspace}
+              storageCollection={storageCollection}
+              setStorageWorkspace={setStorageWorkspace}
+              setStorageCollection={setStorageCollection}
+            />
           )}
 
           {tab === "data" && (
