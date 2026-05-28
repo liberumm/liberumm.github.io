@@ -5804,6 +5804,606 @@ async function buildGraphResultTime(msg={}){
   return state.graphResultTime;
 }
 
+
+
+/*
+ * =========================================================
+ * 12. Synthetic Dataset Studio
+ * =========================================================
+ * Data body is never embedded in the application.
+ * A small plan + seed generates chunked synthetic CSV or direct columnar OPFS data.
+ */
+
+const SYNTHETIC_DATASET_VERSION = 1;
+const SYNTHETIC_MAX_ROWS = 10000000;
+const SYNTHETIC_MAX_COLUMNS = 300;
+const SYNTHETIC_DEFAULT_CHUNK_ROWS = 50000;
+
+const SYNTHETIC_PRESET_DEFS = {
+  sales: {
+    label: "売上データ",
+    description: "注文・顧客・商品・地域・金額・日付を生成します。",
+    columns: [
+      { name:"order_id", kind:"id", prefix:"ORD", type:"string" },
+      { name:"customer_id", kind:"ref", prefix:"CUS", modulo:120000, type:"string" },
+      { name:"product_id", kind:"ref", prefix:"PRD", modulo:30000, type:"string" },
+      { name:"region", kind:"category", type:"string", values:["東京","大阪","福岡","札幌","名古屋","仙台","広島","那覇"], en:["Tokyo","Osaka","Fukuoka","Sapporo","Nagoya","Sendai","Hiroshima","Naha"], weights:[0.28,0.18,0.12,0.08,0.14,0.07,0.08,0.05] },
+      { name:"channel", kind:"category", type:"string", values:["EC","店舗","代理店","展示会"], weights:[0.46,0.34,0.15,0.05] },
+      { name:"quantity", key:"quantity", kind:"int", type:"number", min:1, max:12 },
+      { name:"unit_price", key:"unit_price", kind:"money", type:"number", min:300, max:90000, skew:"log" },
+      { name:"amount", kind:"amount", type:"number" },
+      { name:"ordered_at", kind:"date", type:"string", from:"2023-01-01", to:"2026-12-31" },
+      { name:"status", kind:"category", type:"string", values:["paid","pending","cancelled","refunded"], weights:[0.82,0.09,0.06,0.03] }
+    ]
+  },
+  iot: {
+    label: "センサーログ",
+    description: "端末ID・時刻・温度・湿度・状態を生成します。",
+    columns: [
+      { name:"event_id", kind:"id", prefix:"EVT", type:"string" },
+      { name:"device_id", kind:"ref", prefix:"DEV", modulo:25000, type:"string" },
+      { name:"timestamp", kind:"dateTime", type:"string", from:"2025-01-01", to:"2026-12-31" },
+      { name:"temperature", kind:"number", type:"number", min:-10, max:45, decimals:2, wave:true },
+      { name:"humidity", kind:"number", type:"number", min:15, max:95, decimals:2 },
+      { name:"battery", kind:"number", type:"number", min:0, max:100, decimals:1 },
+      { name:"status", kind:"category", type:"string", values:["normal","warning","error","offline"], weights:[0.86,0.09,0.03,0.02] },
+      { name:"site", kind:"category", type:"string", values:["東京工場","大阪倉庫","福岡支店","札幌拠点"], en:["Tokyo Plant","Osaka Warehouse","Fukuoka Branch","Sapporo Site"] }
+    ]
+  },
+  finance: {
+    label: "取引データ",
+    description: "口座・金額・通貨・加盟店・リスク値を生成します。",
+    columns: [
+      { name:"transaction_id", kind:"id", prefix:"TXN", type:"string" },
+      { name:"account_id", kind:"ref", prefix:"ACC", modulo:180000, type:"string" },
+      { name:"merchant", kind:"category", type:"string", values:["コンビニ","スーパー","ECサイト","交通","飲食","旅行","公共料金"], en:["Convenience","Grocery","E-Commerce","Transit","Restaurant","Travel","Utility"] },
+      { name:"amount", kind:"money", type:"number", min:100, max:500000, skew:"log" },
+      { name:"currency", kind:"category", type:"string", values:["JPY","USD","EUR","SGD"], weights:[0.82,0.10,0.05,0.03] },
+      { name:"risk_score", kind:"number", type:"number", min:0, max:100, decimals:2 },
+      { name:"is_fraud", kind:"boolean", type:"string", trueRate:0.012 },
+      { name:"transaction_at", kind:"dateTime", type:"string", from:"2024-01-01", to:"2026-12-31" }
+    ]
+  },
+  web: {
+    label: "アクセスログ",
+    description: "ユーザー・URL・ステータス・遅延を生成します。",
+    columns: [
+      { name:"request_id", kind:"id", prefix:"REQ", type:"string" },
+      { name:"user_id", kind:"ref", prefix:"USR", modulo:250000, type:"string" },
+      { name:"path", kind:"category", type:"string", values:["/","/search","/products","/cart","/checkout","/account","/api/orders","/api/recommend"] },
+      { name:"status_code", kind:"category", type:"string", values:["200","201","301","400","401","403","404","500"], weights:[0.72,0.04,0.05,0.04,0.03,0.02,0.07,0.03] },
+      { name:"latency_ms", kind:"int", type:"number", min:8, max:5000, skew:"log" },
+      { name:"referrer", kind:"category", type:"string", values:["direct","google","x","newsletter","affiliate","internal"] },
+      { name:"timestamp", kind:"dateTime", type:"string", from:"2025-01-01", to:"2026-12-31" }
+    ]
+  },
+  graph: {
+    label: "Graph結合サンプル",
+    description: "users / orders / products / events に近い結合キーを持つ行を生成します。",
+    columns: [
+      { name:"user_id", kind:"ref", prefix:"USR", modulo:200000, type:"string" },
+      { name:"order_id", kind:"id", prefix:"ORD", type:"string" },
+      { name:"product_id", kind:"ref", prefix:"PRD", modulo:50000, type:"string" },
+      { name:"event_id", kind:"id", prefix:"EVT", type:"string" },
+      { name:"segment", kind:"category", type:"string", values:["new","active","vip","sleeping"], weights:[0.22,0.58,0.08,0.12] },
+      { name:"category", kind:"category", type:"string", values:["食品","家電","衣料","美容","書籍","スポーツ"], en:["Food","Electronics","Apparel","Beauty","Books","Sports"] },
+      { name:"amount", kind:"money", type:"number", min:100, max:120000, skew:"log" },
+      { name:"event_type", kind:"category", type:"string", values:["view","cart","purchase","review","support"], weights:[0.50,0.20,0.18,0.07,0.05] },
+      { name:"event_at", kind:"dateTime", type:"string", from:"2024-01-01", to:"2026-12-31" }
+    ]
+  }
+};
+
+function syntheticHashString(input){
+  let h = 2166136261 >>> 0;
+  const s = String(input ?? "");
+  for (let i=0; i<s.length; i++){
+    h ^= s.charCodeAt(i);
+    h = Math.imul(h, 16777619) >>> 0;
+  }
+  return h >>> 0;
+}
+
+function syntheticMulberry32(seed){
+  let t = seed >>> 0;
+  return function(){
+    t += 0x6D2B79F5;
+    let r = Math.imul(t ^ (t >>> 15), 1 | t);
+    r ^= r + Math.imul(r ^ (r >>> 7), 61 | r);
+    return ((r ^ (r >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+function syntheticClampNumber(value, min, max, fallback){
+  const n = Number(value);
+  if (!Number.isFinite(n)) return fallback;
+  return Math.min(max, Math.max(min, n));
+}
+
+function syntheticRate(value, fallback=0){
+  const n = Number(value);
+  if (!Number.isFinite(n)) return fallback;
+  const normalized = n > 1 ? n / 100 : n;
+  return Math.min(1, Math.max(0, normalized));
+}
+
+function syntheticPad(n, width=8){
+  return String(Math.max(0, Math.floor(Number(n) || 0))).padStart(width, "0");
+}
+
+function syntheticChooseWeighted(rand, values, weights){
+  const list = Array.isArray(values) && values.length ? values : [""];
+  const w = Array.isArray(weights) && weights.length === list.length ? weights.map(Number) : null;
+  if (!w) return list[Math.floor(rand() * list.length) % list.length];
+  const total = w.reduce((a,b)=>a+(Number.isFinite(b) && b > 0 ? b : 0), 0) || 1;
+  let x = rand() * total;
+  for (let i=0; i<list.length; i++){
+    x -= Math.max(0, Number(w[i]) || 0);
+    if (x <= 0) return list[i];
+  }
+  return list[list.length - 1];
+}
+
+function syntheticDateToMs(value, fallback){
+  const t = Date.parse(value || "");
+  return Number.isFinite(t) ? t : Date.parse(fallback);
+}
+
+function syntheticFormatDate(msValue, mode){
+  const d = new Date(msValue);
+  const yyyy = d.getUTCFullYear();
+  const mm = String(d.getUTCMonth() + 1).padStart(2, "0");
+  const dd = String(d.getUTCDate()).padStart(2, "0");
+  if (mode === "slash") return `${yyyy}/${mm}/${dd}`;
+  if (mode === "jp") return `${yyyy}年${mm}月${dd}日`;
+  return `${yyyy}-${mm}-${dd}`;
+}
+
+function syntheticFormatDateTime(msValue, mode){
+  const d = new Date(msValue);
+  const base = syntheticFormatDate(msValue, mode === "mixed" ? "iso" : mode);
+  const hh = String(d.getUTCHours()).padStart(2, "0");
+  const mi = String(d.getUTCMinutes()).padStart(2, "0");
+  const ss = String(d.getUTCSeconds()).padStart(2, "0");
+  return `${base} ${hh}:${mi}:${ss}`;
+}
+
+function syntheticFormatNumber(value, decimals, mode, rand){
+  const n = Number(value);
+  if (!Number.isFinite(n)) return "";
+  const fixed = Number(decimals || 0) > 0 ? n.toFixed(Number(decimals || 0)) : String(Math.round(n));
+  if (mode === "comma") return fixed.replace(/\B(?=(\d{3})+(?!\d))/g, ",");
+  if (mode === "yen") return `¥${fixed.replace(/\B(?=(\d{3})+(?!\d))/g, ",")}`;
+  if (mode === "mixed") {
+    const r = rand();
+    if (r < 0.15) return `¥${fixed.replace(/\B(?=(\d{3})+(?!\d))/g, ",")}`;
+    if (r < 0.45) return fixed.replace(/\B(?=(\d{3})+(?!\d))/g, ",");
+  }
+  return fixed;
+}
+
+function syntheticCsvEscape(value){
+  if (value == null) return "";
+  let s = String(value);
+  if (/^[=+\-@]/.test(s)) s = `'${s}`;
+  s = s.replaceAll('"', '""');
+  return /[",\r\n]/.test(s) ? `"${s}"` : s;
+}
+
+function syntheticPresetColumns(presetName, requestedColumns, numberMode){
+  const preset = SYNTHETIC_PRESET_DEFS[presetName] || SYNTHETIC_PRESET_DEFS.sales;
+  const base = preset.columns.map((c) => ({...c}));
+  const target = Math.max(1, Math.min(SYNTHETIC_MAX_COLUMNS, Number(requestedColumns || base.length)));
+  const out = base.slice(0, target);
+  let i = 1;
+  while (out.length < target) {
+    const mod = i % 6;
+    if (mod === 0) out.push({ name:`metric_${i}`, kind:"number", type:"number", min:0, max:100000, decimals:2 });
+    else if (mod === 1) out.push({ name:`category_${i}`, kind:"category", type:"string", values:["A","B","C","D","E"], weights:[0.40,0.24,0.18,0.12,0.06] });
+    else if (mod === 2) out.push({ name:`flag_${i}`, kind:"boolean", type:"string", trueRate:0.35 });
+    else if (mod === 3) out.push({ name:`note_${i}`, kind:"text", type:"string" });
+    else if (mod === 4) out.push({ name:`score_${i}`, kind:"number", type:"number", min:0, max:1, decimals:4 });
+    else out.push({ name:`code_${i}`, kind:"id", prefix:`C${i}`, type:"string" });
+    i++;
+  }
+  return out.map((col, index) => ({
+    ...col,
+    index,
+    type: (["number","int","money","amount"].includes(col.kind) && String(numberMode || "plain") === "plain") ? "number" : (col.type === "number" && String(numberMode || "plain") === "plain" ? "number" : "string")
+  }));
+}
+
+function syntheticBuildPlan(msg){
+  const preset = String(msg.preset || "sales");
+  const rows = syntheticClampNumber(msg.rows, 1, SYNTHETIC_MAX_ROWS, 1000);
+  const columns = syntheticClampNumber(msg.columns, 1, SYNTHETIC_MAX_COLUMNS, SYNTHETIC_PRESET_DEFS[preset]?.columns?.length || 10);
+  const seed = syntheticHashString(`${msg.seed ?? 42}:${preset}`);
+  const dateMode = String(msg.dateMode || "iso");
+  const numberMode = String(msg.numberMode || "plain");
+  const plan = {
+    version:SYNTHETIC_DATASET_VERSION,
+    preset,
+    presetLabel:SYNTHETIC_PRESET_DEFS[preset]?.label || "売上データ",
+    rows:Math.floor(rows),
+    requestedColumns:Math.floor(columns),
+    seed,
+    seedText:String(msg.seed ?? 42),
+    chunkSize:Math.max(1000, Math.min(250000, Math.floor(Number(msg.syntheticChunkSize || msg.chunkSize || SYNTHETIC_DEFAULT_CHUNK_ROWS) || SYNTHETIC_DEFAULT_CHUNK_ROWS))),
+    nullRate:syntheticRate(msg.nullRate, 0),
+    duplicateRate:syntheticRate(msg.duplicateRate, 0),
+    outlierRate:syntheticRate(msg.outlierRate, 0),
+    emptyRate:syntheticRate(msg.emptyRate, 0),
+    longTextRate:syntheticRate(msg.longTextRate, 0),
+    japaneseRate:syntheticRate(msg.japaneseRate, 0.3),
+    dateMode,
+    numberMode,
+    outputMode:String(msg.outputMode || "open"),
+    datasetName:cleanMetaValue(msg.datasetName || `synthetic_${preset}_${rows}`, `synthetic_${preset}`),
+    storageWorkspace:cleanMetaValue(msg.storageWorkspace || "Synthetic", "Synthetic"),
+    storageCollection:cleanMetaValue(msg.storageCollection || "Generated", "Generated"),
+    tableName:cleanMetaValue(msg.tableName || msg.datasetName || `synthetic_${preset}_${rows}`, `synthetic_${preset}`)
+  };
+  plan.columns = syntheticPresetColumns(preset, plan.requestedColumns, plan.numberMode);
+  plan.schemaColumns = plan.columns.map((col, index) => ({
+    index,
+    name:cleanHeaderName(col.name || `column_${index+1}`, index, {nfkc:true, trim:true, controls:true, collapse:true}),
+    type:col.type === "number" ? "number" : "string",
+    originalName:col.name || `column_${index+1}`,
+    samples:[],
+    numericRatio:col.type === "number" ? 1 : 0,
+    nullRatio:plan.nullRate + plan.emptyRate
+  }));
+  return plan;
+}
+
+function syntheticGenerateCell(col, rowIndex, rand, plan, ctx){
+  const kind = col.kind || "text";
+  let value = "";
+  if (kind === "id") {
+    value = `${col.prefix || "ID"}-${syntheticPad(rowIndex + 1, 9)}`;
+  } else if (kind === "ref") {
+    const modulo = Math.max(1, Number(col.modulo || Math.max(1000, Math.floor(plan.rows / 8))) || 1000);
+    const id = (Math.floor(rand() * modulo) + rowIndex * 13) % modulo;
+    value = `${col.prefix || "REF"}-${syntheticPad(id + 1, 7)}`;
+  } else if (kind === "category") {
+    const useJapanese = rand() < plan.japaneseRate;
+    const values = useJapanese && Array.isArray(col.values) ? col.values : (Array.isArray(col.en) ? col.en : col.values);
+    value = syntheticChooseWeighted(rand, values, col.weights);
+  } else if (kind === "boolean") {
+    value = rand() < Number(col.trueRate ?? 0.5) ? "true" : "false";
+  } else if (kind === "date" || kind === "dateTime") {
+    const from = syntheticDateToMs(col.from, "2024-01-01");
+    const to = syntheticDateToMs(col.to, "2026-12-31");
+    const span = Math.max(1, to - from);
+    const msValue = from + Math.floor(rand() * span);
+    const mode = plan.dateMode === "mixed" ? (rand() < 0.5 ? "iso" : (rand() < 0.5 ? "slash" : "jp")) : plan.dateMode;
+    value = kind === "dateTime" ? syntheticFormatDateTime(msValue, mode) : syntheticFormatDate(msValue, mode);
+  } else if (kind === "int" || kind === "number" || kind === "money") {
+    const min = Number(col.min ?? 0);
+    const max = Number(col.max ?? 1000);
+    let x = min + rand() * (max - min);
+    if (col.skew === "log") {
+      const logMin = Math.log(Math.max(1, min));
+      const logMax = Math.log(Math.max(logMin + 1, max));
+      x = Math.exp(logMin + rand() * (logMax - logMin));
+    }
+    if (col.wave) x += Math.sin(rowIndex / 48) * ((max - min) * 0.08);
+    if (rand() < plan.outlierRate) x = rand() < 0.5 ? max * (5 + rand() * 30) : min - Math.abs(max - min) * (2 + rand() * 8);
+    const decimals = kind === "int" ? 0 : Number(col.decimals ?? (kind === "money" ? 0 : 2));
+    const numeric = decimals > 0 ? Number(x.toFixed(decimals)) : Math.round(x);
+    if (col.key) ctx[col.key] = numeric;
+    value = col.type === "number" && plan.numberMode === "plain" ? numeric : syntheticFormatNumber(numeric, decimals, plan.numberMode, rand);
+  } else if (kind === "amount") {
+    const quantity = Number(ctx.quantity || 1);
+    const unit = Number(ctx.unit_price || 1000);
+    let x = quantity * unit;
+    if (rand() < plan.outlierRate) x *= (5 + rand() * 20);
+    value = col.type === "number" && plan.numberMode === "plain" ? Math.round(x) : syntheticFormatNumber(x, 0, plan.numberMode, rand);
+  } else {
+    const long = rand() < plan.longTextRate;
+    const jp = rand() < plan.japaneseRate;
+    value = long
+      ? (jp ? `これは検索・型推定・長文セル検証用の説明文です。行番号 ${rowIndex + 1} の生成テキストで、CSVの引用符と改行耐性を確認します。` : `Long generated note for row ${rowIndex + 1}. It is used to test search, preview and CSV escaping behavior.`)
+      : (jp ? `メモ ${rowIndex + 1}` : `note ${rowIndex + 1}`);
+  }
+  return value == null ? "" : value;
+}
+
+function syntheticGenerateRow(plan, rowIndex, rand, previousRow){
+  if (previousRow && rand() < plan.duplicateRate) return previousRow.slice();
+  const ctx = {};
+  const row = plan.columns.map((col) => {
+    let value = syntheticGenerateCell(col, rowIndex, rand, plan, ctx);
+    const protectedKind = col.kind === "id";
+    if (!protectedKind && rand() < plan.nullRate) value = "";
+    else if (!protectedKind && rand() < plan.emptyRate) value = "";
+    return value;
+  });
+  return row;
+}
+
+function syntheticPreviewFromPlan(plan, limit=120){
+  const rand = syntheticMulberry32(plan.seed);
+  const rows = [];
+  let previous = null;
+  const count = Math.min(Number(limit || 120), plan.rows);
+  for (let i=0; i<count; i++){
+    const row = syntheticGenerateRow(plan, i, rand, previous);
+    rows.push(row);
+    previous = row;
+  }
+  return {
+    header:plan.schemaColumns.map((c)=>c.name),
+    rows,
+    summary:syntheticPlanSummary(plan, count)
+  };
+}
+
+function syntheticPlanSummary(plan, previewRows=0){
+  const approxBytes = Math.round(plan.rows * plan.schemaColumns.length * 14);
+  return {
+    preset:plan.preset,
+    presetLabel:plan.presetLabel,
+    rows:plan.rows,
+    columns:plan.schemaColumns.length,
+    chunkSize:plan.chunkSize,
+    seed:plan.seedText,
+    approxBytes,
+    approxMB:Math.round(approxBytes / 1024 / 1024),
+    nullRate:plan.nullRate,
+    duplicateRate:plan.duplicateRate,
+    outlierRate:plan.outlierRate,
+    japaneseRate:plan.japaneseRate,
+    dateMode:plan.dateMode,
+    numberMode:plan.numberMode,
+    outputMode:plan.outputMode,
+    previewRows
+  };
+}
+
+async function syntheticCsvFileFromPlan(plan){
+  const rand = syntheticMulberry32(plan.seed);
+  const chunks = [];
+  const header = plan.schemaColumns.map((c)=>syntheticCsvEscape(c.name)).join(",") + "\n";
+  chunks.push(header);
+  let previous = null;
+  const t0 = now();
+  for (let start=0; start<plan.rows; start += plan.chunkSize){
+    if (state.cancelled) throw new Error("Cancelled");
+    const take = Math.min(plan.chunkSize, plan.rows - start);
+    const lines = new Array(take);
+    for (let i=0; i<take; i++){
+      const row = syntheticGenerateRow(plan, start + i, rand, previous);
+      lines[i] = row.map(syntheticCsvEscape).join(",");
+      previous = row;
+    }
+    chunks.push(lines.join("\n"), "\n");
+    post("SYNTHETIC_PROGRESS", { value:Math.min(99, Math.floor(((start + take) / plan.rows) * 100)), text:`Synthetic CSV生成中... ${fmt(start + take)}/${fmt(plan.rows)} rows` });
+    if ((start / plan.chunkSize) % 2 === 0) await workerYield();
+  }
+  const filename = `${plan.datasetName || "synthetic_dataset"}.csv`.replace(/[\\/:*?"<>|]+/g, "_");
+  const blob = new Blob(chunks, { type:"text/csv;charset=utf-8" });
+  const file = typeof File === "function"
+    ? new File([blob], filename, { type:"text/csv;charset=utf-8", lastModified:Date.now() })
+    : blob;
+  if (!file.name) {
+    try { Object.defineProperty(file, "name", { value:filename }); } catch {}
+    try { Object.defineProperty(file, "lastModified", { value:Date.now() }); } catch {}
+  }
+  return { file, filename, bytes:blob.size, ms:now()-t0, summary:syntheticPlanSummary(plan) };
+}
+
+async function syntheticBuildColumnarDataset(plan, msg){
+  clearChunkCache();
+  state.cancelled = false;
+  const root = await rootDir();
+  const id = makeDatasetId(plan.datasetName || `synthetic_${plan.preset}`);
+  const dir = await root.getDirectoryHandle(id, { create:true });
+  const t0 = now();
+  const columns = plan.schemaColumns;
+  const rules = makeRules({
+    ruleTrim:true,
+    ruleNfkc:true,
+    ruleControls:true,
+    ruleCollapse:true,
+    ruleEmptyNull:true,
+    ruleNumericSymbols:true,
+    ruleDedupSpaces:true,
+    ruleSkipBadRows:false,
+    nullTokens:"NULL\nN/A\nNA\n-\n",
+    numericThreshold:0.90
+  });
+  try {
+    const rand = syntheticMulberry32(plan.seed);
+    let chunk = initChunk(columns);
+    let chunkIndex = 0;
+    let totalRows = 0;
+    let previous = null;
+    const chunkMetas = [];
+
+    for (let rowIndex=0; rowIndex<plan.rows; rowIndex++){
+      if (state.cancelled) throw new Error("Cancelled");
+      const row = syntheticGenerateRow(plan, rowIndex, rand, previous);
+      previous = row;
+      addRowToChunk(chunk, row, columns, rules);
+      totalRows++;
+      if (chunk.rows >= plan.chunkSize) {
+        const meta = await flushChunk(dir, chunkIndex, chunk, columns);
+        chunkMetas.push(meta);
+        chunkIndex++;
+        chunk = initChunk(columns);
+        post("SYNTHETIC_PROGRESS", { value:Math.min(95, Math.floor((totalRows / plan.rows) * 95)), text:`Synthetic Dataset保存中... chunk ${fmt(chunkIndex)} / rows ${fmt(totalRows)}` });
+        await workerYield();
+      } else if (totalRows % 50000 === 0) {
+        post("SYNTHETIC_PROGRESS", { value:Math.min(95, Math.floor((totalRows / plan.rows) * 95)), text:`Synthetic Dataset生成中... ${fmt(totalRows)}/${fmt(plan.rows)} rows` });
+      }
+    }
+
+    if (chunk.rows > 0) {
+      const meta = await flushChunk(dir, chunkIndex, chunk, columns);
+      chunkMetas.push(meta);
+      chunkIndex++;
+    }
+
+    const cleanReport = {
+      sourceRows:totalRows,
+      totalRows,
+      skippedRows:0,
+      malformedRows:0,
+      changedCells:0,
+      nullCells:chunkMetas.flatMap(c=>c.stats || []).reduce((a,s)=>a+(s.nulls||0),0),
+      invalidNumbers:chunkMetas.flatMap(c=>c.stats || []).reduce((a,s)=>a+(s.invalidNumbers||0),0),
+      synthetic:true,
+      syntheticPlan:syntheticPlanSummary(plan)
+    };
+
+    const manifest = {
+      id,
+      name:plan.datasetName,
+      storageWorkspace:plan.storageWorkspace,
+      storageCollection:plan.storageCollection,
+      tableName:plan.tableName,
+      storagePath:`${plan.storageWorkspace} / ${plan.storageCollection} / ${plan.tableName}`,
+      originalFileName:`${plan.datasetName}.synthetic.csv`,
+      sourceFiles:[{name:`${plan.datasetName}.synthetic.csv`, size:0, sourceRows:totalRows, totalRows, skippedRows:0, malformedRows:0, synthetic:true}],
+      createdAt:new Date().toISOString(),
+      mode:"synthetic-columnar",
+      formatVersion:5,
+      features:integrityFeatureFlags({synthetic:true}),
+      encoding:"utf-8",
+      delimiter:",",
+      fileSize:0,
+      chunkSize:plan.chunkSize,
+      totalRows,
+      sourceRows:totalRows,
+      chunks:chunkIndex,
+      columns,
+      rules,
+      cleanReport,
+      synthetic:{
+        version:SYNTHETIC_DATASET_VERSION,
+        preset:plan.preset,
+        presetLabel:plan.presetLabel,
+        seed:plan.seedText,
+        generatedAt:new Date().toISOString(),
+        quality:{
+          nullRate:plan.nullRate,
+          duplicateRate:plan.duplicateRate,
+          outlierRate:plan.outlierRate,
+          emptyRate:plan.emptyRate,
+          longTextRate:plan.longTextRate,
+          japaneseRate:plan.japaneseRate,
+          dateMode:plan.dateMode,
+          numberMode:plan.numberMode
+        }
+      }
+    };
+
+    post("SYNTHETIC_PROGRESS", { value:97, text:"Synthetic manifestを書き込み中..." });
+    await writeJson(dir, "manifest.json", manifest);
+    await writeJson(dir, "chunks.json", chunkMetas);
+
+    state.dataset = { id, manifest, chunks:chunkMetas };
+    state.virtual = null;
+    state.memory = null;
+    state.manifest = manifest;
+    state.dir = dir;
+    state.searchMatches = [];
+    state.dataQueryMatches = null;
+    state.dataQueryMeta = null;
+    state.pivotTable = null;
+    state.pivotTileIndex = null;
+    state.timeTable = null;
+    return { manifest, chunks:chunkMetas, ms:now()-t0, summary:syntheticPlanSummary(plan) };
+  } catch (err) {
+    await cleanupDatasetDir(root, id);
+    throw err;
+  }
+}
+
+function syntheticGraphSetSpecs(plan){
+  const userRows = Math.max(100, Math.min(plan.rows, Math.floor(plan.rows * 0.20)));
+  const productRows = Math.max(50, Math.min(50000, Math.floor(plan.rows * 0.05)));
+  const orderRows = plan.rows;
+  const eventRows = Math.max(plan.rows, Math.floor(plan.rows * 1.25));
+  return [
+    { name:"users", rows:userRows, columns:[
+      {name:"user_id", kind:"id", prefix:"USR", type:"string"},
+      {name:"name", kind:"text", type:"string"},
+      {name:"region", kind:"category", type:"string", values:["東京","大阪","福岡","札幌","名古屋"], en:["Tokyo","Osaka","Fukuoka","Sapporo","Nagoya"]},
+      {name:"segment", kind:"category", type:"string", values:["new","active","vip","sleeping"], weights:[0.22,0.58,0.08,0.12]},
+      {name:"registered_at", kind:"date", type:"string", from:"2021-01-01", to:"2026-12-31"}
+    ]},
+    { name:"products", rows:productRows, columns:[
+      {name:"product_id", kind:"id", prefix:"PRD", type:"string"},
+      {name:"category", kind:"category", type:"string", values:["食品","家電","衣料","美容","書籍","スポーツ"], en:["Food","Electronics","Apparel","Beauty","Books","Sports"]},
+      {name:"price", kind:"money", type:"number", min:100, max:120000, skew:"log"},
+      {name:"supplier_id", kind:"ref", prefix:"SUP", modulo:8000, type:"string"}
+    ]},
+    { name:"orders", rows:orderRows, columns:[
+      {name:"order_id", kind:"id", prefix:"ORD", type:"string"},
+      {name:"user_id", kind:"ref", prefix:"USR", modulo:userRows, type:"string"},
+      {name:"product_id", kind:"ref", prefix:"PRD", modulo:productRows, type:"string"},
+      {name:"amount", kind:"money", type:"number", min:100, max:120000, skew:"log"},
+      {name:"ordered_at", kind:"dateTime", type:"string", from:"2024-01-01", to:"2026-12-31"}
+    ]},
+    { name:"events", rows:eventRows, columns:[
+      {name:"event_id", kind:"id", prefix:"EVT", type:"string"},
+      {name:"user_id", kind:"ref", prefix:"USR", modulo:userRows, type:"string"},
+      {name:"event_type", kind:"category", type:"string", values:["view","cart","purchase","review","support"], weights:[0.50,0.20,0.18,0.07,0.05]},
+      {name:"event_at", kind:"dateTime", type:"string", from:"2024-01-01", to:"2026-12-31"}
+    ]}
+  ];
+}
+
+async function syntheticGraphSetFiles(plan){
+  const specs = syntheticGraphSetSpecs(plan);
+  const files = [];
+  for (let i=0; i<specs.length; i++){
+    const spec = specs[i];
+    const subPlan = {
+      ...plan,
+      seed:syntheticHashString(`${plan.seedText}:${spec.name}`),
+      rows:spec.rows,
+      columns:spec.columns.map((c, index)=>({...c,index,type:c.type === "number" && plan.numberMode === "plain" ? "number" : "string"})),
+      schemaColumns:spec.columns.map((c, index)=>({index, name:c.name, type:c.type === "number" && plan.numberMode === "plain" ? "number" : "string", originalName:c.name, samples:[], numericRatio:c.type === "number" ? 1 : 0, nullRatio:0})),
+      datasetName:`${plan.datasetName}_${spec.name}`
+    };
+    const item = await syntheticCsvFileFromPlan(subPlan);
+    files.push({ name:item.filename, file:item.file, bytes:item.bytes, rows:spec.rows, columns:spec.columns.length });
+    post("SYNTHETIC_PROGRESS", { value:Math.min(99, Math.floor(((i + 1) / specs.length) * 100)), text:`Graph CSVセット生成中... ${spec.name}.csv` });
+  }
+  return { files, summary:{...syntheticPlanSummary(plan), graphSet:true, tables:files.map(({name, rows, columns, bytes})=>({name, rows, columns, bytes}))} };
+}
+
+async function handleSyntheticPreview(msg){
+  const plan = syntheticBuildPlan(msg);
+  const preview = syntheticPreviewFromPlan(plan, Number(msg.previewRows || 120));
+  post("SYNTHETIC_PREVIEW_DONE", { ...preview, plan });
+}
+
+async function handleSyntheticDataset(msg){
+  const plan = syntheticBuildPlan(msg);
+  state.cancelled = false;
+  post("SYNTHETIC_PROGRESS", { value:1, text:`Synthetic Dataset生成開始: ${plan.presetLabel} / ${fmt(plan.rows)} rows / ${fmt(plan.schemaColumns.length)} cols` });
+  if (plan.outputMode === "graphSet") {
+    const graphSet = await syntheticGraphSetFiles(plan);
+    post("SYNTHETIC_DATASET_DONE", { outputMode:plan.outputMode, ...graphSet });
+    post("SYNTHETIC_PROGRESS", { value:100, text:"Graph CSVセット生成完了" });
+    return;
+  }
+  if (plan.outputMode === "download") {
+    const csv = await syntheticCsvFileFromPlan(plan);
+    post("SYNTHETIC_DATASET_DONE", { outputMode:plan.outputMode, ...csv });
+    post("SYNTHETIC_PROGRESS", { value:100, text:`Synthetic CSV生成完了: ${csv.filename}` });
+    return;
+  }
+  const result = await syntheticBuildColumnarDataset(plan, msg);
+  post("SYNTHETIC_DATASET_DONE", { outputMode:plan.outputMode, ...result });
+  post("SYNTHETIC_PROGRESS", { value:100, text:`Synthetic Dataset ready: ${fmt(result.manifest.totalRows)} rows` });
+}
+
+
 self.onmessage=async(e)=>{
   const msg=e.data||{};
   try{
@@ -5956,6 +6556,17 @@ self.onmessage=async(e)=>{
       const result=await runPerfBench(msg);
       post("PERF_BENCH_DONE", result);
       post("PROGRESS", {value:100, text:"PERF_BENCH complete"});
+      return;
+    }
+
+
+    if (msg.type==="GENERATE_SYNTHETIC_PREVIEW"){
+      await handleSyntheticPreview(msg);
+      return;
+    }
+
+    if (msg.type==="GENERATE_SYNTHETIC_DATASET"){
+      await handleSyntheticDataset(msg);
       return;
     }
 
@@ -7054,9 +7665,9 @@ function createAsaCommandScheduler(originalHandler){
   let running = false;
 
   const high = new Set(["READ_PAGE","READ_DATA_QUERY_PAGE","READ_SEARCH_PAGE","READ_GRAPH_JOIN_PAGE","READ_GRAPH_RESULT_SEARCH_PAGE","READ_PIVOT_VIEWPORT","CANCEL","OPFS_ESTIMATE","OPFS_LIST","ADAPTIVE_KERNEL_STATUS","HYBRID_SURFACE_STATUS","ROW_SURFACE_STATUS","EXECUTION_PLANE_STATUS","OBSERVATION_ENGINE_STATUS","REMOTE_EXECUTION_STATUS","SURFACE_ACCELERATOR_STATUS"]);
-  const low = new Set(["BUILD_COLUMNAR","MERGE_OPFS_DATASETS","VALIDATE_MERGE","PREVIEW_CLEAN","ADAPTIVE_PERF_BENCH","PERF_BENCH","EXTERNAL_STORAGE_SYNC","ROW_SURFACE_PREFETCH"]);
+  const low = new Set(["BUILD_COLUMNAR","GENERATE_SYNTHETIC_DATASET","MERGE_OPFS_DATASETS","VALIDATE_MERGE","PREVIEW_CLEAN","ADAPTIVE_PERF_BENCH","PERF_BENCH","EXTERNAL_STORAGE_SYNC","ROW_SURFACE_PREFETCH"]);
 
-  const mutation = new Set(["BUILD_COLUMNAR","OPFS_LOAD","OPFS_OPEN_VIRTUAL","OPFS_OPEN_MEMORY","EXTERNAL_STORAGE_OPEN","MERGE_OPFS_DATASETS","OPFS_DELETE","PURGE_SELECTED","PURGE_ALL","FORGET_SESSION"]);
+  const mutation = new Set(["BUILD_COLUMNAR","GENERATE_SYNTHETIC_DATASET","OPFS_LOAD","OPFS_OPEN_VIRTUAL","OPFS_OPEN_MEMORY","EXTERNAL_STORAGE_OPEN","MERGE_OPFS_DATASETS","OPFS_DELETE","PURGE_SELECTED","PURGE_ALL","FORGET_SESSION"]);
 
   function priority(type){
     if (high.has(type)) return "high";
@@ -7369,6 +7980,18 @@ function downloadText(filename, text, type = "text/csv;charset=utf-8") {
   const a = document.createElement("a");
   a.href = url;
   a.download = withExportTimestamp(filename);
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(url);
+}
+
+function downloadBlob(filename, blob) {
+  const safeBlob = blob instanceof Blob ? blob : new Blob([blob || ""], { type:"application/octet-stream" });
+  const url = URL.createObjectURL(safeBlob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = withExportTimestamp(filename || "download.bin");
   document.body.appendChild(a);
   a.click();
   a.remove();
@@ -9570,6 +10193,197 @@ function Section({ title, children, hint, icon, defaultCollapsed = false, action
 }
 
 
+
+const SYNTHETIC_UI_PRESETS = [
+  { value:"sales", label:"売上データ", help:"注文ID・顧客・商品・地域・金額・日付を生成" },
+  { value:"iot", label:"センサーログ", help:"端末ID・時刻・温度・湿度・状態を生成" },
+  { value:"finance", label:"取引データ", help:"口座・金額・通貨・加盟店・リスク値を生成" },
+  { value:"web", label:"アクセスログ", help:"ユーザー・URL・ステータス・遅延を生成" },
+  { value:"graph", label:"Graph結合サンプル", help:"user_id / order_id / product_id など結合キーを生成" },
+];
+
+const SYNTHETIC_DEFAULT_CONFIG = {
+  preset:"sales",
+  rows:"100000",
+  columns:"30",
+  seed:"42",
+  syntheticChunkSize:"50000",
+  nullRate:"1",
+  duplicateRate:"2",
+  outlierRate:"0.1",
+  emptyRate:"1",
+  longTextRate:"0",
+  japaneseRate:"30",
+  dateMode:"mixed",
+  numberMode:"plain",
+  outputMode:"open",
+};
+
+function syntheticNumber(value, fallback=0) {
+  const n = Number(value);
+  return Number.isFinite(n) ? n : fallback;
+}
+
+function syntheticRateLabel(value) {
+  const n = syntheticNumber(value, 0);
+  return `${n}%`;
+}
+
+function estimateSyntheticDataset(config) {
+  const rows = Math.max(1, syntheticNumber(config.rows, 1000));
+  const columns = Math.max(1, syntheticNumber(config.columns, 10));
+  const avgBytes = 14 + syntheticNumber(config.longTextRate, 0) * 0.9 + syntheticNumber(config.japaneseRate, 0) * 0.08;
+  const bytes = Math.round(rows * columns * avgBytes);
+  return {
+    rows,
+    columns,
+    bytes,
+    mb: bytes / 1024 / 1024,
+    chunkSize: Math.max(1000, syntheticNumber(config.syntheticChunkSize, 50000)),
+    purpose: rows >= 1000000 ? "大規模性能テスト" : rows >= 100000 ? "通常性能テスト" : "機能確認",
+  };
+}
+
+function SyntheticDataPanel({
+  config,
+  setField,
+  previewTable,
+  status,
+  summary,
+  onPreview,
+  onGenerate,
+  onCancel,
+  busy,
+}) {
+  const estimate = estimateSyntheticDataset(config);
+  const preset = SYNTHETIC_UI_PRESETS.find((x) => x.value === config.preset) || SYNTHETIC_UI_PRESETS[0];
+
+  return (
+    <Box sx={{ display:"grid", gridTemplateColumns:{ xs:"minmax(0, 1fr)", lg:"420px minmax(0, 1fr)" }, gap:0.75, minWidth:0 }}>
+      <Stack spacing={0.75} sx={{ minWidth:0 }}>
+        <Section title="Synthetic Data Generator" icon={<Article fontSize="small" />} hint="データ本体は持たず、種類・量・乱れ・文字形式からWorker内でchunk生成します。" hideCollapse>
+          <Stack spacing={0.75}>
+            <Alert severity="info">
+              サンプルデータをハードコードせず、seedとパラメータから再現可能に生成します。同じseedなら同じCSVになります。
+            </Alert>
+
+            <Typography variant="subtitle2" sx={{ fontWeight:900 }}>1. データの種類</Typography>
+            <TextField select label="データ種類" value={config.preset} onChange={(e)=>setField("preset", e.target.value)} fullWidth>
+              {SYNTHETIC_UI_PRESETS.map((item)=><MenuItem key={item.value} value={item.value}>{item.label}：{item.help}</MenuItem>)}
+            </TextField>
+            <Typography variant="caption" color="text.secondary">{preset.help}</Typography>
+
+            <Divider />
+
+            <Typography variant="subtitle2" sx={{ fontWeight:900 }}>2. データ量</Typography>
+            <Box sx={{ display:"grid", gridTemplateColumns:"repeat(2, minmax(0, 1fr))", gap:0.75 }}>
+              <SmallNumberField label="行数" value={config.rows} onChange={(v)=>setField("rows", v)} min="1" step="1000" sx={{ width:"100%" }} />
+              <SmallNumberField label="列数" value={config.columns} onChange={(v)=>setField("columns", v)} min="1" max="300" step="1" sx={{ width:"100%" }} />
+              <SmallNumberField label="生成単位" value={config.syntheticChunkSize} onChange={(v)=>setField("syntheticChunkSize", v)} min="1000" step="1000" sx={{ width:"100%" }} />
+              <TextField label="再現番号 seed" value={config.seed} onChange={(e)=>setField("seed", e.target.value)} helperText="同じ番号なら同じデータ" />
+            </Box>
+
+            <Divider />
+
+            <Typography variant="subtitle2" sx={{ fontWeight:900 }}>3. データの乱れ具合</Typography>
+            <Box sx={{ display:"grid", gridTemplateColumns:"repeat(2, minmax(0, 1fr))", gap:0.75 }}>
+              <SmallNumberField label="欠損率 %" value={config.nullRate} onChange={(v)=>setField("nullRate", v)} min="0" max="100" step="0.1" sx={{ width:"100%" }} />
+              <SmallNumberField label="重複率 %" value={config.duplicateRate} onChange={(v)=>setField("duplicateRate", v)} min="0" max="100" step="0.1" sx={{ width:"100%" }} />
+              <SmallNumberField label="外れ値率 %" value={config.outlierRate} onChange={(v)=>setField("outlierRate", v)} min="0" max="100" step="0.1" sx={{ width:"100%" }} />
+              <SmallNumberField label="空文字率 %" value={config.emptyRate} onChange={(v)=>setField("emptyRate", v)} min="0" max="100" step="0.1" sx={{ width:"100%" }} />
+              <SmallNumberField label="長文率 %" value={config.longTextRate} onChange={(v)=>setField("longTextRate", v)} min="0" max="100" step="0.1" sx={{ width:"100%" }} />
+              <SmallNumberField label="日本語率 %" value={config.japaneseRate} onChange={(v)=>setField("japaneseRate", v)} min="0" max="100" step="1" sx={{ width:"100%" }} />
+            </Box>
+            <Typography variant="caption" color="text.secondary">
+              欠損・重複・外れ値を増やすほど、型推定・検索・集計のテストが厳しくなります。
+            </Typography>
+
+            <Divider />
+
+            <Typography variant="subtitle2" sx={{ fontWeight:900 }}>4. 日本語・文字形式</Typography>
+            <Box sx={{ display:"grid", gridTemplateColumns:"repeat(2, minmax(0, 1fr))", gap:0.75 }}>
+              <TextField select label="日付形式" value={config.dateMode} onChange={(e)=>setField("dateMode", e.target.value)}>
+                <MenuItem value="iso">ISO: 2026-05-28</MenuItem>
+                <MenuItem value="slash">スラッシュ: 2026/05/28</MenuItem>
+                <MenuItem value="jp">日本語: 2026年05月28日</MenuItem>
+                <MenuItem value="mixed">混在</MenuItem>
+              </TextField>
+              <TextField select label="数値形式" value={config.numberMode} onChange={(e)=>setField("numberMode", e.target.value)}>
+                <MenuItem value="plain">数値: 1234</MenuItem>
+                <MenuItem value="comma">カンマ: 1,234</MenuItem>
+                <MenuItem value="yen">円記号: ¥1,234</MenuItem>
+                <MenuItem value="mixed">混在</MenuItem>
+              </TextField>
+            </Box>
+
+            <Divider />
+
+            <Typography variant="subtitle2" sx={{ fontWeight:900 }}>5. 出力方法</Typography>
+            <TextField select label="出力方法" value={config.outputMode} onChange={(e)=>setField("outputMode", e.target.value)} fullWidth>
+              <MenuItem value="open">生成してすぐ開く</MenuItem>
+              <MenuItem value="opfs">OPFSへ保存して開く</MenuItem>
+              <MenuItem value="download">CSVをダウンロード</MenuItem>
+              <MenuItem value="graphSet">Graph用CSVセットをダウンロード</MenuItem>
+            </TextField>
+            <Typography variant="caption" color="text.secondary">
+              すぐ試すなら「生成してすぐ開く」。Graph Join検証なら「Graph用CSVセット」を使います。
+            </Typography>
+
+            <Stack direction="row" useFlexGap flexWrap="wrap" spacing={0.75}>
+              <Button variant="outlined" startIcon={<Search />} onClick={onPreview} disabled={busy}>プレビュー生成</Button>
+              <Button variant="contained" startIcon={<Send />} onClick={onGenerate} disabled={busy}>生成開始</Button>
+              <Button color="warning" onClick={onCancel} disabled={!busy}>キャンセル</Button>
+            </Stack>
+          </Stack>
+        </Section>
+      </Stack>
+
+      <Stack spacing={0.75} sx={{ minWidth:0 }}>
+        <Section title="生成見積もり" icon={<Schema fontSize="small" />} hint="生成前にサイズと用途を確認します。" hideCollapse>
+          <Stack direction="row" useFlexGap flexWrap="wrap" spacing={0.6} sx={{ mb:0.75 }}>
+            <Chip color="primary" label={`${fmt(estimate.rows)} rows`} />
+            <Chip label={`${fmt(estimate.columns)} cols`} />
+            <Chip label={`約 ${estimate.mb.toFixed(1)} MB`} />
+            <Chip label={`chunk ${fmt(estimate.chunkSize)} rows`} />
+            <Chip color={estimate.rows >= 1000000 ? "warning" : "success"} label={estimate.purpose} />
+          </Stack>
+          <Box sx={{ display:"grid", gridTemplateColumns:{ xs:"1fr", sm:"repeat(2, 1fr)" }, gap:0.5 }}>
+            <Typography variant="body2">データ種類：{preset.label}</Typography>
+            <Typography variant="body2">再現番号：{config.seed}</Typography>
+            <Typography variant="body2">欠損率：{syntheticRateLabel(config.nullRate)}</Typography>
+            <Typography variant="body2">重複率：{syntheticRateLabel(config.duplicateRate)}</Typography>
+            <Typography variant="body2">外れ値率：{syntheticRateLabel(config.outlierRate)}</Typography>
+            <Typography variant="body2">日本語率：{syntheticRateLabel(config.japaneseRate)}</Typography>
+          </Box>
+          {estimate.rows >= 1000000 && (
+            <Alert severity="warning" sx={{ mt:0.75 }}>
+              100万行以上は生成・保存に時間がかかります。途中でキャンセルできます。
+            </Alert>
+          )}
+        </Section>
+
+        <Section title="生成結果 / プレビュー" icon={<TableChart fontSize="small" />} hint="プレビューは先頭行だけ生成します。本生成はWorkerでchunk処理します。" hideCollapse>
+          <Stack direction="row" useFlexGap flexWrap="wrap" spacing={0.6} sx={{ mb:0.75 }}>
+            <Chip color={busy ? "warning" : "default"} label={busy ? "生成中" : "待機中"} />
+            {summary?.rows != null && <Chip label={`${fmt(summary.rows)} rows`} />}
+            {summary?.columns != null && <Chip label={`${fmt(summary.columns)} cols`} />}
+            {summary?.approxMB != null && <Chip label={`約 ${fmt(summary.approxMB)} MB`} />}
+          </Stack>
+          <Typography variant="body2" color="text.secondary" sx={{ mb:0.75 }}>{status || "プレビュー生成または生成開始を実行してください。"}</Typography>
+          {previewTable?.header?.length ? (
+            <DataTable table={previewTable} tableId="syntheticPreview" height={360} />
+          ) : (
+            <Alert severity="info">
+              「プレビュー生成」で、現在のパラメータが実際の列・値にどう反映されるか確認できます。
+            </Alert>
+          )}
+        </Section>
+      </Stack>
+    </Box>
+  );
+}
+
+
 function PivotTileGrid({ meta, view, onRequest, height = 640 }) {
   const scrollerRef = useRef(null);
   const timerRef = useRef(null);
@@ -11370,6 +12184,11 @@ function App() {
   const [logs, setLogs] = useState([]);
   const [status, setStatus] = useState("CSVを選択してAnalyze Schemaを実行してください。");
 
+  const [syntheticConfig, setSyntheticConfig] = useState(() => ({ ...SYNTHETIC_DEFAULT_CONFIG }));
+  const [syntheticPreviewTable, setSyntheticPreviewTable] = useState(null);
+  const [syntheticStatus, setSyntheticStatus] = useState("パラメータを指定して、テスト用データを生成できます。");
+  const [syntheticSummary, setSyntheticSummary] = useState(null);
+
   const [schema, setSchema] = useState(null);
   const [manifest, setManifest] = useState(null);
   const [visibleCols, setVisibleCols] = useState([]);
@@ -11548,6 +12367,41 @@ function App() {
   function appendLog(text) {
     const line = `[${new Date().toLocaleTimeString()}] ${text}`;
     setLogs((prev) => [...prev.slice(-500), line]);
+  }
+
+  function setSyntheticField(field, value) {
+    setSyntheticConfig((prev) => ({ ...prev, [field]: value }));
+  }
+
+  function syntheticPayload() {
+    return {
+      ...syntheticConfig,
+      rows:Number(syntheticConfig.rows || 1000),
+      columns:Number(syntheticConfig.columns || 10),
+      syntheticChunkSize:Number(syntheticConfig.syntheticChunkSize || 50000),
+      storageWorkspace:storageWorkspace || "Synthetic",
+      storageCollection:storageCollection || "Generated",
+      datasetName:tableName || datasetName || `synthetic_${syntheticConfig.preset}_${syntheticConfig.rows}`,
+      tableName:tableName || datasetName || `synthetic_${syntheticConfig.preset}_${syntheticConfig.rows}`,
+      previewRows:Number(previewRows || 120),
+    };
+  }
+
+  function generateSyntheticPreview() {
+    setSyntheticPreviewTable(null);
+    setSyntheticStatus("Synthetic previewを生成中です。");
+    post({ type:"GENERATE_SYNTHETIC_PREVIEW", ...syntheticPayload() });
+  }
+
+  function generateSyntheticDataset() {
+    setSyntheticStatus("Synthetic Datasetを生成中です。");
+    setSyntheticSummary(null);
+    post({ type:"GENERATE_SYNTHETIC_DATASET", ...syntheticPayload() });
+  }
+
+  function cancelSyntheticGeneration() {
+    postWorkerCommand({ type:"CANCEL" });
+    setSyntheticStatus("Synthetic Dataset生成のキャンセルを要求しました。");
   }
 
 
@@ -12348,6 +13202,75 @@ function App() {
         return;
       },
 
+      "SYNTHETIC_PROGRESS"(msg) {
+        setProgress(msg.value ?? 0);
+        setProgressText(msg.text || "");
+        setSyntheticStatus(msg.text || "");
+        if ((msg.value ?? 0) >= 100) { setBusy(false); setBusyLabel(""); }
+        return;
+      },
+
+      "SYNTHETIC_PREVIEW_DONE"(msg) {
+        setBusy(false); setBusyLabel("");
+        setProgress(100);
+        setProgressText("Synthetic preview complete");
+        setSyntheticPreviewTable({ header:msg.header || [], rows:msg.rows || [] });
+        setSyntheticSummary(msg.summary || null);
+        setSyntheticStatus(`プレビュー生成完了: ${fmt(msg.rows?.length || 0)} rows / ${fmt(msg.header?.length || 0)} cols。seed=${msg.summary?.seed || syntheticConfig.seed}`);
+        appendLog(`Synthetic preview: ${msg.summary?.presetLabel || msg.plan?.preset || ""} / ${fmt(msg.summary?.rows || 0)} rows`);
+        return;
+      },
+
+      "SYNTHETIC_DATASET_DONE"(msg) {
+        setBusy(false); setBusyLabel("");
+        setProgress(100);
+        setProgressText("Synthetic Dataset complete");
+        setSyntheticSummary(msg.summary || null);
+
+        if (Array.isArray(msg.files) && msg.files.length) {
+          for (const item of msg.files) {
+            if (item.file) downloadBlob(item.name || item.file.name || "synthetic.csv", item.file);
+          }
+          setSyntheticStatus(`Graph用CSVセットを生成しました: ${fmt(msg.files.length)} files`);
+          appendLog(`Synthetic graph CSV set generated: ${fmt(msg.files.length)} files`);
+          return;
+        }
+
+        if (msg.file) {
+          downloadBlob(msg.filename || msg.file.name || "synthetic_dataset.csv", msg.file);
+          setSyntheticStatus(`CSVを生成しました: ${msg.filename || msg.file.name || "synthetic_dataset.csv"} / ${humanBytes(msg.bytes || msg.file.size || 0)}`);
+          appendLog(`Synthetic CSV generated: ${msg.filename || msg.file.name || ""}`);
+          return;
+        }
+
+        if (msg.manifest) {
+          activateDatasetSurface(msg.manifest, {
+            clearFiles:false,
+            clearCleanTable:false,
+            progressText:"Synthetic Dataset生成完了",
+            status:`Synthetic Datasetを開きました: ${msg.manifest.name || msg.manifest.id} / ${fmt(msg.manifest.totalRows)} rows / ${fmt(msg.manifest.columns?.length || 0)} cols`,
+            logMessage:`Synthetic dataset opened: ${msg.manifest.id}`,
+          });
+          setSyntheticStatus(`生成して開きました: ${fmt(msg.manifest.totalRows)} rows / ${fmt(msg.manifest.columns?.length || 0)} cols / seed=${msg.summary?.seed || syntheticConfig.seed}`);
+          setCleanReport([
+            ["Synthetic preset", msg.summary?.presetLabel || msg.manifest.synthetic?.presetLabel || ""],
+            ["Rows", fmt(msg.manifest.totalRows)],
+            ["Columns", fmt(msg.manifest.columns?.length || 0)],
+            ["Chunks", fmt(msg.manifest.chunks || 0)],
+            ["Seed", msg.summary?.seed || msg.manifest.synthetic?.seed || ""],
+            ["Null rate", `${Math.round((msg.summary?.nullRate || 0) * 10000) / 100}%`],
+            ["Duplicate rate", `${Math.round((msg.summary?.duplicateRate || 0) * 10000) / 100}%`],
+            ["Outlier rate", `${Math.round((msg.summary?.outlierRate || 0) * 10000) / 100}%`],
+          ]);
+          refreshStorageInventory();
+          readActiveDatasetPage([]);
+          return;
+        }
+
+        setSyntheticStatus("Synthetic Dataset生成は完了しましたが、返却形式を判定できませんでした。");
+        return;
+      },
+
     };
 
     const workerRouter = createWorkerMessageRouter(workerMessageHandlers, {
@@ -12417,6 +13340,8 @@ function App() {
       RUN_GRAPH_RESULT_SEARCH: "Graph Query結果内検索",
       BUILD_GRAPH_RESULT_PIVOT: "Graph Query結果Pivot",
       BUILD_GRAPH_RESULT_TIME: "Graph Query結果Time",
+      GENERATE_SYNTHETIC_PREVIEW: "Synthetic Preview生成",
+      GENERATE_SYNTHETIC_DATASET: "Synthetic Dataset生成",
     };
     const planner = createCommandLifecyclePlanner({
       getLabel: (message) => labels[message.type],
@@ -13659,9 +14584,24 @@ function App() {
               <Tab value="time" icon={<Timeline />} iconPosition="start" label="Time" />
               <Tab value="storage" icon={<Storage />} iconPosition="start" label="Storage" />
               <Tab value="schema" icon={<Schema />} iconPosition="start" label="Schema" />
+              <Tab value="synthetic" icon={<Article />} iconPosition="start" label="Synthetic" />
               <Tab value="log" icon={<Article />} iconPosition="start" label="Log" />
             </Tabs>
           </Paper>
+
+          {tab === "synthetic" && (
+            <SyntheticDataPanel
+              config={syntheticConfig}
+              setField={setSyntheticField}
+              previewTable={syntheticPreviewTable}
+              status={syntheticStatus}
+              summary={syntheticSummary}
+              onPreview={generateSyntheticPreview}
+              onGenerate={generateSyntheticDataset}
+              onCancel={cancelSyntheticGeneration}
+              busy={busy && String(busyLabel || "").includes("Synthetic")}
+            />
+          )}
 
           {tab === "clean" && (
             <Box sx={{ display: "grid", gridTemplateColumns: { xs: "minmax(0, 1fr)", md: "340px minmax(0, 1fr)" }, gap: 0.5, minWidth: 0, maxWidth: "100%" }}>
