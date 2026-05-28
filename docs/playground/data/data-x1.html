@@ -288,7 +288,8 @@ function uniqueNames(names){
 
 function makeRules(msg){
   const tokens = String(msg.nullTokens ?? "").split(/\r?\n/).map(x=>x.trim()).filter(Boolean);
-  return {
+  const nullTokenSet = new Set(tokens.map((x) => String(x).toLowerCase()));
+  const rules = {
     trim:!!msg.ruleTrim,
     nfkc:!!msg.ruleNfkc,
     controls:!!msg.ruleControls,
@@ -298,11 +299,15 @@ function makeRules(msg){
     dedupSpaces:!!msg.ruleDedupSpaces,
     skipBadRows:!!msg.ruleSkipBadRows,
     nullTokens:tokens,
+    nullTokenSet,
     numericThreshold:Number(msg.numericThreshold ?? 0.9)
   };
+  rules.fastCleanNoop = !rules.trim && !rules.nfkc && !rules.controls && !rules.collapse && !rules.dedupSpaces && !rules.emptyNull && !tokens.length;
+  return rules;
 }
 
 function cleanCell(raw, rules){
+  if (rules?.fastCleanNoop) return {value:raw == null ? "" : raw, changed:false, wasNull:false};
   let s = raw == null ? "" : String(raw);
   let changed = false;
   const before = s;
@@ -312,15 +317,16 @@ function cleanCell(raw, rules){
   if (rules.trim) { const n=s.trim(); changed ||= n!==s; s=n; }
   if (rules.collapse) { const n=s.replace(/[ \t]+/g," "); changed ||= n!==s; s=n; }
   if (rules.emptyNull && s === "") return {value:null, changed: changed || before !== s, wasNull:true};
-  if (rules.nullTokens.some(t => s.toLowerCase() === t.toLowerCase())) return {value:null, changed:true, wasNull:true};
+  if (rules.nullTokenSet?.size && rules.nullTokenSet.has(s.toLowerCase())) return {value:null, changed:true, wasNull:true};
   return {value:s, changed:changed || before !== s, wasNull:false};
 }
 
 function numberCandidate(value, rules){
   if (value == null) return {ok:false, value:NaN};
+  if (typeof value === "number") return Number.isFinite(value) ? {ok:true, value} : {ok:false, value:NaN};
   let s = String(value).trim();
   if (!s) return {ok:false, value:NaN};
-  if (rules.numericSymbols) {
+  if (rules?.numericSymbols) {
     let pct = false;
     if (s.endsWith("%")) { pct = true; s = s.slice(0,-1); }
     s = s.replace(/[,\s]/g,"").replace(/[￥¥$€£]/g,"");
@@ -334,11 +340,20 @@ function numberCandidate(value, rules){
 
 async function* fileLines(file, encoding, start=0, progressLabel="", progressBase=0, progressSpan=100){
   const decoder = new TextDecoder(encoding);
-  const chunkSize = 4 * 1024 * 1024;
+  const chunkSize = 8 * 1024 * 1024;
   let pos=start;
-  let record="";
+  let recordParts=[];
   let inQuotes=false;
   let pendingQuote=false;
+
+  const append = (value) => {
+    if (value) recordParts.push(value);
+  };
+  const takeRecord = () => {
+    let record = recordParts.length === 1 ? recordParts[0] : recordParts.join("");
+    recordParts = [];
+    return record.endsWith("\r") ? record.slice(0, -1) : record;
+  };
 
   function* consumeText(text){
     for (let i=0;i<text.length;i++){
@@ -346,11 +361,11 @@ async function* fileLines(file, encoding, start=0, progressLabel="", progressBas
 
       if (pendingQuote){
         if (inQuotes && ch === '"'){
-          record += '""';
+          append('""');
           pendingQuote = false;
           continue;
         }
-        record += '"';
+        append('"');
         inQuotes = !inQuotes;
         pendingQuote = false;
       }
@@ -361,10 +376,9 @@ async function* fileLines(file, encoding, start=0, progressLabel="", progressBas
       }
 
       if (ch === "\n" && !inQuotes){
-        yield record.replace(/\r$/,"");
-        record="";
+        yield takeRecord();
       } else {
-        record += ch;
+        append(ch);
       }
     }
   }
@@ -385,10 +399,10 @@ async function* fileLines(file, encoding, start=0, progressLabel="", progressBas
   const tail=decoder.decode();
   if (tail) yield* consumeText(tail);
   if (pendingQuote){
-    record += '"';
+    append('"');
     pendingQuote=false;
   }
-  if (record.length) yield record.replace(/\r$/,"");
+  if (recordParts.length) yield takeRecord();
 }
 
 function opfsAvailable(){ return !!(self.navigator && navigator.storage && navigator.storage.getDirectory); }
@@ -3231,23 +3245,40 @@ function addRowToChunk(chunk, cells, columns, rules){
   chunk.rows++;
 }
 
+async function runLimitedConcurrency(items, limit, worker){
+  const list = Array.isArray(items) ? items : [];
+  const concurrency = Math.max(1, Math.min(8, Number(limit || 4)));
+  let cursor = 0;
+  const runners = Array.from({length:Math.min(concurrency, list.length)}, async () => {
+    while (cursor < list.length){
+      const index = cursor++;
+      await worker(list[index], index);
+    }
+  });
+  await Promise.all(runners);
+}
+
 async function flushChunk(datasetDir, chunkIndex, chunk, columns){
   const chunkDir=await datasetDir.getDirectoryHandle(`chunk_${String(chunkIndex).padStart(6,"0")}`, {create:true});
   const columnStats={};
-  for (const col of columns){
+
+  await runLimitedConcurrency(columns, 4, async (col) => {
     if (col.type === "number"){
       const arr=new Float64Array(chunk.numeric[col.index]);
       await writeBuffer(chunkDir, colFileName(col.index,col.type), arr.buffer);
       columnStats[String(col.index)] = makeColumnStatForMeta(chunk.stats[col.index], chunk.rows);
     } else {
       const arr=new Int32Array(chunk.stringIds[col.index]);
-      await writeBuffer(chunkDir, colFileName(col.index,col.type), arr.buffer);
-      await writeJson(chunkDir, dictFileName(col.index), chunk.dictValues[col.index]);
       chunk.stats[col.index].distinct = chunk.dictValues[col.index].length;
+      await Promise.all([
+        writeBuffer(chunkDir, colFileName(col.index,col.type), arr.buffer),
+        writeJson(chunkDir, dictFileName(col.index), chunk.dictValues[col.index])
+      ]);
       columnStats[String(col.index)] = makeColumnStatForMeta(chunk.stats[col.index], chunk.rows, chunk.dictValues[col.index]);
     }
-  }
-  const meta={chunkIndex,rowCount:chunk.rows,stats:chunk.stats,columnStats,indexVersion:1};
+  });
+
+  const meta={chunkIndex,rowCount:chunk.rows,stats:chunk.stats,columnStats,indexVersion:2,flushStrategy:"parallel-column-writes-v2"};
   await writeJson(chunkDir,"meta.json",meta);
   return meta;
 }
@@ -6299,10 +6330,104 @@ function tokenizeSafeFormula(input) {
   return tokens;
 }
 
-function evaluateSafeFormula(expression, rowMap) {
-  const tokens = tokenizeSafeFormula(expression);
+const SAFE_FORMULA_COMPILED_CACHE_MAX = 256;
+const safeFormulaCompiledCache = new Map();
+
+function safeFormulaCacheGet(expression){
+  const key = String(expression || "").trim();
+  const item = safeFormulaCompiledCache.get(key);
+  if (!item) return null;
+  safeFormulaCompiledCache.delete(key);
+  safeFormulaCompiledCache.set(key, item);
+  return item;
+}
+
+function safeFormulaCacheSet(expression, compiled){
+  const key = String(expression || "").trim();
+  if (!key || !compiled) return compiled;
+  if (safeFormulaCompiledCache.has(key)) safeFormulaCompiledCache.delete(key);
+  safeFormulaCompiledCache.set(key, compiled);
+  while (safeFormulaCompiledCache.size > SAFE_FORMULA_COMPILED_CACHE_MAX) {
+    const oldest = safeFormulaCompiledCache.keys().next().value;
+    safeFormulaCompiledCache.delete(oldest);
+  }
+  return compiled;
+}
+
+function safeFormulaAstEval(node, runtime){
+  if (!node) return "";
+  if (node.type === "literal") return node.value;
+  if (node.type === "unary") {
+    const v = safeFormulaAstEval(node.value, runtime);
+    if (node.op === "!") return !v;
+    if (node.op === "-") return -safeFormulaNumber(v);
+    return v;
+  }
+  if (node.type === "binary") {
+    const op = node.op;
+    if (op === "&&") return Boolean(safeFormulaAstEval(node.left, runtime)) && Boolean(safeFormulaAstEval(node.right, runtime));
+    if (op === "||") return Boolean(safeFormulaAstEval(node.left, runtime)) || Boolean(safeFormulaAstEval(node.right, runtime));
+    const left = safeFormulaAstEval(node.left, runtime);
+    const right = safeFormulaAstEval(node.right, runtime);
+    if (op === "+") {
+      return (typeof left === "string" || typeof right === "string")
+        ? `${left ?? ""}${right ?? ""}`.slice(0, SAFE_FORMULA_MAX_RESULT_LENGTH)
+        : safeFormulaNumber(left) + safeFormulaNumber(right);
+    }
+    if (op === "-") return safeFormulaNumber(left) - safeFormulaNumber(right);
+    if (op === "*") return safeFormulaNumber(left) * safeFormulaNumber(right);
+    if (op === "/") {
+      const b = safeFormulaNumber(right);
+      return b === 0 ? "" : safeFormulaNumber(left) / b;
+    }
+    if (op === "%") {
+      const b = safeFormulaNumber(right);
+      return b === 0 ? "" : safeFormulaNumber(left) % b;
+    }
+    if (op === ">") return left > right;
+    if (op === "<") return left < right;
+    if (op === ">=") return left >= right;
+    if (op === "<=") return left <= right;
+    if (op === "==") return String(left) === String(right);
+    if (op === "!=") return String(left) !== String(right);
+    return "";
+  }
+  if (node.type === "call") {
+    const name = node.name;
+    if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(name)) throw new Error("Invalid function name");
+    if (!Object.prototype.hasOwnProperty.call(runtime, name)) throw new Error(`Function is not allowed: ${name}`);
+    const fn = runtime[name];
+    if (typeof fn !== "function") throw new Error(`Invalid function: ${name}`);
+    return fn(...node.args.map((arg) => safeFormulaAstEval(arg, runtime)));
+  }
+  return "";
+}
+
+function safeFormulaAstRequiredColumns(node, out=new Set()){
+  if (!node) return out;
+  if (node.type === "call") {
+    if (node.name === "col" && node.args?.[0]?.type === "literal") out.add(String(node.args[0].value || ""));
+    for (const arg of node.args || []) safeFormulaAstRequiredColumns(arg, out);
+  } else {
+    safeFormulaAstRequiredColumns(node.left, out);
+    safeFormulaAstRequiredColumns(node.right, out);
+    safeFormulaAstRequiredColumns(node.value, out);
+  }
+  return out;
+}
+
+function compileSafeFormula(expression){
+  const src = String(expression || "").trim();
+  if (!src) {
+    const empty = { expression:"", requiredColumns:[], evaluate:() => "" };
+    return empty;
+  }
+
+  const cached = safeFormulaCacheGet(src);
+  if (cached) return cached;
+
+  const tokens = tokenizeSafeFormula(src);
   let pos = 0;
-  const runtime = createSafeFormulaRuntime(rowMap);
 
   const peek = () => tokens[pos];
   const take = (value = null) => {
@@ -6313,41 +6438,20 @@ function evaluateSafeFormula(expression, rowMap) {
     return t;
   };
 
-  const callFunction = (name, args) => {
-    if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(name)) {
-      throw new Error("Invalid function name");
-    }
-    if (!Object.prototype.hasOwnProperty.call(runtime, name)) {
-      throw new Error(`Function is not allowed: ${name}`);
-    }
-    const fn = runtime[name];
-    if (typeof fn !== "function") {
-      throw new Error(`Invalid function: ${name}`);
-    }
-    return fn(...args);
-  };
-
   const parsePrimary = () => {
     const t = peek();
     if (!t) throw new Error("Unexpected end of formula");
-
     if (t.type === "number" || t.type === "string") {
       pos++;
-      return t.value;
+      return { type:"literal", value:t.value };
     }
-
     if (t.type === "ident") {
       pos++;
       const name = t.value;
-
-      if (name === "true") return true;
-      if (name === "false") return false;
-      if (name === "null") return null;
-
-      if (peek()?.value !== "(") {
-        throw new Error(`Bare identifier is not allowed: ${name}`);
-      }
-
+      if (name === "true") return { type:"literal", value:true };
+      if (name === "false") return { type:"literal", value:false };
+      if (name === "null") return { type:"literal", value:null };
+      if (peek()?.value !== "(") throw new Error(`Bare identifier is not allowed: ${name}`);
       take("(");
       const args = [];
       if (peek()?.value !== ")") {
@@ -6358,114 +6462,60 @@ function evaluateSafeFormula(expression, rowMap) {
         }
       }
       take(")");
-      return callFunction(name, args);
+      return { type:"call", name, args };
     }
-
     if (t.value === "(") {
       take("(");
       const v = parseExpression();
       take(")");
       return v;
     }
-
     throw new Error("Invalid expression");
   };
 
   const parseUnary = () => {
-    if (peek()?.value === "!") {
-      take("!");
-      return !parseUnary();
-    }
-    if (peek()?.value === "-") {
-      take("-");
-      return -safeFormulaNumber(parseUnary());
+    if (peek()?.value === "!" || peek()?.value === "-") {
+      const op = take().value;
+      return { type:"unary", op, value:parseUnary() };
     }
     return parsePrimary();
   };
 
-  const numericBinary = (left, right, op) => {
-    const a = safeFormulaNumber(left);
-    const b = safeFormulaNumber(right);
-    if ((op === "/" || op === "%") && b === 0) return "";
-    if (op === "*") return a * b;
-    if (op === "/") return a / b;
-    if (op === "%") return a % b;
-    if (op === "-") return a - b;
-    return a + b;
-  };
-
-  const parseMul = () => {
-    let left = parseUnary();
-    while (["*", "/", "%"].includes(peek()?.value)) {
+  const parseBinaryLevel = (next, ops) => {
+    let left = next();
+    while (ops.includes(peek()?.value)) {
       const op = take().value;
-      const right = parseUnary();
-      left = numericBinary(left, right, op);
+      left = { type:"binary", op, left, right:next() };
     }
     return left;
   };
 
-  const parseAdd = () => {
-    let left = parseMul();
-    while (["+", "-"].includes(peek()?.value)) {
-      const op = take().value;
-      const right = parseMul();
-      if (op === "+") {
-        left = typeof left === "string" || typeof right === "string"
-          ? `${left ?? ""}${right ?? ""}`.slice(0, SAFE_FORMULA_MAX_RESULT_LENGTH)
-          : numericBinary(left, right, "+");
-      } else {
-        left = numericBinary(left, right, "-");
-      }
+  const parseMul = () => parseBinaryLevel(parseUnary, ["*", "/", "%"]);
+  const parseAdd = () => parseBinaryLevel(parseMul, ["+", "-"]);
+  const parseCompare = () => parseBinaryLevel(parseAdd, [">", "<", ">=", "<=", "==", "!="]);
+  const parseAnd = () => parseBinaryLevel(parseCompare, ["&&"]);
+  const parseExpression = () => parseBinaryLevel(parseAnd, ["||"]);
+
+  const ast = parseExpression();
+  if (pos !== tokens.length) throw new Error("Unexpected token");
+
+  const requiredColumns = [...safeFormulaAstRequiredColumns(ast)].filter(Boolean);
+  const compiled = {
+    expression:src,
+    ast,
+    requiredColumns,
+    evaluate(rowMap){
+      const result = safeFormulaAstEval(ast, createSafeFormulaRuntime(rowMap));
+      return typeof result === "string" ? result.slice(0, SAFE_FORMULA_MAX_RESULT_LENGTH) : (result == null ? "" : result);
     }
-    return left;
   };
-
-  const parseCompare = () => {
-    let left = parseAdd();
-    while ([">", "<", ">=", "<=", "==", "!="].includes(peek()?.value)) {
-      const op = take().value;
-      const right = parseAdd();
-
-      if (op === ">") left = left > right;
-      else if (op === "<") left = left < right;
-      else if (op === ">=") left = left >= right;
-      else if (op === "<=") left = left <= right;
-      else if (op === "==") left = String(left) === String(right);
-      else if (op === "!=") left = String(left) !== String(right);
-    }
-    return left;
-  };
-
-  const parseAnd = () => {
-    let left = parseCompare();
-    while (peek()?.value === "&&") {
-      take("&&");
-      left = Boolean(left) && Boolean(parseCompare());
-    }
-    return left;
-  };
-
-  const parseExpression = () => {
-    let left = parseAnd();
-    while (peek()?.value === "||") {
-      take("||");
-      left = Boolean(left) || Boolean(parseAnd());
-    }
-    return left;
-  };
-
-  const result = parseExpression();
-
-  if (pos !== tokens.length) {
-    throw new Error("Unexpected token");
-  }
-
-  if (typeof result === "string") {
-    return result.slice(0, SAFE_FORMULA_MAX_RESULT_LENGTH);
-  }
-
-  return result == null ? "" : result;
+  return safeFormulaCacheSet(src, compiled);
 }
+
+function evaluateSafeFormula(expression, rowMap) {
+  return compileSafeFormula(expression).evaluate(rowMap);
+}
+
 
 function evaluateGraphDerivedColumnSafe(d, rowMap) {
   try {
@@ -6495,6 +6545,50 @@ function normalizeGraphDerivedColumnsForWorker(items=[]) {
     })
     .filter((d) => d.newColumnName);
 }
+function compileGraphDerivedColumnsForWorker(items=[], header=[]){
+  const normalized = normalizeGraphDerivedColumnsForWorker(items);
+  const headerList = Array.isArray(header) ? header.map(String) : [];
+  const headerLookup = new Map(headerList.map((name, index) => [String(name).toLowerCase(), index]));
+  return normalized.map((d) => {
+    if ((d.valueMode || "constant") !== "formula") {
+      return {
+        ...d,
+        compiledMode:"constant",
+        requiredColumns:[],
+        requiredColumnIndices:[],
+        evaluate:() => d.constantValue ?? ""
+      };
+    }
+    const compiled = compileSafeFormula(d.formulaExpression || "");
+    const requiredColumns = compiled.requiredColumns || [];
+    const requiredColumnIndices = requiredColumns
+      .map((name) => headerLookup.get(String(name).toLowerCase()))
+      .filter((idx) => Number.isFinite(idx));
+    return {
+      ...d,
+      compiledMode:"formula",
+      requiredColumns,
+      requiredColumnIndices,
+      evaluate:(rowMap) => compiled.evaluate(rowMap)
+    };
+  });
+}
+
+function evaluateCompiledGraphDerivedColumnForWorker(compiled, rowMap){
+  try {
+    return compiled?.evaluate ? compiled.evaluate(rowMap) : evaluateGraphDerivedColumnForWorker(compiled, rowMap);
+  } catch (e) {
+    return `#ERR ${e?.message || "formula"}`;
+  }
+}
+
+function buildRowMapFromHeader(header, row){
+  const map = {};
+  for (let i = 0; i < (header || []).length; i++) map[header[i]] = row?.[i];
+  return map;
+}
+
+
 
 function valueByFlexibleNameForWorker(rowMap, key){
   return valueByFlexibleName(rowMap, key);
@@ -6533,7 +6627,7 @@ function graphExportIndexesForHeader(header, derivedColumns, outputColumnNames=n
 }
 
 function appendRowsToCsvLines(lines, header, rows, derivedColumns, outputColumnNames=null){
-  const derived = normalizeGraphDerivedColumnsForWorker(derivedColumns);
+  const derived = compileGraphDerivedColumnsForWorker(derivedColumns, header);
   const indexes = graphExportIndexesForHeader(header, derivedColumns, outputColumnNames);
   const useProjection = Array.isArray(outputColumnNames) && outputColumnNames.length && indexes.length;
   if (!derived.length){
@@ -6545,9 +6639,8 @@ function appendRowsToCsvLines(lines, header, rows, derivedColumns, outputColumnN
     return;
   }
   for (const row of rows || []){
-    const rowMap = {};
-    header.forEach((h, i) => { rowMap[h] = row?.[i]; });
-    const extra = derived.map((d) => evaluateGraphDerivedColumnForWorker(d, rowMap));
+    const rowMap = buildRowMapFromHeader(header, row);
+    const extra = derived.map((d) => evaluateCompiledGraphDerivedColumnForWorker(d, rowMap));
     const fullRow = [...(row || []), ...extra];
     const outRow = useProjection ? indexes.map((idx) => fullRow?.[idx] ?? "") : fullRow;
     lines.push(outRow.map(csvEscape).join(","));
@@ -6564,7 +6657,7 @@ function normalizeExportLimit(value){
 // Graph Query Result as a temporary, non-persisted dataset for Search / Pivot / Time.
 // The result itself is not stored; each analysis reads the latest Graph Result lazily.
 function graphApplyDerivedRows(header, rows, derivedColumns=[], outputColumnNames=null){
-  const derived = normalizeGraphDerivedColumnsForWorker(derivedColumns);
+  const derived = compileGraphDerivedColumnsForWorker(derivedColumns, header);
   const fullHeader = graphExportHeader(header, derived, null);
   const outHeader = graphExportHeader(header, derived, outputColumnNames);
   const indexes = graphExportIndexesForHeader(header, derived, outputColumnNames);
@@ -6574,9 +6667,8 @@ function graphApplyDerivedRows(header, rows, derivedColumns=[], outputColumnName
   }
   const outRows=[];
   for (const row of rows || []){
-    const rowMap={};
-    header.forEach((h,i)=>{ rowMap[h]=row?.[i]; });
-    const extra=derived.map((d)=>evaluateGraphDerivedColumnForWorker(d,rowMap));
+    const rowMap=buildRowMapFromHeader(header, row);
+    const extra=derived.map((d)=>evaluateCompiledGraphDerivedColumnForWorker(d,rowMap));
     const full=[...(row || []), ...extra];
     outRows.push(useProjection ? indexes.map((idx)=>full?.[idx] ?? "") : full);
   }
@@ -7105,6 +7197,123 @@ function graphResultWindowCacheSet(surface, key, value){
   }
 }
 
+function graphResultFilterCacheKey({filters, selected, derivedColumns, outputColumnNames}={}){
+  return [
+    "filter-v2",
+    graphResultWindowCacheDigest(filters || {}),
+    Array.isArray(selected) ? selected.join(".") : "",
+    graphResultWindowCacheDigest(derivedColumns || []),
+    graphResultWindowCacheDigest(outputColumnNames || [])
+  ].join("|");
+}
+
+function graphResultFilterIndexCacheGet(surface, key){
+  if (!surface || !key || !surface.filterIndexCache || typeof surface.filterIndexCache !== "object") return null;
+  const entry = surface.filterIndexCache.map?.[key];
+  if (!entry) return null;
+  entry.lastUsedMs = Date.now();
+  return Array.isArray(entry.orders) ? entry : null;
+}
+
+function graphResultFilterIndexCacheSet(surface, key, orders){
+  if (!surface || !key || !Array.isArray(orders)) return;
+  if (!surface.filterIndexCache || typeof surface.filterIndexCache !== "object") {
+    surface.filterIndexCache = { map:Object.create(null), order:[], max:8 };
+  }
+  const cache = surface.filterIndexCache;
+  if (!cache.map) cache.map = Object.create(null);
+  if (!Array.isArray(cache.order)) cache.order = [];
+  if (!cache.map[key]) cache.order.push(key);
+  const nowMs = Date.now();
+  cache.map[key] = { orders, totalMatches:orders.length, createdAtMs:nowMs, lastUsedMs:nowMs };
+  const max = Math.max(2, Math.min(16, Number(cache.max || 8)));
+  while (cache.order.length > max) {
+    const oldest = cache.order.shift();
+    if (oldest && oldest !== key) delete cache.map[oldest];
+  }
+}
+
+async function readGraphResultSurfaceRowsByOrders(surface, sourceIndices, orders){
+  const safeOrders = (Array.isArray(orders) ? orders : [])
+    .map((n) => Math.max(0, Math.floor(Number(n))))
+    .filter(Number.isFinite);
+  if (!safeOrders.length) return {rows:[], scanned:0, chunks:0, strategy:"orders-empty"};
+
+  const requiredSource = graphResultSurfaceRequiredSourceIndices(surface, sourceIndices);
+  if (!requiredSource.length) return {rows:[], scanned:0, chunks:0, strategy:"orders-empty"};
+
+  if (surface.mode === "join") {
+    const sourceRows = Array.isArray(surface.rows) ? surface.rows : [];
+    return {
+      rows:safeOrders.map((order) => graphResultSurfaceMaterializeValueArray(
+        (sourceIdx) => graphResultSurfaceValueFromJoin(surface, sourceRows[order] || [], sourceIdx),
+        requiredSource
+      )),
+      scanned:safeOrders.length,
+      chunks:Math.ceil(safeOrders.length / 5000),
+      strategy:"join-orders"
+    };
+  }
+
+  const requiredActual = graphResultSurfaceRequiredActualColumns(surface, requiredSource);
+  if (!requiredActual.length) return {rows:[], scanned:0, chunks:0, strategy:"orders-empty"};
+
+  const rowIds = safeOrders.map((order) => Array.isArray(surface.rowIds) ? Number(surface.rowIds[order]) : Number(order));
+  const { buckets } = d3VizBucketRowIdsByChunkFast(rowIds);
+  const rows = new Array(rowIds.length);
+  let scanned = 0;
+  let chunkCount = 0;
+
+  for (const [chunkIndex, refsRaw] of buckets.entries()){
+    if (state.cancelled) throw new Error("Cancelled");
+    const refs = Array.isArray(refsRaw) ? refsRaw.slice().sort((a,b) => a.localRow - b.localRow) : [];
+    if (!refs.length) continue;
+    const chunk = await readChunkColumns(chunkIndex, requiredActual, {
+      surfacePlan:{
+        version:GRAPH_RESULT_SURFACE_VERSION,
+        surface:"graph-result-filter-orders",
+        surfaceId:surface.id,
+        requiredColumns:requiredActual,
+        warmColumns:requiredActual,
+        hotColumns:requiredActual
+      }
+    });
+    for (const ref of refs){
+      const localRow = Number(ref.localRow);
+      const order = Number(ref.order);
+      if (!Number.isFinite(localRow) || localRow < 0 || localRow >= chunk.rowCount) continue;
+      rows[order] = graphResultSurfaceMaterializeValueArray(
+        (sourceIdx) => graphResultSurfaceValueFromDataChunk(surface, chunk, sourceIdx, localRow),
+        requiredSource
+      );
+      scanned++;
+    }
+    chunkCount++;
+    if (chunkCount % 4 === 0) await workerYield();
+  }
+
+  return {rows:rows.filter((row) => Array.isArray(row)), scanned, chunks:chunkCount, strategy:"filter-order-index"};
+}
+
+async function graphResultBuildFilteredOrders(surface, selected, header, effectiveDerivedColumns, effectiveOutputColumnNames, filters){
+  const orders = [];
+  await forEachGraphResultSurfaceRow(surface, selected, {
+    label:"GraphResultSurface filter-index",
+    progress:false,
+    rowLimit:Number.POSITIVE_INFINITY,
+    chunkYieldEvery:4,
+    visit:(value, rowOrder) => {
+      const baseRow = graphResultSurfaceMaterializeValueArray(value, selected);
+      const appliedOne = graphApplyDerivedRows(header, [baseRow], effectiveDerivedColumns, effectiveOutputColumnNames);
+      const outRow = appliedOne.rows?.[0] || baseRow;
+      if (graphResultOutputRowMatches(outRow, filters)) orders.push(rowOrder);
+      return true;
+    }
+  });
+  return orders;
+}
+
+
 function graphResultSurfaceRowWindowBuckets(surface, start, limit){
   if (!surface || surface.mode !== "data") return { buckets:new Map(), rowCount:0, strategy:"none" };
   const safeStart = Math.max(0, Number(start || 0));
@@ -7296,35 +7505,38 @@ async function readGraphResultWindow({mode="data", surfaceId=null, page=1, pageS
     return response;
   }
 
-  const rows = [];
-  let matched = 0;
-  await forEachGraphResultSurfaceRow(surface, selected, {
-    label:"GraphResultSurface filtered page",
-    progressBase:0,
-    progressSpan:99,
-    progress:false,
-    rowLimit:Number.POSITIVE_INFINITY,
-    chunkYieldEvery:4,
-    visit:(value) => {
-      const baseRow = graphResultSurfaceMaterializeValueArray(value, selected);
-      const appliedOne = graphApplyDerivedRows(header, [baseRow], effectiveDerivedColumns, effectiveOutputColumnNames);
-      const outRow = appliedOne.rows?.[0] || baseRow;
-      if (!graphResultOutputRowMatches(outRow, filters)) return true;
-      if (matched >= start && rows.length < limit) rows.push(outRow);
-      matched++;
-      return true;
-    }
+  const filterCacheKey = graphResultFilterCacheKey({
+    filters,
+    selected,
+    derivedColumns:effectiveDerivedColumns,
+    outputColumnNames:effectiveOutputColumnNames
   });
+  let filterEntry = graphResultFilterIndexCacheGet(surface, filterCacheKey);
+  if (!filterEntry) {
+    const orders = await graphResultBuildFilteredOrders(surface, selected, header, effectiveDerivedColumns, effectiveOutputColumnNames, filters);
+    graphResultFilterIndexCacheSet(surface, filterCacheKey, orders);
+    filterEntry = graphResultFilterIndexCacheGet(surface, filterCacheKey) || {orders, totalMatches:orders.length};
+  }
 
+  const totalMatches = Number(filterEntry.totalMatches ?? filterEntry.orders?.length ?? 0);
+  const pageOrders = (filterEntry.orders || []).slice(start, start + limit);
+  const orderWindow = await readGraphResultSurfaceRowsByOrders(surface, selected, pageOrders);
+  const appliedRows = graphApplyDerivedRows(header, orderWindow.rows, effectiveDerivedColumns, effectiveOutputColumnNames);
   const appliedHeader = graphApplyDerivedRows(header, [], effectiveDerivedColumns, effectiveOutputColumnNames);
+
   return {
-    header:appliedHeader.header || header,
-    rows,
+    header:appliedHeader.header || appliedRows.header || header,
+    rows:appliedRows.rows || [],
     surface:graphResultSurfaceSummary(surface),
     surfaceId:surface.id,
     startRow:start,
-    totalMatches:matched,
+    totalMatches,
     filtered:true,
+    filterCacheHit:!!filterEntry,
+    filterIndexSize:totalMatches,
+    windowStrategy:orderWindow.strategy,
+    windowScanned:orderWindow.scanned,
+    windowChunks:orderWindow.chunks,
     page:safePage,
     pageSize:safePageSize
   };
@@ -8760,47 +8972,58 @@ function d3VizRequiredActualColumnsFromSource(indices, projectionMap){
   return out;
 }
 
-function d3VizMakeSurfaceAdapterGraphFast(sourceColumns, sourceMode, chunkRows){
-  const surface = getGraphResultSurface({mode:sourceMode});
+function d3VizMakeSurfaceAdapterGraphFast(sourceColumns, sourceMode, chunkRows, msg={}){
+  const surface = getGraphResultSurface({mode:sourceMode, surfaceId:msg.surfaceId || null});
   const projectionMap = d3VizGraphDataProjectionMap(sourceColumns);
   const manifestColumns = Array.isArray(state.manifest?.columns) ? state.manifest.columns : [];
+  const baseHeader = surface?.header || d3VizSourceColumnList(sourceColumns).map((c) => c.name);
+  const compiledDerived = compileGraphDerivedColumnsForWorker(msg.derivedColumns || surface?.derivedColumns || [], baseHeader);
+  const effectiveColumns = surface
+    ? graphResultEffectiveColumns(surface, compiledDerived)
+    : d3VizSourceColumnList(sourceColumns);
+  const baseCount = Array.isArray(surface?.columns) ? surface.columns.length : effectiveColumns.length;
+
+  const effectiveColumn = (idx) => {
+    const sourceIdx = Number(idx);
+    return effectiveColumns.find((column) => Number(column.sourceIndex ?? column.index) === sourceIdx || Number(column.index) === sourceIdx) || null;
+  };
 
   return {
     dataSource:"graph",
     dataSourceLabel:`Graph Query Result / ${sourceMode}`,
     sourceMode,
     surfaceId:surface?.id || null,
-    strategy:"worker-graph-result-surface-rowid-columnar-v5",
+    strategy:compiledDerived.length ? "worker-graph-result-surface-derived-columnar-v6" : "worker-graph-result-surface-rowid-columnar-v6",
     totalRows:() => graphResultTotalRows(sourceMode, surface?.id || null),
     hasColumn:(idx) => {
       const sourceIdx = Number(idx);
-      if (surface) return !!graphResultSurfaceColumn(surface, sourceIdx);
+      if (surface) return !!effectiveColumn(sourceIdx);
       const actual = projectionMap.get(sourceIdx);
       return Number.isFinite(actual) && !!manifestColumns[actual];
     },
     name:(idx) => {
       const sourceIdx = Number(idx);
-      if (surface) return graphResultSurfaceColumn(surface, sourceIdx)?.name || d3VizGraphColumnName(sourceColumns, sourceIdx);
+      if (surface) return effectiveColumn(sourceIdx)?.name || d3VizGraphColumnName(sourceColumns, sourceIdx);
       const actual = projectionMap.get(sourceIdx);
       return manifestColumns[actual]?.name || d3VizGraphColumnName(sourceColumns, sourceIdx);
     },
     type:(idx) => {
       const sourceIdx = Number(idx);
-      if (surface) return graphResultSurfaceColumn(surface, sourceIdx)?.type || "string";
+      if (surface) return effectiveColumn(sourceIdx)?.type || "string";
       const actual = projectionMap.get(sourceIdx);
       return manifestColumns[actual]?.type || "string";
     },
     resolveDomains:async (indices, label) => {
       const domains = new Map();
       const valid = d3VizValidColumnList(indices, {
-        hasColumn:(i) => surface ? !!graphResultSurfaceColumn(surface, i) : Number.isFinite(projectionMap.get(Number(i)))
+        hasColumn:(i) => surface ? !!effectiveColumn(i) : Number.isFinite(projectionMap.get(Number(i)))
       });
       for (const idx of valid){
         domains.set(Number(idx), { min:Infinity, max:-Infinity, found:false, source:"graph-result-surface-domain" });
       }
       if (!domains.size) return domains;
 
-      await d3VizMakeSurfaceAdapterGraphFast(sourceColumns, sourceMode, chunkRows)
+      await d3VizMakeSurfaceAdapterGraphFast(sourceColumns, sourceMode, chunkRows, msg)
         .scan([...domains.keys()], label, (value) => {
           for (const idx of domains.keys()){
             const n = d3VizParseNumber(value(idx));
@@ -8825,14 +9048,40 @@ function d3VizMakeSurfaceAdapterGraphFast(sourceColumns, sourceMode, chunkRows){
       return domains;
     },
     scan:async (indices, label, visit) => {
-      const currentSurface = surface || getGraphResultSurface({mode:sourceMode});
+      const currentSurface = surface || getGraphResultSurface({mode:sourceMode, surfaceId:msg.surfaceId || null});
       if (currentSurface && currentSurface.mode === "data") {
-        return await forEachGraphResultSurfaceRow(currentSurface, indices, {
+        const requested = d3VizValidColumnList(indices, { hasColumn:(i) => !!effectiveColumn(i) });
+        const baseSource = new Set();
+        const derivedSource = [];
+        for (const idx of requested){
+          if (idx < baseCount) baseSource.add(idx);
+          else derivedSource.push(idx);
+        }
+        for (const idx of derivedSource){
+          const compiled = compiledDerived[idx - baseCount];
+          for (const required of compiled?.requiredColumnIndices || []) baseSource.add(required);
+        }
+        const scanSource = [...baseSource].filter((idx) => idx >= 0 && idx < baseCount);
+        return await forEachGraphResultSurfaceRow(currentSurface, scanSource, {
           label:label || "D3 GraphResultSurface",
           progressBase:45,
           progressSpan:54,
           chunkYieldEvery:4,
-          visit:(value) => visit((sourceIdx) => value(sourceIdx))
+          visit:(value) => {
+            let rowMap = null;
+            const getValue = (sourceIdx) => {
+              const idx = Number(sourceIdx);
+              if (idx < baseCount) return value(idx);
+              const compiled = compiledDerived[idx - baseCount];
+              if (!compiled) return "";
+              if (!rowMap) {
+                rowMap = {};
+                for (let i = 0; i < baseCount; i++) rowMap[currentSurface.header?.[i] || `Column ${i + 1}`] = value(i);
+              }
+              return evaluateCompiledGraphDerivedColumnForWorker(compiled, rowMap);
+            };
+            visit(getValue);
+          }
         });
       }
 
@@ -8850,7 +9099,7 @@ function d3VizMakeSurfaceAdapterGraphFast(sourceColumns, sourceMode, chunkRows){
         if (state.cancelled) throw new Error("Cancelled");
         const chunk = await readChunkColumns(chunkIndex, requiredActual, {
           surfacePlan:{
-            version:5,
+            version:6,
             surface:"d3-graph-rowid-columnar-reduce",
             requiredColumns:requiredActual,
             warmColumns:requiredActual,
@@ -8919,9 +9168,17 @@ function d3VizGraphFastRequiredSourceIndices(msg, sourceColumns){
 
 function d3VizCanUseGraphFastPath(sourceColumns, sourceMode, msg={}){
   if (sourceMode !== "data") return false;
-  if (normalizeGraphDerivedColumnsForWorker(msg.derivedColumns || []).length) return false;
   if (Array.isArray(msg.graphOutputColumnNames) && msg.graphOutputColumnNames.length) return false;
   if (!state.manifest || !d3VizActiveChunkCount()) return false;
+  const surface = getGraphResultSurface({mode:sourceMode, surfaceId:msg.surfaceId || null});
+  if (surface) {
+    const baseHeader = surface.header || d3VizSourceColumnList(sourceColumns).map((c) => c.name);
+    const compiledDerived = compileGraphDerivedColumnsForWorker(msg.derivedColumns || surface.derivedColumns || [], baseHeader);
+    const effectiveColumns = graphResultEffectiveColumns(surface, compiledDerived);
+    const valid = new Set(effectiveColumns.map((c) => Number(c.sourceIndex ?? c.index)));
+    const required = d3VizGraphFastRequiredSourceIndices(msg, sourceColumns);
+    return required.length > 0 && required.every((idx) => valid.has(Number(idx)));
+  }
   const projectionMap = d3VizGraphDataProjectionMap(sourceColumns);
   const required = d3VizGraphFastRequiredSourceIndices(msg, sourceColumns);
   return required.length > 0 && required.every((idx) => Number.isFinite(projectionMap.get(Number(idx))));
@@ -8932,7 +9189,7 @@ async function buildD3GraphResultVisualizationSurface(msg){
   const sourceColumns = d3VizSourceColumnList(msg.sourceColumns);
   const chunkRows = d3VizSafeInt(msg.chunkRows, 500, 50000, 10000);
   const adapter = d3VizCanUseGraphFastPath(sourceColumns, sourceMode, msg)
-    ? d3VizMakeSurfaceAdapterGraphFast(sourceColumns, sourceMode, chunkRows)
+    ? d3VizMakeSurfaceAdapterGraphFast(sourceColumns, sourceMode, chunkRows, msg)
     : d3VizMakeSurfaceAdapterGraph(sourceColumns, sourceMode, chunkRows, msg);
 
   const key = d3VizSurfaceCacheKey(msg, adapter);
@@ -10608,6 +10865,7 @@ function VisualHyperTensorTableView({
   const [columnFilters, setColumnFilters] = useState({});
   const [pendingPage, setPendingPage] = useState(null);
   const [renderStats, setRenderStats] = useState({fps:0, avgPaintMs:0, lastPaintMs:0, dropped:0, visibleRows:0, visibleCols:0, cacheMode:"viewport-canvas"});
+  const [headerViewport, setHeaderViewport] = useState({left:0, width:900});
 
   const effectiveGlobalFilter = externalLazy ? String(externalGlobalFilter || "") : globalFilter;
   const effectiveColumnFilters = externalLazy && externalColumnFilters && typeof externalColumnFilters === "object" ? externalColumnFilters : columnFilters;
@@ -10642,6 +10900,7 @@ function VisualHyperTensorTableView({
     }
     stateRef.current.scrollTop = 0;
     stateRef.current.scrollLeft = 0;
+    setHeaderViewport((prev) => ({...prev, left:0}));
   }, [externalLazy, lazyResetKey]);
 
   const decoratedRows = useMemo(() => {
@@ -10689,6 +10948,10 @@ function VisualHyperTensorTableView({
   const widths = useMemo(() => displayHeader.map((_, i) => getColumnWidth(i)), [displayHeader, getColumnWidth, columnWidths]);
   const prefix = useMemo(() => visualBuildPrefix(widths), [widths]);
   const totalWidth = Math.max(720, Number(prefix.total || 0));
+  const headerVisibleCols = useMemo(() => {
+    const win = visualVisibleColumnWindow(prefix, widths, headerViewport.left, headerViewport.width || 900);
+    return win.indices || [];
+  }, [prefix, widths, headerViewport.left, headerViewport.width]);
   const logicalContentHeight = Math.max(1, safeTotal * rowHeight);
   const contentHeight = Math.max(bodyViewportHeight, Math.min(logicalContentHeight, TILE_TABLE_MAX_SCROLL_PX));
   const compressedY = logicalContentHeight > TILE_TABLE_MAX_SCROLL_PX;
@@ -10928,7 +11191,9 @@ function VisualHyperTensorTableView({
     const el = scrollRef.current;
     if (!el) return;
     const update = () => {
-      stateRef.current.viewport = {width:Math.max(240, el.clientWidth || 900), height:Math.max(120, canvasHeight)};
+      const width = Math.max(240, el.clientWidth || 900);
+      stateRef.current.viewport = {width, height:Math.max(120, canvasHeight)};
+      setHeaderViewport((prev) => (prev.width === width ? prev : {...prev, width}));
       schedulePaint("resize");
     };
     update();
@@ -10976,6 +11241,8 @@ function VisualHyperTensorTableView({
     const nextLeft = el.scrollLeft || 0;
     stateRef.current.scrollTop = nextTop;
     stateRef.current.scrollLeft = nextLeft;
+    const width = Math.max(240, el.clientWidth || stateRef.current.viewport.width || 900);
+    setHeaderViewport((prev) => (prev.left === nextLeft && prev.width === width ? prev : {left:nextLeft, width}));
     schedulePaint("scroll");
     if (externalLazy && safeTotal) {
       const virtualStart = virtualRowFromBodyTop(nextTop);
@@ -11120,13 +11387,14 @@ function VisualHyperTensorTableView({
                 style={{ position:"absolute", left:0, top:0, cursor:"default", touchAction:"pan-x pan-y", pointerEvents:"auto" }}
               />
             </Box>
-            <Box sx={{ position:"sticky", top:0, zIndex:8, width:totalWidth, height:headerHeight, bgcolor:"background.paper", borderBottom:"1px solid", borderColor:"divider", display:"flex", boxShadow:"0 1px 0 rgba(148,163,184,.25)" }}>
-              {displayHeader.map((name, ci) => {
+            <Box sx={{ position:"sticky", top:0, zIndex:8, width:totalWidth, height:headerHeight, bgcolor:"background.paper", borderBottom:"1px solid", borderColor:"divider", boxShadow:"0 1px 0 rgba(148,163,184,.25)", overflow:"hidden" }}>
+              {headerVisibleCols.map((ci) => {
+                const name = displayHeader[ci];
                 const w = Number(widths[ci] || minColumnWidth);
                 const activeSort = sort.index === ci;
                 const filterValue = effectiveColumnFilters?.[ci] || "";
                 return (
-                  <Box key={`${tableId}-h-${ci}`} sx={{ width:w, minWidth:w, maxWidth:w, height:headerHeight, position:"relative", borderRight:"1px solid", borderColor:"divider", overflow:"hidden", bgcolor:activeSort ? "action.selected" : "background.paper" }}>
+                  <Box key={`${tableId}-h-${ci}`} sx={{ position:"absolute", left:Number(prefix[ci] || 0), top:0, width:w, minWidth:w, maxWidth:w, height:headerHeight, borderRight:"1px solid", borderColor:"divider", overflow:"hidden", bgcolor:activeSort ? "action.selected" : "background.paper" }}>
                     <Button
                       size="small"
                       disabled={!sortable || externalLazy}
