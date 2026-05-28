@@ -2,7 +2,7 @@
 <html lang="ja">
 <head>
   <meta charset="UTF-8" />
-  <title>Quantum CSV Grid - v11 Agent Knowledge Build</title>
+  <title>Quantum CSV Grid - v12 Simulation What-if Build</title>
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Roboto:wght@300;400;600;700&display=swap" />
   <link rel="stylesheet" href="https://fonts.googleapis.com/icon?family=Material+Icons" />
@@ -12490,6 +12490,453 @@ registerRuntimeCommand("RUN_KNOWLEDGE_GRAPH", {
 
 
 
+
+/*
+ * =========================================================
+ * Simulation / What-if Kernel v12
+ * =========================================================
+ * v12 turns discovered profiles / hypotheses into virtual scenario surfaces.
+ * It does not mutate the source dataset. It estimates scenario impact from
+ * sampled column tiles, then emits comparable scenario plans and D3 actions.
+ */
+const SIMULATION_WHATIF_KERNEL_VERSION = 12;
+const SIMULATION_WHATIF_CACHE_LIMIT = 10;
+
+if (!olapKernelRuntime.simulationWhatIf) olapKernelRuntime.simulationWhatIf = new Map();
+
+function v12SimulationCacheKey(input){
+  const manifestKey = `${state.manifest?.id || ""}:${state.manifest?.totalRows || 0}:${state.manifest?.columns?.length || 0}`;
+  const cfg = [
+    String(input?.goal || "").trim().toLowerCase(),
+    String(input?.scenarioMode || "auto"),
+    Number(input?.sampleRows || 0),
+    Number(input?.maxColumns || 0),
+    Number(input?.topN || 0),
+    semanticOverrideHashForWorker(input?.semanticOverrides)
+  ].join("|");
+  return hashText32(`v12|${manifestKey}|${cfg}`);
+}
+
+function v12RememberSimulation(key, value){
+  const cache = olapKernelRuntime.simulationWhatIf;
+  if (!cache) return;
+  if (cache.has(key)) cache.delete(key);
+  cache.set(key, { at:now(), value });
+  while (cache.size > SIMULATION_WHATIF_CACHE_LIMIT) {
+    const first = cache.keys().next().value;
+    cache.delete(first);
+  }
+}
+
+function v12ScenarioScore({ signal=0.5, confidence=0.5, reversibility=0.9, cost=0.4 } = {}){
+  const s = Math.max(0, Math.min(1, Number(signal || 0)));
+  const c = Math.max(0.05, Math.min(1, Number(confidence || 0.5)));
+  const r = Math.max(0.1, Math.min(1, Number(reversibility || 0.9)));
+  const k = Math.max(0.1, Number(cost || 0.4));
+  return Math.round((s * c * r / k) * 1000) / 10;
+}
+
+function v12ColumnBySemantic(cols, semantics){
+  const allowed = new Set((semantics || []).map(String));
+  return (cols || []).filter((c)=>allowed.has(String(c.semanticType || c.effectiveSemantic || "")));
+}
+
+function v12SafePct(n){
+  const v = Number(n || 0);
+  if (!Number.isFinite(v)) return "0%";
+  return `${Math.round(v * 1000) / 10}%`;
+}
+
+function v12MakeScenarioD3Plan(scenario, fallback){
+  if (scenario?.chartPlan) return scenario.chartPlan;
+  return fallback || null;
+}
+
+function v12BuildOutlierScenarios({ measures, categories, topN }){
+  const out = [];
+  for (const m of measures.slice(0, Math.max(1, topN))){
+    const avg = Number(m.numeric?.avg);
+    const max = Number(m.numeric?.max);
+    const std = Number(m.numeric?.stddev);
+    const count = Number(m.numeric?.count || 0);
+    if (!Number.isFinite(avg) || !Number.isFinite(max) || !Number.isFinite(std) || std <= 0 || count < 50) continue;
+    const z = (max - avg) / std;
+    if (z < 3) continue;
+    const trimShare = Math.min(0.05, Math.max(0.005, 1 / Math.max(100, count)));
+    const estimatedAvgAfter = avg + ((avg - max) * trimShare);
+    const delta = estimatedAvgAfter - avg;
+    const group = categories[0];
+    const plan = group
+      ? v8MakeD3Plan({ chartType:"boxplot", xColumn:group.index, yColumn:m.index, aggregation:"Avg" })
+      : v8MakeD3Plan({ chartType:"histogram", xColumn:m.index, yColumn:-1, aggregation:"Count" });
+    out.push({
+      id:`v12-outlier-trim-${m.index}`,
+      type:"exclude_outliers",
+      title:`${m.name} の外れ値上位を除外したら？`,
+      description:`最大値が平均から約 ${Math.round(z * 10) / 10}σ 離れています。上位外れ値を仮想除外した場合の平均影響を見ます。`,
+      targetColumn:m.name,
+      targetColumnIndex:m.index,
+      scenarioLabel:"上位外れ値を仮想除外",
+      base:{ metric:"avg", value:avg, rows:m.sampleRows },
+      scenario:{ metric:"avg_after_trim", value:estimatedAvgAfter, trimShare },
+      delta:{ absolute:delta, relative:avg ? delta / Math.abs(avg) : 0 },
+      confidence:Math.max(0.25, Math.min(0.92, count / Math.max(500, Number(m.sampleRows || count)))),
+      score:v12ScenarioScore({ signal:Math.min(1, z / 10), confidence:Math.min(1, count / 5000), cost:0.35 }),
+      chartPlan:plan,
+      evidence:[
+        ["column", m.name],
+        ["avg", Math.round(avg * 1000) / 1000],
+        ["max", Math.round(max * 1000) / 1000],
+        ["z-score approx", Math.round(z * 10) / 10],
+        ["assumed trim", v12SafePct(trimShare)]
+      ],
+      counterChecks:[
+        { type:"sample_only", label:"sample推定", result:"warning", detail:"正確値はScenario Surfaceのexact化で再測定してください。" },
+        { type:"reversible", label:"元データ非破壊", result:"passed", detail:"仮想Surfaceなので元Datasetは変更されません。" }
+      ],
+      nextActions:[
+        { type:"run_d3", label:"外れ値分布をD3で確認" },
+        { type:"create_filter", label:"外れ値候補行を確認" },
+      ]
+    });
+  }
+  return out;
+}
+
+function v12BuildMissingScenarios({ cols, topN }){
+  const out = [];
+  for (const c of cols.filter((x)=>Number(x.nullRate || 0) >= 0.08).slice(0, topN)){
+    const nullRate = Number(c.nullRate || 0);
+    const top = c.top?.[0]?.value || "";
+    const isMeasure = String(c.semanticType) === "measure";
+    const fillValue = isMeasure
+      ? Number.isFinite(Number(c.numeric?.avg)) ? Math.round(Number(c.numeric.avg) * 1000) / 1000 : 0
+      : top || "(mode)";
+    out.push({
+      id:`v12-fill-missing-${c.index}`,
+      type:"fill_missing",
+      title:`${c.name} の欠損を補完したら？`,
+      description:`欠損率 ${v12SafePct(nullRate)} の列です。分析前処理として補完した場合の影響を仮想比較します。`,
+      targetColumn:c.name,
+      targetColumnIndex:c.index,
+      scenarioLabel:isMeasure ? "平均補完" : "最頻値補完",
+      base:{ metric:"nullRate", value:nullRate, rows:c.sampleRows },
+      scenario:{ metric:"nullRate_after_fill", value:0, fillValue },
+      delta:{ absolute:-nullRate, relative:nullRate ? -1 : 0 },
+      confidence:Math.max(0.2, Math.min(0.9, Number(c.sampleRows || 0) / 10000)),
+      score:v12ScenarioScore({ signal:nullRate, confidence:Math.min(1, Number(c.sampleRows || 0) / 5000), cost:0.25 }),
+      chartPlan:v8MakeD3Plan({ chartType:"bar", xColumn:c.index, aggregation:"Count" }),
+      evidence:[
+        ["column", c.name],
+        ["semantic", c.semanticType],
+        ["null rate", v12SafePct(nullRate)],
+        ["fill value", String(fillValue)]
+      ],
+      counterChecks:[
+        { type:"bias_risk", label:"補完バイアス", result:nullRate >= 0.4 ? "warning" : "passed", detail:nullRate >= 0.4 ? "欠損が多いため補完後の解釈に注意。" : "欠損率は中程度以下です。" }
+      ],
+      nextActions:[
+        { type:"run_d3", label:"欠損分布をD3で確認" },
+        { type:"export_scenario", label:"補完シナリオの要約を出力" },
+      ]
+    });
+  }
+  return out;
+}
+
+function v12BuildSegmentScenarios({ measures, categories, topN }){
+  const out = [];
+  for (const cat of categories.slice(0, Math.min(4, topN))){
+    const top = cat.top?.[0];
+    if (!top || Number(top.count || 0) <= 0) continue;
+    const share = Math.max(0, Math.min(1, Number(cat.topShare || 0)));
+    if (share < 0.12) continue;
+    for (const m of measures.slice(0, 3)){
+      const avg = Number(m.numeric?.avg);
+      if (!Number.isFinite(avg)) continue;
+      const assumedLift = share >= 0.5 ? 0.08 : 0.04;
+      const valueAfterExclude = avg * (1 - assumedLift * share);
+      out.push({
+        id:`v12-segment-exclude-${cat.index}-${m.index}`,
+        type:"exclude_segment",
+        title:`${cat.name}=${top.value} を除外して ${m.name} を見たら？`,
+        description:`${cat.name} は ${top.value} に ${v12SafePct(share)} 偏っています。支配的セグメントを除外した比較Surfaceを作る候補です。`,
+        targetColumn:m.name,
+        targetColumnIndex:m.index,
+        segmentColumn:cat.name,
+        segmentColumnIndex:cat.index,
+        segmentValue:top.value,
+        scenarioLabel:`${cat.name}=${top.value} を仮想除外`,
+        base:{ metric:"avg", value:avg, segmentShare:share },
+        scenario:{ metric:"avg_after_excluding_segment", value:valueAfterExclude, excludedShare:share },
+        delta:{ absolute:valueAfterExclude - avg, relative:avg ? (valueAfterExclude - avg) / Math.abs(avg) : 0 },
+        confidence:Math.max(0.25, Math.min(0.88, Number(cat.sampleRows || 0) / 10000)),
+        score:v12ScenarioScore({ signal:share, confidence:Math.min(1, Number(top.count || 0) / 1000), cost:0.45 }),
+        chartPlan:v8MakeD3Plan({ chartType:"bar", xColumn:cat.index, yColumn:m.index, aggregation:"Avg" }),
+        evidence:[
+          ["segment column", cat.name],
+          ["segment value", top.value],
+          ["segment share", v12SafePct(share)],
+          ["measure", m.name],
+          ["base avg", Math.round(avg * 1000) / 1000]
+        ],
+        counterChecks:[
+          { type:"segment_size", label:"セグメントサイズ", result:share >= 0.03 ? "passed" : "warning", detail:`sample share ${v12SafePct(share)}` },
+          { type:"causality", label:"因果ではない", result:"warning", detail:"これは仮想比較であり、因果効果の証明ではありません。" }
+        ],
+        nextActions:[
+          { type:"run_d3", label:"セグメント別D3を実行" },
+          { type:"apply_filter", label:"該当セグメント行を確認" },
+        ]
+      });
+    }
+  }
+  return out;
+}
+
+function v12BuildAdjustmentScenarios({ measures, categories, topN }){
+  const out = [];
+  for (const m of measures.slice(0, Math.min(4, topN))){
+    const avg = Number(m.numeric?.avg);
+    if (!Number.isFinite(avg)) continue;
+    const percent = 0.1;
+    const after = avg * (1 + percent);
+    out.push({
+      id:`v12-adjust-${m.index}`,
+      type:"adjust_measure",
+      title:`${m.name} を +10% したら？`,
+      description:`価格・金額・スコアなどの指標列を仮想的に10%調整したScenario Surfaceです。`,
+      targetColumn:m.name,
+      targetColumnIndex:m.index,
+      scenarioLabel:"+10% 仮想調整",
+      base:{ metric:"avg", value:avg },
+      scenario:{ metric:"avg_after_adjust", value:after, adjustPercent:percent },
+      delta:{ absolute:after - avg, relative:percent },
+      confidence:0.72,
+      score:v12ScenarioScore({ signal:0.55, confidence:0.72, cost:0.2 }),
+      chartPlan:categories[0]
+        ? v8MakeD3Plan({ chartType:"bar", xColumn:categories[0].index, yColumn:m.index, aggregation:"Avg" })
+        : v8MakeD3Plan({ chartType:"histogram", xColumn:m.index, aggregation:"Count" }),
+      evidence:[
+        ["measure", m.name],
+        ["base avg", Math.round(avg * 1000) / 1000],
+        ["after +10%", Math.round(after * 1000) / 1000]
+      ],
+      counterChecks:[
+        { type:"business_rule", label:"業務制約未考慮", result:"warning", detail:"価格弾力性・需要変化は別途仮定が必要です。" }
+      ],
+      nextActions:[
+        { type:"run_d3", label:"調整対象の分布を確認" },
+      ]
+    });
+  }
+  return out;
+}
+
+function v12BuildTimeWindowScenarios({ dates, measures, topN }){
+  const out = [];
+  for (const d of dates.slice(0, 2)){
+    const m = measures[0];
+    if (!m) continue;
+    out.push({
+      id:`v12-time-window-${d.index}-${m.index}`,
+      type:"time_window",
+      title:`${d.name} の期間を絞って ${m.name} を比較したら？`,
+      description:"時系列列を使い、特定期間だけのScenario Surfaceを作る候補です。スパイク・季節性・期間偏りの検証に使います。",
+      targetColumn:m.name,
+      targetColumnIndex:m.index,
+      timeColumn:d.name,
+      timeColumnIndex:d.index,
+      scenarioLabel:"期間限定Surface",
+      base:{ metric:"all_period", value:"all rows" },
+      scenario:{ metric:"focused_period", value:"hot window candidate" },
+      delta:{ absolute:0, relative:0 },
+      confidence:0.62,
+      score:v12ScenarioScore({ signal:0.45, confidence:0.62, cost:0.35 }),
+      chartPlan:v8MakeD3Plan({ chartType:"line", xColumn:d.index, yColumn:m.index, aggregation:"Avg" }),
+      evidence:[
+        ["time column", d.name],
+        ["measure", m.name],
+        ["sample rows", fmt(d.sampleRows || 0)]
+      ],
+      counterChecks:[
+        { type:"period_bias", label:"期間偏り確認", result:"warning", detail:"期間選択で結論が変わるか確認してください。" }
+      ],
+      nextActions:[
+        { type:"run_d3", label:"時系列D3を実行" },
+      ]
+    });
+  }
+  return out;
+}
+
+function v12BuildSimulationScenarios(sample, input){
+  const cols = sample.columns || [];
+  const topN = Math.max(3, Math.min(24, Number(input?.topN || 10)));
+  const measures = v12ColumnBySemantic(cols, ["measure"]).filter((c)=>Number(c.numeric?.count || 0) > 0);
+  const categories = v12ColumnBySemantic(cols, ["category","status","dimension","email","url"]).filter((c)=>Number(c.distinct || 0) > 1);
+  const dates = v12ColumnBySemantic(cols, ["date"]).filter((c)=>Number(c.nonNull || 0) > 0);
+
+  const scenarios = [
+    ...v12BuildOutlierScenarios({ measures, categories, topN }),
+    ...v12BuildMissingScenarios({ cols, topN }),
+    ...v12BuildSegmentScenarios({ measures, categories, topN }),
+    ...v12BuildAdjustmentScenarios({ measures, categories, topN }),
+    ...v12BuildTimeWindowScenarios({ dates, measures, topN }),
+  ];
+
+  const unique = [];
+  const seen = new Set();
+  for (const s of scenarios.sort((a,b)=>Number(b.score || 0) - Number(a.score || 0))) {
+    if (!s || seen.has(s.id)) continue;
+    seen.add(s.id);
+    unique.push(s);
+  }
+  return unique.slice(0, topN * 2);
+}
+
+function v12BuildSimulationReport({ goal, scenarios, sample }){
+  const lines = [];
+  lines.push(`# v12 Simulation / What-if Report`);
+  lines.push("");
+  lines.push(`Goal: ${goal || "What-if分析"}`);
+  lines.push(`Dataset: ${state.manifest?.name || state.manifest?.id || "active"}`);
+  lines.push(`Sample: ${fmt(sample.metrics?.sampledRows || 0)} / ${fmt(sample.metrics?.totalRows || 0)} rows`);
+  lines.push("");
+  lines.push(`## Top Scenarios`);
+  for (const s of (scenarios || []).slice(0, 8)) {
+    lines.push(`- ${s.title}`);
+    lines.push(`  - type: ${s.type}`);
+    lines.push(`  - score: ${Math.round(Number(s.score || 0) * 10) / 10}, confidence: ${Math.round(Number(s.confidence || 0) * 1000) / 10}%`);
+    if (s.delta && Number.isFinite(Number(s.delta.relative))) {
+      lines.push(`  - estimated delta: ${v12SafePct(Number(s.delta.relative))}`);
+    }
+  }
+  lines.push("");
+  lines.push("Note: v12は元データを変更しない仮想Scenario Surfaceです。重要な判断前にはexact再測定・業務制約確認を行ってください。");
+  return lines.join("\n");
+}
+
+async function runSimulationWhatIfKernelV12(input){
+  if (!state.manifest || !Array.isArray(state.manifest.columns) || !state.manifest.columns.length) {
+    throw new Error("Storage Datasetを開いてからSimulationを実行してください。");
+  }
+  const started = now();
+  const goal = String(input?.goal || "").trim() || "重要なWhat-ifシナリオを作る";
+
+  post("SIMULATION_WHATIF_PROGRESS", {
+    stage:"profile",
+    progress:8,
+    goal,
+    totalRows:Number(state.manifest.totalRows || 0),
+  });
+
+  const sample = await v8SampleProfiles({
+    sampleRows:Number(input?.sampleRows || 220000),
+    maxColumns:Number(input?.maxColumns || 160),
+    topN:Number(input?.topN || 12),
+    mode:"simulation",
+    semanticOverrides:normalizeSemanticOverridesForWorker(input?.semanticOverrides),
+  });
+
+  post("SIMULATION_WHATIF_PROGRESS", {
+    stage:"scenario-build",
+    progress:76,
+    goal,
+    sampledRows:sample.metrics.sampledRows,
+    totalRows:sample.metrics.totalRows,
+  });
+
+  const scenarios = v12BuildSimulationScenarios(sample, input);
+  const suggestedCharts = scenarios
+    .filter((s)=>s.chartPlan)
+    .slice(0, Math.max(6, Math.min(18, Number(input?.topN || 12))))
+    .map((s)=>({
+      id:`chart-${s.id}`,
+      title:s.title,
+      reason:s.description,
+      score:s.score,
+      plan:s.chartPlan,
+      scenarioId:s.id,
+      scenarioType:s.type,
+    }));
+
+  const reportDraft = v12BuildSimulationReport({ goal, scenarios, sample });
+
+  const result = {
+    version:SIMULATION_WHATIF_KERNEL_VERSION,
+    dataset:{
+      id:state.manifest?.id || "",
+      name:state.manifest?.name || "",
+      rows:Number(state.manifest?.totalRows || 0),
+      columns:Number(state.manifest?.columns?.length || 0),
+    },
+    goal,
+    scenarios,
+    suggestedCharts,
+    reportDraft,
+    summary:{
+      scenarioCount:scenarios.length,
+      chartCount:suggestedCharts.length,
+      sampledRows:sample.metrics.sampledRows,
+      totalRows:sample.metrics.totalRows,
+      semanticOverrideCount:sample.metrics.semanticOverrideCount || 0,
+    },
+    metrics:{
+      ...(sample.metrics || {}),
+      ms:Math.round(now() - started),
+      cache:"miss",
+      kernel:"Simulation / What-if Kernel v12",
+    }
+  };
+
+  post("SIMULATION_WHATIF_PROGRESS", {
+    stage:"done",
+    progress:98,
+    goal,
+    scenarioCount:scenarios.length,
+  });
+
+  return result;
+}
+
+registerRuntimeCommand("RUN_SIMULATION_WHATIF", {
+  validate(msg){
+    return {
+      goal:String(msg.goal || "").slice(0, 500),
+      scenarioMode:String(msg.scenarioMode || "auto"),
+      sampleRows:Number(msg.sampleRows || 220000),
+      maxColumns:Number(msg.maxColumns || 160),
+      topN:Number(msg.topN || 12),
+      force:Boolean(msg.force),
+      semanticOverrides:normalizeSemanticOverridesForWorker(msg.semanticOverrides),
+    };
+  },
+  plan(input){
+    return {
+      kind:"simulation-whatif",
+      cost:"medium",
+      input
+    };
+  },
+  async execute(plan){
+    const key = v12SimulationCacheKey(plan.input);
+    const cached = !plan.input.force && olapKernelRuntime.simulationWhatIf?.get(key);
+    if (cached?.value) {
+      return {
+        ...cached.value,
+        metrics:{...(cached.value.metrics || {}), cache:"hit", ms:0}
+      };
+    }
+    const result = await runSimulationWhatIfKernelV12(plan.input);
+    v12RememberSimulation(key, result);
+    return result;
+  },
+  project(result){ return result; },
+  doneType:"SIMULATION_WHATIF_DONE",
+});
+
+
 const runtimeKernel = createRuntimeKernel({
   runtimeState: state,
   post,
@@ -16068,19 +16515,19 @@ function saveSettings(settings) {
 
 const SEMANTIC_OVERRIDE_STORAGE_KEY = "quantumCsvGrid.semanticOverrides.v1";
 const SEMANTIC_OVERRIDE_OPTIONS = [
-  { value: "auto", label: "Auto" },
-  { value: "id", label: "ID" },
-  { value: "entity", label: "Entity" },
-  { value: "category", label: "Category" },
-  { value: "status", label: "Status" },
-  { value: "dimension", label: "Dimension" },
-  { value: "measure", label: "Measure" },
-  { value: "date", label: "Date / Time" },
-  { value: "email", label: "Email" },
-  { value: "url", label: "URL" },
-  { value: "text", label: "Text" },
-  { value: "boolean", label: "Boolean" },
-  { value: "ignore", label: "Ignore" },
+  { value: "auto", label: "Auto（自動）", jp: "自動" },
+  { value: "id", label: "ID（識別子）", jp: "識別子" },
+  { value: "entity", label: "Entity（実体）", jp: "実体" },
+  { value: "category", label: "Category（カテゴリ）", jp: "カテゴリ" },
+  { value: "status", label: "Status（状態）", jp: "状態" },
+  { value: "dimension", label: "Dimension（分析軸）", jp: "分析軸" },
+  { value: "measure", label: "Measure（指標・数値）", jp: "指標・数値" },
+  { value: "date", label: "Date / Time（日付・時刻）", jp: "日付・時刻" },
+  { value: "email", label: "Email（メール）", jp: "メール" },
+  { value: "url", label: "URL（リンク）", jp: "リンク" },
+  { value: "text", label: "Text（テキスト）", jp: "テキスト" },
+  { value: "boolean", label: "Boolean（真偽値）", jp: "真偽値" },
+  { value: "ignore", label: "Ignore（分析対象外）", jp: "分析対象外" },
 ];
 const SEMANTIC_OVERRIDE_VALUES = new Set(SEMANTIC_OVERRIDE_OPTIONS.map((x) => x.value));
 
@@ -20161,12 +20608,176 @@ function KnowledgeGraphPanel({
 
 
 
+
+function SimulationWhatIfPanel({
+  manifest,
+  goal,
+  setGoal,
+  result,
+  status,
+  time,
+  busy,
+  onRun,
+  onRunFresh,
+  onApplyChart,
+  onExportReport,
+}) {
+  const scenarios = Array.isArray(result?.scenarios) ? result.scenarios : [];
+  const charts = Array.isArray(result?.suggestedCharts) ? result.suggestedCharts : [];
+  const summary = result?.summary || {};
+  const reportDraft = String(result?.reportDraft || "");
+
+  const scenarioRows = scenarios.map((s) => [
+    s.type || "",
+    s.title || "",
+    s.targetColumn || "",
+    s.segmentColumn ? `${s.segmentColumn}=${s.segmentValue || ""}` : "",
+    Number.isFinite(Number(s.delta?.relative)) ? `${Math.round(Number(s.delta.relative) * 1000) / 10}%` : "",
+    `${Math.round(Number(s.confidence || 0) * 1000) / 10}%`,
+    Math.round(Number(s.score || 0) * 10) / 10,
+  ]);
+
+  return (
+    <Section
+      title="Simulation / What-if"
+      icon={<Analytics />}
+      hint="v12: 元データを変更せず、仮想Scenario Surfaceで外れ値除外・欠損補完・セグメント除外・指標調整を比較します。"
+    >
+      <Stack spacing={1}>
+        <Stack direction={{ xs:"column", md:"row" }} spacing={1} alignItems={{ xs:"stretch", md:"center" }}>
+          <TextField
+            label="What-if Goal"
+            size="small"
+            value={goal}
+            onChange={(e) => setGoal(e.target.value)}
+            placeholder="例: 外れ値を除いたら？ / 欠損を補完したら？ / category=Aを除外したら？"
+            sx={{ flex: 1, minWidth: 280 }}
+          />
+          <Button variant="contained" disabled={!manifest || busy} onClick={onRun}>Run v12 Simulation</Button>
+          <Button variant="outlined" disabled={!manifest || busy} onClick={onRunFresh}>Force Simulation Rescan</Button>
+          <Button variant="outlined" disabled={!result} onClick={onExportReport}>Export Report</Button>
+        </Stack>
+
+        <Alert severity={manifest ? "info" : "warning"}>
+          {status}
+          {time ? ` / ${time}` : ""}
+        </Alert>
+
+        {result && (
+          <>
+            <Stack direction="row" useFlexGap flexWrap="wrap" spacing={0.75}>
+              <Chip color="primary" label={`scenarios ${fmt(summary.scenarioCount || scenarios.length)}`} />
+              <Chip color="secondary" label={`charts ${fmt(summary.chartCount || charts.length)}`} />
+              <Chip label={`sample ${fmt(summary.sampledRows || 0)} / ${fmt(summary.totalRows || 0)}`} />
+              <Chip label={`cache ${result.metrics?.cache || "miss"}`} />
+              <Chip color="success" label="non-destructive" />
+            </Stack>
+
+            <Paper variant="outlined" sx={{ p:1, minWidth:0 }}>
+              <Typography variant="subtitle1" sx={{ fontWeight:900, mb:0.75 }}>Scenario Comparison</Typography>
+              <DataTable
+                table={{
+                  header:["type", "scenario", "target", "segment", "estimated delta", "confidence", "score"],
+                  rows:scenarioRows,
+                  page:1,
+                  pageSize:scenarioRows.length || 1,
+                  startRow:0,
+                  totalMatches:scenarioRows.length,
+                }}
+                tableId="simulation-scenarios"
+                height={360}
+              />
+            </Paper>
+
+            <Box sx={{ display:"grid", gridTemplateColumns:{ xs:"1fr", lg:"1fr 1fr" }, gap:1, alignItems:"start" }}>
+              <Paper variant="outlined" sx={{ p:1, minWidth:0 }}>
+                <Typography variant="subtitle1" sx={{ fontWeight:900, mb:0.75 }}>Top What-if Cards</Typography>
+                <Stack spacing={0.75}>
+                  {scenarios.length ? scenarios.slice(0, 8).map((s) => (
+                    <Paper key={s.id || s.title} variant="outlined" sx={{ p:0.9 }}>
+                      <Stack spacing={0.5}>
+                        <Stack direction={{ xs:"column", md:"row" }} justifyContent="space-between" alignItems={{ xs:"stretch", md:"center" }} spacing={1}>
+                          <Box sx={{ minWidth:0 }}>
+                            <Typography variant="body2" sx={{ fontWeight:900 }}>{s.title || "Scenario"}</Typography>
+                            <Typography variant="caption" color="text.secondary">{s.description || ""}</Typography>
+                          </Box>
+                          <Stack direction="row" spacing={0.5}>
+                            <Chip size="small" label={s.type || "what-if"} />
+                            <Chip size="small" color="primary" label={`score ${Math.round(Number(s.score || 0) * 10) / 10}`} />
+                            <Button size="small" disabled={!s.chartPlan} onClick={() => onApplyChart?.(s.chartPlan)}>Run D3</Button>
+                          </Stack>
+                        </Stack>
+                        {Array.isArray(s.evidence) && s.evidence.length ? (
+                          <Typography variant="caption" color="text.secondary">
+                            {s.evidence.slice(0, 4).map((x) => `${x[0]}: ${x[1]}`).join(" / ")}
+                          </Typography>
+                        ) : null}
+                        {Array.isArray(s.counterChecks) && s.counterChecks.length ? (
+                          <Stack direction="row" useFlexGap flexWrap="wrap" spacing={0.5}>
+                            {s.counterChecks.slice(0, 3).map((c, i) => (
+                              <Chip key={i} size="small" label={`${c.label || c.type}: ${c.result || ""}`} color={c.result === "passed" ? "success" : "warning"} />
+                            ))}
+                          </Stack>
+                        ) : null}
+                      </Stack>
+                    </Paper>
+                  )) : (
+                    <Typography color="text.secondary">Simulationを実行するとScenario候補が表示されます。</Typography>
+                  )}
+                </Stack>
+              </Paper>
+
+              <Paper variant="outlined" sx={{ p:1, minWidth:0 }}>
+                <Typography variant="subtitle1" sx={{ fontWeight:900, mb:0.75 }}>v12 Suggested Visualizations</Typography>
+                <Stack spacing={0.75}>
+                  {charts.length ? charts.slice(0, 10).map((c) => (
+                    <Paper key={c.id || c.title} variant="outlined" sx={{ p:0.9 }}>
+                      <Stack direction={{ xs:"column", md:"row" }} justifyContent="space-between" alignItems={{ xs:"stretch", md:"center" }} spacing={1}>
+                        <Box sx={{ minWidth:0 }}>
+                          <Typography variant="body2" sx={{ fontWeight:800 }}>{c.title || "Chart"}</Typography>
+                          <Typography variant="caption" color="text.secondary">{c.reason || ""}</Typography>
+                        </Box>
+                        <Stack direction="row" spacing={0.5}>
+                          <Chip size="small" label={c.scenarioType || "scenario"} />
+                          <Button size="small" onClick={() => onApplyChart?.(c.plan)}>Run D3</Button>
+                        </Stack>
+                      </Stack>
+                    </Paper>
+                  )) : (
+                    <Typography color="text.secondary">Scenarioに対応するD3候補が生成されると表示されます。</Typography>
+                  )}
+                </Stack>
+              </Paper>
+            </Box>
+
+            <Paper variant="outlined" sx={{ p:1 }}>
+              <Stack direction="row" justifyContent="space-between" alignItems="center" spacing={1} sx={{ mb:0.75 }}>
+                <Typography variant="subtitle1" sx={{ fontWeight:900 }}>Simulation Report Draft</Typography>
+                <Button size="small" disabled={!reportDraft} onClick={onExportReport}>Export Markdown</Button>
+              </Stack>
+              <TextField
+                value={reportDraft}
+                multiline
+                minRows={9}
+                fullWidth
+                InputProps={{ readOnly:true }}
+              />
+            </Paper>
+          </>
+        )}
+      </Stack>
+    </Section>
+  );
+}
+
+
 function ReliabilityDiagnosticsPanel({
   manifest,
   autonomousInsights,
   autonomousResearch,
   agentResult,
   knowledgeGraph,
+  simulationWhatIf,
   d3VizResult,
   runtimeMetrics,
 }) {
@@ -20175,6 +20786,7 @@ function ReliabilityDiagnosticsPanel({
     ["Worker command", "RUN_AUTONOMOUS_RESEARCH", "registered via runtime command", Boolean(autonomousResearch) ? "observed" : "ready"],
     ["Worker command", "RUN_COLLABORATIVE_AGENT", "v10 command available after this build", Boolean(agentResult) ? "observed" : "ready"],
     ["Worker command", "RUN_KNOWLEDGE_GRAPH", "v11 command available after this build", Boolean(knowledgeGraph) ? "observed" : "ready"],
+    ["Worker command", "RUN_SIMULATION_WHATIF", "v12 command available after this build", Boolean(simulationWhatIf) ? "observed" : "ready"],
     ["Runtime split", "legacy monolith removed", "Babel対象はJSX chunkのみ", "ok"],
     ["D3", "normalizer", "Visualize / v8 / v11のPlan反映で使用", "ok"],
     ["Security", "unsafe eval", "unsafe dynamic execution not used in generated build", "ok"],
@@ -20247,6 +20859,7 @@ function ReliabilityDiagnosticsPanel({
             <Chip label="Autonomous Research v9" color={autonomousResearch ? "success" : "default"} />
             <Chip label="Collaborative Agent v10" color={agentResult ? "success" : "default"} />
             <Chip label="Knowledge Graph v11" color={knowledgeGraph ? "success" : "default"} />
+            <Chip label="Simulation v12" color={simulationWhatIf ? "success" : "default"} />
           </Stack>
         </Paper>
       </Stack>
@@ -20431,6 +21044,10 @@ function App() {
   const [knowledgeGraph, setKnowledgeGraph] = useState(null);
   const [knowledgeGraphStatus, setKnowledgeGraphStatus] = useState("Storage Datasetを開くと、v11 Knowledge Graphを実行できます。");
   const [knowledgeGraphTime, setKnowledgeGraphTime] = useState("");
+  const [simulationGoal, setSimulationGoal] = useState(initialSettings.simulationGoal || "外れ値や欠損を変えた場合の影響を見たい");
+  const [simulationWhatIf, setSimulationWhatIf] = useState(null);
+  const [simulationStatus, setSimulationStatus] = useState("Storage Datasetを開くと、v12 Simulation / What-ifを実行できます。");
+  const [simulationTime, setSimulationTime] = useState("");
 
 
   const [syntheticPreviewTable, setSyntheticPreviewTable] = useState(null);
@@ -20516,6 +21133,11 @@ function App() {
       ? "Storage Datasetを開きました。Run v11 Knowledge Graphで関係面を測定できます。"
       : "Storage Datasetを開くと、v11 Knowledge Graphを実行できます。");
     setKnowledgeGraphTime("");
+    setSimulationWhatIf(null);
+    setSimulationStatus(manifest
+      ? "Storage Datasetを開きました。Run v12 SimulationでWhat-ifシナリオを作成できます。"
+      : "Storage Datasetを開くと、v12 Simulation / What-ifを実行できます。");
+    setSimulationTime("");
   }, [manifest?.id]);
 
   useEffect(() => { searchPageRef.current = searchPage; }, [searchPage]);
@@ -20549,9 +21171,10 @@ function App() {
       mainPanel,
       tab,
       agentGoal,
+      simulationGoal,
       rules,
     });
-  }, [themeMode, tableDensity, previewRows, encoding, csvExportEncoding, delimiter, chunkSize, sampleRows, pageSize, graphResultPageSize, storageWorkspace, storageCollection, memoryMaxMB, memoryMaxRows, externalProvider, externalEndpoint, externalPrefix, externalAuthMode, s3Region, s3Bucket, mainPanel, tab, agentGoal, rules]);
+  }, [themeMode, tableDensity, previewRows, encoding, csvExportEncoding, delimiter, chunkSize, sampleRows, pageSize, graphResultPageSize, storageWorkspace, storageCollection, memoryMaxMB, memoryMaxRows, externalProvider, externalEndpoint, externalPrefix, externalAuthMode, s3Region, s3Bucket, mainPanel, tab, agentGoal, simulationGoal, rules]);
 
   function appendLog(text) {
     const line = `[${new Date().toLocaleTimeString()}] ${text}`;
@@ -20749,6 +21372,8 @@ function App() {
     setAutonomousResearchStatus(`${reason} Run v9 Researchで再検証してください。`);
     setAgentStatus(`${reason} Run v10 Agentで再計画してください。`);
     setKnowledgeGraphStatus(`${reason} Run v11 Knowledge Graphで再構築してください。`);
+    setSimulationWhatIf(null);
+    setSimulationStatus(`${reason} Run v12 Simulationでシナリオを再作成してください。`);
   }
 
   function setColumnSemanticOverride(column, value) {
@@ -21567,6 +22192,26 @@ function App() {
         return;
       },
 
+      "SIMULATION_WHATIF_PROGRESS"(msg) {
+        const stage = msg.stage || "simulation";
+        setSimulationStatus(`v12 Simulation ${stage}: ${msg.goal || simulationGoal || ""}`);
+        if (Number.isFinite(Number(msg.progress))) {
+          setProgress(Math.max(1, Math.min(99, Number(msg.progress))));
+        }
+        return;
+      },
+
+      "SIMULATION_WHATIF_DONE"(msg) {
+        setSimulationWhatIf(msg);
+        setSimulationStatus(`v12 Simulation ready: ${fmt(msg.summary?.scenarioCount || msg.scenarios?.length || 0)} scenarios / ${fmt(msg.summary?.chartCount || msg.suggestedCharts?.length || 0)} charts`);
+        setSimulationTime(ms(msg.metrics?.ms));
+        setBusy(false);
+        setBusyLabel("");
+        setProgress(100);
+        setProgressText("v12 Simulation完了");
+        return;
+      },
+
       "SYNTHETIC_PREVIEW_DONE"(msg) {
         setSyntheticPreviewTable({ header: msg.header || [], rows: msg.rows || [] });
         setSyntheticReport(Object.entries(msg.report || {}).map(([k, v]) => [k, typeof v === "number" ? fmt(v) : String(v)]));
@@ -21966,6 +22611,36 @@ function App() {
       force,
       semanticOverrides:compactSemanticOverrides(semanticOverrides),
     });
+  }
+
+  function runSimulationWhatIf(force = false) {
+    if (!manifestRef.current) {
+      setSimulationStatus("Storage Datasetを開いてからv12 Simulationを実行してください。");
+      return;
+    }
+    const goal = String(simulationGoal || "").trim() || "重要なWhat-ifシナリオを作る";
+    setSimulationStatus(force ? "v12 Simulationを再スキャンしています..." : "v12 Simulation / What-if Scenarioを作成しています...");
+    setSimulationTime("");
+    post({
+      type:"RUN_SIMULATION_WHATIF",
+      goal,
+      scenarioMode:"auto",
+      sampleRows:240000,
+      maxColumns:160,
+      topN:12,
+      force,
+      semanticOverrides:compactSemanticOverrides(semanticOverrides),
+    });
+  }
+
+  function exportSimulationReport() {
+    const text = String(simulationWhatIf?.reportDraft || "");
+    if (!text) {
+      setSimulationStatus("ExportできるSimulation Reportがありません。先にRun v12 Simulationを実行してください。");
+      return;
+    }
+    downloadText("simulation_whatif_report.md", text, { encoding:csvExportEncoding });
+    setSimulationStatus("Simulation ReportをMarkdownでExportしました。");
   }
 
   function exportAgentReport() {
@@ -23276,6 +23951,7 @@ function App() {
               <Tab value="research" icon={<Analytics />} iconPosition="start" label="Research" />
               <Tab value="agent" icon={<Analytics />} iconPosition="start" label="Agent" />
               <Tab value="knowledge" icon={<Schema />} iconPosition="start" label="Knowledge" />
+              <Tab value="simulation" icon={<Analytics />} iconPosition="start" label="Simulation" />
               <Tab value="search" icon={<Search />} iconPosition="start" label="Search" />
               <Tab value="pivot" icon={<TableChart />} iconPosition="start" label="Pivot" />
               <Tab value="time" icon={<Timeline />} iconPosition="start" label="Time" />
@@ -23531,6 +24207,22 @@ function App() {
               onRun={() => runKnowledgeGraph(false)}
               onRunFresh={() => runKnowledgeGraph(true)}
               onApplyChart={applyAutonomousD3Plan}
+            />
+          )}
+
+          {tab === "simulation" && (
+            <SimulationWhatIfPanel
+              manifest={manifest}
+              goal={simulationGoal}
+              setGoal={setSimulationGoal}
+              result={simulationWhatIf}
+              status={simulationStatus}
+              time={simulationTime}
+              busy={busy}
+              onRun={() => runSimulationWhatIf(false)}
+              onRunFresh={() => runSimulationWhatIf(true)}
+              onApplyChart={applyAutonomousD3Plan}
+              onExportReport={exportSimulationReport}
             />
           )}
 
@@ -23894,6 +24586,7 @@ function App() {
               autonomousResearch={autonomousResearch}
               agentResult={agentResult}
               knowledgeGraph={knowledgeGraph}
+              simulationWhatIf={simulationWhatIf}
               d3VizResult={d3VizResult}
               runtimeMetrics={runtimeMetricsRef.current}
             />
