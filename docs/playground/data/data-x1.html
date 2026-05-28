@@ -2,7 +2,7 @@
 <html lang="ja">
 <head>
   <meta charset="UTF-8" />
-  <title>Quantum CSV Grid - Hybrid Surface Distributed HyperTensor Full Build</title>
+  <title>Quantum CSV Grid - D3 Infinite Surface DataSource Build</title>
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Roboto:wght@300;400;600;700&display=swap" />
   <link rel="stylesheet" href="https://fonts.googleapis.com/icon?family=Material+Icons" />
@@ -81,7 +81,7 @@ storage boundary, query boundary, or graph boundary changes.
  * 07. Worker pool, remote execution, external storage adapter
  * 08. Search, data query, pivot, time series
  * 09. Graph query execution and graph result projections
- * 10. Message router: self.onmessage
+ * 10. Runtime Kernel v2: command boundary / measurement / legacy-safe fallback
  *
  * Maintenance invariant:
  * Heavy data-domain logic stays here, off the UI thread.
@@ -115,6 +115,16 @@ let state = {
   adaptiveKernel:{enabled:true,version:2,mode:"adaptive",cache:true,selfTuning:true,lastStrategy:null,lastBench:null},
   hyperTensor:{enabled:true,version:2,lastPlan:null},
   externalDataset:null,
+  runtime:{
+    kernelVersion:2,
+    bootedAt:new Date().toISOString(),
+    commandCount:0,
+    failureCount:0,
+    fallbackCount:0,
+    lastCommandType:"",
+    lastStrategy:"legacy",
+    lastError:null
+  },
   cancelled:false
 };
 
@@ -3184,6 +3194,575 @@ async function flushChunk(datasetDir, chunkIndex, chunk, columns){
   return meta;
 }
 
+
+/*
+ * =========================================================
+ * SYNTHETIC DATASET STUDIO v1
+ * =========================================================
+ * Plan-based Chunk Generator:
+ * - UI sends only SyntheticDataPlan.
+ * - Worker generates deterministic chunks with seeded RNG.
+ * - Preview/Download are CSV sinks.
+ * - Open/OPFS are Direct Columnar sinks, avoiding CSV re-import.
+ */
+
+const SYNTHETIC_STUDIO_VERSION = 1;
+const SYNTHETIC_MAX_ROWS = 5000000;
+const SYNTHETIC_MAX_COLUMNS = 300;
+const SYNTHETIC_MAX_CHUNK_SIZE = 100000;
+const SYNTHETIC_MIN_CHUNK_SIZE = 1000;
+
+function syntheticClampNumber(value, min, max, fallback, integer = true){
+  const n = Number(value);
+  if (!Number.isFinite(n)) return fallback;
+  const v = Math.max(min, Math.min(max, integer ? Math.floor(n) : n));
+  return integer ? Math.floor(v) : v;
+}
+
+function syntheticClampRate(value){
+  return syntheticClampNumber(value, 0, 1, 0, false);
+}
+
+function syntheticSafeDatasetName(value, fallback = "synthetic_dataset"){
+  return safeId(String(value || fallback).slice(0, 80)) || fallback;
+}
+
+function syntheticEstimateBytes(plan){
+  const avgCellBytes = plan.format?.numberMode === "currency" ? 14 : 18;
+  return Math.max(0, Math.round(plan.rows * plan.columns * avgCellBytes));
+}
+
+function createSeededRandom(seed){
+  let a = (Number(seed) >>> 0) || 42;
+  return {
+    next(){
+      a |= 0;
+      a = (a + 0x6D2B79F5) | 0;
+      let t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    },
+    int(min, max){
+      const lo = Math.ceil(Number(min));
+      const hi = Math.floor(Number(max));
+      return Math.floor(this.next() * (hi - lo + 1)) + lo;
+    },
+    pick(items){
+      const list = Array.isArray(items) && items.length ? items : [null];
+      return list[this.int(0, list.length - 1)];
+    },
+    weightedPick(items, weights){
+      const list = Array.isArray(items) && items.length ? items : [null];
+      const ws = Array.isArray(weights) && weights.length === list.length ? weights.map(Number) : list.map(()=>1);
+      const total = ws.reduce((a,b)=>a + Math.max(0, Number(b || 0)), 0) || list.length;
+      let r = this.next() * total;
+      for (let i=0;i<list.length;i++){
+        r -= Math.max(0, Number(ws[i] || 0));
+        if (r <= 0) return list[i];
+      }
+      return list[list.length - 1];
+    }
+  };
+}
+
+const SYNTHETIC_JA_NAMES = ["佐藤","鈴木","高橋","田中","伊藤","渡辺","山本","中村","小林","加藤","吉田","山田","佐々木","山口","松本"];
+const SYNTHETIC_EN_NAMES = ["Avery","Morgan","Jordan","Taylor","Casey","Riley","Cameron","Quinn","Hayden","Parker"];
+const SYNTHETIC_REGIONS_JA = ["北海道","東北","関東","中部","関西","中国","四国","九州","沖縄"];
+const SYNTHETIC_REGIONS_EN = ["North","East","South","West","Central","Online","Overseas"];
+const SYNTHETIC_MERCHANTS = ["Aozora Mart","Metro Books","Northwind Travel","Sakura Pay","Quantum Store","Cafe Orbit","Nomad Market"];
+const SYNTHETIC_PATHS = ["/","/search","/products","/products/detail","/cart","/checkout","/account","/api/items","/help","/campaign"];
+const SYNTHETIC_REFERRERS = ["direct","google","x.com","newsletter","partner","ad-network","internal"];
+const SYNTHETIC_STATUS = ["ok","warn","error"];
+const SYNTHETIC_CURRENCIES = ["JPY","USD","EUR"];
+const SYNTHETIC_CHANNELS = ["online","store","partner"];
+const SYNTHETIC_ORDER_STATUS = ["paid","pending","refunded"];
+const SYNTHETIC_ACCESS_CODES = [200,200,200,200,301,404,429,500];
+
+function validateSyntheticPlan(rawPlan = {}){
+  const presetRaw = String(rawPlan.preset || "sales").toLowerCase();
+  const preset = ["sales","iot","finance","access","graph"].includes(presetRaw) ? presetRaw : "sales";
+  const outputModeRaw = String(rawPlan.output?.mode || "open");
+  const mode = ["open","opfs","download","graphSet"].includes(outputModeRaw) ? outputModeRaw : "open";
+  const rows = syntheticClampNumber(rawPlan.rows, 1, SYNTHETIC_MAX_ROWS, 100000);
+  const columns = syntheticClampNumber(rawPlan.columns, 1, SYNTHETIC_MAX_COLUMNS, 24);
+  const chunkSize = syntheticClampNumber(rawPlan.chunkSize, SYNTHETIC_MIN_CHUNK_SIZE, SYNTHETIC_MAX_CHUNK_SIZE, 50000);
+  const seed = syntheticClampNumber(rawPlan.seed, 0, 2147483647, 42);
+  const plan = {
+    preset,
+    rows,
+    columns,
+    chunkSize,
+    seed,
+    quality:{
+      nullRate:syntheticClampRate(rawPlan.quality?.nullRate),
+      duplicateRate:syntheticClampRate(rawPlan.quality?.duplicateRate),
+      outlierRate:syntheticClampRate(rawPlan.quality?.outlierRate),
+      emptyRate:syntheticClampRate(rawPlan.quality?.emptyRate),
+      longTextRate:syntheticClampRate(rawPlan.quality?.longTextRate),
+      japaneseRate:syntheticClampRate(rawPlan.quality?.japaneseRate)
+    },
+    format:{
+      dateMode:["iso","slash","mixed"].includes(rawPlan.format?.dateMode) ? rawPlan.format.dateMode : "iso",
+      numberMode:["raw","comma","currency","mixed"].includes(rawPlan.format?.numberMode) ? rawPlan.format.numberMode : "raw",
+      encodingHint:["utf8","sjis"].includes(rawPlan.format?.encodingHint) ? rawPlan.format.encodingHint : "utf8"
+    },
+    output:{
+      mode,
+      datasetName:syntheticSafeDatasetName(rawPlan.output?.datasetName || rawPlan.datasetName || `synthetic_${preset}_${rows}_seed${seed}`)
+    }
+  };
+  plan.estimatedBytes = syntheticEstimateBytes(plan);
+  return plan;
+}
+
+function syntheticBaseColumns(preset){
+  if (preset === "iot") return [
+    ["event_id","string","id"], ["device_id","string","device"], ["timestamp","string","timestamp"],
+    ["temperature","number","temperature"], ["humidity","number","humidity"], ["battery","number","battery"],
+    ["status","string","iotStatus"], ["location","string","location"]
+  ];
+  if (preset === "finance") return [
+    ["tx_id","string","id"], ["account_id","string","account"], ["amount","number","financeAmount"],
+    ["currency","string","currency"], ["merchant","string","merchant"], ["risk_score","number","riskScore"],
+    ["tx_at","string","timestamp"], ["status","string","financeStatus"]
+  ];
+  if (preset === "access") return [
+    ["request_id","string","id"], ["user_id","string","user"], ["path","string","path"],
+    ["status_code","number","statusCode"], ["latency_ms","number","latency"], ["referrer","string","referrer"],
+    ["timestamp","string","timestamp"], ["region","string","region"]
+  ];
+  if (preset === "graph") return [
+    ["event_id","string","id"], ["user_id","string","user"], ["order_id","string","order"],
+    ["product_id","string","product"], ["event_type","string","eventType"], ["amount","number","amount"],
+    ["created_at","string","timestamp"], ["region","string","region"]
+  ];
+  return [
+    ["order_id","string","id"], ["customer_id","string","customer"], ["product_id","string","product"],
+    ["region","string","region"], ["channel","string","channel"], ["quantity","number","quantity"],
+    ["unit_price","number","unitPrice"], ["amount","number","amount"], ["ordered_at","string","date"], ["status","string","orderStatus"]
+  ];
+}
+
+function createSyntheticColumns(plan){
+  const base = syntheticBaseColumns(plan.preset).slice(0, plan.columns);
+  while(base.length < plan.columns){
+    const i = base.length + 1;
+    const numeric = i % 3 === 0;
+    base.push([`extra_${String(i).padStart(3,"0")}`, numeric ? "number" : "string", numeric ? "extraNumber" : "extraText"]);
+  }
+  return base.map(([name,type,generator], index)=>({ index, name, type, generator, synthetic:true }));
+}
+
+function syntheticDateAt(rowIndex, rng, plan, timestamp = false){
+  const start = Date.UTC(2022, 0, 1);
+  const spanDays = 365 * 3;
+  const d = new Date(start + ((rowIndex * 37 + rng.int(0, spanDays)) % spanDays) * 86400000 + (timestamp ? rng.int(0, 86399) * 1000 : 0));
+  const iso = timestamp ? d.toISOString() : d.toISOString().slice(0,10);
+  if (plan.format.dateMode === "slash") return iso.replace(/-/g,"/").replace("T"," ").replace("Z","");
+  if (plan.format.dateMode === "mixed" && rng.next() < 0.5) return iso.replace(/-/g,"/").replace("T"," ").replace("Z","");
+  return iso;
+}
+
+function syntheticLongText(rng, plan){
+  const ja = rng.next() < plan.quality.japaneseRate;
+  const seedWords = ja
+    ? ["検証","異常値","欠損","表記ゆれ","東京都","売上","注文","重要","サンプル","長文"]
+    : ["synthetic","quality","outlier","missing","duplicate","surface","chunk","runtime","sample","long"];
+  const len = rng.int(12, 44);
+  const words=[];
+  for (let i=0;i<len;i++) words.push(rng.pick(seedWords));
+  return words.join(ja ? "、" : " ");
+}
+
+function syntheticFormatNumber(value, rng, plan, currency = false){
+  let n = Number(value || 0);
+  const mode = plan.format.numberMode === "mixed" ? rng.pick(["raw","comma", currency ? "currency" : "raw"]) : plan.format.numberMode;
+  if (mode === "currency" || currency) return `¥${Math.round(n).toLocaleString("ja-JP")}`;
+  if (mode === "comma") return Math.round(n).toLocaleString("en-US");
+  return Math.round(n * 100) / 100;
+}
+
+function syntheticApplyQuality(value, column, rowIndex, rng, plan){
+  if (rng.next() < plan.quality.nullRate) return null;
+  if (rng.next() < plan.quality.emptyRate) return "";
+  if (column.type === "string" && rng.next() < plan.quality.longTextRate) return syntheticLongText(rng, plan);
+  if (column.type === "number" && rng.next() < plan.quality.outlierRate) return Number(value || 1) * rng.pick([25, 50, 100, -25]);
+  return value;
+}
+
+function syntheticValueForColumn(column, rowIndex, rng, plan){
+  const i = rowIndex + 1;
+  const ja = rng.next() < plan.quality.japaneseRate;
+  switch(column.generator){
+    case "id": return `${plan.preset}_${String(i).padStart(9,"0")}`;
+    case "order": return `ord_${String((i % Math.max(1, Math.floor(plan.rows * 0.8))) + 1).padStart(9,"0")}`;
+    case "customer": return `cust_${String((i % 250000) + 1).padStart(7,"0")}`;
+    case "user": return `user_${String((i % 500000) + 1).padStart(7,"0")}`;
+    case "account": return `acct_${String((i % 300000) + 1).padStart(7,"0")}`;
+    case "product": return `prod_${String((i % 50000) + 1).padStart(6,"0")}`;
+    case "device": return `dev_${String((i % 20000) + 1).padStart(6,"0")}`;
+    case "region": return rng.pick(ja ? SYNTHETIC_REGIONS_JA : SYNTHETIC_REGIONS_EN);
+    case "location": return rng.pick(ja ? ["東京","大阪","名古屋","札幌","福岡","仙台","広島"] : ["tokyo","osaka","nagoya","sapporo","fukuoka","sendai"]);
+    case "channel": return rng.pick(SYNTHETIC_CHANNELS);
+    case "quantity": return rng.int(1, 12);
+    case "unitPrice": return syntheticFormatNumber(rng.int(300, 80000) + rng.next(), rng, {...plan, format:{...plan.format, numberMode:"raw"}}, false);
+    case "amount": return Math.round((rng.int(1, 12) * rng.int(300, 80000) * (0.85 + rng.next() * 0.35)) * 100) / 100;
+    case "financeAmount": return Math.round((rng.next() < 0.08 ? -1 : 1) * rng.int(100, 900000) * 100) / 100;
+    case "date": return syntheticDateAt(rowIndex, rng, plan, false);
+    case "timestamp": return syntheticDateAt(rowIndex, rng, plan, true);
+    case "orderStatus": return rng.weightedPick(SYNTHETIC_ORDER_STATUS, [92,6,2]);
+    case "iotStatus": return rng.weightedPick(SYNTHETIC_STATUS, [94,5,1]);
+    case "financeStatus": return rng.weightedPick(["approved","declined","review"], [88,7,5]);
+    case "currency": return rng.weightedPick(SYNTHETIC_CURRENCIES, [82,12,6]);
+    case "merchant": return rng.pick(SYNTHETIC_MERCHANTS);
+    case "riskScore": return Math.round(Math.pow(rng.next(), 2) * 1000) / 10;
+    case "temperature": return Math.round((18 + rng.next() * 15 + Math.sin(i / 1000) * 5) * 10) / 10;
+    case "humidity": return Math.round((35 + rng.next() * 45) * 10) / 10;
+    case "battery": return Math.max(0, Math.round((100 - (i % 10000) / 100 + rng.next() * 5) * 10) / 10);
+    case "path": return rng.pick(SYNTHETIC_PATHS);
+    case "statusCode": return rng.pick(SYNTHETIC_ACCESS_CODES);
+    case "latency": return Math.round(Math.pow(rng.next(), 2.2) * 1800 + 20);
+    case "referrer": return rng.pick(SYNTHETIC_REFERRERS);
+    case "eventType": return rng.pick(["view","click","cart","purchase","refund","login","logout"]);
+    case "extraNumber": return Math.round((rng.next() * 100000 - 25000) * 100) / 100;
+    case "extraText": return ja ? `${rng.pick(SYNTHETIC_JA_NAMES)}_${rng.pick(SYNTHETIC_REGIONS_JA)}_${i % 1000}` : `${rng.pick(SYNTHETIC_EN_NAMES)}_${rng.pick(SYNTHETIC_REGIONS_EN)}_${i % 1000}`;
+    default: return "";
+  }
+}
+
+function createSyntheticRow(columns, rowIndex, rng, plan){
+  return columns.map((column)=>syntheticApplyQuality(syntheticValueForColumn(column, rowIndex, rng, plan), column, rowIndex, rng, plan));
+}
+
+function syntheticCsvCell(value){
+  if (value == null) return "";
+  let s = String(value);
+  if (/^[=+\-@]/.test(s)) s = "'" + s;
+  if (/[",\r\n]/.test(s)) s = `"${s.replace(/"/g,'""')}"`;
+  return s;
+}
+
+function syntheticRowsToCsv(header, rows, includeHeader){
+  const lines = [];
+  if (includeHeader) lines.push(header.map(syntheticCsvCell).join(","));
+  for (const row of rows) lines.push(row.map(syntheticCsvCell).join(","));
+  return lines.join("\n") + "\n";
+}
+
+function syntheticRules(){
+  return {
+    trim:false,nfkc:false,controls:true,collapse:false,emptyNull:true,numericSymbols:true,dedupSpaces:false,skipBadRows:false,nullTokens:[],numericThreshold:0.9
+  };
+}
+
+async function syntheticGeneratePreview(rawPlan){
+  const plan = validateSyntheticPlan(rawPlan);
+  const columns = createSyntheticColumns(plan);
+  const rng = createSeededRandom(plan.seed);
+  const header = columns.map(c=>c.name);
+  const rows = [];
+  const recent = [];
+  const limit = Math.min(100, plan.rows);
+  const t0 = now();
+  for (let i=0;i<limit;i++){
+    if (state.cancelled) throw new Error("Cancelled");
+    let row;
+    if (recent.length && rng.next() < plan.quality.duplicateRate) row = recent[rng.int(0, recent.length - 1)].slice();
+    else row = createSyntheticRow(columns, i, rng, plan);
+    recent.push(row);
+    if (recent.length > 64) recent.shift();
+    rows.push(row);
+  }
+  return {
+    plan,
+    header,
+    rows,
+    report:{
+      previewRows:rows.length,
+      estimatedRows:plan.rows,
+      columns:columns.length,
+      estimatedBytes:plan.estimatedBytes,
+      seed:plan.seed,
+      preset:plan.preset,
+      ms:now() - t0
+    }
+  };
+}
+
+async function syntheticGenerateColumnarDataset(rawPlan){
+  clearChunkCache();
+  const plan = validateSyntheticPlan(rawPlan);
+  const columns = createSyntheticColumns(plan);
+  const root = await rootDir();
+  const id = makeDatasetId(plan.output.datasetName);
+  const dir = await root.getDirectoryHandle(id, {create:true});
+  const t0 = now();
+  const rules = syntheticRules();
+
+  try{
+    const rng = createSeededRandom(plan.seed);
+    let chunk = initChunk(columns);
+    let chunkIndex = 0;
+    let totalRows = 0;
+    const chunkMetas = [];
+    const recent = [];
+    postProgress(1, `Synthetic dataset generation started: ${fmt(plan.rows)} rows / ${fmt(plan.columns)} columns`);
+
+    for (let rowIndex=0; rowIndex<plan.rows; rowIndex++){
+      if (state.cancelled) throw new Error("Cancelled");
+      let row;
+      if (recent.length && rng.next() < plan.quality.duplicateRate) row = recent[rng.int(0, recent.length - 1)].slice();
+      else row = createSyntheticRow(columns, rowIndex, rng, plan);
+      recent.push(row);
+      if (recent.length > 128) recent.shift();
+
+      addRowToChunk(chunk, row, columns, rules);
+      totalRows++;
+
+      if (chunk.rows >= plan.chunkSize){
+        const meta = await flushChunk(dir, chunkIndex, chunk, columns);
+        chunkMetas.push(meta);
+        chunkIndex++;
+        chunk = initChunk(columns);
+        const pct = Math.min(98, Math.floor((totalRows / plan.rows) * 100));
+        const elapsed = now() - t0;
+        const payload = { generatedRows:totalRows, totalRows:plan.rows, percent:pct, elapsedMs:elapsed, estimatedBytes:plan.estimatedBytes, chunkCount:chunkIndex };
+        post("SYNTHETIC_PROGRESS", payload);
+        postProgress(pct, `Synthetic columnar chunks ${fmt(chunkIndex)} / rows ${fmt(totalRows)}/${fmt(plan.rows)}`, payload);
+        await workerYield();
+      }
+    }
+
+    if (chunk.rows > 0){
+      const meta = await flushChunk(dir, chunkIndex, chunk, columns);
+      chunkMetas.push(meta);
+      chunkIndex++;
+    }
+
+    const cleanReport = {
+      sourceRows:plan.rows,
+      totalRows,
+      skippedRows:0,
+      malformedRows:0,
+      changedCells:chunkMetas.flatMap(c=>c.stats).reduce((a,s)=>a+(s.changedCells||0),0),
+      nullCells:chunkMetas.flatMap(c=>c.stats).reduce((a,s)=>a+(s.nulls||0),0),
+      invalidNumbers:chunkMetas.flatMap(c=>c.stats).reduce((a,s)=>a+(s.invalidNumbers||0),0),
+      synthetic:true,
+      preset:plan.preset,
+      seed:plan.seed,
+      estimatedBytes:plan.estimatedBytes
+    };
+
+    const tableName = cleanMetaValue(plan.output.datasetName, `synthetic_${plan.preset}`);
+    const manifest = {
+      id,
+      name:tableName,
+      storageWorkspace:"Synthetic",
+      storageCollection:plan.preset,
+      tableName,
+      storagePath:`Synthetic / ${plan.preset} / ${tableName}`,
+      originalFileName:`${tableName}.csv`,
+      sourceFiles:[{name:`${tableName}.csv`,size:plan.estimatedBytes,sourceRows:plan.rows,totalRows,skippedRows:0,malformedRows:0,synthetic:true}],
+      createdAt:new Date().toISOString(),
+      mode:"synthetic-columnar",
+      formatVersion:5,
+      features:integrityFeatureFlags({syntheticData:true}),
+      encoding:"utf-8",
+      delimiter:",",
+      fileSize:plan.estimatedBytes,
+      chunkSize:plan.chunkSize,
+      totalRows,
+      sourceRows:plan.rows,
+      chunks:chunkIndex,
+      columns,
+      rules,
+      syntheticPlan:plan,
+      cleanReport
+    };
+
+    await writeJson(dir,"manifest.json",manifest);
+    await writeJson(dir,"chunks.json",chunkMetas);
+
+    state.dataset={id,manifest,chunks:chunkMetas};
+    state.virtual=null; state.memory=null; state.externalDataset=null; state.manifest=manifest; state.dir=dir;
+    state.searchMatches=[]; state.dataQueryMatches=null; state.dataQueryMeta=null; state.pivotTable=null; state.pivotTileIndex=null; state.timeTable=null;
+
+    return {
+      outputMode:plan.output.mode,
+      manifest,
+      chunks:chunkMetas,
+      ms:now()-t0,
+      metrics:{
+        syntheticGenerateMs:now()-t0,
+        syntheticRowsPerSec:Math.round(totalRows / Math.max(0.001, (now()-t0)/1000)),
+        syntheticBytesWritten:plan.estimatedBytes,
+        syntheticChunkCount:chunkIndex
+      }
+    };
+  }catch(error){
+    await cleanupDatasetDir(root,id);
+    throw error;
+  }
+}
+
+async function syntheticGenerateCsvBlob(rawPlan){
+  const plan = validateSyntheticPlan(rawPlan);
+  const columns = createSyntheticColumns(plan);
+  const header = columns.map(c=>c.name);
+  const rng = createSeededRandom(plan.seed);
+  const t0 = now();
+  const parts = [];
+  const encoder = new TextEncoder();
+  const recent = [];
+  let generated = 0;
+  let bytes = 0;
+
+  for (let start=0; start<plan.rows; start+=plan.chunkSize){
+    if (state.cancelled) throw new Error("Cancelled");
+    const end = Math.min(plan.rows, start + plan.chunkSize);
+    const rows = [];
+    for (let i=start;i<end;i++){
+      let row;
+      if (recent.length && rng.next() < plan.quality.duplicateRate) row = recent[rng.int(0, recent.length - 1)].slice();
+      else row = createSyntheticRow(columns, i, rng, plan);
+      recent.push(row);
+      if (recent.length > 128) recent.shift();
+      rows.push(row);
+    }
+    const encoded = encoder.encode(syntheticRowsToCsv(header, rows, start === 0));
+    parts.push(encoded);
+    bytes += encoded.byteLength;
+    generated = end;
+    const pct = Math.min(99, Math.floor((generated / plan.rows) * 100));
+    const payload = { generatedRows:generated, totalRows:plan.rows, percent:pct, elapsedMs:now()-t0, estimatedBytes:bytes, chunkCount:Math.ceil(generated/plan.chunkSize) };
+    post("SYNTHETIC_PROGRESS", payload);
+    postProgress(pct, `Synthetic CSV chunks ${fmt(payload.chunkCount)} / rows ${fmt(generated)}/${fmt(plan.rows)}`, payload);
+    await workerYield();
+  }
+
+  const blob = new Blob(parts, {type:"text/csv;charset=utf-8"});
+  return {
+    outputMode:"download",
+    fileName:`${plan.output.datasetName}.csv`,
+    blob,
+    bytes:blob.size,
+    rows:plan.rows,
+    columns:plan.columns,
+    ms:now()-t0,
+    metrics:{
+      syntheticGenerateMs:now()-t0,
+      syntheticRowsPerSec:Math.round(plan.rows / Math.max(0.001, (now()-t0)/1000)),
+      syntheticBytesWritten:blob.size,
+      syntheticChunkCount:Math.ceil(plan.rows/plan.chunkSize)
+    }
+  };
+}
+
+function graphPlanForTable(basePlan, table, rows){
+  const p = validateSyntheticPlan({...basePlan, preset:"graph", rows, columns:8, output:{mode:"download", datasetName:`${basePlan.output.datasetName}_${table}`}});
+  p.graphTable = table;
+  return p;
+}
+
+function createSyntheticGraphColumns(table){
+  const specs = {
+    users:[["user_id","string","user"],["name","string","extraText"],["region","string","region"],["signup_at","string","date"]],
+    products:[["product_id","string","product"],["category","string","region"],["product_name","string","extraText"],["unit_price","number","unitPrice"]],
+    orders:[["order_id","string","order"],["user_id","string","user"],["product_id","string","product"],["quantity","number","quantity"],["amount","number","amount"],["ordered_at","string","timestamp"]],
+    events:[["event_id","string","id"],["user_id","string","user"],["event_type","string","eventType"],["path","string","path"],["created_at","string","timestamp"]]
+  }[table] || [];
+  return specs.map(([name,type,generator], index)=>({index,name,type,generator,synthetic:true}));
+}
+
+async function syntheticGenerateGraphSet(rawPlan){
+  const basePlan = validateSyntheticPlan({...rawPlan, output:{...(rawPlan.output || {}), mode:"graphSet"}});
+  const t0 = now();
+  const tableRows = {
+    users:Math.max(10, Math.floor(basePlan.rows * 0.25)),
+    products:Math.max(10, Math.min(100000, Math.floor(basePlan.rows * 0.05))),
+    orders:basePlan.rows,
+    events:Math.max(10, Math.floor(basePlan.rows * 1.5))
+  };
+  const files = [];
+  let doneRows = 0;
+  const totalRows = Object.values(tableRows).reduce((a,b)=>a+b,0);
+
+  for (const table of ["users","products","orders","events"]){
+    if (state.cancelled) throw new Error("Cancelled");
+    const plan = graphPlanForTable(basePlan, table, tableRows[table]);
+    const columns = createSyntheticGraphColumns(table);
+    const header = columns.map(c=>c.name);
+    const rng = createSeededRandom(basePlan.seed + table.length * 101);
+    const parts = [];
+    const encoder = new TextEncoder();
+
+    for (let start=0; start<plan.rows; start+=plan.chunkSize){
+      if (state.cancelled) throw new Error("Cancelled");
+      const end = Math.min(plan.rows, start + plan.chunkSize);
+      const rows = [];
+      for (let i=start;i<end;i++) rows.push(createSyntheticRow(columns, i, rng, plan));
+      parts.push(encoder.encode(syntheticRowsToCsv(header, rows, start === 0)));
+      doneRows += rows.length;
+      const pct = Math.min(99, Math.floor((doneRows / totalRows) * 100));
+      const payload = { generatedRows:doneRows, totalRows, percent:pct, elapsedMs:now()-t0, chunkCount:files.length + 1 };
+      post("SYNTHETIC_PROGRESS", payload);
+      postProgress(pct, `Synthetic GraphSet ${table}: rows ${fmt(doneRows)}/${fmt(totalRows)}`, payload);
+      await workerYield();
+    }
+
+    const blob = new Blob(parts, {type:"text/csv;charset=utf-8"});
+    files.push({ name:`${basePlan.output.datasetName}_${table}.csv`, blob, bytes:blob.size, rows:plan.rows, columns:columns.length });
+  }
+
+  return {
+    outputMode:"graphSet",
+    files,
+    relationHints:[
+      "users.user_id = orders.user_id",
+      "orders.product_id = products.product_id",
+      "users.user_id = events.user_id"
+    ],
+    rows:totalRows,
+    ms:now()-t0,
+    metrics:{
+      syntheticGenerateMs:now()-t0,
+      syntheticRowsPerSec:Math.round(totalRows / Math.max(0.001, (now()-t0)/1000)),
+      syntheticBytesWritten:files.reduce((a,f)=>a+Number(f.bytes||0),0),
+      syntheticChunkCount:files.length
+    }
+  };
+}
+
+async function handleSyntheticPreviewCommand(msg){
+  state.cancelled=false;
+  try{
+    postProgress(1, "Synthetic preview generation...");
+    const result = await syntheticGeneratePreview(msg.plan || msg);
+    post("SYNTHETIC_PREVIEW_DONE", result);
+    postProgress(100, `Synthetic preview ready: ${fmt(result.rows.length)} rows`);
+  }catch(error){
+    if (String(error?.message || "") === "Cancelled") post("SYNTHETIC_CANCELLED", {message:"Synthetic preview cancelled"});
+    else post("SYNTHETIC_ERROR", {message:error?.message || String(error), stack:error?.stack || ""});
+  }
+}
+
+async function handleSyntheticDatasetCommand(msg){
+  state.cancelled=false;
+  try{
+    const plan = validateSyntheticPlan(msg.plan || msg);
+    let result;
+    if (plan.output.mode === "download") result = await syntheticGenerateCsvBlob(plan);
+    else if (plan.output.mode === "graphSet") result = await syntheticGenerateGraphSet(plan);
+    else result = await syntheticGenerateColumnarDataset(plan);
+    post("SYNTHETIC_DATASET_DONE", result);
+    postProgress(100, `Synthetic generation complete: ${result.manifest?.name || result.fileName || result.outputMode}`);
+  }catch(error){
+    if (String(error?.message || "") === "Cancelled") post("SYNTHETIC_CANCELLED", {message:"Synthetic generation cancelled"});
+    else post("SYNTHETIC_ERROR", {message:error?.message || String(error), stack:error?.stack || ""});
+  }
+}
+
+
 function schemaHeaderSignature(schema){
   return (schema?.columns || []).map(c => c.name).join("\u001f");
 }
@@ -5808,605 +6387,924 @@ async function buildGraphResultTime(msg={}){
 
 /*
  * =========================================================
- * 12. Synthetic Dataset Studio
+ * Runtime Kernel v2
  * =========================================================
- * Data body is never embedded in the application.
- * A small plan + seed generates chunked synthetic CSV or direct columnar OPFS data.
+ * Purpose:
+ * - Worker入口を巨大if routerから切り離し、Command / Plan / Execution /
+ *   Measurement / Fallback の実行面へ寄せる。
+ * - 既存の巨大routerは legacyWorkerMessageRouter として温存し、
+ *   互換性を崩さず段階的にCommand化できる。
+ * - 新機能は registerRuntimeCommand(type, command) で追加し、
+ *   self.onmessageへ直接ifを足さない。
  */
 
-const SYNTHETIC_DATASET_VERSION = 1;
-const SYNTHETIC_MAX_ROWS = 10000000;
-const SYNTHETIC_MAX_COLUMNS = 300;
-const SYNTHETIC_DEFAULT_CHUNK_ROWS = 50000;
+function createRuntimeMeasurement(){
+  const entries = [];
+  const maxEntries = 300;
 
-const SYNTHETIC_PRESET_DEFS = {
-  sales: {
-    label: "売上データ",
-    description: "注文・顧客・商品・地域・金額・日付を生成します。",
-    columns: [
-      { name:"order_id", kind:"id", prefix:"ORD", type:"string" },
-      { name:"customer_id", kind:"ref", prefix:"CUS", modulo:120000, type:"string" },
-      { name:"product_id", kind:"ref", prefix:"PRD", modulo:30000, type:"string" },
-      { name:"region", kind:"category", type:"string", values:["東京","大阪","福岡","札幌","名古屋","仙台","広島","那覇"], en:["Tokyo","Osaka","Fukuoka","Sapporo","Nagoya","Sendai","Hiroshima","Naha"], weights:[0.28,0.18,0.12,0.08,0.14,0.07,0.08,0.05] },
-      { name:"channel", kind:"category", type:"string", values:["EC","店舗","代理店","展示会"], weights:[0.46,0.34,0.15,0.05] },
-      { name:"quantity", key:"quantity", kind:"int", type:"number", min:1, max:12 },
-      { name:"unit_price", key:"unit_price", kind:"money", type:"number", min:300, max:90000, skew:"log" },
-      { name:"amount", kind:"amount", type:"number" },
-      { name:"ordered_at", kind:"date", type:"string", from:"2023-01-01", to:"2026-12-31" },
-      { name:"status", kind:"category", type:"string", values:["paid","pending","cancelled","refunded"], weights:[0.82,0.09,0.06,0.03] }
-    ]
-  },
-  iot: {
-    label: "センサーログ",
-    description: "端末ID・時刻・温度・湿度・状態を生成します。",
-    columns: [
-      { name:"event_id", kind:"id", prefix:"EVT", type:"string" },
-      { name:"device_id", kind:"ref", prefix:"DEV", modulo:25000, type:"string" },
-      { name:"timestamp", kind:"dateTime", type:"string", from:"2025-01-01", to:"2026-12-31" },
-      { name:"temperature", kind:"number", type:"number", min:-10, max:45, decimals:2, wave:true },
-      { name:"humidity", kind:"number", type:"number", min:15, max:95, decimals:2 },
-      { name:"battery", kind:"number", type:"number", min:0, max:100, decimals:1 },
-      { name:"status", kind:"category", type:"string", values:["normal","warning","error","offline"], weights:[0.86,0.09,0.03,0.02] },
-      { name:"site", kind:"category", type:"string", values:["東京工場","大阪倉庫","福岡支店","札幌拠点"], en:["Tokyo Plant","Osaka Warehouse","Fukuoka Branch","Sapporo Site"] }
-    ]
-  },
-  finance: {
-    label: "取引データ",
-    description: "口座・金額・通貨・加盟店・リスク値を生成します。",
-    columns: [
-      { name:"transaction_id", kind:"id", prefix:"TXN", type:"string" },
-      { name:"account_id", kind:"ref", prefix:"ACC", modulo:180000, type:"string" },
-      { name:"merchant", kind:"category", type:"string", values:["コンビニ","スーパー","ECサイト","交通","飲食","旅行","公共料金"], en:["Convenience","Grocery","E-Commerce","Transit","Restaurant","Travel","Utility"] },
-      { name:"amount", kind:"money", type:"number", min:100, max:500000, skew:"log" },
-      { name:"currency", kind:"category", type:"string", values:["JPY","USD","EUR","SGD"], weights:[0.82,0.10,0.05,0.03] },
-      { name:"risk_score", kind:"number", type:"number", min:0, max:100, decimals:2 },
-      { name:"is_fraud", kind:"boolean", type:"string", trueRate:0.012 },
-      { name:"transaction_at", kind:"dateTime", type:"string", from:"2024-01-01", to:"2026-12-31" }
-    ]
-  },
-  web: {
-    label: "アクセスログ",
-    description: "ユーザー・URL・ステータス・遅延を生成します。",
-    columns: [
-      { name:"request_id", kind:"id", prefix:"REQ", type:"string" },
-      { name:"user_id", kind:"ref", prefix:"USR", modulo:250000, type:"string" },
-      { name:"path", kind:"category", type:"string", values:["/","/search","/products","/cart","/checkout","/account","/api/orders","/api/recommend"] },
-      { name:"status_code", kind:"category", type:"string", values:["200","201","301","400","401","403","404","500"], weights:[0.72,0.04,0.05,0.04,0.03,0.02,0.07,0.03] },
-      { name:"latency_ms", kind:"int", type:"number", min:8, max:5000, skew:"log" },
-      { name:"referrer", kind:"category", type:"string", values:["direct","google","x","newsletter","affiliate","internal"] },
-      { name:"timestamp", kind:"dateTime", type:"string", from:"2025-01-01", to:"2026-12-31" }
-    ]
-  },
-  graph: {
-    label: "Graph結合サンプル",
-    description: "users / orders / products / events に近い結合キーを持つ行を生成します。",
-    columns: [
-      { name:"user_id", kind:"ref", prefix:"USR", modulo:200000, type:"string" },
-      { name:"order_id", kind:"id", prefix:"ORD", type:"string" },
-      { name:"product_id", kind:"ref", prefix:"PRD", modulo:50000, type:"string" },
-      { name:"event_id", kind:"id", prefix:"EVT", type:"string" },
-      { name:"segment", kind:"category", type:"string", values:["new","active","vip","sleeping"], weights:[0.22,0.58,0.08,0.12] },
-      { name:"category", kind:"category", type:"string", values:["食品","家電","衣料","美容","書籍","スポーツ"], en:["Food","Electronics","Apparel","Beauty","Books","Sports"] },
-      { name:"amount", kind:"money", type:"number", min:100, max:120000, skew:"log" },
-      { name:"event_type", kind:"category", type:"string", values:["view","cart","purchase","review","support"], weights:[0.50,0.20,0.18,0.07,0.05] },
-      { name:"event_at", kind:"dateTime", type:"string", from:"2024-01-01", to:"2026-12-31" }
-    ]
-  }
-};
-
-function syntheticHashString(input){
-  let h = 2166136261 >>> 0;
-  const s = String(input ?? "");
-  for (let i=0; i<s.length; i++){
-    h ^= s.charCodeAt(i);
-    h = Math.imul(h, 16777619) >>> 0;
-  }
-  return h >>> 0;
-}
-
-function syntheticMulberry32(seed){
-  let t = seed >>> 0;
-  return function(){
-    t += 0x6D2B79F5;
-    let r = Math.imul(t ^ (t >>> 15), 1 | t);
-    r ^= r + Math.imul(r ^ (r >>> 7), 61 | r);
-    return ((r ^ (r >>> 14)) >>> 0) / 4294967296;
-  };
-}
-
-function syntheticClampNumber(value, min, max, fallback){
-  const n = Number(value);
-  if (!Number.isFinite(n)) return fallback;
-  return Math.min(max, Math.max(min, n));
-}
-
-function syntheticRate(value, fallback=0){
-  const n = Number(value);
-  if (!Number.isFinite(n)) return fallback;
-  const normalized = n > 1 ? n / 100 : n;
-  return Math.min(1, Math.max(0, normalized));
-}
-
-function syntheticPad(n, width=8){
-  return String(Math.max(0, Math.floor(Number(n) || 0))).padStart(width, "0");
-}
-
-function syntheticChooseWeighted(rand, values, weights){
-  const list = Array.isArray(values) && values.length ? values : [""];
-  const w = Array.isArray(weights) && weights.length === list.length ? weights.map(Number) : null;
-  if (!w) return list[Math.floor(rand() * list.length) % list.length];
-  const total = w.reduce((a,b)=>a+(Number.isFinite(b) && b > 0 ? b : 0), 0) || 1;
-  let x = rand() * total;
-  for (let i=0; i<list.length; i++){
-    x -= Math.max(0, Number(w[i]) || 0);
-    if (x <= 0) return list[i];
-  }
-  return list[list.length - 1];
-}
-
-function syntheticDateToMs(value, fallback){
-  const t = Date.parse(value || "");
-  return Number.isFinite(t) ? t : Date.parse(fallback);
-}
-
-function syntheticFormatDate(msValue, mode){
-  const d = new Date(msValue);
-  const yyyy = d.getUTCFullYear();
-  const mm = String(d.getUTCMonth() + 1).padStart(2, "0");
-  const dd = String(d.getUTCDate()).padStart(2, "0");
-  if (mode === "slash") return `${yyyy}/${mm}/${dd}`;
-  if (mode === "jp") return `${yyyy}年${mm}月${dd}日`;
-  return `${yyyy}-${mm}-${dd}`;
-}
-
-function syntheticFormatDateTime(msValue, mode){
-  const d = new Date(msValue);
-  const base = syntheticFormatDate(msValue, mode === "mixed" ? "iso" : mode);
-  const hh = String(d.getUTCHours()).padStart(2, "0");
-  const mi = String(d.getUTCMinutes()).padStart(2, "0");
-  const ss = String(d.getUTCSeconds()).padStart(2, "0");
-  return `${base} ${hh}:${mi}:${ss}`;
-}
-
-function syntheticFormatNumber(value, decimals, mode, rand){
-  const n = Number(value);
-  if (!Number.isFinite(n)) return "";
-  const fixed = Number(decimals || 0) > 0 ? n.toFixed(Number(decimals || 0)) : String(Math.round(n));
-  if (mode === "comma") return fixed.replace(/\B(?=(\d{3})+(?!\d))/g, ",");
-  if (mode === "yen") return `¥${fixed.replace(/\B(?=(\d{3})+(?!\d))/g, ",")}`;
-  if (mode === "mixed") {
-    const r = rand();
-    if (r < 0.15) return `¥${fixed.replace(/\B(?=(\d{3})+(?!\d))/g, ",")}`;
-    if (r < 0.45) return fixed.replace(/\B(?=(\d{3})+(?!\d))/g, ",");
-  }
-  return fixed;
-}
-
-function syntheticCsvEscape(value){
-  if (value == null) return "";
-  let s = String(value);
-  if (/^[=+\-@]/.test(s)) s = `'${s}`;
-  s = s.replaceAll('"', '""');
-  return /[",\r\n]/.test(s) ? `"${s}"` : s;
-}
-
-function syntheticPresetColumns(presetName, requestedColumns, numberMode){
-  const preset = SYNTHETIC_PRESET_DEFS[presetName] || SYNTHETIC_PRESET_DEFS.sales;
-  const base = preset.columns.map((c) => ({...c}));
-  const target = Math.max(1, Math.min(SYNTHETIC_MAX_COLUMNS, Number(requestedColumns || base.length)));
-  const out = base.slice(0, target);
-  let i = 1;
-  while (out.length < target) {
-    const mod = i % 6;
-    if (mod === 0) out.push({ name:`metric_${i}`, kind:"number", type:"number", min:0, max:100000, decimals:2 });
-    else if (mod === 1) out.push({ name:`category_${i}`, kind:"category", type:"string", values:["A","B","C","D","E"], weights:[0.40,0.24,0.18,0.12,0.06] });
-    else if (mod === 2) out.push({ name:`flag_${i}`, kind:"boolean", type:"string", trueRate:0.35 });
-    else if (mod === 3) out.push({ name:`note_${i}`, kind:"text", type:"string" });
-    else if (mod === 4) out.push({ name:`score_${i}`, kind:"number", type:"number", min:0, max:1, decimals:4 });
-    else out.push({ name:`code_${i}`, kind:"id", prefix:`C${i}`, type:"string" });
-    i++;
-  }
-  return out.map((col, index) => ({
-    ...col,
-    index,
-    type: (["number","int","money","amount"].includes(col.kind) && String(numberMode || "plain") === "plain") ? "number" : (col.type === "number" && String(numberMode || "plain") === "plain" ? "number" : "string")
-  }));
-}
-
-function syntheticBuildPlan(msg){
-  const preset = String(msg.preset || "sales");
-  const rows = syntheticClampNumber(msg.rows, 1, SYNTHETIC_MAX_ROWS, 1000);
-  const columns = syntheticClampNumber(msg.columns, 1, SYNTHETIC_MAX_COLUMNS, SYNTHETIC_PRESET_DEFS[preset]?.columns?.length || 10);
-  const seed = syntheticHashString(`${msg.seed ?? 42}:${preset}`);
-  const dateMode = String(msg.dateMode || "iso");
-  const numberMode = String(msg.numberMode || "plain");
-  const plan = {
-    version:SYNTHETIC_DATASET_VERSION,
-    preset,
-    presetLabel:SYNTHETIC_PRESET_DEFS[preset]?.label || "売上データ",
-    rows:Math.floor(rows),
-    requestedColumns:Math.floor(columns),
-    seed,
-    seedText:String(msg.seed ?? 42),
-    chunkSize:Math.max(1000, Math.min(250000, Math.floor(Number(msg.syntheticChunkSize || msg.chunkSize || SYNTHETIC_DEFAULT_CHUNK_ROWS) || SYNTHETIC_DEFAULT_CHUNK_ROWS))),
-    nullRate:syntheticRate(msg.nullRate, 0),
-    duplicateRate:syntheticRate(msg.duplicateRate, 0),
-    outlierRate:syntheticRate(msg.outlierRate, 0),
-    emptyRate:syntheticRate(msg.emptyRate, 0),
-    longTextRate:syntheticRate(msg.longTextRate, 0),
-    japaneseRate:syntheticRate(msg.japaneseRate, 0.3),
-    dateMode,
-    numberMode,
-    outputMode:String(msg.outputMode || "open"),
-    datasetName:cleanMetaValue(msg.datasetName || `synthetic_${preset}_${rows}`, `synthetic_${preset}`),
-    storageWorkspace:cleanMetaValue(msg.storageWorkspace || "Synthetic", "Synthetic"),
-    storageCollection:cleanMetaValue(msg.storageCollection || "Generated", "Generated"),
-    tableName:cleanMetaValue(msg.tableName || msg.datasetName || `synthetic_${preset}_${rows}`, `synthetic_${preset}`)
-  };
-  plan.columns = syntheticPresetColumns(preset, plan.requestedColumns, plan.numberMode);
-  plan.schemaColumns = plan.columns.map((col, index) => ({
-    index,
-    name:cleanHeaderName(col.name || `column_${index+1}`, index, {nfkc:true, trim:true, controls:true, collapse:true}),
-    type:col.type === "number" ? "number" : "string",
-    originalName:col.name || `column_${index+1}`,
-    samples:[],
-    numericRatio:col.type === "number" ? 1 : 0,
-    nullRatio:plan.nullRate + plan.emptyRate
-  }));
-  return plan;
-}
-
-function syntheticGenerateCell(col, rowIndex, rand, plan, ctx){
-  const kind = col.kind || "text";
-  let value = "";
-  if (kind === "id") {
-    value = `${col.prefix || "ID"}-${syntheticPad(rowIndex + 1, 9)}`;
-  } else if (kind === "ref") {
-    const modulo = Math.max(1, Number(col.modulo || Math.max(1000, Math.floor(plan.rows / 8))) || 1000);
-    const id = (Math.floor(rand() * modulo) + rowIndex * 13) % modulo;
-    value = `${col.prefix || "REF"}-${syntheticPad(id + 1, 7)}`;
-  } else if (kind === "category") {
-    const useJapanese = rand() < plan.japaneseRate;
-    const values = useJapanese && Array.isArray(col.values) ? col.values : (Array.isArray(col.en) ? col.en : col.values);
-    value = syntheticChooseWeighted(rand, values, col.weights);
-  } else if (kind === "boolean") {
-    value = rand() < Number(col.trueRate ?? 0.5) ? "true" : "false";
-  } else if (kind === "date" || kind === "dateTime") {
-    const from = syntheticDateToMs(col.from, "2024-01-01");
-    const to = syntheticDateToMs(col.to, "2026-12-31");
-    const span = Math.max(1, to - from);
-    const msValue = from + Math.floor(rand() * span);
-    const mode = plan.dateMode === "mixed" ? (rand() < 0.5 ? "iso" : (rand() < 0.5 ? "slash" : "jp")) : plan.dateMode;
-    value = kind === "dateTime" ? syntheticFormatDateTime(msValue, mode) : syntheticFormatDate(msValue, mode);
-  } else if (kind === "int" || kind === "number" || kind === "money") {
-    const min = Number(col.min ?? 0);
-    const max = Number(col.max ?? 1000);
-    let x = min + rand() * (max - min);
-    if (col.skew === "log") {
-      const logMin = Math.log(Math.max(1, min));
-      const logMax = Math.log(Math.max(logMin + 1, max));
-      x = Math.exp(logMin + rand() * (logMax - logMin));
-    }
-    if (col.wave) x += Math.sin(rowIndex / 48) * ((max - min) * 0.08);
-    if (rand() < plan.outlierRate) x = rand() < 0.5 ? max * (5 + rand() * 30) : min - Math.abs(max - min) * (2 + rand() * 8);
-    const decimals = kind === "int" ? 0 : Number(col.decimals ?? (kind === "money" ? 0 : 2));
-    const numeric = decimals > 0 ? Number(x.toFixed(decimals)) : Math.round(x);
-    if (col.key) ctx[col.key] = numeric;
-    value = col.type === "number" && plan.numberMode === "plain" ? numeric : syntheticFormatNumber(numeric, decimals, plan.numberMode, rand);
-  } else if (kind === "amount") {
-    const quantity = Number(ctx.quantity || 1);
-    const unit = Number(ctx.unit_price || 1000);
-    let x = quantity * unit;
-    if (rand() < plan.outlierRate) x *= (5 + rand() * 20);
-    value = col.type === "number" && plan.numberMode === "plain" ? Math.round(x) : syntheticFormatNumber(x, 0, plan.numberMode, rand);
-  } else {
-    const long = rand() < plan.longTextRate;
-    const jp = rand() < plan.japaneseRate;
-    value = long
-      ? (jp ? `これは検索・型推定・長文セル検証用の説明文です。行番号 ${rowIndex + 1} の生成テキストで、CSVの引用符と改行耐性を確認します。` : `Long generated note for row ${rowIndex + 1}. It is used to test search, preview and CSV escaping behavior.`)
-      : (jp ? `メモ ${rowIndex + 1}` : `note ${rowIndex + 1}`);
-  }
-  return value == null ? "" : value;
-}
-
-function syntheticGenerateRow(plan, rowIndex, rand, previousRow){
-  if (previousRow && rand() < plan.duplicateRate) return previousRow.slice();
-  const ctx = {};
-  const row = plan.columns.map((col) => {
-    let value = syntheticGenerateCell(col, rowIndex, rand, plan, ctx);
-    const protectedKind = col.kind === "id";
-    if (!protectedKind && rand() < plan.nullRate) value = "";
-    else if (!protectedKind && rand() < plan.emptyRate) value = "";
-    return value;
-  });
-  return row;
-}
-
-function syntheticPreviewFromPlan(plan, limit=120){
-  const rand = syntheticMulberry32(plan.seed);
-  const rows = [];
-  let previous = null;
-  const count = Math.min(Number(limit || 120), plan.rows);
-  for (let i=0; i<count; i++){
-    const row = syntheticGenerateRow(plan, i, rand, previous);
-    rows.push(row);
-    previous = row;
-  }
-  return {
-    header:plan.schemaColumns.map((c)=>c.name),
-    rows,
-    summary:syntheticPlanSummary(plan, count)
-  };
-}
-
-function syntheticPlanSummary(plan, previewRows=0){
-  const approxBytes = Math.round(plan.rows * plan.schemaColumns.length * 14);
-  return {
-    preset:plan.preset,
-    presetLabel:plan.presetLabel,
-    rows:plan.rows,
-    columns:plan.schemaColumns.length,
-    chunkSize:plan.chunkSize,
-    seed:plan.seedText,
-    approxBytes,
-    approxMB:Math.round(approxBytes / 1024 / 1024),
-    nullRate:plan.nullRate,
-    duplicateRate:plan.duplicateRate,
-    outlierRate:plan.outlierRate,
-    japaneseRate:plan.japaneseRate,
-    dateMode:plan.dateMode,
-    numberMode:plan.numberMode,
-    outputMode:plan.outputMode,
-    previewRows
-  };
-}
-
-async function syntheticCsvFileFromPlan(plan){
-  const rand = syntheticMulberry32(plan.seed);
-  const chunks = [];
-  const header = plan.schemaColumns.map((c)=>syntheticCsvEscape(c.name)).join(",") + "\n";
-  chunks.push(header);
-  let previous = null;
-  const t0 = now();
-  for (let start=0; start<plan.rows; start += plan.chunkSize){
-    if (state.cancelled) throw new Error("Cancelled");
-    const take = Math.min(plan.chunkSize, plan.rows - start);
-    const lines = new Array(take);
-    for (let i=0; i<take; i++){
-      const row = syntheticGenerateRow(plan, start + i, rand, previous);
-      lines[i] = row.map(syntheticCsvEscape).join(",");
-      previous = row;
-    }
-    chunks.push(lines.join("\n"), "\n");
-    post("SYNTHETIC_PROGRESS", { value:Math.min(99, Math.floor(((start + take) / plan.rows) * 100)), text:`Synthetic CSV生成中... ${fmt(start + take)}/${fmt(plan.rows)} rows` });
-    if ((start / plan.chunkSize) % 2 === 0) await workerYield();
-  }
-  const filename = `${plan.datasetName || "synthetic_dataset"}.csv`.replace(/[\\/:*?"<>|]+/g, "_");
-  const blob = new Blob(chunks, { type:"text/csv;charset=utf-8" });
-  const file = typeof File === "function"
-    ? new File([blob], filename, { type:"text/csv;charset=utf-8", lastModified:Date.now() })
-    : blob;
-  if (!file.name) {
-    try { Object.defineProperty(file, "name", { value:filename }); } catch {}
-    try { Object.defineProperty(file, "lastModified", { value:Date.now() }); } catch {}
-  }
-  return { file, filename, bytes:blob.size, ms:now()-t0, summary:syntheticPlanSummary(plan) };
-}
-
-async function syntheticBuildColumnarDataset(plan, msg){
-  clearChunkCache();
-  state.cancelled = false;
-  const root = await rootDir();
-  const id = makeDatasetId(plan.datasetName || `synthetic_${plan.preset}`);
-  const dir = await root.getDirectoryHandle(id, { create:true });
-  const t0 = now();
-  const columns = plan.schemaColumns;
-  const rules = makeRules({
-    ruleTrim:true,
-    ruleNfkc:true,
-    ruleControls:true,
-    ruleCollapse:true,
-    ruleEmptyNull:true,
-    ruleNumericSymbols:true,
-    ruleDedupSpaces:true,
-    ruleSkipBadRows:false,
-    nullTokens:"NULL\nN/A\nNA\n-\n",
-    numericThreshold:0.90
-  });
-  try {
-    const rand = syntheticMulberry32(plan.seed);
-    let chunk = initChunk(columns);
-    let chunkIndex = 0;
-    let totalRows = 0;
-    let previous = null;
-    const chunkMetas = [];
-
-    for (let rowIndex=0; rowIndex<plan.rows; rowIndex++){
-      if (state.cancelled) throw new Error("Cancelled");
-      const row = syntheticGenerateRow(plan, rowIndex, rand, previous);
-      previous = row;
-      addRowToChunk(chunk, row, columns, rules);
-      totalRows++;
-      if (chunk.rows >= plan.chunkSize) {
-        const meta = await flushChunk(dir, chunkIndex, chunk, columns);
-        chunkMetas.push(meta);
-        chunkIndex++;
-        chunk = initChunk(columns);
-        post("SYNTHETIC_PROGRESS", { value:Math.min(95, Math.floor((totalRows / plan.rows) * 95)), text:`Synthetic Dataset保存中... chunk ${fmt(chunkIndex)} / rows ${fmt(totalRows)}` });
-        await workerYield();
-      } else if (totalRows % 50000 === 0) {
-        post("SYNTHETIC_PROGRESS", { value:Math.min(95, Math.floor((totalRows / plan.rows) * 95)), text:`Synthetic Dataset生成中... ${fmt(totalRows)}/${fmt(plan.rows)} rows` });
-      }
-    }
-
-    if (chunk.rows > 0) {
-      const meta = await flushChunk(dir, chunkIndex, chunk, columns);
-      chunkMetas.push(meta);
-      chunkIndex++;
-    }
-
-    const cleanReport = {
-      sourceRows:totalRows,
-      totalRows,
-      skippedRows:0,
-      malformedRows:0,
-      changedCells:0,
-      nullCells:chunkMetas.flatMap(c=>c.stats || []).reduce((a,s)=>a+(s.nulls||0),0),
-      invalidNumbers:chunkMetas.flatMap(c=>c.stats || []).reduce((a,s)=>a+(s.invalidNumbers||0),0),
-      synthetic:true,
-      syntheticPlan:syntheticPlanSummary(plan)
+  function record(entry){
+    const normalized = {
+      at: new Date().toISOString(),
+      type: String(entry?.type || "UNKNOWN"),
+      ok: entry?.ok !== false,
+      durationMs: Math.round(Number(entry?.durationMs || 0)),
+      strategy: entry?.strategy || "legacy",
+      rows: Number.isFinite(Number(entry?.rows)) ? Number(entry.rows) : null,
+      bytes: Number.isFinite(Number(entry?.bytes)) ? Number(entry.bytes) : null,
+      fallback: Boolean(entry?.fallback),
+      errorCode: entry?.errorCode || null,
     };
+    entries.push(normalized);
+    if (entries.length > maxEntries) entries.shift();
+    return normalized;
+  }
 
-    const manifest = {
-      id,
-      name:plan.datasetName,
-      storageWorkspace:plan.storageWorkspace,
-      storageCollection:plan.storageCollection,
-      tableName:plan.tableName,
-      storagePath:`${plan.storageWorkspace} / ${plan.storageCollection} / ${plan.tableName}`,
-      originalFileName:`${plan.datasetName}.synthetic.csv`,
-      sourceFiles:[{name:`${plan.datasetName}.synthetic.csv`, size:0, sourceRows:totalRows, totalRows, skippedRows:0, malformedRows:0, synthetic:true}],
-      createdAt:new Date().toISOString(),
-      mode:"synthetic-columnar",
-      formatVersion:5,
-      features:integrityFeatureFlags({synthetic:true}),
-      encoding:"utf-8",
-      delimiter:",",
-      fileSize:0,
-      chunkSize:plan.chunkSize,
-      totalRows,
-      sourceRows:totalRows,
-      chunks:chunkIndex,
-      columns,
-      rules,
-      cleanReport,
-      synthetic:{
-        version:SYNTHETIC_DATASET_VERSION,
-        preset:plan.preset,
-        presetLabel:plan.presetLabel,
-        seed:plan.seedText,
-        generatedAt:new Date().toISOString(),
-        quality:{
-          nullRate:plan.nullRate,
-          duplicateRate:plan.duplicateRate,
-          outlierRate:plan.outlierRate,
-          emptyRate:plan.emptyRate,
-          longTextRate:plan.longTextRate,
-          japaneseRate:plan.japaneseRate,
-          dateMode:plan.dateMode,
-          numberMode:plan.numberMode
+  function snapshot(){
+    const recent = entries.slice(-50);
+    const failures = entries.filter((x)=>!x.ok).length;
+    const fallback = entries.filter((x)=>x.fallback).length;
+    const totalDuration = entries.reduce((sum,x)=>sum + Number(x.durationMs || 0), 0);
+    return {
+      count: entries.length,
+      failures,
+      fallback,
+      averageDurationMs: entries.length ? Math.round(totalDuration / entries.length) : 0,
+      recent,
+    };
+  }
+
+  return { record, snapshot };
+}
+
+function normalizeCommandMessage(raw){
+  const msg = raw && typeof raw === "object" ? raw : {};
+  const type = String(msg.type || "");
+  const requestId = msg.requestId || `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  return { ...msg, type, requestId };
+}
+
+function normalizeCommandError(error){
+  return {
+    code: error?.code || "WORKER_RUNTIME_ERROR",
+    message: error?.message || String(error || "Worker runtime error"),
+    stack: error?.stack || "",
+  };
+}
+
+function defineRuntimeCommand(command){
+  if (!command || typeof command.execute !== "function") {
+    throw new Error("Runtime command requires execute(plan, state, tools)");
+  }
+  return {
+    validate: command.validate || ((msg)=>msg),
+    plan: command.plan || ((input)=>({kind:"direct", strategy:"classic", input})),
+    execute: command.execute,
+    project: command.project || ((result)=>result || {}),
+    doneType: command.doneType || null,
+  };
+}
+
+function createRuntimeCommandRegistry(initialDefinitions = {}){
+  const table = new Map();
+  for (const [type, command] of Object.entries(initialDefinitions)) {
+    table.set(String(type), defineRuntimeCommand(command));
+  }
+  return {
+    get(type){ return table.get(String(type || "")); },
+    set(type, command){ table.set(String(type), defineRuntimeCommand(command)); return this; },
+    has(type){ return table.has(String(type || "")); },
+    keys(){ return [...table.keys()]; },
+  };
+}
+
+function createRuntimeStateSnapshot(runtimeState){
+  return {
+    kernelVersion: runtimeState.runtime?.kernelVersion || 2,
+    commandCount: runtimeState.runtime?.commandCount || 0,
+    failureCount: runtimeState.runtime?.failureCount || 0,
+    fallbackCount: runtimeState.runtime?.fallbackCount || 0,
+    lastCommandType: runtimeState.runtime?.lastCommandType || "",
+    lastStrategy: runtimeState.runtime?.lastStrategy || "",
+    lastError: runtimeState.runtime?.lastError || null,
+    hasFile: Boolean(runtimeState.file),
+    hasManifest: Boolean(runtimeState.manifest),
+    hasDataset: Boolean(runtimeState.dataset),
+    hasVirtualDataset: Boolean(runtimeState.virtual),
+    cache: {
+      entries: chunkColumnCache.map.size,
+      bytes: chunkColumnCache.bytes,
+      hits: chunkColumnCache.hits,
+      misses: chunkColumnCache.misses,
+      evictions: chunkColumnCache.evictions,
+    },
+  };
+}
+
+function createRuntimeKernel({ runtimeState, post, commands, measurement, legacyHandler }){
+  async function executeRegisteredCommand(command, msg, startedAt){
+    const input = command.validate(msg, runtimeState);
+    const plan = await command.plan(input, runtimeState);
+    const result = await command.execute(plan, runtimeState, {
+      post,
+      progress: postProgress,
+      isCancelled: ()=>Boolean(runtimeState.cancelled),
+      now,
+    });
+    const output = command.project(result, runtimeState) || {};
+    const doneType = command.doneType || `${msg.type}_DONE`;
+    post(doneType, { requestId: msg.requestId, ...output });
+
+    runtimeState.runtime.commandCount += 1;
+    runtimeState.runtime.lastCommandType = msg.type;
+    runtimeState.runtime.lastStrategy = plan?.strategy || "classic";
+
+    measurement.record({
+      type: msg.type,
+      ok: true,
+      durationMs: now() - startedAt,
+      strategy: plan?.strategy || "classic",
+      rows: plan?.estimatedRows || result?.rows || null,
+      bytes: plan?.estimatedBytes || null,
+      fallback: false,
+    });
+  }
+
+  async function executeLegacyFallback(msg, startedAt){
+    runtimeState.__lastRouterError = null;
+    runtimeState.__lastCommandType = msg.type;
+    await legacyHandler({ data: msg });
+
+    const routedError = runtimeState.__lastRouterError;
+    runtimeState.runtime.commandCount += 1;
+    runtimeState.runtime.fallbackCount += 1;
+    runtimeState.runtime.lastCommandType = msg.type;
+    runtimeState.runtime.lastStrategy = "legacy";
+
+    if (routedError) {
+      runtimeState.runtime.failureCount += 1;
+      runtimeState.runtime.lastError = routedError;
+    }
+
+    measurement.record({
+      type: msg.type,
+      ok: !routedError,
+      durationMs: now() - startedAt,
+      strategy: "legacy",
+      fallback: true,
+      errorCode: routedError?.code || null,
+    });
+  }
+
+  return {
+    async handle(event){
+      const msg = normalizeCommandMessage(event?.data || event);
+      const startedAt = now();
+
+      try {
+        if (!msg.type) {
+          throw Object.assign(new Error("Worker command type is required"), { code:"INVALID_COMMAND" });
         }
+
+        if (msg.type === "CANCEL") {
+          runtimeState.cancelled = true;
+          runtimeState.runtime.lastCommandType = "CANCEL";
+          post("CANCELLED", { requestId: msg.requestId });
+          measurement.record({ type:"CANCEL", ok:true, durationMs:now() - startedAt, strategy:"kernel" });
+          return;
+        }
+
+        if (msg.type === "RUNTIME_HEALTH") {
+          post("RUNTIME_HEALTH_DONE", {
+            requestId: msg.requestId,
+            state: createRuntimeStateSnapshot(runtimeState),
+            measurement: measurement.snapshot(),
+            commands: commands.keys(),
+          });
+          measurement.record({ type:"RUNTIME_HEALTH", ok:true, durationMs:now() - startedAt, strategy:"kernel" });
+          return;
+        }
+
+        if (msg.type === "RUNTIME_MEASUREMENTS") {
+          post("RUNTIME_MEASUREMENTS_DONE", {
+            requestId: msg.requestId,
+            measurement: measurement.snapshot(),
+          });
+          measurement.record({ type:"RUNTIME_MEASUREMENTS", ok:true, durationMs:now() - startedAt, strategy:"kernel" });
+          return;
+        }
+
+        const command = commands.get(msg.type);
+        if (command) {
+          await executeRegisteredCommand(command, msg, startedAt);
+          return;
+        }
+
+        await executeLegacyFallback(msg, startedAt);
+      } catch (error) {
+        const safeError = normalizeCommandError(error);
+        runtimeState.runtime.commandCount += 1;
+        runtimeState.runtime.failureCount += 1;
+        runtimeState.runtime.lastCommandType = msg.type || "";
+        runtimeState.runtime.lastError = safeError;
+
+        post("ERROR", {
+          requestId: msg.requestId,
+          requestType: msg.type || "",
+          code: safeError.code,
+          message: safeError.message,
+          stack: safeError.stack,
+        });
+
+        measurement.record({
+          type: msg.type || "UNKNOWN",
+          ok: false,
+          durationMs: now() - startedAt,
+          strategy: "kernel",
+          errorCode: safeError.code,
+        });
       }
+    },
+  };
+}
+
+const runtimeMeasurements = createRuntimeMeasurement();
+const runtimeCommands = createRuntimeCommandRegistry();
+
+function registerRuntimeCommand(type, command){
+  runtimeCommands.set(type, command);
+  return runtimeCommands;
+}
+
+
+
+/*
+ * D3 Visualization Surface v2
+ * UI does not receive raw rows. Worker reads columnar tiles, reduces them into a bounded
+ * visualization surface, and D3 only paints the compact projection.
+ */
+const D3_VIZ_SURFACE_VERSION = 2;
+const D3_VIZ_MAX_BUCKETS = 2400;
+const D3_VIZ_MAX_TOP_N = 1000;
+const D3_VIZ_MAX_CATEGORY_KEYS = 200000;
+
+function d3VizSafeInt(value, min, max, fallback){
+  const n = Number(value);
+  if (!Number.isFinite(n)) return fallback;
+  return Math.max(min, Math.min(max, Math.floor(n)));
+}
+
+function d3VizColumnIndex(value){
+  const n = Number(value);
+  return Number.isFinite(n) ? Math.floor(n) : -1;
+}
+
+function d3VizColumn(index){
+  const idx = d3VizColumnIndex(index);
+  return state.manifest?.columns?.[idx] || null;
+}
+
+function d3VizColumnName(index){
+  return d3VizColumn(index)?.name || `Column ${Number(index) + 1}`;
+}
+
+function d3VizNormalizeChartType(value){
+  const type = String(value || "bar").toLowerCase();
+  return ["bar","line","scatter","histogram"].includes(type) ? type : "bar";
+}
+
+function d3VizNormalizeAggregation(value){
+  const raw = String(value || "Count").toLowerCase();
+  if (raw === "sum") return "Sum";
+  if (raw === "avg" || raw === "average" || raw === "mean") return "Avg";
+  if (raw === "min") return "Min";
+  if (raw === "max") return "Max";
+  return "Count";
+}
+
+function d3VizParseNumber(value){
+  if (value == null || value === "") return null;
+  if (typeof value === "number") return Number.isFinite(value) ? value : null;
+  const candidate = numberCandidate(value, { numericSymbols:true });
+  return candidate.ok ? candidate.value : null;
+}
+
+function d3VizCategory(value){
+  const s = value == null || value === "" ? "(empty)" : String(value);
+  return s.length > 180 ? `${s.slice(0,177)}...` : s;
+}
+
+function d3VizAggInit(){
+  return { count:0, valid:0, sum:0, min:Infinity, max:-Infinity };
+}
+
+function d3VizAggAdd(acc, rawValue, countMode){
+  acc.count++;
+  if (countMode) return acc;
+  const n = d3VizParseNumber(rawValue);
+  if (n == null) return acc;
+  acc.valid++;
+  acc.sum += n;
+  if (n < acc.min) acc.min = n;
+  if (n > acc.max) acc.max = n;
+  return acc;
+}
+
+function d3VizAggValue(acc, mode){
+  if (!acc) return 0;
+  if (mode === "Count") return Number(acc.count || 0);
+  if (mode === "Avg") return acc.valid ? acc.sum / acc.valid : 0;
+  if (mode === "Min") return acc.valid ? acc.min : 0;
+  if (mode === "Max") return acc.valid ? acc.max : 0;
+  return Number(acc.sum || 0);
+}
+
+function d3VizActiveChunkCount(){
+  if (activeIsMemory()) return state.memory?.chunks?.length || state.dataset?.chunks?.length || 0;
+  if (activeIsVirtual()) return state.virtual?.globalChunks?.length || 0;
+  return state.dataset?.chunks?.length || 0;
+}
+
+function d3VizTotalRows(){
+  return Number(state.manifest?.totalRows || state.dataset?.totalRows || 0);
+}
+
+function d3VizUniqueColumns(indices){
+  return [...new Set((Array.isArray(indices) ? indices : [])
+    .map(d3VizColumnIndex)
+    .filter((idx) => idx >= 0 && !!d3VizColumn(idx)))];
+}
+
+function d3VizDomainFromStats(columnIndex){
+  let min = Infinity;
+  let max = -Infinity;
+  let found = false;
+  const chunks = d3VizActiveChunkCount();
+  for (let chunkIndex = 0; chunkIndex < chunks; chunkIndex++){
+    const stat = columnStatFromChunkMeta(chunkMetaForIndex(chunkIndex), columnIndex);
+    if (!stat || stat.type !== "number") return null;
+    if (Number.isFinite(stat.min) && Number.isFinite(stat.max)){
+      min = Math.min(min, Number(stat.min));
+      max = Math.max(max, Number(stat.max));
+      found = true;
+    }
+  }
+  if (!found) return null;
+  if (min === max) {
+    min -= 0.5;
+    max += 0.5;
+  }
+  return { min, max, source:"chunk-stats" };
+}
+
+function d3VizBucketIndex(value, min, max, buckets){
+  if (!Number.isFinite(value)) return -1;
+  if (max <= min) return 0;
+  const ratio = (value - min) / (max - min);
+  return Math.max(0, Math.min(buckets - 1, Math.floor(ratio * buckets)));
+}
+
+async function d3VizScanDomains(requiredColumns, label){
+  const domains = new Map();
+  for (const idx of requiredColumns) domains.set(idx, { min:Infinity, max:-Infinity, found:false, source:"scan" });
+
+  const chunks = d3VizActiveChunkCount();
+  let scanned = 0;
+  for (let chunkIndex = 0; chunkIndex < chunks; chunkIndex++){
+    if (state.cancelled) throw new Error("Cancelled");
+    const chunk = await readChunkColumns(chunkIndex, requiredColumns, {
+      surfacePlan:{ surface:"d3-viz-domain-scan", requiredColumns, warmColumns:requiredColumns, hotColumns:[] }
+    });
+    const rowCount = Number(chunk?.rowCount || 0);
+    for (let localRow = 0; localRow < rowCount; localRow++){
+      for (const idx of requiredColumns){
+        const n = d3VizParseNumber(valueFromColumn(chunk.columns.get(idx), localRow));
+        if (n == null) continue;
+        const domain = domains.get(idx);
+        domain.min = Math.min(domain.min, n);
+        domain.max = Math.max(domain.max, n);
+        domain.found = true;
+      }
+    }
+    scanned += rowCount;
+    postProgress(Math.min(92, Math.floor(((chunkIndex + 1) / Math.max(1, chunks)) * 42)), `${label}: numeric domain scan ${fmt(chunkIndex + 1)}/${fmt(chunks)} / rows ${fmt(scanned)}`);
+  }
+
+  const out = new Map();
+  for (const [idx, domain] of domains.entries()){
+    if (!domain.found) continue;
+    if (domain.min === domain.max) {
+      domain.min -= 0.5;
+      domain.max += 0.5;
+    }
+    out.set(idx, domain);
+  }
+  return out;
+}
+
+async function d3VizResolveDomains(indices, label){
+  const unique = d3VizUniqueColumns(indices);
+  const resolved = new Map();
+  const needScan = [];
+  for (const idx of unique){
+    const fromStats = d3VizDomainFromStats(idx);
+    if (fromStats) resolved.set(idx, fromStats);
+    else needScan.push(idx);
+  }
+  if (needScan.length){
+    const scanned = await d3VizScanDomains(needScan, label);
+    for (const [idx, domain] of scanned.entries()) resolved.set(idx, domain);
+  }
+  return resolved;
+}
+
+async function d3VizForEachRow(requiredColumns, label, visit){
+  const chunks = d3VizActiveChunkCount();
+  let scanned = 0;
+  for (let chunkIndex = 0; chunkIndex < chunks; chunkIndex++){
+    if (state.cancelled) throw new Error("Cancelled");
+    const chunk = await readChunkColumns(chunkIndex, requiredColumns, {
+      surfacePlan:{ surface:"d3-viz-aggregate", requiredColumns, warmColumns:requiredColumns, hotColumns:requiredColumns }
+    });
+    const rowCount = Number(chunk?.rowCount || 0);
+    for (let localRow = 0; localRow < rowCount; localRow++){
+      visit(chunk.columns, localRow, chunkIndex);
+    }
+    scanned += rowCount;
+    postProgress(Math.min(99, 45 + Math.floor(((chunkIndex + 1) / Math.max(1, chunks)) * 54)), `${label}: tile reduce ${fmt(chunkIndex + 1)}/${fmt(chunks)} / rows ${fmt(scanned)}`);
+  }
+  return { scanned, chunks };
+}
+
+
+function d3VizNormalizeDataSource(value){
+  const source = String(value || "active").toLowerCase();
+  return source === "graph" ? "graph" : "active";
+}
+
+function d3VizNormalizeGraphMode(value){
+  return String(value || "data").toLowerCase() === "join" ? "join" : "data";
+}
+
+function d3VizSourceColumnList(columns){
+  return (Array.isArray(columns) ? columns : [])
+    .map((column, fallbackIndex) => ({
+      index:d3VizColumnIndex(column?.index ?? fallbackIndex),
+      name:String(column?.name || `Column ${fallbackIndex + 1}`),
+      type:String(column?.type || "string")
+    }))
+    .filter((column) => column.index >= 0);
+}
+
+function d3VizGraphColumn(columns, index){
+  const idx = d3VizColumnIndex(index);
+  return d3VizSourceColumnList(columns).find((column) => Number(column.index) === idx) || null;
+}
+
+function d3VizGraphColumnName(columns, index){
+  return d3VizGraphColumn(columns, index)?.name || `Column ${Number(index) + 1}`;
+}
+
+function d3VizGraphUniqueColumns(columns, indices){
+  const list = d3VizSourceColumnList(columns);
+  const valid = new Set(list.map((column) => Number(column.index)));
+  return [...new Set((Array.isArray(indices) ? indices : [])
+    .map(d3VizColumnIndex)
+    .filter((idx) => idx >= 0 && valid.has(idx)))];
+}
+
+function d3VizGraphValue(row, index){
+  const idx = d3VizColumnIndex(index);
+  return Array.isArray(row) && idx >= 0 ? row[idx] : undefined;
+}
+
+async function d3VizForEachGraphResultRow({ mode="data", chunkRows=10000, label="D3 graph-result surface", visit } = {}){
+  const sourceMode = d3VizNormalizeGraphMode(mode);
+  const safeChunkRows = d3VizSafeInt(chunkRows, 500, 50000, 10000);
+  const total = graphResultTotalRows(sourceMode);
+  if (!total) throw new Error("Graph Query Result is empty. Run Graph Query first.");
+  let scanned = 0;
+  let header = [];
+  for (let start = 0; start < total; start += safeChunkRows){
+    if (state.cancelled) throw new Error("Cancelled");
+    const page = Math.floor(start / safeChunkRows) + 1;
+    const table = await readGraphResultWindow({ mode:sourceMode, page, pageSize:Math.min(safeChunkRows, total - start) });
+    if (!header.length) header = Array.isArray(table.header) ? table.header : [];
+    const rows = Array.isArray(table.rows) ? table.rows : [];
+    for (let i = 0; i < rows.length; i++){
+      visit(rows[i] || [], start + i, header);
+    }
+    scanned += rows.length;
+    postProgress(Math.min(99, 45 + Math.floor((scanned / Math.max(1, total)) * 54)), `${label}: graph result reduce ${fmt(scanned)}/${fmt(total)}`);
+    if (start % (safeChunkRows * 4) === 0) await workerYield();
+  }
+  return { scanned, chunks:Math.ceil(total / Math.max(1, safeChunkRows)), total, header };
+}
+
+async function d3VizResolveGraphDomains({ columns, indices, mode, chunkRows, label }){
+  const domains = new Map();
+  for (const idx of d3VizGraphUniqueColumns(columns, indices)) {
+    if (!d3VizGraphColumn(columns, idx)) continue;
+    domains.set(idx, { min:Infinity, max:-Infinity, found:false, source:"graph-result-scan" });
+  }
+  if (!domains.size) return domains;
+
+  await d3VizForEachGraphResultRow({
+    mode,
+    chunkRows,
+    label,
+    visit:(row) => {
+      for (const idx of domains.keys()){
+        const n = d3VizParseNumber(d3VizGraphValue(row, idx));
+        if (n == null) continue;
+        const domain = domains.get(idx);
+        domain.min = Math.min(domain.min, n);
+        domain.max = Math.max(domain.max, n);
+        domain.found = true;
+      }
+    }
+  });
+
+  for (const [idx, domain] of [...domains.entries()]){
+    if (!domain.found) {
+      domains.delete(idx);
+      continue;
+    }
+    if (domain.min === domain.max) {
+      domain.min -= 0.5;
+      domain.max += 0.5;
+    }
+  }
+  return domains;
+}
+
+async function buildD3GraphResultVisualizationSurface(msg){
+  const startedAt = now();
+  const chartType = d3VizNormalizeChartType(msg.chartType);
+  const sourceMode = d3VizNormalizeGraphMode(msg.sourceMode || msg.graphMode);
+  const sourceColumns = d3VizSourceColumnList(msg.sourceColumns);
+  const xIdx = d3VizColumnIndex(msg.xColumnIndex);
+  const yIdx = d3VizColumnIndex(msg.yColumnIndex);
+  const aggregation = d3VizNormalizeAggregation(msg.aggregation);
+  const topN = d3VizSafeInt(msg.topN, 1, D3_VIZ_MAX_TOP_N, 80);
+  const buckets = d3VizSafeInt(msg.buckets, 8, D3_VIZ_MAX_BUCKETS, 240);
+  const categoryLimit = d3VizSafeInt(msg.categoryLimit, topN, D3_VIZ_MAX_CATEGORY_KEYS, 50000);
+  const chunkRows = d3VizSafeInt(msg.chunkRows, 500, 50000, 10000);
+  const countMode = chartType === "scatter" ? false : (aggregation === "Count" || yIdx < 0 || !d3VizGraphColumn(sourceColumns, yIdx));
+  const totalRows = graphResultTotalRows(sourceMode);
+  const xLabel = d3VizGraphColumnName(sourceColumns, xIdx);
+  const yLabel = countMode ? "Count" : `${aggregation}(${d3VizGraphColumnName(sourceColumns, yIdx)})`;
+  const metadata = {
+    version:D3_VIZ_SURFACE_VERSION,
+    strategy:"worker-graph-result-window-reduce",
+    dataSource:"graph",
+    dataSourceLabel:`Graph Query Result / ${sourceMode}`,
+    sourceMode,
+    chartType,
+    aggregation,
+    xColumnIndex:xIdx,
+    xColumnName:xLabel,
+    yColumnIndex:countMode ? -1 : yIdx,
+    yColumnName:countMode ? "Rows" : d3VizGraphColumnName(sourceColumns, yIdx),
+    xLabel,
+    yLabel,
+    totalRows,
+    bucketCount:buckets,
+    topN,
+    categoryLimit,
+    builtAt:new Date().toISOString()
+  };
+
+  if (!d3VizGraphColumn(sourceColumns, xIdx)) throw new Error("Select a valid Graph Result X column.");
+  if (chartType === "scatter" && (countMode || !d3VizGraphColumn(sourceColumns, yIdx))) throw new Error("Scatter requires numeric X and numeric Y columns.");
+  if (!totalRows) throw new Error("Graph Query Result is empty. Run Graph Query first.");
+
+  postProgress(1, `D3 Surface Plan: Graph Result / ${chartType} / ${fmt(totalRows)} rows / ${xLabel}`);
+
+  if (chartType === "bar"){
+    const groups = new Map();
+    const overflow = d3VizAggInit();
+    let overflowed = false;
+    const exec = await d3VizForEachGraphResultRow({
+      mode:sourceMode,
+      chunkRows,
+      label:"D3 graph bar surface",
+      visit:(row) => {
+        const key = d3VizCategory(d3VizGraphValue(row, xIdx));
+        let acc = groups.get(key);
+        if (!acc) {
+          if (groups.size >= categoryLimit) {
+            overflowed = true;
+            d3VizAggAdd(overflow, countMode ? null : d3VizGraphValue(row, yIdx), countMode);
+            return;
+          }
+          acc = d3VizAggInit();
+          groups.set(key, acc);
+        }
+        d3VizAggAdd(acc, countMode ? null : d3VizGraphValue(row, yIdx), countMode);
+      }
+    });
+
+    let rows = [...groups.entries()].map(([key, acc]) => ({
+      key,
+      value:d3VizAggValue(acc, aggregation),
+      count:acc.count,
+      valid:acc.valid
+    }));
+    if (overflowed) rows.push({ key:"(other categories)", value:d3VizAggValue(overflow, aggregation), count:overflow.count, valid:overflow.valid, overflow:true });
+    rows.sort((a,b) => Math.abs(Number(b.value || 0)) - Math.abs(Number(a.value || 0)));
+    rows = rows.slice(0, topN);
+
+    return {
+      surface:{ ...metadata, kind:"bar", rows, reducedRows:rows.length, categoriesTracked:groups.size, overflowed, scanned:exec.scanned, chunks:exec.chunks },
+      ms:now() - startedAt
     };
-
-    post("SYNTHETIC_PROGRESS", { value:97, text:"Synthetic manifestを書き込み中..." });
-    await writeJson(dir, "manifest.json", manifest);
-    await writeJson(dir, "chunks.json", chunkMetas);
-
-    state.dataset = { id, manifest, chunks:chunkMetas };
-    state.virtual = null;
-    state.memory = null;
-    state.manifest = manifest;
-    state.dir = dir;
-    state.searchMatches = [];
-    state.dataQueryMatches = null;
-    state.dataQueryMeta = null;
-    state.pivotTable = null;
-    state.pivotTileIndex = null;
-    state.timeTable = null;
-    return { manifest, chunks:chunkMetas, ms:now()-t0, summary:syntheticPlanSummary(plan) };
-  } catch (err) {
-    await cleanupDatasetDir(root, id);
-    throw err;
   }
-}
 
-function syntheticGraphSetSpecs(plan){
-  const userRows = Math.max(100, Math.min(plan.rows, Math.floor(plan.rows * 0.20)));
-  const productRows = Math.max(50, Math.min(50000, Math.floor(plan.rows * 0.05)));
-  const orderRows = plan.rows;
-  const eventRows = Math.max(plan.rows, Math.floor(plan.rows * 1.25));
-  return [
-    { name:"users", rows:userRows, columns:[
-      {name:"user_id", kind:"id", prefix:"USR", type:"string"},
-      {name:"name", kind:"text", type:"string"},
-      {name:"region", kind:"category", type:"string", values:["東京","大阪","福岡","札幌","名古屋"], en:["Tokyo","Osaka","Fukuoka","Sapporo","Nagoya"]},
-      {name:"segment", kind:"category", type:"string", values:["new","active","vip","sleeping"], weights:[0.22,0.58,0.08,0.12]},
-      {name:"registered_at", kind:"date", type:"string", from:"2021-01-01", to:"2026-12-31"}
-    ]},
-    { name:"products", rows:productRows, columns:[
-      {name:"product_id", kind:"id", prefix:"PRD", type:"string"},
-      {name:"category", kind:"category", type:"string", values:["食品","家電","衣料","美容","書籍","スポーツ"], en:["Food","Electronics","Apparel","Beauty","Books","Sports"]},
-      {name:"price", kind:"money", type:"number", min:100, max:120000, skew:"log"},
-      {name:"supplier_id", kind:"ref", prefix:"SUP", modulo:8000, type:"string"}
-    ]},
-    { name:"orders", rows:orderRows, columns:[
-      {name:"order_id", kind:"id", prefix:"ORD", type:"string"},
-      {name:"user_id", kind:"ref", prefix:"USR", modulo:userRows, type:"string"},
-      {name:"product_id", kind:"ref", prefix:"PRD", modulo:productRows, type:"string"},
-      {name:"amount", kind:"money", type:"number", min:100, max:120000, skew:"log"},
-      {name:"ordered_at", kind:"dateTime", type:"string", from:"2024-01-01", to:"2026-12-31"}
-    ]},
-    { name:"events", rows:eventRows, columns:[
-      {name:"event_id", kind:"id", prefix:"EVT", type:"string"},
-      {name:"user_id", kind:"ref", prefix:"USR", modulo:userRows, type:"string"},
-      {name:"event_type", kind:"category", type:"string", values:["view","cart","purchase","review","support"], weights:[0.50,0.20,0.18,0.07,0.05]},
-      {name:"event_at", kind:"dateTime", type:"string", from:"2024-01-01", to:"2026-12-31"}
-    ]}
-  ];
-}
+  if (chartType === "histogram"){
+    const domains = await d3VizResolveGraphDomains({ columns:sourceColumns, indices:[xIdx], mode:sourceMode, chunkRows, label:"D3 graph histogram surface" });
+    const domain = domains.get(xIdx);
+    if (!domain) throw new Error("Histogram requires a numeric X column.");
+    const bins = Array.from({ length:buckets }, (_, i) => ({
+      x0:domain.min + (domain.max - domain.min) * (i / buckets),
+      x1:domain.min + (domain.max - domain.min) * ((i + 1) / buckets),
+      count:0
+    }));
+    const exec = await d3VizForEachGraphResultRow({
+      mode:sourceMode,
+      chunkRows,
+      label:"D3 graph histogram surface",
+      visit:(row) => {
+        const n = d3VizParseNumber(d3VizGraphValue(row, xIdx));
+        if (n == null) return;
+        bins[d3VizBucketIndex(n, domain.min, domain.max, buckets)].count++;
+      }
+    });
 
-async function syntheticGraphSetFiles(plan){
-  const specs = syntheticGraphSetSpecs(plan);
-  const files = [];
-  for (let i=0; i<specs.length; i++){
-    const spec = specs[i];
-    const subPlan = {
-      ...plan,
-      seed:syntheticHashString(`${plan.seedText}:${spec.name}`),
-      rows:spec.rows,
-      columns:spec.columns.map((c, index)=>({...c,index,type:c.type === "number" && plan.numberMode === "plain" ? "number" : "string"})),
-      schemaColumns:spec.columns.map((c, index)=>({index, name:c.name, type:c.type === "number" && plan.numberMode === "plain" ? "number" : "string", originalName:c.name, samples:[], numericRatio:c.type === "number" ? 1 : 0, nullRatio:0})),
-      datasetName:`${plan.datasetName}_${spec.name}`
+    return {
+      surface:{ ...metadata, kind:"histogram", bins, domain, reducedRows:bins.length, scanned:exec.scanned, chunks:exec.chunks },
+      ms:now() - startedAt
     };
-    const item = await syntheticCsvFileFromPlan(subPlan);
-    files.push({ name:item.filename, file:item.file, bytes:item.bytes, rows:spec.rows, columns:spec.columns.length });
-    post("SYNTHETIC_PROGRESS", { value:Math.min(99, Math.floor(((i + 1) / specs.length) * 100)), text:`Graph CSVセット生成中... ${spec.name}.csv` });
   }
-  return { files, summary:{...syntheticPlanSummary(plan), graphSet:true, tables:files.map(({name, rows, columns, bytes})=>({name, rows, columns, bytes}))} };
+
+  if (chartType === "line"){
+    const domains = await d3VizResolveGraphDomains({ columns:sourceColumns, indices:[xIdx], mode:sourceMode, chunkRows, label:"D3 graph line surface" });
+    const domain = domains.get(xIdx);
+    if (!domain) throw new Error("Line chart requires a numeric X column.");
+    const bins = Array.from({ length:buckets }, (_, i) => ({
+      x0:domain.min + (domain.max - domain.min) * (i / buckets),
+      x1:domain.min + (domain.max - domain.min) * ((i + 1) / buckets),
+      agg:d3VizAggInit()
+    }));
+    const exec = await d3VizForEachGraphResultRow({
+      mode:sourceMode,
+      chunkRows,
+      label:"D3 graph line surface",
+      visit:(row) => {
+        const x = d3VizParseNumber(d3VizGraphValue(row, xIdx));
+        if (x == null) return;
+        const bin = bins[d3VizBucketIndex(x, domain.min, domain.max, buckets)];
+        d3VizAggAdd(bin.agg, countMode ? null : d3VizGraphValue(row, yIdx), countMode);
+      }
+    });
+    const points = bins
+      .map((bin) => ({ x:(bin.x0 + bin.x1) / 2, y:d3VizAggValue(bin.agg, aggregation), count:bin.agg.count, x0:bin.x0, x1:bin.x1 }))
+      .filter((point) => point.count > 0);
+
+    return {
+      surface:{ ...metadata, kind:"line", points, domain, reducedRows:points.length, scanned:exec.scanned, chunks:exec.chunks },
+      ms:now() - startedAt
+    };
+  }
+
+  const domains = await d3VizResolveGraphDomains({ columns:sourceColumns, indices:[xIdx, yIdx], mode:sourceMode, chunkRows, label:"D3 graph scatter density surface" });
+  const xDomain = domains.get(xIdx);
+  const yDomain = domains.get(yIdx);
+  if (!xDomain || !yDomain) throw new Error("Scatter requires numeric X and numeric Y columns.");
+  const grid = Math.max(4, Math.min(160, Math.ceil(Math.sqrt(buckets))));
+  const cells = new Map();
+  const exec = await d3VizForEachGraphResultRow({
+    mode:sourceMode,
+    chunkRows,
+    label:"D3 graph scatter density surface",
+    visit:(row) => {
+      const x = d3VizParseNumber(d3VizGraphValue(row, xIdx));
+      const y = d3VizParseNumber(d3VizGraphValue(row, yIdx));
+      if (x == null || y == null) return;
+      const xi = d3VizBucketIndex(x, xDomain.min, xDomain.max, grid);
+      const yi = d3VizBucketIndex(y, yDomain.min, yDomain.max, grid);
+      const key = `${xi}\u001f${yi}`;
+      let cell = cells.get(key);
+      if (!cell) {
+        cell = { count:0, xSum:0, ySum:0, xi, yi };
+        cells.set(key, cell);
+      }
+      cell.count++;
+      cell.xSum += x;
+      cell.ySum += y;
+    }
+  });
+
+  const points = [...cells.values()]
+    .map((cell) => ({ x:cell.xSum / cell.count, y:cell.ySum / cell.count, count:cell.count, xi:cell.xi, yi:cell.yi }))
+    .sort((a,b) => b.count - a.count)
+    .slice(0, buckets);
+
+  return {
+    surface:{ ...metadata, kind:"scatter", points, xDomain, yDomain, grid, reducedRows:points.length, scanned:exec.scanned, chunks:exec.chunks },
+    ms:now() - startedAt
+  };
 }
 
-async function handleSyntheticPreview(msg){
-  const plan = syntheticBuildPlan(msg);
-  const preview = syntheticPreviewFromPlan(plan, Number(msg.previewRows || 120));
-  post("SYNTHETIC_PREVIEW_DONE", { ...preview, plan });
+async function buildD3VisualizationSurface(msg){
+  const dataSource = d3VizNormalizeDataSource(msg.dataSource);
+  if (dataSource === "graph") return await buildD3GraphResultVisualizationSurface(msg);
+  if (!state.manifest || !d3VizActiveChunkCount()) throw new Error("Open a Storage dataset before building D3 visualization.");
+  const startedAt = now();
+  const chartType = d3VizNormalizeChartType(msg.chartType);
+  const xIdx = d3VizColumnIndex(msg.xColumnIndex);
+  const yIdx = d3VizColumnIndex(msg.yColumnIndex);
+  const aggregation = d3VizNormalizeAggregation(msg.aggregation);
+  const topN = d3VizSafeInt(msg.topN, 1, D3_VIZ_MAX_TOP_N, 80);
+  const buckets = d3VizSafeInt(msg.buckets, 8, D3_VIZ_MAX_BUCKETS, 240);
+  const categoryLimit = d3VizSafeInt(msg.categoryLimit, topN, D3_VIZ_MAX_CATEGORY_KEYS, 50000);
+  const countMode = chartType === "scatter" ? false : (aggregation === "Count" || yIdx < 0 || !d3VizColumn(yIdx));
+  const yLabel = countMode ? "Count" : `${aggregation}(${d3VizColumnName(yIdx)})`;
+  const xLabel = d3VizColumnName(xIdx);
+  const totalRows = d3VizTotalRows();
+  const metadata = {
+    version:D3_VIZ_SURFACE_VERSION,
+    strategy:"worker-columnar-tile-reduce",
+    dataSource:"active",
+    dataSourceLabel:"Active Dataset",
+    sourceMode:"columnar",
+    chartType,
+    aggregation,
+    xColumnIndex:xIdx,
+    xColumnName:xLabel,
+    yColumnIndex:countMode ? -1 : yIdx,
+    yColumnName:countMode ? "Rows" : d3VizColumnName(yIdx),
+    xLabel,
+    yLabel,
+    totalRows,
+    bucketCount:buckets,
+    topN,
+    categoryLimit,
+    builtAt:new Date().toISOString()
+  };
+
+  if (!d3VizColumn(xIdx)) throw new Error("Select a valid X column.");
+  if ((chartType === "line" || chartType === "scatter") && !countMode && !d3VizColumn(yIdx)) throw new Error("Select a valid Y column.");
+  if (chartType === "scatter" && (countMode || !d3VizColumn(yIdx))) throw new Error("Scatter requires numeric X and numeric Y columns.");
+
+  postProgress(1, `D3 Surface Plan: ${chartType} / ${fmt(totalRows)} rows / ${xLabel}`);
+
+  if (chartType === "bar"){
+    const required = d3VizUniqueColumns([xIdx, ...(countMode ? [] : [yIdx])]);
+    const groups = new Map();
+    const overflow = d3VizAggInit();
+    let overflowed = false;
+    const exec = await d3VizForEachRow(required, "D3 bar surface", (columns, localRow) => {
+      const key = d3VizCategory(valueFromColumn(columns.get(xIdx), localRow));
+      let acc = groups.get(key);
+      if (!acc) {
+        if (groups.size >= categoryLimit) {
+          overflowed = true;
+          d3VizAggAdd(overflow, countMode ? null : valueFromColumn(columns.get(yIdx), localRow), countMode);
+          return;
+        }
+        acc = d3VizAggInit();
+        groups.set(key, acc);
+      }
+      d3VizAggAdd(acc, countMode ? null : valueFromColumn(columns.get(yIdx), localRow), countMode);
+    });
+
+    let rows = [...groups.entries()].map(([key, acc]) => ({
+      key,
+      value:d3VizAggValue(acc, aggregation),
+      count:acc.count,
+      valid:acc.valid
+    }));
+    if (overflowed) rows.push({ key:"(other categories)", value:d3VizAggValue(overflow, aggregation), count:overflow.count, valid:overflow.valid, overflow:true });
+    rows.sort((a,b) => Math.abs(Number(b.value || 0)) - Math.abs(Number(a.value || 0)));
+    rows = rows.slice(0, topN);
+
+    return {
+      surface:{ ...metadata, kind:"bar", rows, reducedRows:rows.length, categoriesTracked:groups.size, overflowed, scanned:exec.scanned, chunks:exec.chunks },
+      ms:now() - startedAt
+    };
+  }
+
+  if (chartType === "histogram"){
+    const domains = await d3VizResolveDomains([xIdx], "D3 histogram surface");
+    const domain = domains.get(xIdx);
+    if (!domain) throw new Error("Histogram requires a numeric X column.");
+    const bins = Array.from({ length:buckets }, (_, i) => ({
+      x0:domain.min + (domain.max - domain.min) * (i / buckets),
+      x1:domain.min + (domain.max - domain.min) * ((i + 1) / buckets),
+      count:0
+    }));
+    const exec = await d3VizForEachRow([xIdx], "D3 histogram surface", (columns, localRow) => {
+      const n = d3VizParseNumber(valueFromColumn(columns.get(xIdx), localRow));
+      if (n == null) return;
+      bins[d3VizBucketIndex(n, domain.min, domain.max, buckets)].count++;
+    });
+
+    return {
+      surface:{ ...metadata, kind:"histogram", bins, domain, reducedRows:bins.length, scanned:exec.scanned, chunks:exec.chunks },
+      ms:now() - startedAt
+    };
+  }
+
+  if (chartType === "line"){
+    const domains = await d3VizResolveDomains([xIdx], "D3 line surface");
+    const domain = domains.get(xIdx);
+    if (!domain) throw new Error("Line chart requires a numeric X column.");
+    const required = d3VizUniqueColumns([xIdx, ...(countMode ? [] : [yIdx])]);
+    const bins = Array.from({ length:buckets }, (_, i) => ({
+      x0:domain.min + (domain.max - domain.min) * (i / buckets),
+      x1:domain.min + (domain.max - domain.min) * ((i + 1) / buckets),
+      agg:d3VizAggInit()
+    }));
+    const exec = await d3VizForEachRow(required, "D3 line surface", (columns, localRow) => {
+      const x = d3VizParseNumber(valueFromColumn(columns.get(xIdx), localRow));
+      if (x == null) return;
+      const bin = bins[d3VizBucketIndex(x, domain.min, domain.max, buckets)];
+      d3VizAggAdd(bin.agg, countMode ? null : valueFromColumn(columns.get(yIdx), localRow), countMode);
+    });
+    const points = bins
+      .map((bin) => ({ x:(bin.x0 + bin.x1) / 2, y:d3VizAggValue(bin.agg, aggregation), count:bin.agg.count, x0:bin.x0, x1:bin.x1 }))
+      .filter((point) => point.count > 0);
+
+    return {
+      surface:{ ...metadata, kind:"line", points, domain, reducedRows:points.length, scanned:exec.scanned, chunks:exec.chunks },
+      ms:now() - startedAt
+    };
+  }
+
+  const domains = await d3VizResolveDomains([xIdx, yIdx], "D3 scatter density surface");
+  const xDomain = domains.get(xIdx);
+  const yDomain = domains.get(yIdx);
+  if (!xDomain || !yDomain) throw new Error("Scatter requires numeric X and numeric Y columns.");
+  const grid = Math.max(4, Math.min(160, Math.ceil(Math.sqrt(buckets))));
+  const cells = new Map();
+  const exec = await d3VizForEachRow(d3VizUniqueColumns([xIdx, yIdx]), "D3 scatter density surface", (columns, localRow) => {
+    const x = d3VizParseNumber(valueFromColumn(columns.get(xIdx), localRow));
+    const y = d3VizParseNumber(valueFromColumn(columns.get(yIdx), localRow));
+    if (x == null || y == null) return;
+    const xi = d3VizBucketIndex(x, xDomain.min, xDomain.max, grid);
+    const yi = d3VizBucketIndex(y, yDomain.min, yDomain.max, grid);
+    const key = `${xi}\u001f${yi}`;
+    let cell = cells.get(key);
+    if (!cell) {
+      cell = { count:0, xSum:0, ySum:0, xi, yi };
+      cells.set(key, cell);
+    }
+    cell.count++;
+    cell.xSum += x;
+    cell.ySum += y;
+  });
+
+  const points = [...cells.values()]
+    .map((cell) => ({ x:cell.xSum / cell.count, y:cell.ySum / cell.count, count:cell.count, xi:cell.xi, yi:cell.yi }))
+    .sort((a,b) => b.count - a.count)
+    .slice(0, buckets);
+
+  return {
+    surface:{ ...metadata, kind:"scatter", points, xDomain, yDomain, grid, reducedRows:points.length, scanned:exec.scanned, chunks:exec.chunks },
+    ms:now() - startedAt
+  };
 }
 
-async function handleSyntheticDataset(msg){
-  const plan = syntheticBuildPlan(msg);
-  state.cancelled = false;
-  post("SYNTHETIC_PROGRESS", { value:1, text:`Synthetic Dataset生成開始: ${plan.presetLabel} / ${fmt(plan.rows)} rows / ${fmt(plan.schemaColumns.length)} cols` });
-  if (plan.outputMode === "graphSet") {
-    const graphSet = await syntheticGraphSetFiles(plan);
-    post("SYNTHETIC_DATASET_DONE", { outputMode:plan.outputMode, ...graphSet });
-    post("SYNTHETIC_PROGRESS", { value:100, text:"Graph CSVセット生成完了" });
-    return;
-  }
-  if (plan.outputMode === "download") {
-    const csv = await syntheticCsvFileFromPlan(plan);
-    post("SYNTHETIC_DATASET_DONE", { outputMode:plan.outputMode, ...csv });
-    post("SYNTHETIC_PROGRESS", { value:100, text:`Synthetic CSV生成完了: ${csv.filename}` });
-    return;
-  }
-  const result = await syntheticBuildColumnarDataset(plan, msg);
-  post("SYNTHETIC_DATASET_DONE", { outputMode:plan.outputMode, ...result });
-  post("SYNTHETIC_PROGRESS", { value:100, text:`Synthetic Dataset ready: ${fmt(result.manifest.totalRows)} rows` });
-}
 
-
-self.onmessage=async(e)=>{
+async function legacyWorkerMessageRouter(e){
   const msg=e.data||{};
+  state.__lastRouterError = null;
+  state.__lastCommandType = msg.type || "";
   try{
+    if (msg.type==="GENERATE_SYNTHETIC_PREVIEW"){
+      await handleSyntheticPreviewCommand(msg);
+      return;
+    }
+
+    if (msg.type==="GENERATE_SYNTHETIC_DATASET"){
+      await handleSyntheticDatasetCommand(msg);
+      return;
+    }
+
+    if (msg.type==="CANCEL_SYNTHETIC_GENERATION"){
+      state.cancelled=true;
+      post("SYNTHETIC_CANCELLED", {message:"Synthetic generation cancellation requested"});
+      return;
+    }
+
+    if (msg.type==="BUILD_D3_VIZ_SURFACE"){
+      state.cancelled=false;
+      const result=await buildD3VisualizationSurface(msg);
+      post("D3_VIZ_SURFACE_DONE", result);
+      postProgress(100, `D3 Surface ready: ${result.surface?.kind || "surface"} / ${fmt(result.surface?.reducedRows || 0)} marks / scanned ${fmt(result.surface?.scanned || 0)} rows`);
+      return;
+    }
+
     if (msg.type==="EXECUTE_CHUNK_BATCH"){
       state.cancelled=false;
       await hydrateChunkExecutionContext(msg.context);
@@ -6556,17 +7454,6 @@ self.onmessage=async(e)=>{
       const result=await runPerfBench(msg);
       post("PERF_BENCH_DONE", result);
       post("PROGRESS", {value:100, text:"PERF_BENCH complete"});
-      return;
-    }
-
-
-    if (msg.type==="GENERATE_SYNTHETIC_PREVIEW"){
-      await handleSyntheticPreview(msg);
-      return;
-    }
-
-    if (msg.type==="GENERATE_SYNTHETIC_DATASET"){
-      await handleSyntheticDataset(msg);
       return;
     }
 
@@ -6865,6 +7752,7 @@ self.onmessage=async(e)=>{
     }
 
   }catch(err){
+    state.__lastRouterError = { code:"LEGACY_ROUTER_ERROR", message:err?.message || String(err), requestType:msg?.type || "" };
     post("ERROR",{
       message:err?.message || String(err),
       stack:err?.stack || "",
@@ -6874,867 +7762,59 @@ self.onmessage=async(e)=>{
     });
     postProgress(0,`Error: ${err?.message || String(err)}`);
   }
-};
+}
 
+
+const runtimeKernel = createRuntimeKernel({
+  runtimeState: state,
+  post,
+  commands: runtimeCommands,
+  measurement: runtimeMeasurements,
+  legacyHandler: legacyWorkerMessageRouter,
+});
 
 /*
- * =========================================================
- * 11. Adaptive Surface Accelerator v3
- * =========================================================
- * UI/UX and Worker command compatibility invariant:
- * - No UI shape, command name, or response name is changed.
- * - Existing domain functions are wrapped at the runtime boundary.
- * - Acceleration is surface-based: plan hash -> result surface -> page surface.
+ * Runtime Fast Path
+ * ---------------------------------------------------------
+ * Data processing commands are the hot path. They must not pay the
+ * control-plane cost of normalize / plan wrapper / measurement / fallback
+ * accounting on every message.
+ *
+ * Rule:
+ * - Control-plane commands and newly registered runtime commands go through
+ *   Runtime Kernel.
+ * - Existing data-plane commands go directly to legacyWorkerMessageRouter.
+ *
+ * This keeps the structural boundary while restoring the original execution
+ * speed for ANALYZE / BUILD_COLUMNAR / RUN_DATA_QUERY / READ_PAGE /
+ * graph / pivot / chunk operations.
  */
+const RUNTIME_CONTROL_COMMANDS = new Set([
+  "CANCEL",
+  "RUNTIME_HEALTH",
+  "RUNTIME_MEASUREMENTS",
+]);
 
-const ASA_ACCELERATOR_VERSION = 3;
-
-function asaSafeNumber(n, fallback=0){
-  const v = Number(n);
-  return Number.isFinite(v) ? v : fallback;
+function shouldUseRuntimeKernel(rawMessage){
+  if (!rawMessage || typeof rawMessage !== "object") return true;
+  const type = String(rawMessage.type || "");
+  if (!type) return true;
+  return RUNTIME_CONTROL_COMMANDS.has(type) || runtimeCommands.has(type);
 }
 
-function asaStableNormalize(value, depth=0){
-  if (depth > 8) return "[depth]";
-  if (value == null) return value;
-  const t = typeof value;
-  if (t === "number") return Number.isFinite(value) ? value : String(value);
-  if (t === "string" || t === "boolean") return value;
-  if (t === "function") return "[function]";
-  if (value instanceof File) return {file:value.name, size:value.size, lastModified:value.lastModified || 0};
-  if (ArrayBuffer.isView(value)) {
-    return {typed:value.constructor?.name || "TypedArray", length:value.length, byteLength:value.byteLength, first:Array.from(value.slice ? value.slice(0, 8) : []).join("|")};
+self.onmessage = (event) => {
+  const rawMessage = event?.data || {};
+  if (shouldUseRuntimeKernel(rawMessage)) {
+    runtimeKernel.handle(event);
+    return;
   }
-  if (value instanceof ArrayBuffer) return {arrayBuffer:value.byteLength};
-  if (Array.isArray(value)) {
-    if (value.length > 128) {
-      return {
-        arrayLength:value.length,
-        head:value.slice(0, 64).map(v => asaStableNormalize(v, depth + 1)),
-        tail:value.slice(-16).map(v => asaStableNormalize(v, depth + 1))
-      };
-    }
-    return value.map(v => asaStableNormalize(v, depth + 1));
-  }
-  if (value instanceof Map) {
-    return {map:[...value.entries()].slice(0, 256).map(([k,v]) => [asaStableNormalize(k, depth + 1), asaStableNormalize(v, depth + 1)])};
-  }
-  if (value instanceof Set) {
-    return {set:[...value.values()].slice(0, 256).map(v => asaStableNormalize(v, depth + 1))};
-  }
-  const out = {};
-  for (const k of Object.keys(value).sort()) {
-    if (k === "rows" && Array.isArray(value[k]) && value[k].length > 1000) {
-      out[k] = {rows:value[k].length, first:value[k][0], last:value[k][value[k].length - 1]};
-    } else if (k === "file" && value[k] instanceof File) {
-      out[k] = asaStableNormalize(value[k], depth + 1);
-    } else if (!["stack"].includes(k)) {
-      out[k] = asaStableNormalize(value[k], depth + 1);
-    }
-  }
-  return out;
-}
 
-function asaStableStringify(value){
-  try { return JSON.stringify(asaStableNormalize(value)); }
-  catch { return String(value); }
-}
-
-function asaHashString(input){
-  const str = String(input || "");
-  let h = 2166136261;
-  for (let i=0; i<str.length; i++){
-    h ^= str.charCodeAt(i);
-    h = Math.imul(h, 16777619);
-  }
-  return (h >>> 0).toString(36);
-}
-
-function asaPlanHash(namespace, payload){
-  return `${namespace}:${asaHashString(asaStableStringify(payload))}`;
-}
-
-function asaDatasetFingerprint(){
-  const manifest = state.manifest || {};
-  const datasetId = state.dataset?.id || state.externalDataset?.id || manifest.id || state.memory?.id || state.virtual?.id || "active";
-  const cols = Array.isArray(manifest.columns)
-    ? manifest.columns.map(c => `${c.index}:${c.name}:${c.type}`).join("|")
-    : "";
-  return asaPlanHash("dataset", {
-    datasetId,
-    totalRows:manifest.totalRows || 0,
-    chunkCount:manifest.chunkCount || manifest.chunks || state.virtual?.chunks?.length || 0,
-    columns:cols,
-    schemaKey:state.schemaFileKey || "",
-    source:state.externalDataset ? "external" : state.memory ? "memory" : state.virtual ? "virtual" : "opfs"
-  });
-}
-
-function asaGraphFingerprint(){
-  return asaPlanHash("graph", {
-    joinRows:state.graphJoinResult?.rows?.length || 0,
-    joinHeader:state.graphJoinResult?.header || [],
-    graphMs:state.graphJoinResult?.ms || 0,
-    searchRows:state.graphResultSearch?.rows?.length || 0
-  });
-}
-
-function asaRowIdsFingerprint(rowIds){
-  if (!Array.isArray(rowIds)) return "no-rowids";
-  const n = rowIds.length;
-  return asaPlanHash("rowIds", {n, head:rowIds.slice(0, 64), tail:rowIds.slice(Math.max(0, n - 32))});
-}
-
-function asaEstimateBytes(value, depth=0){
-  if (value == null) return 0;
-  if (depth > 5) return 64;
-  if (typeof value === "string") return value.length * 2;
-  if (typeof value === "number") return 8;
-  if (typeof value === "boolean") return 4;
-  if (ArrayBuffer.isView(value)) return value.byteLength || 0;
-  if (value instanceof ArrayBuffer) return value.byteLength || 0;
-  if (Array.isArray(value)) {
-    if (!value.length) return 24;
-    const sample = value.slice(0, Math.min(32, value.length));
-    const avg = sample.reduce((sum, x) => sum + asaEstimateBytes(x, depth + 1), 0) / sample.length;
-    return 24 + Math.ceil(avg * value.length);
-  }
-  if (value instanceof Map) return Math.min(1024 * 1024, value.size * 96);
-  if (typeof value === "object") {
-    let bytes = 32;
-    for (const k of Object.keys(value).slice(0, 64)) bytes += asaEstimateBytes(k, depth + 1) + asaEstimateBytes(value[k], depth + 1);
-    return bytes;
-  }
-  return 64;
-}
-
-function createAsaLruCache(name, options={}){
-  const maxEntries = Math.max(1, Number(options.maxEntries || 128));
-  let maxBytes = Math.max(1024 * 1024, Number(options.maxBytes || 64 * 1024 * 1024));
-  const map = new Map();
-  const stats = {name, hits:0, misses:0, puts:0, evictions:0, bytes:0, maxBytes, maxEntries};
-  function touch(key, entry){
-    map.delete(key);
-    entry.lastUsed = now();
-    map.set(key, entry);
-    return entry.value;
-  }
-  function evict(){
-    while (map.size > maxEntries || stats.bytes > maxBytes) {
-      const first = map.keys().next().value;
-      if (first === undefined) break;
-      const old = map.get(first);
-      stats.bytes -= Number(old?.bytes || 0);
-      map.delete(first);
-      stats.evictions++;
-    }
-    stats.bytes = Math.max(0, stats.bytes);
-  }
-  return {
-    get name(){ return name; },
-    get(key){
-      const entry = map.get(key);
-      if (!entry){ stats.misses++; return undefined; }
-      stats.hits++;
-      entry.hits = (entry.hits || 0) + 1;
-      return touch(key, entry);
-    },
-    put(key, value, bytes){
-      const size = Math.max(0, Number(bytes ?? asaEstimateBytes(value)));
-      if (size > maxBytes) return value;
-      if (map.has(key)){
-        const old = map.get(key);
-        stats.bytes -= Number(old?.bytes || 0);
-        map.delete(key);
-      }
-      map.set(key, {value, bytes:size, lastUsed:now(), hits:0});
-      stats.bytes += size;
-      stats.puts++;
-      evict();
-      return value;
-    },
-    delete(key){
-      const old = map.get(key);
-      if (!old) return false;
-      stats.bytes -= Number(old.bytes || 0);
-      return map.delete(key);
-    },
-    clear(){
-      map.clear();
-      stats.bytes = 0;
-    },
-    resize(bytes){
-      maxBytes = Math.max(1024 * 1024, Number(bytes || maxBytes));
-      stats.maxBytes = maxBytes;
-      evict();
-    },
-    snapshot(){
-      return {...stats, entries:map.size, hitRate:(stats.hits + stats.misses) ? stats.hits / (stats.hits + stats.misses) : 0};
-    }
-  };
-}
-
-const asaRuntime = {
-  version:ASA_ACCELERATOR_VERSION,
-  resultSurfaceCache:createAsaLruCache("resultSurface", {maxEntries:96, maxBytes:96 * 1024 * 1024}),
-  pageSurfaceCache:createAsaLruCache("pageSurface", {maxEntries:256, maxBytes:96 * 1024 * 1024}),
-  partialSurfaceCache:createAsaLruCache("partialSurface", {maxEntries:64, maxBytes:96 * 1024 * 1024}),
-  planCache:createAsaLruCache("planHash", {maxEntries:512, maxBytes:8 * 1024 * 1024}),
-  graphSurfaceCache:createAsaLruCache("graphSurface", {maxEntries:64, maxBytes:64 * 1024 * 1024}),
-  searchChunkIndex:new Map(),
-  metrics:{
-    commandCount:0,
-    queuedCommands:0,
-    cacheHits:0,
-    cacheMisses:0,
-    pagePrefetches:0,
-    invalidations:0,
-    wrappedErrors:0,
-    lastCommand:null,
-    lastDurationMs:0,
-    queueMaxDepth:0
-  }
+  legacyWorkerMessageRouter(event);
 };
 
-function asaDeviceMemoryBudget(){
-  const gb = Number(navigator?.deviceMemory || 8);
-  if (gb <= 4) return {chunk:128, surface:96};
-  if (gb <= 8) return {chunk:256, surface:160};
-  return {chunk:512, surface:256};
-}
+  
 
-function asaApplyAdaptiveBudget(){
-  const b = asaDeviceMemoryBudget();
-  if (typeof chunkColumnCache === "object") {
-    chunkColumnCache.maxBytes = b.chunk * 1024 * 1024;
-    chunkColumnCache.maxEntries = Math.max(chunkColumnCache.maxEntries || 128, b.chunk);
-  }
-  asaRuntime.resultSurfaceCache.resize(b.surface * 1024 * 1024);
-  asaRuntime.pageSurfaceCache.resize(b.surface * 1024 * 1024);
-  asaRuntime.partialSurfaceCache.resize(Math.floor(b.surface * 0.75) * 1024 * 1024);
-  asaRuntime.graphSurfaceCache.resize(Math.floor(b.surface * 0.75) * 1024 * 1024);
-}
-asaApplyAdaptiveBudget();
-
-function asaClearSurfaces(reason="manual"){
-  asaRuntime.resultSurfaceCache.clear();
-  asaRuntime.pageSurfaceCache.clear();
-  asaRuntime.partialSurfaceCache.clear();
-  asaRuntime.planCache.clear();
-  asaRuntime.graphSurfaceCache.clear();
-  asaRuntime.searchChunkIndex.clear();
-  asaRuntime.metrics.invalidations++;
-  asaRuntime.metrics.lastInvalidationReason = reason;
-}
-
-function asaStatus(extra={}){
-  return {
-    version:asaRuntime.version,
-    budget:asaDeviceMemoryBudget(),
-    caches:{
-      result:asaRuntime.resultSurfaceCache.snapshot(),
-      page:asaRuntime.pageSurfaceCache.snapshot(),
-      partial:asaRuntime.partialSurfaceCache.snapshot(),
-      plan:asaRuntime.planCache.snapshot(),
-      graph:asaRuntime.graphSurfaceCache.snapshot(),
-      chunk:typeof chunkCacheSnapshot === "function" ? chunkCacheSnapshot() : null,
-      searchChunkIndexEntries:asaRuntime.searchChunkIndex.size
-    },
-    metrics:{...asaRuntime.metrics},
-    dataset:asaDatasetFingerprint(),
-    ...extra
-  };
-}
-
-function asaWithCache(cache, key, producer, options={}){
-  const cached = cache.get(key);
-  if (cached !== undefined) {
-    asaRuntime.metrics.cacheHits++;
-    if (options.onHit) options.onHit(cached);
-    if (options.progressText) post("PROGRESS", {value:100, text:`${options.progressText} cache hit`});
-    return Promise.resolve(options.cloneOnRead ? asaShallowClone(cached) : cached);
-  }
-  asaRuntime.metrics.cacheMisses++;
-  return Promise.resolve()
-    .then(producer)
-    .then(value => {
-      cache.put(key, options.cloneOnWrite ? asaShallowClone(value) : value, options.bytes);
-      return value;
-    });
-}
-
-function asaShallowClone(value){
-  if (Array.isArray(value)) return value.slice();
-  if (value && typeof value === "object") return {...value};
-  return value;
-}
-
-function asaPageKey(kind, payload){
-  return asaPlanHash(`page:${kind}`, {dataset:asaDatasetFingerprint(), graph:asaGraphFingerprint(), ...payload});
-}
-
-function asaResultKey(kind, payload){
-  return asaPlanHash(`result:${kind}`, {dataset:asaDatasetFingerprint(), graph:asaGraphFingerprint(), ...payload});
-}
-
-function asaPartialKey(kind, payload){
-  return asaPlanHash(`partial:${kind}`, {dataset:asaDatasetFingerprint(), graph:asaGraphFingerprint(), ...payload});
-}
-
-function asaSearchIndexKey(columnIndex, op, value){
-  return asaPlanHash("searchIndex", {dataset:asaDatasetFingerprint(), columnIndex, op, value:String(value ?? "").toLowerCase()});
-}
-
-function asaTrigrams(value){
-  const s = String(value ?? "").toLowerCase();
-  if (s.length < 3) return s ? [s] : [];
-  const out = [];
-  for (let i=0; i<=s.length - 3; i++) out.push(s.slice(i, i+3));
-  return [...new Set(out)];
-}
-
-function asaRememberSearchChunkIndex(columnIndex, op, value, result){
-  const o = String(op || "").toLowerCase();
-  if (!["contains", "startswith", "eq"].includes(o)) return;
-  const grams = o === "contains" ? asaTrigrams(value) : [String(value ?? "").toLowerCase()];
-  if (!grams.length) return;
-  asaRuntime.searchChunkIndex.set(asaSearchIndexKey(columnIndex, op, value), {
-    columnIndex:Number(columnIndex),
-    op:o,
-    grams,
-    matches:Number(result?.matches || 0),
-    skippedChunks:Number(result?.skippedChunks || 0),
-    at:now()
-  });
-  while (asaRuntime.searchChunkIndex.size > 256) {
-    const first = asaRuntime.searchChunkIndex.keys().next().value;
-    if (first === undefined) break;
-    asaRuntime.searchChunkIndex.delete(first);
-  }
-}
-
-
-async function asaCandidateChunksForPredicate(predicate, label="candidate chunks"){
-  const idx = Number(predicate?.columnIndex);
-  const op = String(predicate?.op || "").toLowerCase();
-  const value = predicate?.value ?? "";
-  const col = state.manifest?.columns?.[idx];
-  if (!col || col.type !== "string") return null;
-  if (!["contains","startswith","endswith","eq"].includes(op)) return null;
-  const q = String(value ?? "").toLowerCase();
-  if (!q && !["eq"].includes(op)) return null;
-  const key = asaPlanHash("candidateChunks", {dataset:asaDatasetFingerprint(), columnIndex:idx, op, value:q});
-  const cached = asaRuntime.planCache.get(key);
-  if (cached !== undefined) return cached;
-
-  const total = typeof activeChunkCount === "function" ? activeChunkCount() : Number(state.manifest?.chunks || 0);
-  if (!total || typeof readChunkColumns !== "function") return null;
-
-  const chunks = [];
-  for (let c=0; c<total; c++){
-    if (state.cancelled) throw new Error("Cancelled");
-    try {
-      const chunk = await readChunkColumns(c, [idx], {accelerator:"candidate-chunk-index"});
-      const colData = chunk?.columns?.get(idx);
-      const dict = Array.isArray(colData?.dict) ? colData.dict : [];
-      let ok = false;
-      for (let i=0; i<dict.length; i++){
-        const s = String(dict[i] ?? "").toLowerCase();
-        if (
-          (op === "contains" && s.includes(q)) ||
-          (op === "startswith" && s.startsWith(q)) ||
-          (op === "endswith" && s.endsWith(q)) ||
-          (op === "eq" && s === q)
-        ){
-          ok = true;
-          break;
-        }
-      }
-      if (ok) chunks.push(c);
-      if (c % 8 === 0) {
-        postProgress(Math.min(96, Math.floor(((c + 1) / Math.max(1,total)) * 30)), `${label}: chunk dictionary index ${fmt(c+1)}/${fmt(total)} / candidates ${fmt(chunks.length)}`);
-        await workerYield();
-      }
-    } catch {
-      return null;
-    }
-  }
-
-  const result = {chunks, total, skipped:Math.max(0, total - chunks.length), indexed:true};
-  asaRuntime.planCache.put(key, result, Math.max(1024, chunks.length * 8 + 256));
-  return result;
-}
-
-async function asaCandidateChunksForPredicates(predicates, label="candidate chunks"){
-  const list = (Array.isArray(predicates) ? predicates : []).filter(Boolean);
-  const eligible = list.filter(p => {
-    const col = state.manifest?.columns?.[Number(p?.columnIndex)];
-    return col?.type === "string" && ["contains","startswith","endswith","eq"].includes(String(p?.op || "").toLowerCase());
-  });
-  if (!eligible.length) return null;
-
-  let current = null;
-  let total = null;
-  let indexed = 0;
-  for (const p of eligible){
-    const res = await asaCandidateChunksForPredicate(p, label);
-    if (!res || !Array.isArray(res.chunks)) continue;
-    indexed++;
-    total = res.total;
-    const set = new Set(res.chunks);
-    current = current == null ? set : new Set([...current].filter(x => set.has(x)));
-    if (!current.size) break;
-  }
-  if (!indexed || current == null) return null;
-  const chunks = [...current].sort((a,b)=>a-b);
-  return {chunks, total:Number(total || chunks.length), skipped:Math.max(0, Number(total || 0) - chunks.length), indexed};
-}
-
-async function asaRunWithSelectedChunks(candidate, producer){
-  if (!candidate || !Array.isArray(candidate.chunks) || !candidate.indexed) return await producer();
-  const total = Number(candidate.total || candidate.chunks.length);
-  if (!total || candidate.chunks.length >= total) return await producer();
-  if (typeof selectChunksForPlan !== "function") return await producer();
-
-  const originalSelectChunksForPlan = selectChunksForPlan;
-  selectChunksForPlan = function(plan){
-    const explicit = Array.isArray(plan?.chunks) ? plan.chunks : null;
-    if (explicit && explicit.length) return originalSelectChunksForPlan(plan);
-    return candidate.chunks.slice();
-  };
-  try {
-    const result = await producer();
-    return {
-      ...result,
-      acceleratorCandidateChunks:{
-        indexed:candidate.indexed,
-        totalChunks:total,
-        candidateChunks:candidate.chunks.length,
-        skippedBeforeExecution:Math.max(0, total - candidate.chunks.length)
-      }
-    };
-  } finally {
-    selectChunksForPlan = originalSelectChunksForPlan;
-  }
-}
-
-
-function asaPrefetchPage(kind, page, pageSize, cols, reader){
-  const p = Number(page || 1);
-  const size = Number(pageSize || 500);
-  const selected = Array.isArray(cols) ? cols : [];
-  for (const next of [p + 1, p - 1]) {
-    if (next < 1) continue;
-    const key = asaPageKey(kind, {page:next, pageSize:size, columns:selected});
-    if (asaRuntime.pageSurfaceCache.get(key) !== undefined) continue;
-    // get() above records a miss; neutralize user-facing hit rate distortion lightly.
-    asaRuntime.metrics.pagePrefetches++;
-    Promise.resolve()
-      .then(() => reader(next, size, selected))
-      .then(result => asaRuntime.pageSurfaceCache.put(key, result))
-      .catch(()=>null);
-  }
-}
-
-function asaInstallFunctionWrappers(){
-  const wrapAsync = (name, installer) => {
-    try {
-      if (typeof self[name] === "function") return;
-    } catch {}
-    try { installer(); } catch (err) { asaRuntime.metrics.wrappedErrors++; }
-  };
-
-  if (typeof readPage === "function" && !readPage.__asaWrapped) {
-    const original = readPage;
-    readPage = async function(page, pageSize, cols){
-      const selected = typeof normalizeCols === "function" ? normalizeCols(cols) : (Array.isArray(cols) ? cols : []);
-      const key = asaPageKey("readPage", {page:Number(page||1), pageSize:Number(pageSize||500), columns:selected});
-      const cached = asaRuntime.pageSurfaceCache.get(key);
-      if (cached !== undefined) {
-        asaRuntime.metrics.cacheHits++;
-        asaPrefetchPage("readPage", page, pageSize, selected, original);
-        return cached;
-      }
-      asaRuntime.metrics.cacheMisses++;
-      const result = await original(page, pageSize, cols);
-      asaRuntime.pageSurfaceCache.put(key, result);
-      asaPrefetchPage("readPage", page, pageSize, selected, original);
-      return result;
-    };
-    readPage.__asaWrapped = true;
-  }
-
-  if (typeof readRowsByGlobal === "function" && !readRowsByGlobal.__asaWrapped) {
-    const original = readRowsByGlobal;
-    readRowsByGlobal = async function(rowIds, cols){
-      const selected = typeof normalizeCols === "function" ? normalizeCols(cols) : (Array.isArray(cols) ? cols : []);
-      const key = asaPageKey("rowIds", {rowIds:asaRowIdsFingerprint(rowIds), columns:selected});
-      return asaWithCache(asaRuntime.pageSurfaceCache, key, () => original(rowIds, cols));
-    };
-    readRowsByGlobal.__asaWrapped = true;
-  }
-
-  if (typeof runSearch === "function" && !runSearch.__asaWrapped) {
-    const original = runSearch;
-    runSearch = async function(args={}){
-      const key = asaResultKey("search", {
-        columnIndex:Number(args.columnIndex),
-        op:args.op,
-        value:args.value,
-        maxMatches:args.maxMatches
-      });
-      const cached = asaRuntime.resultSurfaceCache.get(key);
-      if (cached !== undefined) {
-        asaRuntime.metrics.cacheHits++;
-        state.searchMatches = Array.isArray(cached.refs) ? cached.refs : [];
-        return {...cached.result, ms:0, cacheHit:true, accelerator:asaStatus({surface:"search"})};
-      }
-      asaRuntime.metrics.cacheMisses++;
-      const candidateChunks = await asaCandidateChunksForPredicates([{columnIndex:Number(args.columnIndex), op:args.op, value:args.value}], "Search Accelerator");
-      const result = await asaRunWithSelectedChunks(candidateChunks, () => original(args));
-      asaRememberSearchChunkIndex(args.columnIndex, args.op, args.value, result);
-      asaRuntime.resultSurfaceCache.put(key, {refs:Array.isArray(state.searchMatches) ? state.searchMatches.slice() : [], result});
-      return {...result, cacheHit:false, accelerator:asaStatus({surface:"search"})};
-    };
-    runSearch.__asaWrapped = true;
-  }
-
-  if (typeof runDataQuery === "function" && !runDataQuery.__asaWrapped) {
-    const original = runDataQuery;
-    runDataQuery = async function(args={}){
-      const key = asaResultKey("dataQuery", {
-        filters:args.filters,
-        filterGroups:args.filterGroups,
-        sort:args.sort,
-        maxRows:args.maxRows,
-        projection:args.projection
-      });
-      const cached = asaRuntime.resultSurfaceCache.get(key);
-      if (cached !== undefined) {
-        asaRuntime.metrics.cacheHits++;
-        state.dataQueryMatches = Array.isArray(cached.matches) ? cached.matches : null;
-        state.dataQueryMeta = cached.meta || state.dataQueryMeta;
-        return {...cached.result, ms:0, cacheHit:true, accelerator:asaStatus({surface:"dataQuery"})};
-      }
-      asaRuntime.metrics.cacheMisses++;
-      const normalizedFiltersForCandidates = typeof normalizeGlobalFilters === "function" ? normalizeGlobalFilters(args.filters) : (Array.isArray(args.filters) ? args.filters : []);
-      const candidateChunks = await asaCandidateChunksForPredicates(normalizedFiltersForCandidates, "Data Query Accelerator");
-      const result = await asaRunWithSelectedChunks(candidateChunks, () => original(args));
-      asaRuntime.resultSurfaceCache.put(key, {
-        matches:Array.isArray(state.dataQueryMatches) ? state.dataQueryMatches.slice() : null,
-        meta:state.dataQueryMeta ? {...state.dataQueryMeta} : null,
-        result
-      });
-      return {...result, cacheHit:false, accelerator:asaStatus({surface:"dataQuery"})};
-    };
-    runDataQuery.__asaWrapped = true;
-  }
-
-  if (typeof readDataQueryPage === "function" && !readDataQueryPage.__asaWrapped) {
-    const original = readDataQueryPage;
-    readDataQueryPage = async function(page, pageSize, cols){
-      const selected = typeof normalizeCols === "function" ? normalizeCols(cols) : (Array.isArray(cols) ? cols : []);
-      const key = asaPageKey("dataQueryPage", {
-        queryMeta:state.dataQueryMeta,
-        rowIds:asaRowIdsFingerprint(state.dataQueryMatches),
-        page:Number(page||1),
-        pageSize:Number(pageSize||500),
-        columns:selected
-      });
-      const result = await asaWithCache(asaRuntime.pageSurfaceCache, key, () => original(page, pageSize, cols));
-      asaPrefetchPage("dataQueryPage", page, pageSize, selected, original);
-      return result;
-    };
-    readDataQueryPage.__asaWrapped = true;
-  }
-
-  if (typeof buildPivot === "function" && !buildPivot.__asaWrapped) {
-    const original = buildPivot;
-    buildPivot = async function(args={}){
-      const key = asaPartialKey("pivot", {
-        rowFields:args.rowFields,
-        columnFields:args.columnFields,
-        valueField:args.valueField,
-        aggregation:args.aggregation,
-        maxRows:args.maxRows,
-        maxCols:args.maxCols,
-        dataQuery:state.dataQueryMeta,
-        rowIds:asaRowIdsFingerprint(state.dataQueryMatches)
-      });
-      const cached = asaRuntime.partialSurfaceCache.get(key);
-      if (cached !== undefined) {
-        asaRuntime.metrics.cacheHits++;
-        state.pivotTable = cached.pivotTable || null;
-        state.pivotTileIndex = cached.pivotTileIndex || null;
-        return {...cached.result, cacheHit:true, accelerator:asaStatus({surface:"pivot"})};
-      }
-      asaRuntime.metrics.cacheMisses++;
-      const result = await original(args);
-      asaRuntime.partialSurfaceCache.put(key, {
-        pivotTable:state.pivotTable,
-        pivotTileIndex:state.pivotTileIndex,
-        result
-      });
-      return {...result, cacheHit:false, accelerator:asaStatus({surface:"pivot"})};
-    };
-    buildPivot.__asaWrapped = true;
-  }
-
-  if (typeof readPivotViewport === "function" && !readPivotViewport.__asaWrapped) {
-    const original = readPivotViewport;
-    readPivotViewport = function(args={}){
-      const key = asaPageKey("pivotViewport", {args, pivot:state.pivotTileIndex ? {rows:state.pivotTileIndex.rowKeys?.length, cols:state.pivotTileIndex.colKeys?.length, mode:state.pivotTileIndex.mode} : null});
-      const cached = asaRuntime.pageSurfaceCache.get(key);
-      if (cached !== undefined) {
-        asaRuntime.metrics.cacheHits++;
-        return cached;
-      }
-      asaRuntime.metrics.cacheMisses++;
-      const result = original(args);
-      asaRuntime.pageSurfaceCache.put(key, result);
-      return result;
-    };
-    readPivotViewport.__asaWrapped = true;
-  }
-
-  if (typeof buildTimeSeries === "function" && !buildTimeSeries.__asaWrapped) {
-    const original = buildTimeSeries;
-    buildTimeSeries = async function(args={}){
-      const key = asaPartialKey("timeSeries", {
-        timeField:args.timeField,
-        bucket:args.bucket,
-        groupField:args.groupField,
-        valueField:args.valueField,
-        aggregation:args.aggregation,
-        maxBuckets:args.maxBuckets,
-        dataQuery:state.dataQueryMeta,
-        rowIds:asaRowIdsFingerprint(state.dataQueryMatches)
-      });
-      const cached = asaRuntime.partialSurfaceCache.get(key);
-      if (cached !== undefined) {
-        asaRuntime.metrics.cacheHits++;
-        state.timeTable = cached.timeTable || null;
-        return {...cached.result, cacheHit:true, accelerator:asaStatus({surface:"timeSeries"})};
-      }
-      asaRuntime.metrics.cacheMisses++;
-      const result = await original(args);
-      asaRuntime.partialSurfaceCache.put(key, {timeTable:state.timeTable, result});
-      return {...result, cacheHit:false, accelerator:asaStatus({surface:"timeSeries"})};
-    };
-    buildTimeSeries.__asaWrapped = true;
-  }
-
-  if (typeof runGraphJoinQuery === "function" && !runGraphJoinQuery.__asaWrapped) {
-    const original = runGraphJoinQuery;
-    runGraphJoinQuery = async function(args={}){
-      const key = asaResultKey("graphJoin", {plan:args.plan, pageSize:args.pageSize});
-      const cached = asaRuntime.graphSurfaceCache.get(key);
-      if (cached !== undefined) {
-        asaRuntime.metrics.cacheHits++;
-        state.graphJoinResult = cached.graphJoinResult || null;
-        return {...cached.result, ms:0, cacheHit:true, accelerator:asaStatus({surface:"graphJoin"})};
-      }
-      asaRuntime.metrics.cacheMisses++;
-      const result = await original(args);
-      asaRuntime.graphSurfaceCache.put(key, {graphJoinResult:state.graphJoinResult, result});
-      return {...result, cacheHit:false, accelerator:asaStatus({surface:"graphJoin"})};
-    };
-    runGraphJoinQuery.__asaWrapped = true;
-  }
-
-  if (typeof readGraphJoinPage === "function" && !readGraphJoinPage.__asaWrapped) {
-    const original = readGraphJoinPage;
-    readGraphJoinPage = async function(page, pageSize, origin=""){
-      const key = asaPageKey("graphJoinPage", {graph:asaGraphFingerprint(), page:Number(page||1), pageSize:Number(pageSize||500), origin});
-      return asaWithCache(asaRuntime.pageSurfaceCache, key, () => original(page, pageSize, origin));
-    };
-    readGraphJoinPage.__asaWrapped = true;
-  }
-
-  if (typeof runGraphResultSearch === "function" && !runGraphResultSearch.__asaWrapped) {
-    const original = runGraphResultSearch;
-    runGraphResultSearch = async function(msg={}){
-      const key = asaResultKey("graphResultSearch", {
-        graph:asaGraphFingerprint(),
-        mode:msg.mode,
-        columnIndex:msg.columnIndex,
-        op:msg.op,
-        value:msg.value,
-        maxMatches:msg.maxMatches
-      });
-      const cached = asaRuntime.graphSurfaceCache.get(key);
-      if (cached !== undefined) {
-        asaRuntime.metrics.cacheHits++;
-        state.graphResultSearch = cached.graphResultSearch || null;
-        return {...cached.result, ms:0, cacheHit:true, accelerator:asaStatus({surface:"graphResultSearch"})};
-      }
-      asaRuntime.metrics.cacheMisses++;
-      const result = await original(msg);
-      asaRuntime.graphSurfaceCache.put(key, {graphResultSearch:state.graphResultSearch, result});
-      return {...result, cacheHit:false, accelerator:asaStatus({surface:"graphResultSearch"})};
-    };
-    runGraphResultSearch.__asaWrapped = true;
-  }
-
-  if (typeof readGraphResultSearchPage === "function" && !readGraphResultSearchPage.__asaWrapped) {
-    const original = readGraphResultSearchPage;
-    readGraphResultSearchPage = function(page, pageSize){
-      const key = asaPageKey("graphResultSearchPage", {graph:asaGraphFingerprint(), page:Number(page||1), pageSize:Number(pageSize||500), rows:state.graphResultSearch?.rows?.length || 0});
-      const cached = asaRuntime.pageSurfaceCache.get(key);
-      if (cached !== undefined) {
-        asaRuntime.metrics.cacheHits++;
-        return cached;
-      }
-      asaRuntime.metrics.cacheMisses++;
-      const result = original(page, pageSize);
-      asaRuntime.pageSurfaceCache.put(key, result);
-      return result;
-    };
-    readGraphResultSearchPage.__asaWrapped = true;
-  }
-
-  if (typeof buildGraphResultPivot === "function" && !buildGraphResultPivot.__asaWrapped) {
-    const original = buildGraphResultPivot;
-    buildGraphResultPivot = async function(msg={}){
-      const key = asaPartialKey("graphResultPivot", {graph:asaGraphFingerprint(), msg});
-      const cached = asaRuntime.partialSurfaceCache.get(key);
-      if (cached !== undefined) {
-        asaRuntime.metrics.cacheHits++;
-        state.graphResultPivot = cached.graphResultPivot || null;
-        return {...cached.result, cacheHit:true, accelerator:asaStatus({surface:"graphResultPivot"})};
-      }
-      asaRuntime.metrics.cacheMisses++;
-      const result = await original(msg);
-      asaRuntime.partialSurfaceCache.put(key, {graphResultPivot:state.graphResultPivot, result});
-      return {...result, cacheHit:false, accelerator:asaStatus({surface:"graphResultPivot"})};
-    };
-    buildGraphResultPivot.__asaWrapped = true;
-  }
-
-  if (typeof buildGraphResultTime === "function" && !buildGraphResultTime.__asaWrapped) {
-    const original = buildGraphResultTime;
-    buildGraphResultTime = async function(msg={}){
-      const key = asaPartialKey("graphResultTime", {graph:asaGraphFingerprint(), msg});
-      const cached = asaRuntime.partialSurfaceCache.get(key);
-      if (cached !== undefined) {
-        asaRuntime.metrics.cacheHits++;
-        state.graphResultTime = cached.graphResultTime || null;
-        return {...cached.result, cacheHit:true, accelerator:asaStatus({surface:"graphResultTime"})};
-      }
-      asaRuntime.metrics.cacheMisses++;
-      const result = await original(msg);
-      asaRuntime.partialSurfaceCache.put(key, {graphResultTime:state.graphResultTime, result});
-      return {...result, cacheHit:false, accelerator:asaStatus({surface:"graphResultTime"})};
-    };
-    buildGraphResultTime.__asaWrapped = true;
-  }
-
-  if (typeof readGraphResultWindow === "function" && !readGraphResultWindow.__asaWrapped) {
-    const original = readGraphResultWindow;
-    readGraphResultWindow = async function(msg={}){
-      const key = asaPageKey("graphResultWindow", {graph:asaGraphFingerprint(), msg:{...msg, page:Number(msg.page||1), pageSize:Number(msg.pageSize||500)}});
-      return asaWithCache(asaRuntime.pageSurfaceCache, key, () => original(msg));
-    };
-    readGraphResultWindow.__asaWrapped = true;
-  }
-
-  if (typeof clearChunkCache === "function" && !clearChunkCache.__asaWrapped) {
-    const original = clearChunkCache;
-    clearChunkCache = function(){
-      asaClearSurfaces("clearChunkCache");
-      return original();
-    };
-    clearChunkCache.__asaWrapped = true;
-  }
-
-  if (typeof clearAdaptiveCaches === "function" && !clearAdaptiveCaches.__asaWrapped) {
-    const original = clearAdaptiveCaches;
-    clearAdaptiveCaches = function(){
-      asaClearSurfaces("clearAdaptiveCaches");
-      const result = original();
-      return {...(result || {}), surfaceAccelerator:asaStatus({cleared:true})};
-    };
-    clearAdaptiveCaches.__asaWrapped = true;
-  }
-}
-
-asaInstallFunctionWrappers();
-
-function createAsaCommandScheduler(originalHandler){
-  const queues = {high:[], normal:[], low:[]};
-  let running = false;
-
-  const high = new Set(["READ_PAGE","READ_DATA_QUERY_PAGE","READ_SEARCH_PAGE","READ_GRAPH_JOIN_PAGE","READ_GRAPH_RESULT_SEARCH_PAGE","READ_PIVOT_VIEWPORT","CANCEL","OPFS_ESTIMATE","OPFS_LIST","ADAPTIVE_KERNEL_STATUS","HYBRID_SURFACE_STATUS","ROW_SURFACE_STATUS","EXECUTION_PLANE_STATUS","OBSERVATION_ENGINE_STATUS","REMOTE_EXECUTION_STATUS","SURFACE_ACCELERATOR_STATUS"]);
-  const low = new Set(["BUILD_COLUMNAR","GENERATE_SYNTHETIC_DATASET","MERGE_OPFS_DATASETS","VALIDATE_MERGE","PREVIEW_CLEAN","ADAPTIVE_PERF_BENCH","PERF_BENCH","EXTERNAL_STORAGE_SYNC","ROW_SURFACE_PREFETCH"]);
-
-  const mutation = new Set(["BUILD_COLUMNAR","GENERATE_SYNTHETIC_DATASET","OPFS_LOAD","OPFS_OPEN_VIRTUAL","OPFS_OPEN_MEMORY","EXTERNAL_STORAGE_OPEN","MERGE_OPFS_DATASETS","OPFS_DELETE","PURGE_SELECTED","PURGE_ALL","FORGET_SESSION"]);
-
-  function priority(type){
-    if (high.has(type)) return "high";
-    if (low.has(type)) return "low";
-    return "normal";
-  }
-
-  async function runNext(){
-    if (running) return;
-    const item = queues.high.shift() || queues.normal.shift() || queues.low.shift();
-    if (!item) return;
-    running = true;
-    const msg = item.event?.data || {};
-    const type = msg.type || "";
-    const t0 = now();
-    asaRuntime.metrics.commandCount++;
-    asaRuntime.metrics.lastCommand = type;
-    asaRuntime.metrics.queueDepth = queues.high.length + queues.normal.length + queues.low.length;
-
-    try {
-      if (type === "SURFACE_ACCELERATOR_STATUS") {
-        post("SURFACE_ACCELERATOR_STATUS", asaStatus());
-      } else if (type === "SURFACE_ACCELERATOR_CLEAR") {
-        asaClearSurfaces("manualCommand");
-        post("SURFACE_ACCELERATOR_STATUS", asaStatus({cleared:true}));
-      } else {
-        if (mutation.has(type)) asaClearSurfaces(`before:${type}`);
-        await originalHandler(item.event);
-        if (mutation.has(type)) asaClearSurfaces(`after:${type}`);
-      }
-    } finally {
-      asaRuntime.metrics.lastDurationMs = now() - t0;
-      running = false;
-      Promise.resolve().then(runNext);
-    }
-  }
-
-  return {
-    enqueue(event){
-      const msg = event?.data || {};
-      const type = msg.type || "";
-      if (type === "CANCEL") {
-        state.cancelled = true;
-        originalHandler(event);
-        return;
-      }
-      const p = priority(type);
-      queues[p].push({event, at:now()});
-      const depth = queues.high.length + queues.normal.length + queues.low.length;
-      asaRuntime.metrics.queuedCommands++;
-      asaRuntime.metrics.queueMaxDepth = Math.max(asaRuntime.metrics.queueMaxDepth || 0, depth);
-      runNext();
-    }
-  };
-}
-
-if (typeof self.onmessage === "function" && !self.onmessage.__asaScheduled) {
-  const __asaOriginalOnMessage = self.onmessage;
-  const __asaScheduler = createAsaCommandScheduler(__asaOriginalOnMessage);
-  self.onmessage = function(event){
-    return __asaScheduler.enqueue(event);
-  };
-  self.onmessage.__asaScheduled = true;
-}
-
-
-
+  
 </script>
 
   <!-- JSX application source. It is transformed by Babel in the module below. -->
@@ -7761,7 +7841,7 @@ if (typeof self.onmessage === "function" && !self.onmessage.__asaScheduled) {
 
 
 
-const { useCallback, useEffect, useMemo, useRef, useState } = React;
+const { useCallback, useEffect, useMemo, useRef, useState, useReducer } = React;
 
 const {
   ThemeProvider,
@@ -7987,15 +8067,15 @@ function downloadText(filename, text, type = "text/csv;charset=utf-8") {
 }
 
 function downloadBlob(filename, blob) {
-  const safeBlob = blob instanceof Blob ? blob : new Blob([blob || ""], { type:"application/octet-stream" });
-  const url = URL.createObjectURL(safeBlob);
+  if (!(blob instanceof Blob)) return;
+  const url = URL.createObjectURL(blob);
   const a = document.createElement("a");
   a.href = url;
-  a.download = withExportTimestamp(filename || "download.bin");
+  a.download = withExportTimestamp(filename || "download.csv");
   document.body.appendChild(a);
   a.click();
   a.remove();
-  URL.revokeObjectURL(url);
+  setTimeout(() => URL.revokeObjectURL(url), 0);
 }
 
 function SmallNumberField({ label, value, onChange, min, max, step, sx }) {
@@ -9287,6 +9367,347 @@ function DataTable({ table, tableId, height = 520, dense: denseProp, filterable 
   );
 }
 
+
+
+const D3_VIZ_EMPTY_SURFACE = { kind:"empty", rows:[], points:[], bins:[] };
+
+function formatD3VizNumber(value) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return "";
+  return Math.abs(n) >= 1000 ? n.toLocaleString() : String(Math.round(n * 1000) / 1000);
+}
+
+function clampD3VizNumber(value, min, max, fallback) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return fallback;
+  return Math.max(min, Math.min(max, Math.floor(n)));
+}
+
+function d3VizColumnOptions(columns) {
+  return (Array.isArray(columns) ? columns : []).map((column, fallbackIndex) => ({
+    index: Number(column?.index ?? fallbackIndex),
+    name: String(column?.name || `Column ${fallbackIndex + 1}`),
+    type: String(column?.type || "string"),
+  }));
+}
+
+function clearD3Svg(svg, width, height, message) {
+  svg.selectAll("*").remove();
+  svg.attr("viewBox", `0 0 ${width} ${height}`).attr("role", "img");
+  svg.append("text")
+    .attr("x", width / 2)
+    .attr("y", height / 2)
+    .attr("text-anchor", "middle")
+    .attr("font-size", 14)
+    .attr("fill", "currentColor")
+    .attr("opacity", 0.7)
+    .text(message || "No visualization surface");
+}
+
+function d3VizExtent(values, accessor) {
+  const nums = values.map(accessor).filter((v) => Number.isFinite(v));
+  if (!nums.length) return [0, 1];
+  const min = Math.min(...nums);
+  const max = Math.max(...nums);
+  if (min === max) return [min - 0.5, max + 0.5];
+  return [min, max];
+}
+
+function renderD3WorkerBar(svg, surface, options) {
+  const { width, height } = options;
+  const rows = Array.isArray(surface.rows) ? surface.rows : [];
+  if (!rows.length) return clearD3Svg(svg, width, height, "集約結果がありません");
+  const margin = { top: 24, right: 24, bottom: 96, left: 78 };
+  const chartWidth = Math.max(1, width - margin.left - margin.right);
+  const chartHeight = Math.max(1, height - margin.top - margin.bottom);
+  svg.attr("viewBox", `0 0 ${width} ${height}`).attr("role", "img");
+  const x = d3.scaleBand().domain(rows.map((d) => String(d.key))).range([0, chartWidth]).padding(0.18);
+  const yMin = Math.min(0, d3.min(rows, (d) => Number(d.value)) || 0);
+  const yMax = Math.max(0, d3.max(rows, (d) => Number(d.value)) || 1);
+  const y = d3.scaleLinear().domain([yMin, yMax]).nice().range([chartHeight, 0]);
+  const g = svg.append("g").attr("transform", `translate(${margin.left},${margin.top})`);
+  g.append("g").attr("opacity", 0.22).call(d3.axisLeft(y).ticks(6).tickSize(-chartWidth).tickFormat(""));
+  g.append("g").attr("transform", `translate(0,${chartHeight})`)
+    .call(d3.axisBottom(x).tickFormat((d) => String(d).slice(0, 20)))
+    .selectAll("text").attr("transform", "rotate(-38)").attr("text-anchor", "end");
+  g.append("g").call(d3.axisLeft(y).ticks(6));
+  g.selectAll("rect")
+    .data(rows)
+    .join("rect")
+    .attr("x", (d) => x(String(d.key)))
+    .attr("y", (d) => y(Math.max(0, Number(d.value || 0))))
+    .attr("width", x.bandwidth())
+    .attr("height", (d) => Math.abs(y(Number(d.value || 0)) - y(0)))
+    .attr("rx", 4)
+    .attr("fill", "currentColor")
+    .attr("opacity", 0.78)
+    .append("title")
+    .text((d) => `${d.key}\nvalue ${formatD3VizNumber(d.value)}\ncount ${formatD3VizNumber(d.count)}`);
+  svg.append("text").attr("x", margin.left).attr("y", height - 18).attr("font-size", 12).attr("fill", "currentColor").text(surface.xLabel || "Category");
+  svg.append("text").attr("x", 16).attr("y", 18).attr("font-size", 12).attr("fill", "currentColor").text(surface.yLabel || "Value");
+}
+
+function renderD3WorkerHistogram(svg, surface, options) {
+  const { width, height } = options;
+  const bins = Array.isArray(surface.bins) ? surface.bins : [];
+  if (!bins.length) return clearD3Svg(svg, width, height, "集約結果がありません");
+  const margin = { top: 24, right: 24, bottom: 58, left: 78 };
+  const chartWidth = Math.max(1, width - margin.left - margin.right);
+  const chartHeight = Math.max(1, height - margin.top - margin.bottom);
+  svg.attr("viewBox", `0 0 ${width} ${height}`).attr("role", "img");
+  const x = d3.scaleLinear().domain([bins[0].x0, bins[bins.length - 1].x1]).nice().range([0, chartWidth]);
+  const y = d3.scaleLinear().domain([0, d3.max(bins, (d) => Number(d.count)) || 1]).nice().range([chartHeight, 0]);
+  const g = svg.append("g").attr("transform", `translate(${margin.left},${margin.top})`);
+  g.append("g").attr("opacity", 0.22).call(d3.axisLeft(y).ticks(6).tickSize(-chartWidth).tickFormat(""));
+  g.append("g").attr("transform", `translate(0,${chartHeight})`).call(d3.axisBottom(x).ticks(8));
+  g.append("g").call(d3.axisLeft(y).ticks(6));
+  g.selectAll("rect")
+    .data(bins)
+    .join("rect")
+    .attr("x", (bin) => x(Number(bin.x0)) + 1)
+    .attr("y", (bin) => y(Number(bin.count || 0)))
+    .attr("width", (bin) => Math.max(0, x(Number(bin.x1)) - x(Number(bin.x0)) - 1))
+    .attr("height", (bin) => chartHeight - y(Number(bin.count || 0)))
+    .attr("rx", 3)
+    .attr("fill", "currentColor")
+    .attr("opacity", 0.76)
+    .append("title")
+    .text((bin) => `${formatD3VizNumber(bin.x0)} - ${formatD3VizNumber(bin.x1)}\n${formatD3VizNumber(bin.count)} rows`);
+  svg.append("text").attr("x", margin.left).attr("y", height - 18).attr("font-size", 12).attr("fill", "currentColor").text(surface.xLabel || "Value");
+  svg.append("text").attr("x", 16).attr("y", 18).attr("font-size", 12).attr("fill", "currentColor").text("Count");
+}
+
+function renderD3WorkerLine(svg, surface, options) {
+  const { width, height } = options;
+  const points = Array.isArray(surface.points) ? surface.points : [];
+  if (points.length < 2) return clearD3Svg(svg, width, height, "描画できる点が足りません");
+  const margin = { top: 24, right: 24, bottom: 58, left: 78 };
+  const chartWidth = Math.max(1, width - margin.left - margin.right);
+  const chartHeight = Math.max(1, height - margin.top - margin.bottom);
+  svg.attr("viewBox", `0 0 ${width} ${height}`).attr("role", "img");
+  const x = d3.scaleLinear().domain(d3VizExtent(points, (d) => Number(d.x))).nice().range([0, chartWidth]);
+  const y = d3.scaleLinear().domain(d3VizExtent(points, (d) => Number(d.y))).nice().range([chartHeight, 0]);
+  const line = d3.line().defined((d) => Number.isFinite(Number(d.x)) && Number.isFinite(Number(d.y))).x((d) => x(Number(d.x))).y((d) => y(Number(d.y)));
+  const g = svg.append("g").attr("transform", `translate(${margin.left},${margin.top})`);
+  g.append("g").attr("opacity", 0.22).call(d3.axisLeft(y).ticks(6).tickSize(-chartWidth).tickFormat(""));
+  g.append("g").attr("transform", `translate(0,${chartHeight})`).call(d3.axisBottom(x).ticks(8));
+  g.append("g").call(d3.axisLeft(y).ticks(6));
+  g.append("path").datum(points).attr("fill", "none").attr("stroke", "currentColor").attr("stroke-width", 2.2).attr("opacity", 0.9).attr("d", line);
+  g.selectAll("circle").data(points).join("circle").attr("cx", (d) => x(Number(d.x))).attr("cy", (d) => y(Number(d.y))).attr("r", 2.6).attr("fill", "currentColor").attr("opacity", 0.72)
+    .append("title").text((d) => `x ${formatD3VizNumber(d.x)}\ny ${formatD3VizNumber(d.y)}\nrows ${formatD3VizNumber(d.count)}`);
+  svg.append("text").attr("x", margin.left).attr("y", height - 18).attr("font-size", 12).attr("fill", "currentColor").text(surface.xLabel || "X");
+  svg.append("text").attr("x", 16).attr("y", 18).attr("font-size", 12).attr("fill", "currentColor").text(surface.yLabel || "Y");
+}
+
+function renderD3WorkerScatter(svg, surface, options) {
+  const { width, height } = options;
+  const points = Array.isArray(surface.points) ? surface.points : [];
+  if (!points.length) return clearD3Svg(svg, width, height, "描画できる点がありません");
+  const margin = { top: 24, right: 24, bottom: 58, left: 78 };
+  const chartWidth = Math.max(1, width - margin.left - margin.right);
+  const chartHeight = Math.max(1, height - margin.top - margin.bottom);
+  svg.attr("viewBox", `0 0 ${width} ${height}`).attr("role", "img");
+  const x = d3.scaleLinear().domain(d3VizExtent(points, (d) => Number(d.x))).nice().range([0, chartWidth]);
+  const y = d3.scaleLinear().domain(d3VizExtent(points, (d) => Number(d.y))).nice().range([chartHeight, 0]);
+  const r = d3.scaleSqrt().domain([0, d3.max(points, (d) => Number(d.count)) || 1]).range([2, 14]);
+  const g = svg.append("g").attr("transform", `translate(${margin.left},${margin.top})`);
+  g.append("g").attr("opacity", 0.22).call(d3.axisLeft(y).ticks(6).tickSize(-chartWidth).tickFormat(""));
+  g.append("g").attr("transform", `translate(0,${chartHeight})`).call(d3.axisBottom(x).ticks(8));
+  g.append("g").call(d3.axisLeft(y).ticks(6));
+  g.selectAll("circle").data(points).join("circle")
+    .attr("cx", (d) => x(Number(d.x)))
+    .attr("cy", (d) => y(Number(d.y)))
+    .attr("r", (d) => r(Number(d.count || 1)))
+    .attr("fill", "currentColor")
+    .attr("opacity", 0.44)
+    .append("title")
+    .text((d) => `x ${formatD3VizNumber(d.x)}\ny ${formatD3VizNumber(d.y)}\nrows ${formatD3VizNumber(d.count)}`);
+  svg.append("text").attr("x", margin.left).attr("y", height - 18).attr("font-size", 12).attr("fill", "currentColor").text(surface.xLabel || "X");
+  svg.append("text").attr("x", 16).attr("y", 18).attr("font-size", 12).attr("fill", "currentColor").text(surface.yLabel || "Y");
+}
+
+function renderD3WorkerSurface(svgNode, surface) {
+  const svg = d3.select(svgNode);
+  svg.selectAll("*").remove();
+  const width = 1080;
+  const height = 560;
+  const s = surface || D3_VIZ_EMPTY_SURFACE;
+  if (!s.kind || s.kind === "empty") return clearD3Svg(svg, width, height, "Build a visualization surface first");
+  if (s.kind === "bar") return renderD3WorkerBar(svg, s, { width, height });
+  if (s.kind === "histogram") return renderD3WorkerHistogram(svg, s, { width, height });
+  if (s.kind === "line") return renderD3WorkerLine(svg, s, { width, height });
+  if (s.kind === "scatter") return renderD3WorkerScatter(svg, s, { width, height });
+  return clearD3Svg(svg, width, height, "Unsupported D3 surface");
+}
+
+function D3VisualizationPanel({ manifest, columns, graphColumns = [], graphResultCount = 0, graphResultMode = "data", result, status, time, onRun, onClear }) {
+  const svgRef = useRef(null);
+  const activeColumnOptions = useMemo(() => d3VizColumnOptions(columns), [columns]);
+  const graphColumnOptions = useMemo(() => d3VizColumnOptions(graphColumns), [graphColumns]);
+  const canUseActiveSource = Boolean(manifest && activeColumnOptions.length);
+  const canUseGraphSource = Boolean(graphResultCount > 0 && graphColumnOptions.length);
+
+  const [dataSource, setDataSource] = useState("active");
+  const sourceColumns = dataSource === "graph" ? graphColumnOptions : activeColumnOptions;
+  const sourceRows = dataSource === "graph" ? graphResultCount : Number(manifest?.totalRows || 0);
+  const sourceMode = dataSource === "graph" ? graphResultMode : "columnar";
+  const sourceLabel = dataSource === "graph" ? `Graph Query Result / ${graphResultMode}` : "Active Dataset / Columnar Tile";
+
+  const columnOptions = useMemo(() => sourceColumns, [sourceColumns]);
+  const numericOptions = useMemo(() => {
+    const nums = columnOptions.filter((column) => String(column.type).toLowerCase() === "number");
+    return nums.length ? nums : columnOptions;
+  }, [columnOptions]);
+
+  const [chartType, setChartType] = useState("bar");
+  const [xColumn, setXColumn] = useState("");
+  const [yColumn, setYColumn] = useState("-1");
+  const [aggregation, setAggregation] = useState("Count");
+  const [topN, setTopN] = useState("80");
+  const [buckets, setBuckets] = useState("240");
+  const [categoryLimit, setCategoryLimit] = useState("50000");
+  const [chunkRows, setChunkRows] = useState("10000");
+
+  useEffect(() => {
+    if (dataSource === "graph" && !canUseGraphSource) setDataSource("active");
+  }, [dataSource, canUseGraphSource]);
+
+  useEffect(() => {
+    if (!columnOptions.length) {
+      setXColumn("");
+      setYColumn("-1");
+      return;
+    }
+    setXColumn((current) => current && columnOptions.some((column) => String(column.index) === String(current)) ? current : String(columnOptions[0].index));
+    setYColumn((current) => current === "-1" || columnOptions.some((column) => String(column.index) === String(current)) ? current : "-1");
+  }, [dataSource, columnOptions.map((column) => `${column.index}:${column.name}:${column.type}`).join("|")]);
+
+  useEffect(() => {
+    if (chartType === "scatter" && yColumn === "-1" && numericOptions.length) {
+      setYColumn(String(numericOptions[0].index));
+    }
+  }, [chartType, yColumn, numericOptions.map((column) => `${column.index}:${column.name}`).join("|")]);
+
+  useEffect(() => {
+    if (!svgRef.current) return;
+    renderD3WorkerSurface(svgRef.current, result);
+  }, [result]);
+
+  function runSurfacePlan() {
+    const sourceAvailable = dataSource === "graph" ? canUseGraphSource : canUseActiveSource;
+    if (!sourceAvailable) return;
+    onRun?.({
+      dataSource,
+      sourceMode,
+      sourceColumns:columnOptions.map((column) => ({ index:Number(column.index), name:column.name, type:column.type || "string" })),
+      chartType,
+      xColumnIndex:Number(xColumn),
+      yColumnIndex:yColumn === "-1" ? -1 : Number(yColumn),
+      aggregation,
+      topN:clampD3VizNumber(topN, 1, 1000, 80),
+      buckets:clampD3VizNumber(buckets, 8, 2400, 240),
+      categoryLimit:clampD3VizNumber(categoryLimit, 100, 200000, 50000),
+      chunkRows:clampD3VizNumber(chunkRows, 500, 50000, 10000),
+    });
+  }
+
+  const canRun = Boolean((dataSource === "graph" ? canUseGraphSource : canUseActiveSource) && columnOptions.length && xColumn !== "");
+  const markCount = result?.reducedRows || result?.rows?.length || result?.points?.length || result?.bins?.length || 0;
+  const scanned = result?.scanned || 0;
+
+  return (
+    <Box sx={{ display: "grid", gridTemplateColumns: { xs: "1fr", lg: "380px minmax(0, 1fr)" }, gap: 1 }}>
+      <Section title="D3 Infinite Surface Plan" icon={<Analytics />} hint="DataSourceを選び、対象面だけをWorkerで集約します。D3は集約済みSurfaceだけを描画します。">
+        <Stack spacing={1}>
+          <Alert severity="info">
+            DataSourceは観測面です。Active DatasetはColumnar Tileを直接走査し、Graph Query Resultは結果Windowをチャンク走査します。
+          </Alert>
+
+          <TextField select label="DataSource" size="small" fullWidth value={dataSource} onChange={(e) => { setDataSource(e.target.value); onClear?.(); }} disabled={!canUseActiveSource && !canUseGraphSource}>
+            <MenuItem value="active" disabled={!canUseActiveSource}>Active Dataset / Columnar Tile</MenuItem>
+            <MenuItem value="graph" disabled={!canUseGraphSource}>Graph Query Result / Current Result Surface</MenuItem>
+          </TextField>
+
+          <TextField select label="Chart type" size="small" fullWidth value={chartType} onChange={(e) => setChartType(e.target.value)} disabled={!canRun}>
+            <MenuItem value="bar">Bar / category aggregate</MenuItem>
+            <MenuItem value="line">Line / numeric binned series</MenuItem>
+            <MenuItem value="scatter">Scatter / density surface</MenuItem>
+            <MenuItem value="histogram">Histogram / numeric distribution</MenuItem>
+          </TextField>
+
+          <TextField select label={chartType === "histogram" ? "Value column" : "X / Category column"} size="small" fullWidth value={xColumn} onChange={(e) => setXColumn(e.target.value)} disabled={!canRun}>
+            {(chartType === "histogram" || chartType === "line" || chartType === "scatter" ? numericOptions : columnOptions).map((column) => (
+              <MenuItem key={column.index} value={String(column.index)}>{column.name} / {column.type}</MenuItem>
+            ))}
+          </TextField>
+
+          {chartType !== "histogram" && (
+            <TextField select label="Y / Value column" size="small" fullWidth value={yColumn} onChange={(e) => setYColumn(e.target.value)} disabled={!canRun || (aggregation === "Count" && chartType !== "scatter")}>
+              <MenuItem value="-1" disabled={chartType === "scatter"}>Rows / Count</MenuItem>
+              {numericOptions.map((column) => (
+                <MenuItem key={column.index} value={String(column.index)}>{column.name} / {column.type}</MenuItem>
+              ))}
+            </TextField>
+          )}
+
+          {chartType !== "scatter" && (
+            <TextField select label="Aggregation" size="small" fullWidth value={aggregation} onChange={(e) => setAggregation(e.target.value)} disabled={!canRun}>
+              <MenuItem value="Count">Count</MenuItem>
+              <MenuItem value="Sum">Sum</MenuItem>
+              <MenuItem value="Avg">Avg</MenuItem>
+              <MenuItem value="Min">Min</MenuItem>
+              <MenuItem value="Max">Max</MenuItem>
+            </TextField>
+          )}
+
+          {chartType === "bar" ? (
+            <>
+              <TextField label="Top N marks" size="small" value={topN} onChange={(e) => setTopN(e.target.value)} disabled={!canRun} />
+              <TextField label="Category tracking limit" size="small" value={categoryLimit} onChange={(e) => setCategoryLimit(e.target.value)} disabled={!canRun} />
+            </>
+          ) : (
+            <TextField label="Buckets / max marks" size="small" value={buckets} onChange={(e) => setBuckets(e.target.value)} disabled={!canRun} />
+          )}
+
+          {dataSource === "graph" && (
+            <TextField label="Graph chunk rows" size="small" value={chunkRows} onChange={(e) => setChunkRows(e.target.value)} disabled={!canRun} />
+          )}
+
+          <Stack direction="row" spacing={1}>
+            <Button variant="contained" startIcon={<Timeline />} onClick={runSurfacePlan} disabled={!canRun}>Build Surface</Button>
+            <Button onClick={onClear} disabled={!result}>Clear</Button>
+          </Stack>
+
+          <KeyValue rows={[
+            ["DataSource", sourceLabel],
+            ["Source rows", fmt(sourceRows)],
+            ["D3 marks", fmt(markCount)],
+            ["Scanned rows", fmt(scanned)],
+            ["Strategy", result?.strategy || (dataSource === "graph" ? "worker-graph-result-window-reduce" : "worker-columnar-tile-reduce")],
+            ["Elapsed", time || ""],
+            ["Status", status || ""],
+          ]} />
+        </Stack>
+      </Section>
+
+      <Section title="D3 Projection" icon={<Timeline />} hint="SVGは集約済みSurfaceだけを描画します。raw rowsはUIへ渡しません。">
+        <Box sx={{ overflow: "auto", border: "1px solid", borderColor: "divider", borderRadius: 1.5, p: 1, bgcolor: "background.paper" }}>
+          <svg ref={svgRef} style={{ width: "100%", minWidth: 760, height: 560, display: "block" }} />
+        </Box>
+        <Stack direction="row" spacing={0.75} useFlexGap flexWrap="wrap" sx={{ mt: 1 }}>
+          <Chip size="small" label={`source ${result?.dataSourceLabel || sourceLabel}`} />
+          <Chip size="small" label={`surface ${result?.kind || "none"}`} />
+          <Chip size="small" label={`rows ${fmt(result?.totalRows || sourceRows)}`} />
+          <Chip size="small" label={`marks ${fmt(markCount)}`} />
+          {result?.overflowed && <Chip size="small" color="warning" label="category overflow grouped" />}
+          {result?.bucketCount && <Chip size="small" label={`buckets ${fmt(result.bucketCount)}`} />}
+        </Stack>
+      </Section>
+    </Box>
+  );
+}
+
+
 function columnsFromTableHeader(header) {
   return (Array.isArray(header) ? header : []).map((name, index) => ({
     index,
@@ -10189,197 +10610,6 @@ function Section({ title, children, hint, icon, defaultCollapsed = false, action
         </Box>
       </Collapse>
     </Paper>
-  );
-}
-
-
-
-const SYNTHETIC_UI_PRESETS = [
-  { value:"sales", label:"売上データ", help:"注文ID・顧客・商品・地域・金額・日付を生成" },
-  { value:"iot", label:"センサーログ", help:"端末ID・時刻・温度・湿度・状態を生成" },
-  { value:"finance", label:"取引データ", help:"口座・金額・通貨・加盟店・リスク値を生成" },
-  { value:"web", label:"アクセスログ", help:"ユーザー・URL・ステータス・遅延を生成" },
-  { value:"graph", label:"Graph結合サンプル", help:"user_id / order_id / product_id など結合キーを生成" },
-];
-
-const SYNTHETIC_DEFAULT_CONFIG = {
-  preset:"sales",
-  rows:"100000",
-  columns:"30",
-  seed:"42",
-  syntheticChunkSize:"50000",
-  nullRate:"1",
-  duplicateRate:"2",
-  outlierRate:"0.1",
-  emptyRate:"1",
-  longTextRate:"0",
-  japaneseRate:"30",
-  dateMode:"mixed",
-  numberMode:"plain",
-  outputMode:"open",
-};
-
-function syntheticNumber(value, fallback=0) {
-  const n = Number(value);
-  return Number.isFinite(n) ? n : fallback;
-}
-
-function syntheticRateLabel(value) {
-  const n = syntheticNumber(value, 0);
-  return `${n}%`;
-}
-
-function estimateSyntheticDataset(config) {
-  const rows = Math.max(1, syntheticNumber(config.rows, 1000));
-  const columns = Math.max(1, syntheticNumber(config.columns, 10));
-  const avgBytes = 14 + syntheticNumber(config.longTextRate, 0) * 0.9 + syntheticNumber(config.japaneseRate, 0) * 0.08;
-  const bytes = Math.round(rows * columns * avgBytes);
-  return {
-    rows,
-    columns,
-    bytes,
-    mb: bytes / 1024 / 1024,
-    chunkSize: Math.max(1000, syntheticNumber(config.syntheticChunkSize, 50000)),
-    purpose: rows >= 1000000 ? "大規模性能テスト" : rows >= 100000 ? "通常性能テスト" : "機能確認",
-  };
-}
-
-function SyntheticDataPanel({
-  config,
-  setField,
-  previewTable,
-  status,
-  summary,
-  onPreview,
-  onGenerate,
-  onCancel,
-  busy,
-}) {
-  const estimate = estimateSyntheticDataset(config);
-  const preset = SYNTHETIC_UI_PRESETS.find((x) => x.value === config.preset) || SYNTHETIC_UI_PRESETS[0];
-
-  return (
-    <Box sx={{ display:"grid", gridTemplateColumns:{ xs:"minmax(0, 1fr)", lg:"420px minmax(0, 1fr)" }, gap:0.75, minWidth:0 }}>
-      <Stack spacing={0.75} sx={{ minWidth:0 }}>
-        <Section title="Synthetic Data Generator" icon={<Article fontSize="small" />} hint="データ本体は持たず、種類・量・乱れ・文字形式からWorker内でchunk生成します。" hideCollapse>
-          <Stack spacing={0.75}>
-            <Alert severity="info">
-              サンプルデータをハードコードせず、seedとパラメータから再現可能に生成します。同じseedなら同じCSVになります。
-            </Alert>
-
-            <Typography variant="subtitle2" sx={{ fontWeight:900 }}>1. データの種類</Typography>
-            <TextField select label="データ種類" value={config.preset} onChange={(e)=>setField("preset", e.target.value)} fullWidth>
-              {SYNTHETIC_UI_PRESETS.map((item)=><MenuItem key={item.value} value={item.value}>{item.label}：{item.help}</MenuItem>)}
-            </TextField>
-            <Typography variant="caption" color="text.secondary">{preset.help}</Typography>
-
-            <Divider />
-
-            <Typography variant="subtitle2" sx={{ fontWeight:900 }}>2. データ量</Typography>
-            <Box sx={{ display:"grid", gridTemplateColumns:"repeat(2, minmax(0, 1fr))", gap:0.75 }}>
-              <SmallNumberField label="行数" value={config.rows} onChange={(v)=>setField("rows", v)} min="1" step="1000" sx={{ width:"100%" }} />
-              <SmallNumberField label="列数" value={config.columns} onChange={(v)=>setField("columns", v)} min="1" max="300" step="1" sx={{ width:"100%" }} />
-              <SmallNumberField label="生成単位" value={config.syntheticChunkSize} onChange={(v)=>setField("syntheticChunkSize", v)} min="1000" step="1000" sx={{ width:"100%" }} />
-              <TextField label="再現番号 seed" value={config.seed} onChange={(e)=>setField("seed", e.target.value)} helperText="同じ番号なら同じデータ" />
-            </Box>
-
-            <Divider />
-
-            <Typography variant="subtitle2" sx={{ fontWeight:900 }}>3. データの乱れ具合</Typography>
-            <Box sx={{ display:"grid", gridTemplateColumns:"repeat(2, minmax(0, 1fr))", gap:0.75 }}>
-              <SmallNumberField label="欠損率 %" value={config.nullRate} onChange={(v)=>setField("nullRate", v)} min="0" max="100" step="0.1" sx={{ width:"100%" }} />
-              <SmallNumberField label="重複率 %" value={config.duplicateRate} onChange={(v)=>setField("duplicateRate", v)} min="0" max="100" step="0.1" sx={{ width:"100%" }} />
-              <SmallNumberField label="外れ値率 %" value={config.outlierRate} onChange={(v)=>setField("outlierRate", v)} min="0" max="100" step="0.1" sx={{ width:"100%" }} />
-              <SmallNumberField label="空文字率 %" value={config.emptyRate} onChange={(v)=>setField("emptyRate", v)} min="0" max="100" step="0.1" sx={{ width:"100%" }} />
-              <SmallNumberField label="長文率 %" value={config.longTextRate} onChange={(v)=>setField("longTextRate", v)} min="0" max="100" step="0.1" sx={{ width:"100%" }} />
-              <SmallNumberField label="日本語率 %" value={config.japaneseRate} onChange={(v)=>setField("japaneseRate", v)} min="0" max="100" step="1" sx={{ width:"100%" }} />
-            </Box>
-            <Typography variant="caption" color="text.secondary">
-              欠損・重複・外れ値を増やすほど、型推定・検索・集計のテストが厳しくなります。
-            </Typography>
-
-            <Divider />
-
-            <Typography variant="subtitle2" sx={{ fontWeight:900 }}>4. 日本語・文字形式</Typography>
-            <Box sx={{ display:"grid", gridTemplateColumns:"repeat(2, minmax(0, 1fr))", gap:0.75 }}>
-              <TextField select label="日付形式" value={config.dateMode} onChange={(e)=>setField("dateMode", e.target.value)}>
-                <MenuItem value="iso">ISO: 2026-05-28</MenuItem>
-                <MenuItem value="slash">スラッシュ: 2026/05/28</MenuItem>
-                <MenuItem value="jp">日本語: 2026年05月28日</MenuItem>
-                <MenuItem value="mixed">混在</MenuItem>
-              </TextField>
-              <TextField select label="数値形式" value={config.numberMode} onChange={(e)=>setField("numberMode", e.target.value)}>
-                <MenuItem value="plain">数値: 1234</MenuItem>
-                <MenuItem value="comma">カンマ: 1,234</MenuItem>
-                <MenuItem value="yen">円記号: ¥1,234</MenuItem>
-                <MenuItem value="mixed">混在</MenuItem>
-              </TextField>
-            </Box>
-
-            <Divider />
-
-            <Typography variant="subtitle2" sx={{ fontWeight:900 }}>5. 出力方法</Typography>
-            <TextField select label="出力方法" value={config.outputMode} onChange={(e)=>setField("outputMode", e.target.value)} fullWidth>
-              <MenuItem value="open">生成してすぐ開く</MenuItem>
-              <MenuItem value="opfs">OPFSへ保存して開く</MenuItem>
-              <MenuItem value="download">CSVをダウンロード</MenuItem>
-              <MenuItem value="graphSet">Graph用CSVセットをダウンロード</MenuItem>
-            </TextField>
-            <Typography variant="caption" color="text.secondary">
-              すぐ試すなら「生成してすぐ開く」。Graph Join検証なら「Graph用CSVセット」を使います。
-            </Typography>
-
-            <Stack direction="row" useFlexGap flexWrap="wrap" spacing={0.75}>
-              <Button variant="outlined" startIcon={<Search />} onClick={onPreview} disabled={busy}>プレビュー生成</Button>
-              <Button variant="contained" startIcon={<Send />} onClick={onGenerate} disabled={busy}>生成開始</Button>
-              <Button color="warning" onClick={onCancel} disabled={!busy}>キャンセル</Button>
-            </Stack>
-          </Stack>
-        </Section>
-      </Stack>
-
-      <Stack spacing={0.75} sx={{ minWidth:0 }}>
-        <Section title="生成見積もり" icon={<Schema fontSize="small" />} hint="生成前にサイズと用途を確認します。" hideCollapse>
-          <Stack direction="row" useFlexGap flexWrap="wrap" spacing={0.6} sx={{ mb:0.75 }}>
-            <Chip color="primary" label={`${fmt(estimate.rows)} rows`} />
-            <Chip label={`${fmt(estimate.columns)} cols`} />
-            <Chip label={`約 ${estimate.mb.toFixed(1)} MB`} />
-            <Chip label={`chunk ${fmt(estimate.chunkSize)} rows`} />
-            <Chip color={estimate.rows >= 1000000 ? "warning" : "success"} label={estimate.purpose} />
-          </Stack>
-          <Box sx={{ display:"grid", gridTemplateColumns:{ xs:"1fr", sm:"repeat(2, 1fr)" }, gap:0.5 }}>
-            <Typography variant="body2">データ種類：{preset.label}</Typography>
-            <Typography variant="body2">再現番号：{config.seed}</Typography>
-            <Typography variant="body2">欠損率：{syntheticRateLabel(config.nullRate)}</Typography>
-            <Typography variant="body2">重複率：{syntheticRateLabel(config.duplicateRate)}</Typography>
-            <Typography variant="body2">外れ値率：{syntheticRateLabel(config.outlierRate)}</Typography>
-            <Typography variant="body2">日本語率：{syntheticRateLabel(config.japaneseRate)}</Typography>
-          </Box>
-          {estimate.rows >= 1000000 && (
-            <Alert severity="warning" sx={{ mt:0.75 }}>
-              100万行以上は生成・保存に時間がかかります。途中でキャンセルできます。
-            </Alert>
-          )}
-        </Section>
-
-        <Section title="生成結果 / プレビュー" icon={<TableChart fontSize="small" />} hint="プレビューは先頭行だけ生成します。本生成はWorkerでchunk処理します。" hideCollapse>
-          <Stack direction="row" useFlexGap flexWrap="wrap" spacing={0.6} sx={{ mb:0.75 }}>
-            <Chip color={busy ? "warning" : "default"} label={busy ? "生成中" : "待機中"} />
-            {summary?.rows != null && <Chip label={`${fmt(summary.rows)} rows`} />}
-            {summary?.columns != null && <Chip label={`${fmt(summary.columns)} cols`} />}
-            {summary?.approxMB != null && <Chip label={`約 ${fmt(summary.approxMB)} MB`} />}
-          </Stack>
-          <Typography variant="body2" color="text.secondary" sx={{ mb:0.75 }}>{status || "プレビュー生成または生成開始を実行してください。"}</Typography>
-          {previewTable?.header?.length ? (
-            <DataTable table={previewTable} tableId="syntheticPreview" height={360} />
-          ) : (
-            <Alert severity="info">
-              「プレビュー生成」で、現在のパラメータが実際の列・値にどう反映されるか確認できます。
-            </Alert>
-          )}
-        </Section>
-      </Stack>
-    </Box>
   );
 }
 
@@ -12129,6 +12359,258 @@ function createRuntimeMetrics() {
 }
 
 
+function createInitialAppRuntimeSurface() {
+  return {
+    progress: 0,
+    progressText: "Ready",
+    busy: false,
+    busyLabel: "",
+    logs: [],
+    status: "CSVを選択してAnalyze Schemaを実行してください。",
+  };
+}
+
+function appRuntimeSurfaceReducer(state, action) {
+  if (!action || !action.type) return state;
+
+  if (action.type === "runtime/set") {
+    const key = action.key;
+    if (!Object.prototype.hasOwnProperty.call(state, key)) return state;
+    const nextValue = typeof action.valueOrUpdater === "function"
+      ? action.valueOrUpdater(state[key])
+      : action.valueOrUpdater;
+    if (Object.is(state[key], nextValue)) return state;
+    return { ...state, [key]: nextValue };
+  }
+
+  if (action.type === "runtime/batch") {
+    const patch = action.patch || {};
+    let changed = false;
+    const next = { ...state };
+    for (const key of Object.keys(patch)) {
+      if (!Object.prototype.hasOwnProperty.call(state, key)) continue;
+      const value = patch[key];
+      if (!Object.is(next[key], value)) {
+        next[key] = value;
+        changed = true;
+      }
+    }
+    return changed ? next : state;
+  }
+
+  return state;
+}
+
+function createRuntimeSurfaceSetter(dispatch, key) {
+  return function setRuntimeSurfaceValue(valueOrUpdater) {
+    dispatch({ type: "runtime/set", key, valueOrUpdater });
+  };
+}
+
+
+
+
+function createDefaultSyntheticPlanState() {
+  return {
+    preset: "sales",
+    rows: "100000",
+    columns: "30",
+    chunkSize: "50000",
+    seed: "42",
+    nullRate: "0.01",
+    duplicateRate: "0.02",
+    outlierRate: "0.001",
+    emptyRate: "0.01",
+    longTextRate: "0",
+    japaneseRate: "0.3",
+    dateMode: "mixed",
+    numberMode: "mixed",
+    encodingHint: "utf8",
+    outputMode: "open",
+    datasetName: "synthetic_sales_100k_seed42",
+  };
+}
+
+function buildSyntheticPlanFromUi(config) {
+  const preset = String(config.preset || "sales");
+  const rows = Number(config.rows || 100000);
+  const seed = Number(config.seed || 42);
+  return {
+    preset,
+    rows,
+    columns: Number(config.columns || 30),
+    chunkSize: Number(config.chunkSize || 50000),
+    seed,
+    quality: {
+      nullRate: Number(config.nullRate || 0),
+      duplicateRate: Number(config.duplicateRate || 0),
+      outlierRate: Number(config.outlierRate || 0),
+      emptyRate: Number(config.emptyRate || 0),
+      longTextRate: Number(config.longTextRate || 0),
+      japaneseRate: Number(config.japaneseRate || 0),
+    },
+    format: {
+      dateMode: config.dateMode || "mixed",
+      numberMode: config.numberMode || "mixed",
+      encodingHint: config.encodingHint || "utf8",
+    },
+    output: {
+      mode: config.outputMode || "open",
+      datasetName: config.datasetName || `synthetic_${preset}_${rows}_seed${seed}`,
+    },
+  };
+}
+
+function SyntheticDatasetPanel({ busy, previewTable, reportRows, progress, status, time, result, onPreview, onGenerate, onCancel, onClear, onDownloadFile }) {
+  const [config, setConfig] = useState(() => createDefaultSyntheticPlanState());
+  const update = (key) => (eventOrValue) => {
+    const value = eventOrValue?.target ? eventOrValue.target.value : eventOrValue;
+    setConfig((current) => {
+      const next = { ...current, [key]: value };
+      if (key === "preset" || key === "rows" || key === "seed") {
+        const preset = key === "preset" ? value : next.preset;
+        const rows = key === "rows" ? value : next.rows;
+        const seed = key === "seed" ? value : next.seed;
+        next.datasetName = `synthetic_${preset}_${rows || 0}_seed${seed || 42}`.replace(/[^a-zA-Z0-9_.-]+/g, "_").slice(0, 80);
+      }
+      return next;
+    });
+  };
+
+  const plan = useMemo(() => buildSyntheticPlanFromUi(config), [config]);
+  const estimatedBytes = Math.round(Number(plan.rows || 0) * Number(plan.columns || 0) * 18);
+  const largeWarning = Number(plan.rows || 0) >= 1000000;
+  const outputLabel = {
+    open: "生成してすぐ開く",
+    opfs: "OPFSへ保存して開く",
+    download: "CSVをダウンロード",
+    graphSet: "Graph用CSVセットをダウンロード",
+  }[config.outputMode] || config.outputMode;
+
+  return (
+    <Box sx={{ display: "grid", gridTemplateColumns: { xs: "minmax(0, 1fr)", lg: "390px minmax(0, 1fr)" }, gap: 0.75, minWidth: 0 }}>
+      <Section title="Synthetic Data Generator" icon={<Article />} hint="PlanだけをUIで保持し、Workerがseed付きchunk単位で生成します。Open/OPFSはCSVを経由せずDirect Columnar Sinkへ流します。">
+        <Stack spacing={0.9}>
+          <Alert severity="info">
+            大規模データはWorker内で生成します。UI stateに全行は保持しません。Search / Pivot / Time / Graph Query / D3の性能検証に使えます。
+          </Alert>
+
+          <TextField select label="1. データの種類" size="small" value={config.preset} onChange={update("preset")} fullWidth>
+            <MenuItem value="sales">売上データ / Sales</MenuItem>
+            <MenuItem value="iot">センサーログ / IoT</MenuItem>
+            <MenuItem value="finance">取引データ / Finance</MenuItem>
+            <MenuItem value="access">アクセスログ / Access</MenuItem>
+            <MenuItem value="graph">Graph結合用データ / Graph</MenuItem>
+          </TextField>
+
+          <Box sx={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 0.75 }}>
+            <TextField label="行数" type="number" size="small" value={config.rows} onChange={update("rows")} inputProps={{ min: 1, max: 5000000, step: 10000 }} />
+            <TextField label="列数" type="number" size="small" value={config.columns} onChange={update("columns")} inputProps={{ min: 1, max: 300, step: 1 }} />
+            <TextField label="生成単位 / chunkSize" type="number" size="small" value={config.chunkSize} onChange={update("chunkSize")} inputProps={{ min: 1000, max: 100000, step: 1000 }} />
+            <TextField label="再現番号 / seed" type="number" size="small" value={config.seed} onChange={update("seed")} inputProps={{ min: 0, max: 2147483647, step: 1 }} />
+          </Box>
+
+          <Typography variant="subtitle2" sx={{ fontWeight: 900 }}>3. データの乱れ具合</Typography>
+          <Box sx={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 0.75 }}>
+            <TextField label="欠損率" type="number" size="small" value={config.nullRate} onChange={update("nullRate")} inputProps={{ min: 0, max: 1, step: 0.001 }} />
+            <TextField label="重複率" type="number" size="small" value={config.duplicateRate} onChange={update("duplicateRate")} inputProps={{ min: 0, max: 1, step: 0.001 }} />
+            <TextField label="外れ値率" type="number" size="small" value={config.outlierRate} onChange={update("outlierRate")} inputProps={{ min: 0, max: 1, step: 0.001 }} />
+            <TextField label="空文字率" type="number" size="small" value={config.emptyRate} onChange={update("emptyRate")} inputProps={{ min: 0, max: 1, step: 0.001 }} />
+            <TextField label="長文率" type="number" size="small" value={config.longTextRate} onChange={update("longTextRate")} inputProps={{ min: 0, max: 1, step: 0.001 }} />
+            <TextField label="日本語率" type="number" size="small" value={config.japaneseRate} onChange={update("japaneseRate")} inputProps={{ min: 0, max: 1, step: 0.01 }} />
+          </Box>
+
+          <Typography variant="subtitle2" sx={{ fontWeight: 900 }}>4. 日本語・文字形式</Typography>
+          <Box sx={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 0.75 }}>
+            <TextField select label="日付形式" size="small" value={config.dateMode} onChange={update("dateMode")}>
+              <MenuItem value="iso">ISO</MenuItem>
+              <MenuItem value="slash">slash</MenuItem>
+              <MenuItem value="mixed">mixed</MenuItem>
+            </TextField>
+            <TextField select label="数値形式" size="small" value={config.numberMode} onChange={update("numberMode")}>
+              <MenuItem value="raw">raw</MenuItem>
+              <MenuItem value="comma">comma</MenuItem>
+              <MenuItem value="currency">currency</MenuItem>
+              <MenuItem value="mixed">mixed</MenuItem>
+            </TextField>
+            <TextField select label="文字コード想定" size="small" value={config.encodingHint} onChange={update("encodingHint")}>
+              <MenuItem value="utf8">UTF-8</MenuItem>
+              <MenuItem value="sjis">Shift-JIS系テスト</MenuItem>
+            </TextField>
+            <TextField select label="出力方法" size="small" value={config.outputMode} onChange={update("outputMode")}>
+              <MenuItem value="open">生成してすぐ開く</MenuItem>
+              <MenuItem value="opfs">OPFSへ保存して開く</MenuItem>
+              <MenuItem value="download">CSVをダウンロード</MenuItem>
+              <MenuItem value="graphSet">Graph用CSVセットをダウンロード</MenuItem>
+            </TextField>
+          </Box>
+
+          <TextField label="Dataset name" size="small" value={config.datasetName} onChange={update("datasetName")} fullWidth />
+
+          {largeWarning && <Alert severity="warning">100万行以上です。Workerで生成するためUIは固まりませんが、完了まで時間がかかります。途中キャンセルできます。</Alert>}
+
+          <Stack direction="row" spacing={0.75} useFlexGap flexWrap="wrap">
+            <Button variant="outlined" startIcon={<Article />} onClick={() => onPreview?.(plan)} disabled={busy}>Preview 100</Button>
+            <Button variant="contained" color="success" startIcon={<Storage />} onClick={() => onGenerate?.(plan)} disabled={busy}>Generate</Button>
+            <Button color="warning" onClick={onCancel} disabled={!busy}>Cancel</Button>
+            <Button onClick={onClear}>Clear</Button>
+          </Stack>
+
+          <KeyValue rows={[
+            ["Preset", config.preset],
+            ["Output", outputLabel],
+            ["Rows", fmt(plan.rows)],
+            ["Columns", fmt(plan.columns)],
+            ["Chunk size", fmt(plan.chunkSize)],
+            ["Seed", plan.seed],
+            ["Estimated bytes", humanBytes(estimatedBytes)],
+            ["Status", status || ""],
+            ["Elapsed", time || ""],
+          ]} />
+        </Stack>
+      </Section>
+
+      <Stack spacing={0.75} sx={{ minWidth: 0 }}>
+        <Section title="6. 生成見積もり / Progress" icon={<Timeline />}>
+          <LinearProgress variant={busy ? "determinate" : "determinate"} value={Number(progress?.percent || 0)} />
+          <KeyValue rows={[
+            ["Generated rows", `${fmt(progress?.generatedRows || 0)} / ${fmt(progress?.totalRows || plan.rows || 0)}`],
+            ["Percent", `${fmt(progress?.percent || 0)}%`],
+            ["Estimated bytes", humanBytes(progress?.estimatedBytes || estimatedBytes)],
+            ["Chunks", fmt(progress?.chunkCount || 0)],
+            ["Mode", outputLabel],
+          ]} />
+        </Section>
+
+        <Section title="7. プレビュー" icon={<Article />} hint="Previewは最大100行だけUIへ返します。Generate時は全行をUIに保持しません。">
+          <DataTable table={previewTable} tableId="syntheticPreview" height={360} />
+          <Box sx={{ mt: 0.75 }}>
+            <KeyValue rows={reportRows || []} />
+          </Box>
+        </Section>
+
+        {result?.files?.length > 0 && (
+          <Section title="8. 生成ファイル" icon={<Download />}>
+            <Stack spacing={0.75}>
+              {result.files.map((file, index) => (
+                <Stack key={`${file.name}-${index}`} direction="row" spacing={0.75} alignItems="center" useFlexGap flexWrap="wrap">
+                  <Chip label={file.name} />
+                  <Chip label={`${fmt(file.rows || 0)} rows`} />
+                  <Chip label={humanBytes(file.bytes || 0)} />
+                  <Button size="small" startIcon={<Download />} onClick={() => onDownloadFile?.(file)}>Download</Button>
+                </Stack>
+              ))}
+              {result.relationHints?.length > 0 && (
+                <Alert severity="info">{result.relationHints.join(" / ")}</Alert>
+              )}
+            </Stack>
+          </Section>
+        )}
+      </Stack>
+    </Box>
+  );
+}
+
 
 function App() {
   const workerRef = useRef(null);
@@ -12177,17 +12659,18 @@ function App() {
 
   const [mainPanel, setMainPanel] = useState(({ import: "management", workspace: "work" }[initialSettings.mainPanel] || initialSettings.mainPanel || "management"));
   const [tab, setTab] = useState(initialSettings.tab || "clean");
-  const [progress, setProgress] = useState(0);
-  const [progressText, setProgressText] = useState("Ready");
-  const [busy, setBusy] = useState(false);
-  const [busyLabel, setBusyLabel] = useState("");
-  const [logs, setLogs] = useState([]);
-  const [status, setStatus] = useState("CSVを選択してAnalyze Schemaを実行してください。");
-
-  const [syntheticConfig, setSyntheticConfig] = useState(() => ({ ...SYNTHETIC_DEFAULT_CONFIG }));
-  const [syntheticPreviewTable, setSyntheticPreviewTable] = useState(null);
-  const [syntheticStatus, setSyntheticStatus] = useState("パラメータを指定して、テスト用データを生成できます。");
-  const [syntheticSummary, setSyntheticSummary] = useState(null);
+  const [runtimeSurface, dispatchRuntimeSurface] = useReducer(
+    appRuntimeSurfaceReducer,
+    null,
+    createInitialAppRuntimeSurface
+  );
+  const { progress, progressText, busy, busyLabel, logs, status } = runtimeSurface;
+  const setProgress = useMemo(() => createRuntimeSurfaceSetter(dispatchRuntimeSurface, "progress"), []);
+  const setProgressText = useMemo(() => createRuntimeSurfaceSetter(dispatchRuntimeSurface, "progressText"), []);
+  const setBusy = useMemo(() => createRuntimeSurfaceSetter(dispatchRuntimeSurface, "busy"), []);
+  const setBusyLabel = useMemo(() => createRuntimeSurfaceSetter(dispatchRuntimeSurface, "busyLabel"), []);
+  const setLogs = useMemo(() => createRuntimeSurfaceSetter(dispatchRuntimeSurface, "logs"), []);
+  const setStatus = useMemo(() => createRuntimeSurfaceSetter(dispatchRuntimeSurface, "status"), []);
 
   const [schema, setSchema] = useState(null);
   const [manifest, setManifest] = useState(null);
@@ -12284,6 +12767,17 @@ function App() {
   const [timeStatus, setTimeStatus] = useState("Columnar cacheを開いてください。");
   const [timeTime, setTimeTime] = useState("");
 
+  const [d3VizResult, setD3VizResult] = useState(null);
+  const [d3VizStatus, setD3VizStatus] = useState("Storage Datasetを開くと、D3用の全件集約Surfaceを作れます。");
+  const [d3VizTime, setD3VizTime] = useState("");
+
+  const [syntheticPreviewTable, setSyntheticPreviewTable] = useState(null);
+  const [syntheticReport, setSyntheticReport] = useState([]);
+  const [syntheticProgress, setSyntheticProgress] = useState({ generatedRows:0, totalRows:0, percent:0, elapsedMs:0, estimatedBytes:0, chunkCount:0 });
+  const [syntheticStatus, setSyntheticStatus] = useState("Planを設定してPreviewまたはGenerateを実行してください。");
+  const [syntheticTime, setSyntheticTime] = useState("");
+  const [syntheticResult, setSyntheticResult] = useState(null);
+
   const [datasets, setDatasets] = useState([]);
   const [selectedDataset, setSelectedDataset] = useState("");
   const [opfsStatus, setOpfsStatus] = useState("Refreshで保存済みデータセットを確認します。");
@@ -12367,41 +12861,6 @@ function App() {
   function appendLog(text) {
     const line = `[${new Date().toLocaleTimeString()}] ${text}`;
     setLogs((prev) => [...prev.slice(-500), line]);
-  }
-
-  function setSyntheticField(field, value) {
-    setSyntheticConfig((prev) => ({ ...prev, [field]: value }));
-  }
-
-  function syntheticPayload() {
-    return {
-      ...syntheticConfig,
-      rows:Number(syntheticConfig.rows || 1000),
-      columns:Number(syntheticConfig.columns || 10),
-      syntheticChunkSize:Number(syntheticConfig.syntheticChunkSize || 50000),
-      storageWorkspace:storageWorkspace || "Synthetic",
-      storageCollection:storageCollection || "Generated",
-      datasetName:tableName || datasetName || `synthetic_${syntheticConfig.preset}_${syntheticConfig.rows}`,
-      tableName:tableName || datasetName || `synthetic_${syntheticConfig.preset}_${syntheticConfig.rows}`,
-      previewRows:Number(previewRows || 120),
-    };
-  }
-
-  function generateSyntheticPreview() {
-    setSyntheticPreviewTable(null);
-    setSyntheticStatus("Synthetic previewを生成中です。");
-    post({ type:"GENERATE_SYNTHETIC_PREVIEW", ...syntheticPayload() });
-  }
-
-  function generateSyntheticDataset() {
-    setSyntheticStatus("Synthetic Datasetを生成中です。");
-    setSyntheticSummary(null);
-    post({ type:"GENERATE_SYNTHETIC_DATASET", ...syntheticPayload() });
-  }
-
-  function cancelSyntheticGeneration() {
-    postWorkerCommand({ type:"CANCEL" });
-    setSyntheticStatus("Synthetic Dataset生成のキャンセルを要求しました。");
   }
 
 
@@ -12527,6 +12986,9 @@ function App() {
     setSearchTable(null);
     setPivotTable(null);
     setTimeTable(null);
+    setD3VizResult(null);
+    setD3VizStatus("Storage Datasetを開くと、D3用の全件集約Surfaceを作れます。");
+    setD3VizTime("");
     resetColumnState([]);
     if (list.length) {
       const defaultName = list.length > 1 ? `merged_${list.length}_csv` : list[0].name.replace(/\.[^.]+$/, "");
@@ -12688,6 +13150,9 @@ function App() {
     setPage(1);
     setDataQueryActive(false);
     setDataQueryCount(0);
+    setD3VizResult(null);
+    setD3VizStatus("Datasetを開きました。Visualizeタブで全件集約Surfaceを作成できます。");
+    setD3VizTime("");
 
     if (status) setStatus(status);
     if (logMessage) appendLog(logMessage);
@@ -12696,6 +13161,48 @@ function App() {
   function openDatasetSurface(msg, options = {}) {
     activateDatasetSurface(msg?.manifest || null, options);
     readActiveDatasetPage([]);
+  }
+
+  function runSyntheticPreview(plan) {
+    setSyntheticResult(null);
+    setSyntheticStatus("Synthetic previewを生成中...");
+    setSyntheticTime("");
+    setBusy(true);
+    setBusyLabel("Synthetic preview");
+    setProgress(1);
+    setProgressText("Synthetic preview generation...");
+    postWorkerCommand({ type: "GENERATE_SYNTHETIC_PREVIEW", plan });
+  }
+
+  function runSyntheticGenerate(plan) {
+    setSyntheticResult(null);
+    setSyntheticStatus("Synthetic datasetを生成中...");
+    setSyntheticTime("");
+    setSyntheticProgress({ generatedRows:0, totalRows:Number(plan?.rows || 0), percent:0, elapsedMs:0, estimatedBytes:0, chunkCount:0 });
+    setBusy(true);
+    setBusyLabel("Synthetic generation");
+    setProgress(1);
+    setProgressText("Synthetic dataset generation...");
+    postWorkerCommand({ type: "GENERATE_SYNTHETIC_DATASET", plan });
+  }
+
+  function cancelSyntheticGeneration() {
+    postWorkerCommand({ type: "CANCEL_SYNTHETIC_GENERATION" });
+    postWorkerCommand({ type: "CANCEL" });
+    setSyntheticStatus("キャンセルを要求しました。chunk境界で停止します。");
+  }
+
+  function clearSyntheticSurface() {
+    setSyntheticPreviewTable(null);
+    setSyntheticReport([]);
+    setSyntheticProgress({ generatedRows:0, totalRows:0, percent:0, elapsedMs:0, estimatedBytes:0, chunkCount:0 });
+    setSyntheticStatus("Synthetic状態をクリアしました。");
+    setSyntheticTime("");
+    setSyntheticResult(null);
+  }
+
+  function downloadSyntheticFile(file) {
+    if (file?.blob) downloadBlob(file.name || "synthetic.csv", file.blob);
   }
 
 
@@ -12967,6 +13474,9 @@ function App() {
         setPivotTileView(null);
         setTimeTable(null);
         setSearchTable(null);
+        setD3VizResult(null);
+        setD3VizStatus("Storage Datasetを開くと、D3用の全件集約Surfaceを作れます。");
+        setD3VizTime("");
         setVisibleCols([]);
         setPurgeConfirm("");
         setStatus("現在セッションを破棄しました。OPFS内の保存済みデータセットは残っています。");
@@ -13138,6 +13648,95 @@ function App() {
         return;
       },
 
+      "D3_VIZ_SURFACE_DONE"(msg) {
+        const surface = msg.surface || null;
+        setD3VizResult(surface);
+        setD3VizStatus(`D3 Surface ready: ${surface?.kind || "surface"} / marks ${fmt(surface?.reducedRows || 0)} / scanned ${fmt(surface?.scanned || 0)} rows`);
+        setD3VizTime(ms(msg.ms));
+        setBusy(false);
+        setBusyLabel("");
+        return;
+      },
+
+      "SYNTHETIC_PREVIEW_DONE"(msg) {
+        setSyntheticPreviewTable({ header: msg.header || [], rows: msg.rows || [] });
+        setSyntheticReport(Object.entries(msg.report || {}).map(([k, v]) => [k, typeof v === "number" ? fmt(v) : String(v)]));
+        setSyntheticProgress({ generatedRows:msg.rows?.length || 0, totalRows:msg.plan?.rows || msg.report?.estimatedRows || 0, percent:100, elapsedMs:msg.report?.ms || 0, estimatedBytes:msg.report?.estimatedBytes || 0, chunkCount:0 });
+        setSyntheticStatus(`Preview ready: ${fmt(msg.rows?.length || 0)} rows / ${fmt(msg.header?.length || 0)} columns`);
+        setSyntheticTime(ms(msg.report?.ms));
+        setBusy(false);
+        setBusyLabel("");
+        return;
+      },
+
+      "SYNTHETIC_PROGRESS"(msg) {
+        setSyntheticProgress({
+          generatedRows:Number(msg.generatedRows || 0),
+          totalRows:Number(msg.totalRows || 0),
+          percent:Number(msg.percent || 0),
+          elapsedMs:Number(msg.elapsedMs || 0),
+          estimatedBytes:Number(msg.estimatedBytes || 0),
+          chunkCount:Number(msg.chunkCount || 0),
+        });
+        setSyntheticStatus(`Generating: ${fmt(msg.generatedRows || 0)} / ${fmt(msg.totalRows || 0)} rows`);
+        return;
+      },
+
+      "SYNTHETIC_DATASET_DONE"(msg) {
+        setBusy(false);
+        setBusyLabel("");
+        setSyntheticTime(ms(msg.ms || msg.metrics?.syntheticGenerateMs));
+        setSyntheticStatus(`Synthetic complete: ${msg.outputMode || "dataset"}`);
+        setSyntheticProgress((current) => ({ ...current, percent:100 }));
+
+        if (msg.manifest) {
+          activateDatasetSurface(msg.manifest, {
+            clearFiles: false,
+            clearCleanTable: false,
+            progressText: "Synthetic Dataset生成完了",
+            status: `Synthetic Dataset生成完了: ${fmt(msg.manifest.totalRows)} rows / ${fmt(msg.manifest.chunks)} chunks`,
+            logMessage: `Synthetic dataset built: ${msg.manifest.id}`,
+          });
+          refreshStorageInventory();
+          readActiveDatasetPage([]);
+          setSyntheticResult({ manifest:msg.manifest, files:[] });
+          return;
+        }
+
+        if (msg.blob) {
+          const file = { name:msg.fileName || "synthetic.csv", blob:msg.blob, bytes:msg.bytes || msg.blob.size, rows:msg.rows, columns:msg.columns };
+          setSyntheticResult({ files:[file], metrics:msg.metrics || null });
+          downloadBlob(file.name, file.blob);
+          return;
+        }
+
+        if (Array.isArray(msg.files)) {
+          const files = msg.files.map((file) => ({ ...file }));
+          setSyntheticResult({ files, relationHints:msg.relationHints || [], metrics:msg.metrics || null });
+          files.forEach((file) => downloadBlob(file.name, file.blob));
+          return;
+        }
+        return;
+      },
+
+      "SYNTHETIC_CANCELLED"(msg) {
+        setBusy(false);
+        setBusyLabel("");
+        setSyntheticStatus(msg.message || "Synthetic generation cancelled");
+        setStatus(msg.message || "Synthetic generation cancelled");
+        return;
+      },
+
+      "SYNTHETIC_ERROR"(msg) {
+        setBusy(false);
+        setBusyLabel("");
+        setSyntheticStatus(msg.message || "Synthetic generation error");
+        setStatus(msg.message || "Synthetic generation error");
+        appendLog(`SYNTHETIC_ERROR: ${msg.message || "unknown"}`);
+        if (msg.stack) appendLog(String(msg.stack).split("\n").slice(0, 6).join("\n"));
+        return;
+      },
+
       "DATA_QUERY_CLEARED"(msg) {
         setDataQueryActive(false);
         setDataQueryCount(0);
@@ -13202,75 +13801,6 @@ function App() {
         return;
       },
 
-      "SYNTHETIC_PROGRESS"(msg) {
-        setProgress(msg.value ?? 0);
-        setProgressText(msg.text || "");
-        setSyntheticStatus(msg.text || "");
-        if ((msg.value ?? 0) >= 100) { setBusy(false); setBusyLabel(""); }
-        return;
-      },
-
-      "SYNTHETIC_PREVIEW_DONE"(msg) {
-        setBusy(false); setBusyLabel("");
-        setProgress(100);
-        setProgressText("Synthetic preview complete");
-        setSyntheticPreviewTable({ header:msg.header || [], rows:msg.rows || [] });
-        setSyntheticSummary(msg.summary || null);
-        setSyntheticStatus(`プレビュー生成完了: ${fmt(msg.rows?.length || 0)} rows / ${fmt(msg.header?.length || 0)} cols。seed=${msg.summary?.seed || syntheticConfig.seed}`);
-        appendLog(`Synthetic preview: ${msg.summary?.presetLabel || msg.plan?.preset || ""} / ${fmt(msg.summary?.rows || 0)} rows`);
-        return;
-      },
-
-      "SYNTHETIC_DATASET_DONE"(msg) {
-        setBusy(false); setBusyLabel("");
-        setProgress(100);
-        setProgressText("Synthetic Dataset complete");
-        setSyntheticSummary(msg.summary || null);
-
-        if (Array.isArray(msg.files) && msg.files.length) {
-          for (const item of msg.files) {
-            if (item.file) downloadBlob(item.name || item.file.name || "synthetic.csv", item.file);
-          }
-          setSyntheticStatus(`Graph用CSVセットを生成しました: ${fmt(msg.files.length)} files`);
-          appendLog(`Synthetic graph CSV set generated: ${fmt(msg.files.length)} files`);
-          return;
-        }
-
-        if (msg.file) {
-          downloadBlob(msg.filename || msg.file.name || "synthetic_dataset.csv", msg.file);
-          setSyntheticStatus(`CSVを生成しました: ${msg.filename || msg.file.name || "synthetic_dataset.csv"} / ${humanBytes(msg.bytes || msg.file.size || 0)}`);
-          appendLog(`Synthetic CSV generated: ${msg.filename || msg.file.name || ""}`);
-          return;
-        }
-
-        if (msg.manifest) {
-          activateDatasetSurface(msg.manifest, {
-            clearFiles:false,
-            clearCleanTable:false,
-            progressText:"Synthetic Dataset生成完了",
-            status:`Synthetic Datasetを開きました: ${msg.manifest.name || msg.manifest.id} / ${fmt(msg.manifest.totalRows)} rows / ${fmt(msg.manifest.columns?.length || 0)} cols`,
-            logMessage:`Synthetic dataset opened: ${msg.manifest.id}`,
-          });
-          setSyntheticStatus(`生成して開きました: ${fmt(msg.manifest.totalRows)} rows / ${fmt(msg.manifest.columns?.length || 0)} cols / seed=${msg.summary?.seed || syntheticConfig.seed}`);
-          setCleanReport([
-            ["Synthetic preset", msg.summary?.presetLabel || msg.manifest.synthetic?.presetLabel || ""],
-            ["Rows", fmt(msg.manifest.totalRows)],
-            ["Columns", fmt(msg.manifest.columns?.length || 0)],
-            ["Chunks", fmt(msg.manifest.chunks || 0)],
-            ["Seed", msg.summary?.seed || msg.manifest.synthetic?.seed || ""],
-            ["Null rate", `${Math.round((msg.summary?.nullRate || 0) * 10000) / 100}%`],
-            ["Duplicate rate", `${Math.round((msg.summary?.duplicateRate || 0) * 10000) / 100}%`],
-            ["Outlier rate", `${Math.round((msg.summary?.outlierRate || 0) * 10000) / 100}%`],
-          ]);
-          refreshStorageInventory();
-          readActiveDatasetPage([]);
-          return;
-        }
-
-        setSyntheticStatus("Synthetic Dataset生成は完了しましたが、返却形式を判定できませんでした。");
-        return;
-      },
-
     };
 
     const workerRouter = createWorkerMessageRouter(workerMessageHandlers, {
@@ -13320,6 +13850,10 @@ function App() {
       RUN_SEARCH: "検索",
       BUILD_PIVOT: "Pivot集計",
       BUILD_TIME: "時間軸集計",
+      BUILD_D3_VIZ_SURFACE: "D3全件集約Surface作成",
+      GENERATE_SYNTHETIC_PREVIEW: "Synthetic Preview生成",
+      GENERATE_SYNTHETIC_DATASET: "Synthetic Dataset生成",
+      CANCEL_SYNTHETIC_GENERATION: "Synthetic生成キャンセル",
       PERF_BENCH: "性能ベンチマーク",
       ADAPTIVE_PERF_BENCH: "Adaptive性能ベンチマーク",
       ADAPTIVE_KERNEL_STATUS: "Adaptive状態確認",
@@ -13340,8 +13874,6 @@ function App() {
       RUN_GRAPH_RESULT_SEARCH: "Graph Query結果内検索",
       BUILD_GRAPH_RESULT_PIVOT: "Graph Query結果Pivot",
       BUILD_GRAPH_RESULT_TIME: "Graph Query結果Time",
-      GENERATE_SYNTHETIC_PREVIEW: "Synthetic Preview生成",
-      GENERATE_SYNTHETIC_DATASET: "Synthetic Dataset生成",
     };
     const planner = createCommandLifecyclePlanner({
       getLabel: (message) => labels[message.type],
@@ -13448,6 +13980,25 @@ function App() {
     const row = Math.max(1, Number(jumpRow || 1));
     const next = Math.ceil(row / Number(pageSize || 500));
     readPage(next);
+  }
+
+  function runD3Visualization(plan) {
+    const source = String(plan?.dataSource || "active");
+    if (source === "graph") {
+      if (!graphResultCount || !graphResultColumns.length) {
+        setD3VizStatus("Graph Query Resultがありません。先にGraph Queryを実行してください。");
+        return;
+      }
+    } else if (!manifest) {
+      setD3VizStatus("先にStorage Datasetを開いてください。");
+      return;
+    }
+    setD3VizResult(null);
+    setD3VizStatus(source === "graph"
+      ? "WorkerでGraph Query Result Windowをチャンク走査し、D3用Surfaceを集約しています..."
+      : "WorkerでColumnar Tileを全件走査し、D3用Surfaceを集約しています...");
+    setD3VizTime("");
+    post({ type: "BUILD_D3_VIZ_SURFACE", ...plan });
   }
 
   function addDataQueryFilter() {
@@ -14575,36 +15126,11 @@ function App() {
               right={(
                 <>
           <Paper elevation={0} sx={{ mb: 0.5 }}>
-            <Tabs
-              value={tab}
-              onChange={(e, v) => setTab(v)}
-              variant="scrollable"
-              scrollButtons="auto"
-              allowScrollButtonsMobile
-              aria-label="Work tabs"
-              sx={{
-                maxWidth: "100%",
-                minHeight: 42,
-                "& .MuiTabs-scroller": { overflowX: "auto !important" },
-                "& .MuiTabs-flexContainer": { flexWrap: "nowrap" },
-                "& .MuiTab-root": {
-                  flexShrink: 0,
-                  minWidth: { xs: 96, sm: 112 },
-                  px: { xs: 1, sm: 1.5 },
-                },
-                "& .MuiTabs-scrollButtons": {
-                  width: 32,
-                  flexShrink: 0,
-                },
-                "& .MuiTabs-scrollButtons.Mui-disabled": {
-                  opacity: 0.25,
-                },
-              }}
-            >
+            <Tabs value={tab} onChange={(e, v) => setTab(v)} variant="scrollable" scrollButtons="auto">
               <Tab value="clean" icon={<CleaningServices />} iconPosition="start" label="Clean" />
               <Tab value="data" icon={<Article />} iconPosition="start" label="Data" />
               <Tab value="graph" icon={<Analytics />} iconPosition="start" label="Graph Query" />
-              <Tab value="visual" icon={<TableChart />} iconPosition="start" label="Visual" />
+              <Tab value="visualize" icon={<Timeline />} iconPosition="start" label="Visualize" />
               <Tab value="search" icon={<Search />} iconPosition="start" label="Search" />
               <Tab value="pivot" icon={<TableChart />} iconPosition="start" label="Pivot" />
               <Tab value="time" icon={<Timeline />} iconPosition="start" label="Time" />
@@ -14614,20 +15140,6 @@ function App() {
               <Tab value="log" icon={<Article />} iconPosition="start" label="Log" />
             </Tabs>
           </Paper>
-
-          {tab === "synthetic" && (
-            <SyntheticDataPanel
-              config={syntheticConfig}
-              setField={setSyntheticField}
-              previewTable={syntheticPreviewTable}
-              status={syntheticStatus}
-              summary={syntheticSummary}
-              onPreview={generateSyntheticPreview}
-              onGenerate={generateSyntheticDataset}
-              onCancel={cancelSyntheticGeneration}
-              busy={busy && String(busyLabel || "").includes("Synthetic")}
-            />
-          )}
 
           {tab === "clean" && (
             <Box sx={{ display: "grid", gridTemplateColumns: { xs: "minmax(0, 1fr)", md: "340px minmax(0, 1fr)" }, gap: 0.5, minWidth: 0, maxWidth: "100%" }}>
@@ -14795,29 +15307,24 @@ function App() {
             </Section>
           )}
 
-          {tab === "visual" && (
-            <Section title="Visual" icon={<TableChart />} hint="Active Datasetを高速VisualHyperTensor Tableで表示します。既存Data内容は変えず、表示面だけを独立タブとして復元します。">
-              <Stack direction="row" useFlexGap flexWrap="wrap" spacing={1} alignItems="center" sx={{ mb: 0.75 }}>
-                <Button onClick={() => readPage(1)}>First</Button>
-                <Button onClick={() => readPage(page - 1)}>Prev</Button>
-                <TextField label="Page" type="number" size="small" value={page} onChange={(e) => setPage(Number(e.target.value || 1))} sx={{ width: 110 }} />
-                <Typography color="text.secondary">/ {fmt(pageMax)}</Typography>
-                <Button variant="contained" onClick={() => readPage(page)}>Go</Button>
-                <Button onClick={() => readPage(page + 1)}>Next</Button>
-                <Button onClick={() => readPage(pageMax || 1)}>Last</Button>
-                <SmallNumberField label="Page size" value={pageSize} onChange={setPageSize} min="10" step="10" />
-                <SmallNumberField label="Jump row" value={jumpRow} onChange={setJumpRow} min="1" step="1" sx={{ width: 150 }} />
-                <Button onClick={goRow}>Go Row</Button>
-              </Stack>
-              <VisibleColumns columns={columns} visible={visibleCols} onChange={setVisibleCols} />
-              <Box sx={{ mt: 0.75 }}>
-                <DataTable table={dataTable} tableId="visual" />
-              </Box>
-              <Stack direction="row" justifyContent="space-between" sx={{ mt: 0.6 }}>
-                <Typography variant="caption" color="text.secondary">{dataStatus}</Typography>
-                <Typography variant="caption" color="text.secondary">{dataTime}</Typography>
-              </Stack>
-            </Section>
+
+          {tab === "visualize" && (
+            <D3VisualizationPanel
+              manifest={manifest}
+              columns={columns}
+              graphColumns={graphResultColumns}
+              graphResultCount={graphResultCount}
+              graphResultMode={graphResultMode}
+              result={d3VizResult}
+              status={d3VizStatus}
+              time={d3VizTime}
+              onRun={runD3Visualization}
+              onClear={() => {
+                setD3VizResult(null);
+                setD3VizStatus("D3 Surfaceをクリアしました。");
+                setD3VizTime("");
+              }}
+            />
           )}
 
           {tab === "search" && (
@@ -15093,6 +15600,23 @@ function App() {
             </Box>
           )}
 
+          {tab === "synthetic" && (
+            <SyntheticDatasetPanel
+              busy={busy}
+              previewTable={syntheticPreviewTable}
+              reportRows={syntheticReport}
+              progress={syntheticProgress}
+              status={syntheticStatus}
+              time={syntheticTime}
+              result={syntheticResult}
+              onPreview={runSyntheticPreview}
+              onGenerate={runSyntheticGenerate}
+              onCancel={cancelSyntheticGeneration}
+              onClear={clearSyntheticSurface}
+              onDownloadFile={downloadSyntheticFile}
+            />
+          )}
+
           {tab === "log" && (
             <Section title="Log" icon={<Article />}>
               <Box component="pre" sx={{ height: 560, overflow: "auto", m: 0, p: 2, bgcolor: "#0b1020", color: "#d1d5db", borderRadius: 1.5, fontFamily: "ui-monospace, SFMono-Regular, Menlo, Consolas, monospace", fontSize: 12, lineHeight: 1.6 }}>
@@ -15189,6 +15713,7 @@ root.render(
     import Article from "https://esm.sh/@mui/icons-material@7.3.5/Article?deps=react@19.2.0,react-dom@19.2.0";
     import * as ReactFlowLib from "https://esm.sh/@xyflow/react@12.8.4?deps=react@19.2.0,react-dom@19.2.0";
     import * as HtmlToImage from "https://esm.sh/html-to-image@1.11.11";
+    import * as d3 from "https://esm.sh/d3@7.9.0";
 
     const MaterialIcons = {
       UploadFile,
@@ -15228,10 +15753,11 @@ root.render(
       "MaterialIcons",
       "ReactFlowLib",
       "HtmlToImage",
+      "d3",
       code
     );
 
-    runApp(React, createRoot, MaterialUI, MaterialIcons, ReactFlowLib, HtmlToImage);
+    runApp(React, createRoot, MaterialUI, MaterialIcons, ReactFlowLib, HtmlToImage, d3);
   </script>
 </body>
 </html>
