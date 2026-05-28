@@ -2380,16 +2380,63 @@ async function executeChunkExecutionPlan(plan, options={}){
 
 const REMOTE_EXECUTION_ADAPTER_VERSION = 1;
 
+function validateSafeEndpoint(rawEndpoint, { allowLocalhost = false } = {}) {
+  const raw = String(rawEndpoint || "").trim();
+  if (!raw) return { endpoint: "", error: "" };
+
+  let url;
+  try {
+    url = new URL(raw);
+  } catch {
+    return { endpoint: "", error: "Endpoint URL is invalid" };
+  }
+
+  const host = String(url.hostname || "").toLowerCase();
+  const isLocalhost = host === "localhost" || host === "127.0.0.1" || host === "::1";
+  const isPrivateIpv4 =
+    /^10\./.test(host) ||
+    /^192\.168\./.test(host) ||
+    /^172\.(1[6-9]|2\d|3[0-1])\./.test(host) ||
+    /^169\.254\./.test(host) ||
+    host === "0.0.0.0";
+  const isPrivateIpv6 = host === "::" || host === "::1" || /^f[cd][0-9a-f]{2}:/i.test(host) || /^fe80:/i.test(host);
+  const isMetadata = host === "169.254.169.254";
+
+  if (url.username || url.password) {
+    return { endpoint: "", error: "Endpoint credentials in URL are not allowed" };
+  }
+
+  if (url.protocol !== "https:") {
+    const devHttpAllowed = allowLocalhost && url.protocol === "http:" && isLocalhost;
+    if (!devHttpAllowed) {
+      return { endpoint: "", error: "Endpoint must use HTTPS" };
+    }
+  }
+
+  if (!allowLocalhost && (isLocalhost || isPrivateIpv4 || isPrivateIpv6 || isMetadata)) {
+    return { endpoint: "", error: "Private or local network endpoints are not allowed" };
+  }
+
+  if (["file:", "javascript:", "data:", "blob:"].includes(url.protocol)) {
+    return { endpoint: "", error: "Endpoint protocol is not allowed" };
+  }
+
+  url.hash = "";
+  return { endpoint: url.toString().replace(/\/+$/g, ""), error: "" };
+}
+
 function normalizeRemoteExecutionConfig(config={}){
-  const endpoint=String(config.endpoint || "").trim();
   const mode=["off","local-first","remote-first","remote-only"].includes(config.mode) ? config.mode : (config.enabled ? "remote-first" : "off");
+  const checked=validateSafeEndpoint(config.endpoint, { allowLocalhost: !!config.allowLocalhostDev });
   return {
-    enabled:!!config.enabled && !!endpoint && mode !== "off",
-    endpoint,
+    enabled:!!config.enabled && !!checked.endpoint && mode !== "off" && !checked.error,
+    endpoint:checked.endpoint,
     token:String(config.token || ""),
     mode,
     timeoutMs:Math.max(5000, Math.min(15 * 60 * 1000, Number(config.timeoutMs || 120000))),
-    lastProbe:config.lastProbe || null
+    allowLocalhostDev:!!config.allowLocalhostDev,
+    lastProbe:config.lastProbe || null,
+    lastError:checked.error || ""
   };
 }
 
@@ -2407,6 +2454,7 @@ function remoteExecutionStatus(extra={}){
     mode:cfg.mode || "off",
     timeoutMs:Number(cfg.timeoutMs || 120000),
     lastProbe:cfg.lastProbe || null,
+    lastError:cfg.lastError || "",
     ...extra
   };
 }
@@ -2495,7 +2543,7 @@ function normalizeRemoteExecutionResult(plan, options, chunks, response, t0){
 
 async function probeRemoteExecution(config={}){
   const merged=normalizeRemoteExecutionConfig({...state.remoteExecution,...config,enabled:true});
-  if (!merged.endpoint) throw new Error("Remote execution endpoint is empty");
+  if (!merged.endpoint) throw new Error(merged.lastError || "Remote execution endpoint is empty");
   const t0=now();
   const response=await fetchJsonWithTimeout(merged.endpoint,{protocol:"quantum-csv-grid.remote-execution.v1",type:"PING",createdAt:new Date().toISOString()},{token:merged.token,timeoutMs:Math.min(merged.timeoutMs,15000)});
   state.remoteExecution={...merged,lastProbe:{ok:true,checkedAt:new Date().toISOString(),ms:Math.round(now()-t0),response}};
@@ -2523,13 +2571,14 @@ function normalizeExternalStoragePrefix(prefix){
 
 function normalizeExternalStorageConfig(config={}){
   const provider=["custom-http","s3-compatible"].includes(config.provider) ? config.provider : "custom-http";
-  const endpoint=String(config.endpoint || "").trim().replace(/\/+$/g, "");
+  const checked=validateSafeEndpoint(config.endpoint, { allowLocalhost: !!config.allowLocalhostDev });
+  const endpoint=checked.endpoint;
   const authMode=["none","bearer","api-key"].includes(config.authMode) ? config.authMode : "none";
   const bucket=String(config.bucket || "").trim().replace(/^\/+|\/+$/g, "");
   const accessKeyId=String(config.accessKeyId || config.apiKey || "");
   const secretAccessKey=String(config.secretAccessKey || "");
   return {
-    enabled:!!config.enabled && !!endpoint && (provider !== "s3-compatible" || (!!bucket && !!accessKeyId && !!secretAccessKey)),
+    enabled:!!config.enabled && !!endpoint && !checked.error && (provider !== "s3-compatible" || (!!bucket && !!accessKeyId && !!secretAccessKey)),
     provider,
     endpoint,
     authMode,
@@ -2542,7 +2591,9 @@ function normalizeExternalStorageConfig(config={}){
     secretAccessKey,
     sessionToken:String(config.sessionToken || ""),
     forcePathStyle:config.forcePathStyle !== false,
-    lastProbe:config.lastProbe || null
+    allowLocalhostDev:!!config.allowLocalhostDev,
+    lastProbe:config.lastProbe || null,
+    lastError:checked.error || ""
   };
 }
 
@@ -2568,6 +2619,7 @@ function externalStorageStatus(extra={}){
     hasAccessKeyId:!!cfg.accessKeyId,
     hasSecretAccessKey:!!cfg.secretAccessKey,
     hasSessionToken:!!cfg.sessionToken,
+    lastError:cfg.lastError || "",
     ...extra
   };
 }
@@ -2751,6 +2803,9 @@ function externalDatasetIdFromManifestPath(path){
 
 async function testExternalStorage(config={}){
   configureExternalStorage({...state.externalStorage,...config,enabled:true});
+  if (!state.externalStorage?.enabled) {
+    return externalStorageStatus({ok:false,message:state.externalStorage?.lastError || "External Storage is not connected"});
+  }
   const t0=now();
   const prefix=`${normalizeExternalStoragePrefix(state.externalStorage.prefix)}/datasets/`;
   try{
@@ -5939,136 +5994,444 @@ async function buildTimeSeries({timeField, bucket, groupField, valueField, aggre
 
 function csvEscape(v){
   if (v == null) return "";
-  let s=String(v).replaceAll('"','""');
+
+  let s = String(v);
+
+  // Spreadsheet Formula Injection対策: Excel/Sheetsで式として解釈される先頭文字を無効化する。
+  if (/^[=+\-@\t\r]/.test(s)) {
+    s = `'${s}`;
+  }
+
+  s = s.replaceAll('"', '""');
+
   return /[",\r\n]/.test(s) ? `"${s}"` : s;
 }
 
 
-const GRAPH_DERIVED_FORBIDDEN_WORKER = /\b(?:window|document|self|globalThis|Function|eval|fetch|XMLHttpRequest|WebSocket|Worker|importScripts|postMessage|navigator|localStorage|indexedDB|crypto|process|require)\b/;
-const GRAPH_DERIVED_FN_CACHE_WORKER = new Map();
+const SAFE_FORMULA_MAX_LENGTH = 500;
+const SAFE_FORMULA_MAX_TOKENS = 120;
+const SAFE_FORMULA_MAX_RESULT_LENGTH = 50000;
+const SAFE_REGEX_MAX_PATTERN_LENGTH = 160;
 
-function normalizeGraphDerivedColumnsForWorker(items){
-  return (Array.isArray(items) ? items : [])
-    .map((d, i) => ({
-      id:String(d?.id || `derived_${i+1}`),
-      newColumnName:String(d?.newColumnName || d?.name || `new_column_${i+1}`).trim() || `new_column_${i+1}`,
-      valueMode:String(d?.valueMode || "constant"),
-      constantValue:d?.constantValue ?? "",
-      formulaExpression:String(d?.formulaExpression || "")
-    }))
-    .filter((d) => d.newColumnName);
+function safeFormulaString(v){
+  return v == null ? "" : String(v);
 }
 
-function valueByFlexibleNameForWorker(rowMap, key){
-  if (rowMap == null) return undefined;
+function safeFormulaNumber(v, fallback=0){
+  const n = Number(v);
+  return Number.isFinite(n) ? n : fallback;
+}
+
+function valueByFlexibleName(rowMap, name) {
+  if (!rowMap || typeof rowMap !== "object") return undefined;
+  const key = String(name || "");
   if (Object.prototype.hasOwnProperty.call(rowMap, key)) return rowMap[key];
-  const lower = String(key || "").toLowerCase();
+  const lower = key.toLowerCase();
   const found = Object.keys(rowMap).find((k) => String(k).toLowerCase() === lower);
   return found == null ? undefined : rowMap[found];
 }
 
-function evaluateGraphDerivedColumnForWorker(d, rowMap){
-  try{
-    if ((d.valueMode || "constant") !== "formula") return d.constantValue ?? "";
-    const expr = String(d.formulaExpression || "").trim();
-    if (!expr) return "";
-    if (GRAPH_DERIVED_FORBIDDEN_WORKER.test(expr)) return "#BLOCKED";
-    const col = (name) => valueByFlexibleNameForWorker(rowMap, name);
-    const num = (v, fallback=0) => {
-      const n = Number(v);
-      return Number.isFinite(n) ? n : fallback;
-    };
-    const str = (v) => v == null ? "" : String(v);
-    const concat = (...xs) => xs.map((x) => x == null ? "" : String(x)).join("");
-    const coalesce = (...xs) => xs.find((x) => x !== null && x !== undefined && x !== "") ?? "";
-    const lower = (v) => str(v).toLowerCase();
-    const upper = (v) => str(v).toUpperCase();
-    const round = (v, digits=0) => {
-      const m = Math.pow(10, Number(digits) || 0);
-      return Math.round(num(v) * m) / m;
-    };
+function assertSafeRegexPattern(pattern){
+  let p = String(pattern || "");
+  if (!p || p.length > SAFE_REGEX_MAX_PATTERN_LENGTH) throw new Error("Regex pattern is not allowed");
 
-    const splitText = (v, sep="/") => str(v).split(sep);
-    const pathParts = (v) => str(v).replace(/\\+/g,"/").split("/").filter(Boolean);
-    const pathPart = (v, index=0) => {
-      const parts = pathParts(v);
-      let i = Number(index) || 0;
-      if (i < 0) i = parts.length + i;
-      return parts[i] ?? "";
-    };
-    const basename = (v) => {
-      const parts = pathParts(v);
-      return parts.length ? parts[parts.length - 1] : "";
-    };
-    const filename = basename;
-    const dirname = (v) => {
-      const s = str(v).replace(/\\+/g,"/");
-      const p = s.lastIndexOf("/");
-      return p >= 0 ? s.slice(0, p) : "";
-    };
-    const ext = (v) => {
-      const b = basename(v);
-      const p = b.lastIndexOf(".");
-      return p > 0 ? b.slice(p + 1) : "";
-    };
-    const extname = (v) => {
+  // Formula文字列では "\\": が1段階デコードされるため、
+  // 旧レシピの [^/\\] が [^/\] になった場合だけ安全側に補正する。
+  p = p.replace(/\\\]/g, "\\\\]");
+
+  if (/\\[1-9]/.test(p)) throw new Error("Regex backreferences are not allowed");
+  if (/\(\?<|\(\?=|\(\?!/.test(p)) throw new Error("Regex lookaround is not allowed");
+  if (/\([^)]*[*+][^)]*\)\s*[*+{]/.test(p)) throw new Error("Nested regex quantifiers are not allowed");
+  if (/(?:\.\*){2,}|(?:\.\+){2,}/.test(p)) throw new Error("Ambiguous regex repetition is not allowed");
+  return p;
+}
+
+function createSafeFormulaRuntime(rowMap) {
+  const str = safeFormulaString;
+  const num = safeFormulaNumber;
+  const col = (name) => valueByFlexibleName(rowMap, name) ?? "";
+  const pathParts = (v) => str(v).replace(/\\+/g, "/").split("/").filter(Boolean);
+  const pathPart = (v, index=0) => {
+    const parts = pathParts(v);
+    let i = Number(index) || 0;
+    if (i < 0) i = parts.length + i;
+    return parts[i] ?? "";
+  };
+  const basename = (v) => {
+    const parts = pathParts(v);
+    return parts.length ? parts[parts.length - 1] : "";
+  };
+  const dirname = (v) => {
+    const s = str(v).replace(/\\+/g, "/");
+    const p = s.lastIndexOf("/");
+    return p >= 0 ? s.slice(0, p) : "";
+  };
+  const ext = (v) => {
+    const b = basename(v);
+    const p = b.lastIndexOf(".");
+    return p > 0 ? b.slice(p + 1) : "";
+  };
+  const stem = (v) => {
+    const b = basename(v);
+    const p = b.lastIndexOf(".");
+    return p > 0 ? b.slice(0, p) : b;
+  };
+  const before = (v, mark) => {
+    const s = str(v);
+    const m = str(mark);
+    if (!m) return "";
+    const p = s.indexOf(m);
+    return p >= 0 ? s.slice(0, p) : "";
+  };
+  const after = (v, mark) => {
+    const s = str(v);
+    const m = str(mark);
+    if (!m) return "";
+    const p = s.indexOf(m);
+    return p >= 0 ? s.slice(p + m.length) : "";
+  };
+  const between = (v, start, end) => {
+    const a = after(v, start);
+    return a ? before(a, end) : "";
+  };
+  const boundedCount = (n) => Math.max(0, Math.min(10000, Number(n) || 0));
+  const runtime = {
+    col,
+    num,
+    str,
+    concat: (...xs) => xs.map(str).join(""),
+    coalesce: (...xs) => xs.find((x) => x !== null && x !== undefined && x !== "") ?? "",
+    lower: (v) => str(v).toLowerCase(),
+    upper: (v) => str(v).toUpperCase(),
+    round: (v, digits=0) => {
+      const d = Math.max(0, Math.min(10, Number(digits) || 0));
+      const m = Math.pow(10, d);
+      return Math.round(num(v) * m) / m;
+    },
+    abs: (v) => Math.abs(num(v)),
+    min: (...xs) => xs.length ? Math.min(...xs.map((x) => num(x))) : 0,
+    max: (...xs) => xs.length ? Math.max(...xs.map((x) => num(x))) : 0,
+    split: (v, sep="/") => str(v).split(str(sep || "/")).slice(0, 10000),
+    part: pathPart,
+    pathParts,
+    pathPart,
+    basename,
+    filename: basename,
+    dirname,
+    ext,
+    extname: (v) => {
       const e = ext(v);
       return e ? `.${e}` : "";
-    };
-    const stem = (v) => {
-      const b = basename(v);
-      const p = b.lastIndexOf(".");
-      return p > 0 ? b.slice(0, p) : b;
-    };
-    const before = (v, mark) => {
-      const s = str(v), m = str(mark);
-      const p = s.indexOf(m);
-      return p >= 0 ? s.slice(0, p) : "";
-    };
-    const after = (v, mark) => {
-      const s = str(v), m = str(mark);
-      const p = s.indexOf(m);
-      return p >= 0 ? s.slice(p + m.length) : "";
-    };
-    const between = (v, start, end) => {
-      const a = after(v, start);
-      return a ? before(a, end) : "";
-    };
-    const sliceText = (v, start=0, end=undefined) => str(v).slice(Number(start)||0, end == null ? undefined : Number(end));
-    const left = (v, n=1) => str(v).slice(0, Math.max(0, Number(n)||0));
-    const right = (v, n=1) => {
+    },
+    stem,
+    before,
+    after,
+    between,
+    sliceText: (v, start=0, end=undefined) => {
       const s = str(v);
-      return s.slice(Math.max(0, s.length - (Number(n)||0)));
-    };
-    const replaceText = (v, search, replacement="") => str(v).split(str(search)).join(str(replacement));
-    const regexExtract = (v, pattern, group=1, flags="") => {
-      try{
-        const re = new RegExp(String(pattern), String(flags).replace(/[^gimsuy]/g,""));
-        const m = re.exec(str(v));
-        return m ? (m[Number(group)||0] ?? "") : "";
-      }catch{ return ""; }
-    };
-    let fn = GRAPH_DERIVED_FN_CACHE_WORKER.get(expr);
-    if (!fn) {
-      fn = new Function(
-        "col", "num", "str", "concat", "coalesce", "lower", "upper", "round", "abs", "min", "max", "row",
-        "split", "part", "pathParts", "pathPart", "basename", "filename", "dirname", "ext", "extname", "stem",
-        "before", "after", "between", "sliceText", "left", "right", "replaceText", "regexExtract",
-        `"use strict"; return (${expr});`
-      );
-      if (GRAPH_DERIVED_FN_CACHE_WORKER.size > 100) GRAPH_DERIVED_FN_CACHE_WORKER.clear();
-      GRAPH_DERIVED_FN_CACHE_WORKER.set(expr, fn);
+      const a = Math.max(-10000, Math.min(10000, Number(start) || 0));
+      const b = end == null ? undefined : Math.max(-10000, Math.min(10000, Number(end) || 0));
+      return s.slice(a, b);
+    },
+    left: (v, n=1) => str(v).slice(0, boundedCount(n)),
+    right: (v, n=1) => {
+      const s = str(v);
+      const count = boundedCount(n);
+      return s.slice(Math.max(0, s.length - count));
+    },
+    replaceText: (v, search, replacement="") => {
+      const needle = str(search);
+      if (!needle) return str(v);
+      return str(v).split(needle).join(str(replacement)).slice(0, SAFE_FORMULA_MAX_RESULT_LENGTH);
+    },
+    regexExtract: (v, pattern, group=1, flags="") => {
+      const safePattern = assertSafeRegexPattern(pattern);
+      const safeFlags = str(flags).replace(/[^imsuy]/g, "");
+      const re = new RegExp(safePattern, safeFlags);
+      const m = re.exec(str(v).slice(0, SAFE_FORMULA_MAX_RESULT_LENGTH));
+      return m ? (m[Math.max(0, Number(group) || 0)] ?? "") : "";
+    },
+  };
+  return Object.freeze(runtime);
+}
+
+function tokenizeSafeFormula(input) {
+  const src = String(input || "").trim();
+
+  if (!src) return [];
+  if (src.length > SAFE_FORMULA_MAX_LENGTH) {
+    throw new Error("Formula is too long");
+  }
+
+  const tokens = [];
+  let i = 0;
+
+  while (i < src.length) {
+    const ch = src[i];
+
+    if (/\s/.test(ch)) {
+      i++;
+      continue;
     }
-    const value = fn(
-      col, num, str, concat, coalesce, lower, upper, round, Math.abs, Math.min, Math.max, rowMap,
-      splitText, pathPart, pathParts, pathPart, basename, filename, dirname, ext, extname, stem,
-      before, after, between, sliceText, left, right, replaceText, regexExtract
-    );
-    return value == null ? "" : value;
-  }catch(e){
+
+    const two = src.slice(i, i + 2);
+    if (["&&", "||", "==", "!=", ">=", "<="].includes(two)) {
+      tokens.push({ type: "op", value: two });
+      i += 2;
+      continue;
+    }
+
+    if ("+-*/%(),><!".includes(ch)) {
+      tokens.push({ type: "op", value: ch });
+      i++;
+      continue;
+    }
+
+    if (ch === '"' || ch === "'") {
+      const quote = ch;
+      i++;
+      let value = "";
+      let closed = false;
+      while (i < src.length) {
+        const c = src[i++];
+        if (c === "\\") {
+          if (i >= src.length) throw new Error("Invalid string escape");
+          const next = src[i++];
+          if (next === "n") value += "\n";
+          else if (next === "r") value += "\r";
+          else if (next === "t") value += "\t";
+          else if (next === quote || next === "\\") value += next;
+          else throw new Error("Invalid string escape");
+          continue;
+        }
+        if (c === quote) {
+          closed = true;
+          break;
+        }
+        value += c;
+      }
+      if (!closed) throw new Error("Unclosed string literal");
+      tokens.push({ type: "string", value });
+      continue;
+    }
+
+    if (/[0-9.]/.test(ch)) {
+      const m = src.slice(i).match(/^(?:\d+(?:\.\d*)?|\.\d+)(?:e[+-]?\d+)?/i);
+      if (!m) throw new Error("Invalid number");
+      const value = Number(m[0]);
+      if (!Number.isFinite(value)) throw new Error("Invalid number");
+      tokens.push({ type: "number", value });
+      i += m[0].length;
+      continue;
+    }
+
+    if (/[A-Za-z_]/.test(ch)) {
+      const m = src.slice(i).match(/^[A-Za-z_][A-Za-z0-9_]*/);
+      const value = m[0];
+      tokens.push({ type: "ident", value });
+      i += value.length;
+      continue;
+    }
+
+    throw new Error(`Invalid token: ${ch}`);
+  }
+
+  if (tokens.length > SAFE_FORMULA_MAX_TOKENS) {
+    throw new Error("Formula has too many tokens");
+  }
+
+  return tokens;
+}
+
+function evaluateSafeFormula(expression, rowMap) {
+  const tokens = tokenizeSafeFormula(expression);
+  let pos = 0;
+  const runtime = createSafeFormulaRuntime(rowMap);
+
+  const peek = () => tokens[pos];
+  const take = (value = null) => {
+    const t = tokens[pos];
+    if (!t) throw new Error("Unexpected end of formula");
+    if (value != null && t.value !== value) throw new Error(`Expected ${value}`);
+    pos++;
+    return t;
+  };
+
+  const callFunction = (name, args) => {
+    if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(name)) {
+      throw new Error("Invalid function name");
+    }
+    if (!Object.prototype.hasOwnProperty.call(runtime, name)) {
+      throw new Error(`Function is not allowed: ${name}`);
+    }
+    const fn = runtime[name];
+    if (typeof fn !== "function") {
+      throw new Error(`Invalid function: ${name}`);
+    }
+    return fn(...args);
+  };
+
+  const parsePrimary = () => {
+    const t = peek();
+    if (!t) throw new Error("Unexpected end of formula");
+
+    if (t.type === "number" || t.type === "string") {
+      pos++;
+      return t.value;
+    }
+
+    if (t.type === "ident") {
+      pos++;
+      const name = t.value;
+
+      if (name === "true") return true;
+      if (name === "false") return false;
+      if (name === "null") return null;
+
+      if (peek()?.value !== "(") {
+        throw new Error(`Bare identifier is not allowed: ${name}`);
+      }
+
+      take("(");
+      const args = [];
+      if (peek()?.value !== ")") {
+        while (true) {
+          args.push(parseExpression());
+          if (peek()?.value !== ",") break;
+          take(",");
+        }
+      }
+      take(")");
+      return callFunction(name, args);
+    }
+
+    if (t.value === "(") {
+      take("(");
+      const v = parseExpression();
+      take(")");
+      return v;
+    }
+
+    throw new Error("Invalid expression");
+  };
+
+  const parseUnary = () => {
+    if (peek()?.value === "!") {
+      take("!");
+      return !parseUnary();
+    }
+    if (peek()?.value === "-") {
+      take("-");
+      return -safeFormulaNumber(parseUnary());
+    }
+    return parsePrimary();
+  };
+
+  const numericBinary = (left, right, op) => {
+    const a = safeFormulaNumber(left);
+    const b = safeFormulaNumber(right);
+    if ((op === "/" || op === "%") && b === 0) return "";
+    if (op === "*") return a * b;
+    if (op === "/") return a / b;
+    if (op === "%") return a % b;
+    if (op === "-") return a - b;
+    return a + b;
+  };
+
+  const parseMul = () => {
+    let left = parseUnary();
+    while (["*", "/", "%"].includes(peek()?.value)) {
+      const op = take().value;
+      const right = parseUnary();
+      left = numericBinary(left, right, op);
+    }
+    return left;
+  };
+
+  const parseAdd = () => {
+    let left = parseMul();
+    while (["+", "-"].includes(peek()?.value)) {
+      const op = take().value;
+      const right = parseMul();
+      if (op === "+") {
+        left = typeof left === "string" || typeof right === "string"
+          ? `${left ?? ""}${right ?? ""}`.slice(0, SAFE_FORMULA_MAX_RESULT_LENGTH)
+          : numericBinary(left, right, "+");
+      } else {
+        left = numericBinary(left, right, "-");
+      }
+    }
+    return left;
+  };
+
+  const parseCompare = () => {
+    let left = parseAdd();
+    while ([">", "<", ">=", "<=", "==", "!="].includes(peek()?.value)) {
+      const op = take().value;
+      const right = parseAdd();
+
+      if (op === ">") left = left > right;
+      else if (op === "<") left = left < right;
+      else if (op === ">=") left = left >= right;
+      else if (op === "<=") left = left <= right;
+      else if (op === "==") left = String(left) === String(right);
+      else if (op === "!=") left = String(left) !== String(right);
+    }
+    return left;
+  };
+
+  const parseAnd = () => {
+    let left = parseCompare();
+    while (peek()?.value === "&&") {
+      take("&&");
+      left = Boolean(left) && Boolean(parseCompare());
+    }
+    return left;
+  };
+
+  const parseExpression = () => {
+    let left = parseAnd();
+    while (peek()?.value === "||") {
+      take("||");
+      left = Boolean(left) || Boolean(parseAnd());
+    }
+    return left;
+  };
+
+  const result = parseExpression();
+
+  if (pos !== tokens.length) {
+    throw new Error("Unexpected token");
+  }
+
+  if (typeof result === "string") {
+    return result.slice(0, SAFE_FORMULA_MAX_RESULT_LENGTH);
+  }
+
+  return result == null ? "" : result;
+}
+
+function evaluateGraphDerivedColumnSafe(d, rowMap) {
+  try {
+    if ((d.valueMode || "constant") !== "formula") return d.constantValue ?? "";
+
+    const expr = String(d.formulaExpression || "").trim();
+    if (!expr) return "";
+
+    return evaluateSafeFormula(expr, rowMap);
+  } catch (e) {
     return `#ERR ${e?.message || "formula"}`;
   }
 }
+
+function valueByFlexibleNameForWorker(rowMap, key){
+  return valueByFlexibleName(rowMap, key);
+}
+
+function evaluateGraphDerivedColumnForWorker(d, rowMap){
+  return evaluateGraphDerivedColumnSafe(d, rowMap);
+}
+
 
 function graphExportHeader(header, derivedColumns, outputColumnNames=null){
   const derived = normalizeGraphDerivedColumnsForWorker(derivedColumns);
@@ -11637,14 +12000,45 @@ function fileKey(file) {
   return `${file?.name || ""}::${file?.size || 0}::${file?.lastModified || 0}`;
 }
 
+function readJsonStorageSafe(key, fallback, validate, { maxBytes = 200000 } = {}) {
+  try {
+    const raw = localStorage.getItem(key);
+    if (!raw || raw.length > maxBytes) return fallback;
+
+    const parsed = JSON.parse(raw);
+
+    if (validate && !validate(parsed)) {
+      localStorage.removeItem(key);
+      return fallback;
+    }
+
+    return parsed;
+  } catch {
+    try { localStorage.removeItem(key); } catch {}
+    return fallback;
+  }
+}
+
+function writeJsonStorageSafe(key, value) {
+  try {
+    localStorage.setItem(key, JSON.stringify(value));
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+
 const SETTINGS_KEY = "quantumCsvGrid.react.step12.settings.v1";
 function loadSettings() {
-  try { return JSON.parse(localStorage.getItem(SETTINGS_KEY) || "{}"); }
-  catch { return {}; }
+  return readJsonStorageSafe(
+    SETTINGS_KEY,
+    {},
+    (v) => v && typeof v === "object" && !Array.isArray(v)
+  );
 }
 function saveSettings(settings) {
-  try { localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings)); }
-  catch {}
+  writeJsonStorageSafe(SETTINGS_KEY, settings && typeof settings === "object" ? settings : {});
 }
 
 
@@ -11713,18 +12107,18 @@ function normalizeGraphSession(raw){
 }
 
 function loadGraphQuerySessions(){
-  try{
-    const raw=JSON.parse(localStorage.getItem(GRAPH_QUERY_SESSIONS_KEY) || "[]");
-    return (Array.isArray(raw) ? raw : raw.sessions || []).map(normalizeGraphSession).filter(Boolean);
-  }catch{ return []; }
+  const raw = readJsonStorageSafe(
+    GRAPH_QUERY_SESSIONS_KEY,
+    [],
+    (v) => Array.isArray(v) || (v && typeof v === "object" && Array.isArray(v.sessions)),
+    { maxBytes: 1000000 }
+  );
+  return (Array.isArray(raw) ? raw : raw.sessions || []).map(normalizeGraphSession).filter(Boolean);
 }
 
 function saveGraphQuerySessions(sessions){
-  try{
-    const list=(Array.isArray(sessions) ? sessions : []).map(normalizeGraphSession).filter(Boolean).slice(0,100);
-    localStorage.setItem(GRAPH_QUERY_SESSIONS_KEY, JSON.stringify({version:1, updatedAt:new Date().toISOString(), sessions:list}));
-    return true;
-  }catch{ return false; }
+  const list=(Array.isArray(sessions) ? sessions : []).map(normalizeGraphSession).filter(Boolean).slice(0,100);
+  return writeJsonStorageSafe(GRAPH_QUERY_SESSIONS_KEY, {version:1, updatedAt:new Date().toISOString(), sessions:list});
 }
 
 function defaultGraphNodes(columns=[]){
@@ -11763,16 +12157,16 @@ function restoreGraphSessionEdges(session){
 
 const CATALOG_SCOPES_KEY = "quantumCsvGrid.storageCatalogScopes.v1";
 function loadCatalogScopes() {
-  try {
-    const rows = JSON.parse(localStorage.getItem(CATALOG_SCOPES_KEY) || "[]");
-    return Array.isArray(rows) ? rows.filter((x) => x && x.workspace && x.collection) : [];
-  } catch {
-    return [];
-  }
+  const rows = readJsonStorageSafe(
+    CATALOG_SCOPES_KEY,
+    [],
+    (v) => Array.isArray(v),
+    { maxBytes: 200000 }
+  );
+  return Array.isArray(rows) ? rows.filter((x) => x && x.workspace && x.collection) : [];
 }
 function saveCatalogScopes(scopes) {
-  try { localStorage.setItem(CATALOG_SCOPES_KEY, JSON.stringify(scopes || [])); }
-  catch {}
+  writeJsonStorageSafe(CATALOG_SCOPES_KEY, Array.isArray(scopes) ? scopes : []);
 }
 function normalizeScopeName(value, fallback) {
   return String(value || fallback || "").trim() || fallback;
@@ -12911,17 +13305,30 @@ function normalizeGraphDerivedColumns(items=[]) {
 
 function graphDerivedSqlExpression(d) {
   const alias = sqlIdentifier(d.newColumnName || "new_column");
+
   if (d.valueMode === "formula") {
-    const expr = String(d.formulaExpression || "NULL").trim() || "NULL";
-    return `${expr} AS ${alias} /* 計算列 */`;
+    return `NULL AS ${alias} /* client-computed safe formula column */`;
   }
-  return `${sqlLiteral(d.constantValue ?? "")} AS ${alias} /* 固定値列 */`;
+
+  return `${sqlLiteral(d.constantValue ?? "")} AS ${alias} /* fixed column */`;
 }
 
-const GRAPH_DERIVED_FORBIDDEN = /\b(window|document|fetch|XMLHttpRequest|localStorage|sessionStorage|indexedDB|Function|eval|import|constructor|prototype|globalThis|self|postMessage)\b/i;
-const GRAPH_DERIVED_FN_CACHE = new Map();
+const SAFE_FORMULA_MAX_LENGTH = 500;
+const SAFE_FORMULA_MAX_TOKENS = 120;
+const SAFE_FORMULA_MAX_RESULT_LENGTH = 50000;
+const SAFE_REGEX_MAX_PATTERN_LENGTH = 160;
+
+function safeFormulaString(v){
+  return v == null ? "" : String(v);
+}
+
+function safeFormulaNumber(v, fallback=0){
+  const n = Number(v);
+  return Number.isFinite(n) ? n : fallback;
+}
 
 function valueByFlexibleName(rowMap, name) {
+  if (!rowMap || typeof rowMap !== "object") return undefined;
   const key = String(name || "");
   if (Object.prototype.hasOwnProperty.call(rowMap, key)) return rowMap[key];
   const lower = key.toLowerCase();
@@ -12929,108 +13336,403 @@ function valueByFlexibleName(rowMap, name) {
   return found == null ? undefined : rowMap[found];
 }
 
-function evaluateGraphDerivedColumn(d, rowMap) {
-  try {
-    if ((d.valueMode || "constant") !== "formula") return d.constantValue ?? "";
-    const expr = String(d.formulaExpression || "").trim();
-    if (!expr) return "";
-    if (GRAPH_DERIVED_FORBIDDEN.test(expr)) return "#BLOCKED";
-    const col = (name) => valueByFlexibleName(rowMap, name);
-    const num = (v, fallback=0) => {
-      const n = Number(v);
-      return Number.isFinite(n) ? n : fallback;
-    };
-    const str = (v) => v == null ? "" : String(v);
-    const concat = (...xs) => xs.map((x) => x == null ? "" : String(x)).join("");
-    const coalesce = (...xs) => xs.find((x) => x !== null && x !== undefined && x !== "") ?? "";
-    const lower = (v) => str(v).toLowerCase();
-    const upper = (v) => str(v).toUpperCase();
-    const round = (v, digits=0) => {
-      const m = Math.pow(10, Number(digits) || 0);
-      return Math.round(num(v) * m) / m;
-    };
+function assertSafeRegexPattern(pattern){
+  let p = String(pattern || "");
+  if (!p || p.length > SAFE_REGEX_MAX_PATTERN_LENGTH) throw new Error("Regex pattern is not allowed");
 
-    const splitText = (v, sep="/") => str(v).split(sep);
-    const pathParts = (v) => str(v).replace(/\\+/g,"/").split("/").filter(Boolean);
-    const pathPart = (v, index=0) => {
-      const parts = pathParts(v);
-      let i = Number(index) || 0;
-      if (i < 0) i = parts.length + i;
-      return parts[i] ?? "";
-    };
-    const basename = (v) => {
-      const parts = pathParts(v);
-      return parts.length ? parts[parts.length - 1] : "";
-    };
-    const filename = basename;
-    const dirname = (v) => {
-      const s = str(v).replace(/\\+/g,"/");
-      const p = s.lastIndexOf("/");
-      return p >= 0 ? s.slice(0, p) : "";
-    };
-    const ext = (v) => {
-      const b = basename(v);
-      const p = b.lastIndexOf(".");
-      return p > 0 ? b.slice(p + 1) : "";
-    };
-    const extname = (v) => {
+  // Formula文字列では "\\": が1段階デコードされるため、
+  // 旧レシピの [^/\\] が [^/\] になった場合だけ安全側に補正する。
+  p = p.replace(/\\\]/g, "\\\\]");
+
+  if (/\\[1-9]/.test(p)) throw new Error("Regex backreferences are not allowed");
+  if (/\(\?<|\(\?=|\(\?!/.test(p)) throw new Error("Regex lookaround is not allowed");
+  if (/\([^)]*[*+][^)]*\)\s*[*+{]/.test(p)) throw new Error("Nested regex quantifiers are not allowed");
+  if (/(?:\.\*){2,}|(?:\.\+){2,}/.test(p)) throw new Error("Ambiguous regex repetition is not allowed");
+  return p;
+}
+
+function createSafeFormulaRuntime(rowMap) {
+  const str = safeFormulaString;
+  const num = safeFormulaNumber;
+  const col = (name) => valueByFlexibleName(rowMap, name) ?? "";
+  const pathParts = (v) => str(v).replace(/\\+/g, "/").split("/").filter(Boolean);
+  const pathPart = (v, index=0) => {
+    const parts = pathParts(v);
+    let i = Number(index) || 0;
+    if (i < 0) i = parts.length + i;
+    return parts[i] ?? "";
+  };
+  const basename = (v) => {
+    const parts = pathParts(v);
+    return parts.length ? parts[parts.length - 1] : "";
+  };
+  const dirname = (v) => {
+    const s = str(v).replace(/\\+/g, "/");
+    const p = s.lastIndexOf("/");
+    return p >= 0 ? s.slice(0, p) : "";
+  };
+  const ext = (v) => {
+    const b = basename(v);
+    const p = b.lastIndexOf(".");
+    return p > 0 ? b.slice(p + 1) : "";
+  };
+  const stem = (v) => {
+    const b = basename(v);
+    const p = b.lastIndexOf(".");
+    return p > 0 ? b.slice(0, p) : b;
+  };
+  const before = (v, mark) => {
+    const s = str(v);
+    const m = str(mark);
+    if (!m) return "";
+    const p = s.indexOf(m);
+    return p >= 0 ? s.slice(0, p) : "";
+  };
+  const after = (v, mark) => {
+    const s = str(v);
+    const m = str(mark);
+    if (!m) return "";
+    const p = s.indexOf(m);
+    return p >= 0 ? s.slice(p + m.length) : "";
+  };
+  const between = (v, start, end) => {
+    const a = after(v, start);
+    return a ? before(a, end) : "";
+  };
+  const boundedCount = (n) => Math.max(0, Math.min(10000, Number(n) || 0));
+  const runtime = {
+    col,
+    num,
+    str,
+    concat: (...xs) => xs.map(str).join(""),
+    coalesce: (...xs) => xs.find((x) => x !== null && x !== undefined && x !== "") ?? "",
+    lower: (v) => str(v).toLowerCase(),
+    upper: (v) => str(v).toUpperCase(),
+    round: (v, digits=0) => {
+      const d = Math.max(0, Math.min(10, Number(digits) || 0));
+      const m = Math.pow(10, d);
+      return Math.round(num(v) * m) / m;
+    },
+    abs: (v) => Math.abs(num(v)),
+    min: (...xs) => xs.length ? Math.min(...xs.map((x) => num(x))) : 0,
+    max: (...xs) => xs.length ? Math.max(...xs.map((x) => num(x))) : 0,
+    split: (v, sep="/") => str(v).split(str(sep || "/")).slice(0, 10000),
+    part: pathPart,
+    pathParts,
+    pathPart,
+    basename,
+    filename: basename,
+    dirname,
+    ext,
+    extname: (v) => {
       const e = ext(v);
       return e ? `.${e}` : "";
-    };
-    const stem = (v) => {
-      const b = basename(v);
-      const p = b.lastIndexOf(".");
-      return p > 0 ? b.slice(0, p) : b;
-    };
-    const before = (v, mark) => {
-      const s = str(v), m = str(mark);
-      const p = s.indexOf(m);
-      return p >= 0 ? s.slice(0, p) : "";
-    };
-    const after = (v, mark) => {
-      const s = str(v), m = str(mark);
-      const p = s.indexOf(m);
-      return p >= 0 ? s.slice(p + m.length) : "";
-    };
-    const between = (v, start, end) => {
-      const a = after(v, start);
-      return a ? before(a, end) : "";
-    };
-    const sliceText = (v, start=0, end=undefined) => str(v).slice(Number(start)||0, end == null ? undefined : Number(end));
-    const left = (v, n=1) => str(v).slice(0, Math.max(0, Number(n)||0));
-    const right = (v, n=1) => {
+    },
+    stem,
+    before,
+    after,
+    between,
+    sliceText: (v, start=0, end=undefined) => {
       const s = str(v);
-      return s.slice(Math.max(0, s.length - (Number(n)||0)));
-    };
-    const replaceText = (v, search, replacement="") => str(v).split(str(search)).join(str(replacement));
-    const regexExtract = (v, pattern, group=1, flags="") => {
-      try{
-        const re = new RegExp(String(pattern), String(flags).replace(/[^gimsuy]/g,""));
-        const m = re.exec(str(v));
-        return m ? (m[Number(group)||0] ?? "") : "";
-      }catch{ return ""; }
-    };
-    let fn = GRAPH_DERIVED_FN_CACHE.get(expr);
-    if (!fn) {
-      fn = new Function(
-        "col", "num", "str", "concat", "coalesce", "lower", "upper", "round", "abs", "min", "max", "row",
-        "split", "part", "pathParts", "pathPart", "basename", "filename", "dirname", "ext", "extname", "stem",
-        "before", "after", "between", "sliceText", "left", "right", "replaceText", "regexExtract",
-        `"use strict"; return (${expr});`
-      );
-      if (GRAPH_DERIVED_FN_CACHE.size > 100) GRAPH_DERIVED_FN_CACHE.clear();
-      GRAPH_DERIVED_FN_CACHE.set(expr, fn);
+      const a = Math.max(-10000, Math.min(10000, Number(start) || 0));
+      const b = end == null ? undefined : Math.max(-10000, Math.min(10000, Number(end) || 0));
+      return s.slice(a, b);
+    },
+    left: (v, n=1) => str(v).slice(0, boundedCount(n)),
+    right: (v, n=1) => {
+      const s = str(v);
+      const count = boundedCount(n);
+      return s.slice(Math.max(0, s.length - count));
+    },
+    replaceText: (v, search, replacement="") => {
+      const needle = str(search);
+      if (!needle) return str(v);
+      return str(v).split(needle).join(str(replacement)).slice(0, SAFE_FORMULA_MAX_RESULT_LENGTH);
+    },
+    regexExtract: (v, pattern, group=1, flags="") => {
+      const safePattern = assertSafeRegexPattern(pattern);
+      const safeFlags = str(flags).replace(/[^imsuy]/g, "");
+      const re = new RegExp(safePattern, safeFlags);
+      const m = re.exec(str(v).slice(0, SAFE_FORMULA_MAX_RESULT_LENGTH));
+      return m ? (m[Math.max(0, Number(group) || 0)] ?? "") : "";
+    },
+  };
+  return Object.freeze(runtime);
+}
+
+function tokenizeSafeFormula(input) {
+  const src = String(input || "").trim();
+
+  if (!src) return [];
+  if (src.length > SAFE_FORMULA_MAX_LENGTH) {
+    throw new Error("Formula is too long");
+  }
+
+  const tokens = [];
+  let i = 0;
+
+  while (i < src.length) {
+    const ch = src[i];
+
+    if (/\s/.test(ch)) {
+      i++;
+      continue;
     }
-    const value = fn(
-      col, num, str, concat, coalesce, lower, upper, round, Math.abs, Math.min, Math.max, rowMap,
-      splitText, pathPart, pathParts, pathPart, basename, filename, dirname, ext, extname, stem,
-      before, after, between, sliceText, left, right, replaceText, regexExtract
-    );
-    return value == null ? "" : value;
+
+    const two = src.slice(i, i + 2);
+    if (["&&", "||", "==", "!=", ">=", "<="].includes(two)) {
+      tokens.push({ type: "op", value: two });
+      i += 2;
+      continue;
+    }
+
+    if ("+-*/%(),><!".includes(ch)) {
+      tokens.push({ type: "op", value: ch });
+      i++;
+      continue;
+    }
+
+    if (ch === '"' || ch === "'") {
+      const quote = ch;
+      i++;
+      let value = "";
+      let closed = false;
+      while (i < src.length) {
+        const c = src[i++];
+        if (c === "\\") {
+          if (i >= src.length) throw new Error("Invalid string escape");
+          const next = src[i++];
+          if (next === "n") value += "\n";
+          else if (next === "r") value += "\r";
+          else if (next === "t") value += "\t";
+          else if (next === quote || next === "\\") value += next;
+          else throw new Error("Invalid string escape");
+          continue;
+        }
+        if (c === quote) {
+          closed = true;
+          break;
+        }
+        value += c;
+      }
+      if (!closed) throw new Error("Unclosed string literal");
+      tokens.push({ type: "string", value });
+      continue;
+    }
+
+    if (/[0-9.]/.test(ch)) {
+      const m = src.slice(i).match(/^(?:\d+(?:\.\d*)?|\.\d+)(?:e[+-]?\d+)?/i);
+      if (!m) throw new Error("Invalid number");
+      const value = Number(m[0]);
+      if (!Number.isFinite(value)) throw new Error("Invalid number");
+      tokens.push({ type: "number", value });
+      i += m[0].length;
+      continue;
+    }
+
+    if (/[A-Za-z_]/.test(ch)) {
+      const m = src.slice(i).match(/^[A-Za-z_][A-Za-z0-9_]*/);
+      const value = m[0];
+      tokens.push({ type: "ident", value });
+      i += value.length;
+      continue;
+    }
+
+    throw new Error(`Invalid token: ${ch}`);
+  }
+
+  if (tokens.length > SAFE_FORMULA_MAX_TOKENS) {
+    throw new Error("Formula has too many tokens");
+  }
+
+  return tokens;
+}
+
+function evaluateSafeFormula(expression, rowMap) {
+  const tokens = tokenizeSafeFormula(expression);
+  let pos = 0;
+  const runtime = createSafeFormulaRuntime(rowMap);
+
+  const peek = () => tokens[pos];
+  const take = (value = null) => {
+    const t = tokens[pos];
+    if (!t) throw new Error("Unexpected end of formula");
+    if (value != null && t.value !== value) throw new Error(`Expected ${value}`);
+    pos++;
+    return t;
+  };
+
+  const callFunction = (name, args) => {
+    if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(name)) {
+      throw new Error("Invalid function name");
+    }
+    if (!Object.prototype.hasOwnProperty.call(runtime, name)) {
+      throw new Error(`Function is not allowed: ${name}`);
+    }
+    const fn = runtime[name];
+    if (typeof fn !== "function") {
+      throw new Error(`Invalid function: ${name}`);
+    }
+    return fn(...args);
+  };
+
+  const parsePrimary = () => {
+    const t = peek();
+    if (!t) throw new Error("Unexpected end of formula");
+
+    if (t.type === "number" || t.type === "string") {
+      pos++;
+      return t.value;
+    }
+
+    if (t.type === "ident") {
+      pos++;
+      const name = t.value;
+
+      if (name === "true") return true;
+      if (name === "false") return false;
+      if (name === "null") return null;
+
+      if (peek()?.value !== "(") {
+        throw new Error(`Bare identifier is not allowed: ${name}`);
+      }
+
+      take("(");
+      const args = [];
+      if (peek()?.value !== ")") {
+        while (true) {
+          args.push(parseExpression());
+          if (peek()?.value !== ",") break;
+          take(",");
+        }
+      }
+      take(")");
+      return callFunction(name, args);
+    }
+
+    if (t.value === "(") {
+      take("(");
+      const v = parseExpression();
+      take(")");
+      return v;
+    }
+
+    throw new Error("Invalid expression");
+  };
+
+  const parseUnary = () => {
+    if (peek()?.value === "!") {
+      take("!");
+      return !parseUnary();
+    }
+    if (peek()?.value === "-") {
+      take("-");
+      return -safeFormulaNumber(parseUnary());
+    }
+    return parsePrimary();
+  };
+
+  const numericBinary = (left, right, op) => {
+    const a = safeFormulaNumber(left);
+    const b = safeFormulaNumber(right);
+    if ((op === "/" || op === "%") && b === 0) return "";
+    if (op === "*") return a * b;
+    if (op === "/") return a / b;
+    if (op === "%") return a % b;
+    if (op === "-") return a - b;
+    return a + b;
+  };
+
+  const parseMul = () => {
+    let left = parseUnary();
+    while (["*", "/", "%"].includes(peek()?.value)) {
+      const op = take().value;
+      const right = parseUnary();
+      left = numericBinary(left, right, op);
+    }
+    return left;
+  };
+
+  const parseAdd = () => {
+    let left = parseMul();
+    while (["+", "-"].includes(peek()?.value)) {
+      const op = take().value;
+      const right = parseMul();
+      if (op === "+") {
+        left = typeof left === "string" || typeof right === "string"
+          ? `${left ?? ""}${right ?? ""}`.slice(0, SAFE_FORMULA_MAX_RESULT_LENGTH)
+          : numericBinary(left, right, "+");
+      } else {
+        left = numericBinary(left, right, "-");
+      }
+    }
+    return left;
+  };
+
+  const parseCompare = () => {
+    let left = parseAdd();
+    while ([">", "<", ">=", "<=", "==", "!="].includes(peek()?.value)) {
+      const op = take().value;
+      const right = parseAdd();
+
+      if (op === ">") left = left > right;
+      else if (op === "<") left = left < right;
+      else if (op === ">=") left = left >= right;
+      else if (op === "<=") left = left <= right;
+      else if (op === "==") left = String(left) === String(right);
+      else if (op === "!=") left = String(left) !== String(right);
+    }
+    return left;
+  };
+
+  const parseAnd = () => {
+    let left = parseCompare();
+    while (peek()?.value === "&&") {
+      take("&&");
+      left = Boolean(left) && Boolean(parseCompare());
+    }
+    return left;
+  };
+
+  const parseExpression = () => {
+    let left = parseAnd();
+    while (peek()?.value === "||") {
+      take("||");
+      left = Boolean(left) || Boolean(parseAnd());
+    }
+    return left;
+  };
+
+  const result = parseExpression();
+
+  if (pos !== tokens.length) {
+    throw new Error("Unexpected token");
+  }
+
+  if (typeof result === "string") {
+    return result.slice(0, SAFE_FORMULA_MAX_RESULT_LENGTH);
+  }
+
+  return result == null ? "" : result;
+}
+
+function evaluateGraphDerivedColumnSafe(d, rowMap) {
+  try {
+    if ((d.valueMode || "constant") !== "formula") return d.constantValue ?? "";
+
+    const expr = String(d.formulaExpression || "").trim();
+    if (!expr) return "";
+
+    return evaluateSafeFormula(expr, rowMap);
   } catch (e) {
     return `#ERR ${e?.message || "formula"}`;
   }
 }
+
+function evaluateGraphDerivedColumn(d, rowMap) {
+  return evaluateGraphDerivedColumnSafe(d, rowMap);
+}
+
 
 function applyGraphDerivedColumnsToTable(table, derivedColumns=[]) {
   const normalized = normalizeGraphDerivedColumns(derivedColumns);
@@ -13412,7 +14114,7 @@ const GRAPH_FORMULA_RECIPES = [
   { group:"文字列抽出", label:"間を取り出す", expr:'between(col("text"), "[", "]")', desc:"abc[Tokyo]def → Tokyo" },
   { group:"文字列抽出", label:"左からn文字", expr:'left(col("code"), 3)', desc:"ABCDE → ABC" },
   { group:"文字列抽出", label:"右からn文字", expr:'right(col("code"), 4)', desc:"ABCDE1234 → 1234" },
-  { group:"正規表現", label:"正規表現抽出", expr:'regexExtract(col("full_path"), "([^/\\\\]+)\\\\.csv$", 1)', desc:"最後のCSVファイル名部分を抽出" },
+  { group:"正規表現", label:"正規表現抽出", expr:'regexExtract(col("full_path"), "([^/]+)\\\\.csv$", 1)', desc:"最後のCSVファイル名部分を抽出" },
   { group:"整形", label:"置換", expr:'replaceText(col("path"), "\\\\", "/")', desc:"Windows区切りを/へ置換" },
   { group:"整形", label:"連結", expr:'concat(col("dir"), "/", col("file"))', desc:"複数列をつなぐ" },
   { group:"整形", label:"空なら代替", expr:'coalesce(col("memo"), "なし")', desc:"NULL/空文字を置き換える" },
@@ -13444,7 +14146,7 @@ function FormulaRecipePanel({ onPick, fieldOptions=[] }) {
       <Stack spacing={0.8}>
         <Typography variant="subtitle2" sx={{ fontWeight: 900 }}>数式ヘルプ / 入力支援</Typography>
         <Alert severity="info" sx={{ py: 0.25 }}>
-          列名チップを押すと col("列名") を挿入します。JOIN結果では alias.column 形式も使えます。
+          列名チップを押すと col("列名") を挿入します。JOIN結果では alias.column 形式も使えます。任意JavaScriptではなく、安全な許可関数だけを評価します。
         </Alert>
         <TextField size="small" label="カラム検索" value={filterText} onChange={(e) => setFilterText(e.target.value)} placeholder="path, amount, t1.name など" />
         {!!filteredFields.length && (
@@ -13972,7 +14674,7 @@ function GraphQueryEditor({ columns, datasets=[], manifest=null, nodes, setNodes
                   {(selectedNode.data.valueMode || "constant") === "formula" && (
                     <FormulaRecipePanel fieldOptions={allFieldOptions} onPick={(expr) => updateNodeData(selectedNode.id, { formulaExpression: selectedNode.data.formulaExpression ? `${selectedNode.data.formulaExpression}${selectedNode.data.formulaExpression.endsWith(" ") ? "" : " "}${expr}` : expr })} />
                   )}
-                  <Alert severity="info" sx={{ py: 0.25 }}>数式では col("列名") で同じ行の列値を参照します。num/str/concat/coalesce/lower/upper/round のほか、basename, dirname, ext, stem, pathPart, before/after/between, sliceText, left/right, replaceText, regexExtract でパスや文字列を切り出せます。計算列は保存済みDatasetを破壊せず、Graph Query結果テーブルに追加されます。</Alert>
+                  <Alert severity="info" sx={{ py: 0.25 }}>数式では安全な式サブセットだけを実行します。col("列名") で同じ行の列値を参照し、num/str/concat/coalesce/lower/upper/round、basename/dirname/ext/stem/pathPart、before/after/between/sliceText/left/right/replaceText/regexExtract を使えます。JavaScript本体・DOM・外部通信・任意関数呼び出しは実行されません。</Alert>
                 </>
               )}
               {selectedNode.data?.kind === "aggregate" && <Alert severity="info">集計ノードはSQLプレビューへ表現を追加するための予約ノードです。実集計はPivot/Time基盤へ接続する次段階で有効化します。</Alert>}
@@ -14129,19 +14831,67 @@ function GraphQueryEditor({ columns, datasets=[], manifest=null, nodes, setNodes
  * App本体から切り離す。UIコンポーネントはpost(msg)だけを使い、
  * Worker実体・message routing・fallback/error計測を直接持たない。
  */
+function sanitizeWorkerMessage(message) {
+  if (!message || typeof message !== "object") {
+    throw new Error("Worker message must be an object");
+  }
+
+  const type = String(message.type || "").trim();
+
+  if (!/^[A-Z0-9_]{1,64}$/.test(type)) {
+    throw new Error("Invalid worker command type");
+  }
+
+  const safe = { ...message, type };
+
+  const numericKeys = [
+    "limit",
+    "offset",
+    "page",
+    "pageSize",
+    "chunkSize",
+    "sampleSize",
+    "timeoutMs",
+    "batchIndex",
+    "batchSize"
+  ];
+
+  for (const key of numericKeys) {
+    if (key in safe) {
+      const n = Number(safe[key]);
+      if (!Number.isFinite(n) || n < 0) {
+        throw new Error(`Invalid numeric field: ${key}`);
+      }
+      safe[key] = Math.min(n, 10_000_000);
+    }
+  }
+
+  if ("formulaExpression" in safe) {
+    safe.formulaExpression = String(safe.formulaExpression || "").slice(0, SAFE_FORMULA_MAX_LENGTH);
+  }
+
+  return safe;
+}
+
 function createWorkerGateway({ getWorker, onReject, onSent } = {}) {
   return {
     post(message) {
-      const msg = message || {};
-      if (!msg.type) {
-        onReject?.("Worker command rejected: missing type", msg);
+      let msg;
+
+      try {
+        msg = sanitizeWorkerMessage(message);
+      } catch (error) {
+        onReject?.(error?.message || "Worker command rejected", message);
         return false;
       }
+
       const worker = getWorker?.();
+
       if (!worker) {
         onReject?.(`Worker is not ready: ${msg.type}`, msg);
         return false;
       }
+
       worker.postMessage(msg);
       onSent?.(msg);
       return true;
@@ -17599,18 +18349,22 @@ root.render(
       sourceType: "script",
     });
 
-    const runApp = new Function(
-      "React",
-      "createRoot",
-      "MaterialUI",
-      "MaterialIcons",
-      "ReactFlowLib",
-      "HtmlToImage",
-      "d3",
-      code
-    );
+    // Babelの変換結果は、この同一HTML内のapp-codeだけを対象にする。
+    // 任意文字列をnew Functionで実行せず、必要な依存をwindowへ固定してからclassic scriptとして起動する。
+    Object.assign(window, {
+      React,
+      createRoot,
+      MaterialUI,
+      MaterialIcons,
+      ReactFlowLib,
+      HtmlToImage,
+      d3,
+    });
 
-    runApp(React, createRoot, MaterialUI, MaterialIcons, ReactFlowLib, HtmlToImage, d3);
+    const appRuntimeScript = document.createElement("script");
+    appRuntimeScript.type = "text/javascript";
+    appRuntimeScript.textContent = code;
+    document.body.appendChild(appRuntimeScript);
   </script>
 </body>
 </html>
