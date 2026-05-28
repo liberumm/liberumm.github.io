@@ -11217,6 +11217,8 @@ const D3_PROJECTION_TEXT_MAX = 180;
 const D3_PROJECTION_TABLE_TILE_HEIGHT = 34;
 const D3_PROJECTION_TABLE_TILE_OVERSCAN = 10;
 const D3_PROJECTION_TABLE_VIEWPORT_HEIGHT = 420;
+const D3_PROJECTION_TABLE_HEADER_HEIGHT = 40;
+const D3_PROJECTION_TABLE_FILTER_HEIGHT = 54;
 const D3_PROJECTION_TABLE_HEADERS = ["#", "type", "label", "group", "x", "y", "value", "count", "sourcePreview"];
 const D3_PROJECTION_TABLE_COLUMN_WIDTHS = {
   "#": 58,
@@ -11229,6 +11231,18 @@ const D3_PROJECTION_TABLE_COLUMN_WIDTHS = {
   count: 110,
   sourcePreview: 460,
 };
+const D3_PROJECTION_TABLE_MIN_COLUMN_WIDTHS = {
+  "#": 54,
+  type: 86,
+  label: 140,
+  group: 120,
+  x: 120,
+  y: 120,
+  value: 110,
+  count: 90,
+  sourcePreview: 220,
+};
+const D3_PROJECTION_TABLE_MAX_COLUMN_WIDTH = 900;
 
 function d3ProjectionText(value, max = D3_PROJECTION_TEXT_MAX) {
   if (value == null) return "";
@@ -11472,26 +11486,143 @@ function buildD3ProjectionTable(surface) {
   };
 }
 
-function ProjectionDataTable({ table }) {
+function ProjectionDataTable({ table, csvExportEncoding = "utf-8", csvFileStem = "d3_projection" }) {
   const rows = Array.isArray(table?.rows) ? table.rows : [];
   const [scrollTop, setScrollTop] = useState(0);
+  const [filters, setFilters] = useState({});
+  const [columnWidths, setColumnWidths] = useState(() => ({ ...D3_PROJECTION_TABLE_COLUMN_WIDTHS }));
+  const resizeStateRef = useRef(null);
 
   useEffect(() => {
     setScrollTop(0);
+    setFilters({});
   }, [table?.kind, table?.totalRows, rows.length]);
 
-  const totalRows = rows.length;
+  useEffect(() => {
+    const handleMouseMove = (event) => {
+      const state = resizeStateRef.current;
+      if (!state) return;
+
+      const minWidth = D3_PROJECTION_TABLE_MIN_COLUMN_WIDTHS[state.key] || 80;
+      const nextWidth = Math.max(
+        minWidth,
+        Math.min(D3_PROJECTION_TABLE_MAX_COLUMN_WIDTH, state.startWidth + event.clientX - state.startX)
+      );
+
+      setColumnWidths((current) => ({
+        ...current,
+        [state.key]: Math.round(nextWidth),
+      }));
+    };
+
+    const stopResize = () => {
+      if (!resizeStateRef.current) return;
+      resizeStateRef.current = null;
+      document.body.style.cursor = "";
+      document.body.style.userSelect = "";
+    };
+
+    window.addEventListener("mousemove", handleMouseMove);
+    window.addEventListener("mouseup", stopResize);
+    return () => {
+      window.removeEventListener("mousemove", handleMouseMove);
+      window.removeEventListener("mouseup", stopResize);
+      document.body.style.cursor = "";
+      document.body.style.userSelect = "";
+    };
+  }, []);
+
+  const activeFilters = useMemo(() => {
+    const normalized = {};
+    for (const header of D3_PROJECTION_TABLE_HEADERS) {
+      const value = String(filters[header] || "").trim().toLowerCase();
+      if (value) normalized[header] = value;
+    }
+    return normalized;
+  }, [filters]);
+
+  const indexedRows = useMemo(() => rows.map((row, index) => ({ row, originalIndex: index + 1 })), [rows]);
+
+  const filteredRows = useMemo(() => {
+    const entries = Object.entries(activeFilters);
+    if (!entries.length) return indexedRows;
+
+    return indexedRows.filter((item) => entries.every(([key, expected]) => {
+      const value = key === "#"
+        ? String(item.originalIndex)
+        : String(item.row?.[key] ?? "");
+      return value.toLowerCase().includes(expected);
+    }));
+  }, [indexedRows, activeFilters]);
+
+  const hasFilters = Object.keys(activeFilters).length > 0;
+  const totalRows = filteredRows.length;
   const viewportHeight = D3_PROJECTION_TABLE_VIEWPORT_HEIGHT;
+  const scrollSurfaceHeight = D3_PROJECTION_TABLE_HEADER_HEIGHT + D3_PROJECTION_TABLE_FILTER_HEIGHT + viewportHeight;
   const rowHeight = D3_PROJECTION_TABLE_TILE_HEIGHT;
+  const bodyScrollTop = Math.max(0, scrollTop - D3_PROJECTION_TABLE_HEADER_HEIGHT - D3_PROJECTION_TABLE_FILTER_HEIGHT);
   const visibleCount = Math.ceil(viewportHeight / rowHeight) + D3_PROJECTION_TABLE_TILE_OVERSCAN * 2;
-  const startIndex = Math.max(0, Math.floor(scrollTop / rowHeight) - D3_PROJECTION_TABLE_TILE_OVERSCAN);
+  const startIndex = Math.max(0, Math.floor(bodyScrollTop / rowHeight) - D3_PROJECTION_TABLE_TILE_OVERSCAN);
   const endIndex = Math.min(totalRows, startIndex + visibleCount);
-  const visibleRows = rows.slice(startIndex, endIndex);
+  const visibleRows = filteredRows.slice(startIndex, endIndex);
   const gridTemplateColumns = D3_PROJECTION_TABLE_HEADERS
-    .map((header) => `${D3_PROJECTION_TABLE_COLUMN_WIDTHS[header] || 160}px`)
+    .map((header) => `${columnWidths[header] || D3_PROJECTION_TABLE_COLUMN_WIDTHS[header] || 160}px`)
     .join(" ");
   const tableWidth = D3_PROJECTION_TABLE_HEADERS
-    .reduce((sum, header) => sum + (D3_PROJECTION_TABLE_COLUMN_WIDTHS[header] || 160), 0);
+    .reduce((sum, header) => sum + (columnWidths[header] || D3_PROJECTION_TABLE_COLUMN_WIDTHS[header] || 160), 0);
+
+  const setFilter = (key, value) => {
+    setScrollTop(0);
+    setFilters((current) => ({
+      ...current,
+      [key]: value,
+    }));
+  };
+
+  const clearFilters = () => {
+    setScrollTop(0);
+    setFilters({});
+  };
+
+  const startColumnResize = (event, key) => {
+    event.preventDefault();
+    event.stopPropagation();
+
+    resizeStateRef.current = {
+      key,
+      startX: event.clientX,
+      startWidth: columnWidths[key] || D3_PROJECTION_TABLE_COLUMN_WIDTHS[key] || 160,
+    };
+
+    document.body.style.cursor = "col-resize";
+    document.body.style.userSelect = "none";
+  };
+
+  const filteredCsv = useMemo(() => {
+    if (!filteredRows.length) return "";
+    return [
+      D3_PROJECTION_TABLE_HEADERS.map(d3ProjectionCsvEscape).join(","),
+      ...filteredRows.map((item) => D3_PROJECTION_TABLE_HEADERS.map((key) => {
+        if (key === "#") return d3ProjectionCsvEscape(item.originalIndex);
+        return d3ProjectionCsvEscape(item.row?.[key]);
+      }).join(",")),
+    ].join("\n");
+  }, [filteredRows]);
+
+  const copyFilteredCsv = async () => {
+    if (!filteredCsv) return;
+    try {
+      if (!navigator?.clipboard?.writeText) throw new Error("Clipboard is not available");
+      await navigator.clipboard.writeText(filteredCsv);
+    } catch {
+      downloadText(`${csvFileStem}_filtered.csv`, filteredCsv, { encoding:csvExportEncoding });
+    }
+  };
+
+  const exportFilteredCsv = () => {
+    if (!filteredCsv) return;
+    downloadText(`${csvFileStem}_filtered.csv`, filteredCsv, { encoding:csvExportEncoding });
+  };
 
   if (!rows.length) {
     return (
@@ -11501,13 +11632,14 @@ function ProjectionDataTable({ table }) {
     );
   }
 
-  const renderCell = (row, key, rowNumber) => {
-    const value = key === "#" ? rowNumber : row[key];
+  const renderCell = (item, key) => {
+    const value = key === "#" ? item.originalIndex : item.row?.[key];
     const text = String(value ?? "");
     const isNumeric = ["value", "count", "x", "y"].includes(key);
     return (
       <Box
         key={key}
+        role="cell"
         title={text}
         sx={{
           px: 1,
@@ -11539,7 +11671,17 @@ function ProjectionDataTable({ table }) {
           bgcolor: "background.paper",
         }}
       >
-        <Box sx={{ overflowX: "auto" }}>
+        <Box
+          role="table"
+          aria-label="D3 Projection Data Tile Table"
+          onScroll={(event) => setScrollTop(event.currentTarget.scrollTop)}
+          sx={{
+            height: scrollSurfaceHeight,
+            overflow: "auto",
+            overscrollBehavior: "contain",
+            scrollbarGutter: "stable both-edges",
+          }}
+        >
           <Box sx={{ minWidth: tableWidth }}>
             <Box
               role="row"
@@ -11548,7 +11690,8 @@ function ProjectionDataTable({ table }) {
                 gridTemplateColumns,
                 position: "sticky",
                 top: 0,
-                zIndex: 2,
+                zIndex: 4,
+                height: D3_PROJECTION_TABLE_HEADER_HEIGHT,
                 bgcolor: "background.paper",
                 borderBottom: "1px solid",
                 borderColor: "divider",
@@ -11567,57 +11710,142 @@ function ProjectionDataTable({ table }) {
                     borderRight: "1px solid",
                     borderColor: "divider",
                     whiteSpace: "nowrap",
+                    overflow: "hidden",
+                    textOverflow: "ellipsis",
+                    position: "relative",
+                    userSelect: "none",
                   }}
                 >
                   {header}
+                  <Box
+                    aria-label={`Resize ${header} column`}
+                    title="Drag to resize column"
+                    onMouseDown={(event) => startColumnResize(event, header)}
+                    sx={{
+                      position: "absolute",
+                      top: 0,
+                      right: -3,
+                      width: 8,
+                      height: "100%",
+                      cursor: "col-resize",
+                      zIndex: 5,
+                      "&:hover": { bgcolor: "action.hover" },
+                    }}
+                  />
                 </Box>
               ))}
             </Box>
 
             <Box
-              role="table"
-              aria-label="D3 Projection Data Tile Table"
-              onScroll={(event) => setScrollTop(event.currentTarget.scrollTop)}
+              role="row"
               sx={{
-                height: viewportHeight,
-                overflowY: "auto",
-                position: "relative",
-                overscrollBehavior: "contain",
+                display: "grid",
+                gridTemplateColumns,
+                position: "sticky",
+                top: D3_PROJECTION_TABLE_HEADER_HEIGHT,
+                zIndex: 4,
+                height: D3_PROJECTION_TABLE_FILTER_HEIGHT,
+                bgcolor: "background.paper",
+                borderBottom: "1px solid",
+                borderColor: "divider",
               }}
             >
-              <Box sx={{ height: totalRows * rowHeight, position: "relative" }}>
-                {visibleRows.map((row, offset) => {
-                  const absoluteIndex = startIndex + offset;
-                  return (
-                    <Box
-                      key={`${row.type}-${row.label}-${row.group}-${absoluteIndex}`}
-                      role="row"
-                      sx={{
-                        display: "grid",
-                        gridTemplateColumns,
-                        position: "absolute",
-                        top: absoluteIndex * rowHeight,
-                        left: 0,
-                        right: 0,
-                        height: rowHeight,
-                        bgcolor: absoluteIndex % 2 ? "background.default" : "background.paper",
-                        "&:hover": { bgcolor: "action.hover" },
-                      }}
-                    >
-                      {D3_PROJECTION_TABLE_HEADERS.map((key) => renderCell(row, key, absoluteIndex + 1))}
-                    </Box>
-                  );
-                })}
-              </Box>
+              {D3_PROJECTION_TABLE_HEADERS.map((header) => (
+                <Box
+                  key={header}
+                  role="cell"
+                  sx={{
+                    px: 0.75,
+                    py: 0.75,
+                    borderRight: "1px solid",
+                    borderColor: "divider",
+                    minWidth: 0,
+                  }}
+                >
+                  <TextField
+                    value={filters[header] || ""}
+                    onChange={(event) => setFilter(header, event.target.value)}
+                    placeholder={header === "#" ? "No." : `Filter ${header}`}
+                    size="small"
+                    variant="outlined"
+                    fullWidth
+                    inputProps={{
+                      "aria-label": `Filter ${header}`,
+                    }}
+                    sx={{
+                      "& .MuiInputBase-input": {
+                        fontSize: 12,
+                        py: 0.45,
+                        px: 0.75,
+                      },
+                    }}
+                  />
+                </Box>
+              ))}
+            </Box>
+
+            <Box sx={{ height: Math.max(1, totalRows) * rowHeight, position: "relative" }}>
+              {visibleRows.map((item, offset) => {
+                const absoluteIndex = startIndex + offset;
+                return (
+                  <Box
+                    key={`${item.row?.type}-${item.row?.label}-${item.row?.group}-${item.originalIndex}`}
+                    role="row"
+                    sx={{
+                      display: "grid",
+                      gridTemplateColumns,
+                      position: "absolute",
+                      top: absoluteIndex * rowHeight,
+                      left: 0,
+                      right: 0,
+                      height: rowHeight,
+                      bgcolor: absoluteIndex % 2 ? "background.default" : "background.paper",
+                      "&:hover": { bgcolor: "action.hover" },
+                    }}
+                  >
+                    {D3_PROJECTION_TABLE_HEADERS.map((key) => renderCell(item, key))}
+                  </Box>
+                );
+              })}
+
+              {!totalRows && (
+                <Box
+                  sx={{
+                    position: "absolute",
+                    top: 0,
+                    left: 0,
+                    right: 0,
+                    height: rowHeight,
+                    px: 1,
+                    py: 0.75,
+                    color: "text.secondary",
+                    borderBottom: "1px solid",
+                    borderColor: "divider",
+                  }}
+                >
+                  フィルター条件に一致するProjection行はありません。
+                </Box>
+              )}
             </Box>
           </Box>
         </Box>
       </Box>
 
-      <Stack direction="row" spacing={0.75} useFlexGap flexWrap="wrap" sx={{ mt: 0.75 }}>
-        <Chip size="small" label={`tile window ${fmt(startIndex + 1)}-${fmt(Math.max(startIndex, endIndex))}`} />
+      <Stack direction="row" spacing={0.75} alignItems="center" useFlexGap flexWrap="wrap" sx={{ mt: 0.75 }}>
+        <Chip size="small" label={`tile window ${totalRows ? fmt(startIndex + 1) : "0"}-${fmt(Math.max(startIndex, endIndex))}`} />
         <Chip size="small" label={`rendered ${fmt(visibleRows.length)} / ${fmt(totalRows)}`} />
+        {hasFilters && <Chip size="small" color="primary" label={`filtered ${fmt(totalRows)} / ${fmt(rows.length)}`} />}
+        <Chip size="small" label={`width ${fmt(tableWidth)}px`} />
         {table?.capped && <Chip size="small" color="warning" label={`internal cap ${fmt(D3_PROJECTION_TABLE_MAX_ROWS)}`} />}
+        <Button size="small" onClick={clearFilters} disabled={!hasFilters}>
+          Clear filters
+        </Button>
+        <Button size="small" onClick={copyFilteredCsv} disabled={!totalRows}>
+          Copy filtered CSV
+        </Button>
+        <Button size="small" startIcon={<Download />} onClick={exportFilteredCsv} disabled={!totalRows}>
+          Export filtered CSV
+        </Button>
       </Stack>
 
       {(table?.totalRows > rows.length || table?.capped) && (
@@ -11629,7 +11857,8 @@ function ProjectionDataTable({ table }) {
   );
 }
 
-function ProjectionDataTablePanel({ table, open, onToggle, onCopyCsv, onExportCsv }) {
+
+function ProjectionDataTablePanel({ table, open, onToggle, onCopyCsv, onExportCsv, csvExportEncoding = "utf-8", csvFileStem = "d3_projection" }) {
   const rows = Array.isArray(table?.rows) ? table.rows : [];
 
   return (
@@ -11652,7 +11881,7 @@ function ProjectionDataTablePanel({ table, open, onToggle, onCopyCsv, onExportCs
       </Stack>
 
       <Collapse in={open} timeout="auto" unmountOnExit>
-        <ProjectionDataTable table={table} />
+        <ProjectionDataTable table={table} csvExportEncoding={csvExportEncoding} csvFileStem={csvFileStem} />
       </Collapse>
 
       {!rows.length && (
@@ -11916,6 +12145,8 @@ function D3VisualizationPanel({ manifest, columns, graphColumns = [], graphResul
           onToggle={() => setProjectionTableOpen((open) => !open)}
           onCopyCsv={copyProjectionTableCsv}
           onExportCsv={exportProjectionTableCsv}
+          csvExportEncoding={csvExportEncoding}
+          csvFileStem={`d3_projection_${result?.kind || "surface"}`}
         />
       </Box>
     </Box>
