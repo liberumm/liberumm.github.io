@@ -7792,17 +7792,25 @@ function d3VizGraphValue(row, index){
   return Array.isArray(row) && idx >= 0 ? row[idx] : undefined;
 }
 
-async function d3VizForEachGraphResultRow({ mode="data", chunkRows=10000, label="D3 graph-result surface", visit } = {}){
+async function d3VizForEachGraphResultRow({ mode="data", surfaceId=null, chunkRows=10000, label="D3 graph-result surface", readColumns=[], derivedColumns=[], outputColumnNames=null, visit } = {}){
   const sourceMode = d3VizNormalizeGraphMode(mode);
   const safeChunkRows = d3VizSafeInt(chunkRows, 500, 50000, 10000);
-  const total = graphResultTotalRows(sourceMode);
+  const total = graphResultTotalRows(sourceMode, surfaceId);
   if (!total) throw new Error("Graph Query Result is empty. Run Graph Query first.");
   let scanned = 0;
   let header = [];
   for (let start = 0; start < total; start += safeChunkRows){
     if (state.cancelled) throw new Error("Cancelled");
     const page = Math.floor(start / safeChunkRows) + 1;
-    const table = await readGraphResultWindow({ mode:sourceMode, page, pageSize:Math.min(safeChunkRows, total - start) });
+    const table = await readGraphResultWindow({
+      mode:sourceMode,
+      surfaceId,
+      page,
+      pageSize:Math.min(safeChunkRows, total - start),
+      columns:Array.isArray(readColumns) ? readColumns : [],
+      derivedColumns:Array.isArray(derivedColumns) ? derivedColumns : [],
+      outputColumnNames:Array.isArray(outputColumnNames) && outputColumnNames.length ? outputColumnNames : null
+    });
     if (!header.length) header = Array.isArray(table.header) ? table.header : [];
     const rows = Array.isArray(table.rows) ? table.rows : [];
     for (let i = 0; i < rows.length; i++){
@@ -7815,7 +7823,7 @@ async function d3VizForEachGraphResultRow({ mode="data", chunkRows=10000, label=
   return { scanned, chunks:Math.ceil(total / Math.max(1, safeChunkRows)), total, header };
 }
 
-async function d3VizResolveGraphDomains({ columns, indices, mode, chunkRows, label }){
+async function d3VizResolveGraphDomains({ columns, indices, mode, surfaceId=null, chunkRows, label, readColumns=[], derivedColumns=[], outputColumnNames=null }){
   const domains = new Map();
   for (const idx of d3VizGraphUniqueColumns(columns, indices)) {
     if (!d3VizGraphColumn(columns, idx)) continue;
@@ -7825,8 +7833,12 @@ async function d3VizResolveGraphDomains({ columns, indices, mode, chunkRows, lab
 
   await d3VizForEachGraphResultRow({
     mode,
+    surfaceId,
     chunkRows,
     label,
+    readColumns,
+    derivedColumns,
+    outputColumnNames,
     visit:(row) => {
       for (const idx of domains.keys()){
         const n = d3VizParseNumber(d3VizGraphValue(row, idx));
@@ -7973,21 +7985,35 @@ function d3VizMakeSurfaceAdapterActive(){
   };
 }
 
-function d3VizMakeSurfaceAdapterGraph(sourceColumns, sourceMode, chunkRows){
+function d3VizMakeSurfaceAdapterGraph(sourceColumns, sourceMode, chunkRows, msg={}){
   return {
     dataSource:"graph",
     dataSourceLabel:`Graph Query Result / ${sourceMode}`,
     sourceMode,
     strategy:"worker-graph-result-window-reduce",
-    totalRows:() => graphResultTotalRows(sourceMode),
+    totalRows:() => graphResultTotalRows(sourceMode, msg.surfaceId || null),
     hasColumn:(idx) => !!d3VizGraphColumn(sourceColumns, idx),
     name:(idx) => d3VizGraphColumnName(sourceColumns, idx),
     type:(idx) => d3VizGraphColumn(sourceColumns, idx)?.type || "string",
-    resolveDomains:(indices, label) => d3VizResolveGraphDomains({ columns:sourceColumns, indices, mode:sourceMode, chunkRows, label }),
-    scan:(indices, label, visit) => d3VizForEachGraphResultRow({
+    resolveDomains:(indices, label) => d3VizResolveGraphDomains({
+      columns:sourceColumns,
+      indices,
       mode:sourceMode,
+      surfaceId:msg.surfaceId || null,
       chunkRows,
       label,
+      readColumns:Array.isArray(msg.graphReadColumns) ? msg.graphReadColumns : [],
+      derivedColumns:Array.isArray(msg.derivedColumns) ? msg.derivedColumns : [],
+      outputColumnNames:Array.isArray(msg.graphOutputColumnNames) ? msg.graphOutputColumnNames : null
+    }),
+    scan:(indices, label, visit) => d3VizForEachGraphResultRow({
+      mode:sourceMode,
+      surfaceId:msg.surfaceId || null,
+      chunkRows,
+      label,
+      readColumns:Array.isArray(msg.graphReadColumns) ? msg.graphReadColumns : [],
+      derivedColumns:Array.isArray(msg.derivedColumns) ? msg.derivedColumns : [],
+      outputColumnNames:Array.isArray(msg.graphOutputColumnNames) ? msg.graphOutputColumnNames : null,
       visit:(row) => visit((idx) => d3VizGraphValue(row, idx))
     })
   };
@@ -8324,6 +8350,11 @@ function d3VizSurfaceCacheKey(msg, adapter){
     datasetId:state.manifest?.id || state.dataset?.id || "",
     source:adapter?.dataSource || d3VizNormalizeDataSource(msg.dataSource),
     sourceMode,
+    surfaceId:msg.surfaceId || "",
+    sourceColumns:d3VizSourceColumnList(msg.sourceColumns).map((c)=>`${c.index}:${c.name}:${c.type}`).join("|"),
+    graphReadColumns:Array.isArray(msg.graphReadColumns) ? msg.graphReadColumns.map(Number).join(",") : "",
+    graphOutputColumnNames:Array.isArray(msg.graphOutputColumnNames) ? msg.graphOutputColumnNames.map(String).join("|") : "",
+    derivedColumns:normalizeGraphDerivedColumnsForWorker(msg.derivedColumns || []).map((d)=>`${d.newColumnName}:${d.valueMode}:${d.constantValue}:${d.formulaExpression}`).join("|"),
     total:adapter?.totalRows?.() || 0,
     matches:matches ? matches.length : -1,
     sample,
@@ -8637,6 +8668,8 @@ function d3VizGraphFastRequiredSourceIndices(msg, sourceColumns){
 
 function d3VizCanUseGraphFastPath(sourceColumns, sourceMode, msg={}){
   if (sourceMode !== "data") return false;
+  if (normalizeGraphDerivedColumnsForWorker(msg.derivedColumns || []).length) return false;
+  if (Array.isArray(msg.graphOutputColumnNames) && msg.graphOutputColumnNames.length) return false;
   if (!state.manifest || !d3VizActiveChunkCount()) return false;
   const projectionMap = d3VizGraphDataProjectionMap(sourceColumns);
   const required = d3VizGraphFastRequiredSourceIndices(msg, sourceColumns);
@@ -8649,7 +8682,7 @@ async function buildD3GraphResultVisualizationSurface(msg){
   const chunkRows = d3VizSafeInt(msg.chunkRows, 500, 50000, 10000);
   const adapter = d3VizCanUseGraphFastPath(sourceColumns, sourceMode, msg)
     ? d3VizMakeSurfaceAdapterGraphFast(sourceColumns, sourceMode, chunkRows)
-    : d3VizMakeSurfaceAdapterGraph(sourceColumns, sourceMode, chunkRows);
+    : d3VizMakeSurfaceAdapterGraph(sourceColumns, sourceMode, chunkRows, msg);
 
   const key = d3VizSurfaceCacheKey(msg, adapter);
   const cached = d3VizSurfaceCacheGet(key);
@@ -8667,7 +8700,7 @@ async function buildD3GraphResultVisualizationSurface(msg){
   result.surface = {
     ...result.surface,
     cacheHit:false,
-    projectionFastPath:adapter.strategy === "worker-graph-rowid-columnar-reduce-v4"
+    projectionFastPath:adapter.strategy === "worker-graph-result-surface-rowid-columnar-v5"
   };
   return d3VizSurfaceCachePut(key, result);
 }
@@ -14270,6 +14303,84 @@ function compileGraphQuery(nodes, edges, columns, datasets=[]) {
   return plan;
 }
 
+
+function splitSqlSelectList(selectPart) {
+  const src = String(selectPart || "");
+  const parts = [];
+  let buf = "";
+  let quote = "";
+  let depth = 0;
+
+  for (let i = 0; i < src.length; i++) {
+    const ch = src[i];
+
+    if (quote) {
+      buf += ch;
+      if (ch === quote) {
+        if (quote === "'" && src[i + 1] === "'") {
+          buf += src[++i];
+        } else {
+          quote = "";
+        }
+      } else if (ch === "\\" && i + 1 < src.length) {
+        buf += src[++i];
+      }
+      continue;
+    }
+
+    if (ch === "'" || ch === '"' || ch === "`") {
+      quote = ch;
+      buf += ch;
+      continue;
+    }
+
+    if (ch === "(") {
+      depth++;
+      buf += ch;
+      continue;
+    }
+
+    if (ch === ")") {
+      depth = Math.max(0, depth - 1);
+      buf += ch;
+      continue;
+    }
+
+    if (ch === "," && depth === 0) {
+      if (buf.trim()) parts.push(buf.trim());
+      buf = "";
+      continue;
+    }
+
+    buf += ch;
+  }
+
+  if (buf.trim()) parts.push(buf.trim());
+  return parts;
+}
+
+function unquoteSqlIdentifierName(raw) {
+  let s = String(raw || "").trim().replace(/;$/g, "").trim();
+  if ((s.startsWith('"') && s.endsWith('"')) || (s.startsWith("`") && s.endsWith("`"))) {
+    s = s.slice(1, -1);
+  }
+  return s.replace(/""/g, '"').replace(/``/g, "`").trim();
+}
+
+function graphDerivedPreviewAliasFromSelectItem(item) {
+  const withoutComments = String(item || "").replace(/\/\*[\s\S]*?\*\//g, " ").trim();
+  const match = withoutComments.match(/^(?:NULL|TRUE|FALSE|[-+]?\d+(?:\.\d+)?|[-+]?\.\d+|'(?:''|[^'])*'|"(?:\"\"|[^"])*")\s+AS\s+([\s\S]+)$/i);
+  if (!match) return "";
+  const alias = unquoteSqlIdentifierName(match[1]);
+  return alias && !/[,\s()]/.test(alias.replace(/^["`]|["`]$/g, "")) ? alias : "";
+}
+
+function isSqlWildcardSelectItem(item) {
+  const s = String(item || "").replace(/\/\*[\s\S]*?\*\//g, " ").trim();
+  return s === "*" || /^[A-Za-z_][A-Za-z0-9_]*\.\*$/.test(s) || /^"[^"]+"\.\*$/.test(s) || /^`[^`]+`\.\*$/.test(s);
+}
+
+
 function parseSqlValue(raw) {
   let s = String(raw || "").trim().replace(/;$/g, "");
   if ((s.startsWith("'") && s.endsWith("'")) || (s.startsWith('"') && s.endsWith('"'))) s = s.slice(1, -1).replace(/''/g, "'");
@@ -14290,9 +14401,38 @@ function parseSqlToGraphPlan(sql, columns) {
   const orderPart = (m[4] || "").trim();
   const limitPart = (m[5] || "").trim();
   let projection = [];
+  const derivedPreviewAliases = [];
   if (selectPart !== "*") {
-    projection = selectPart.split(",").map((x) => columnBySqlName(columns, x.trim())?.index).filter((x) => x != null).map(Number);
-    if (!projection.length) errors.push("SELECT列を解決できませんでした。列名を確認してください。");
+    const selectItems = splitSqlSelectList(selectPart);
+    const resolvedProjection = [];
+    let wildcard = false;
+    let unresolved = 0;
+
+    for (const item of selectItems) {
+      if (isSqlWildcardSelectItem(item)) {
+        wildcard = true;
+        continue;
+      }
+
+      const derivedAlias = graphDerivedPreviewAliasFromSelectItem(item);
+      if (derivedAlias) {
+        derivedPreviewAliases.push(derivedAlias);
+        continue;
+      }
+
+      const col = columnBySqlName(columns, item);
+      if (col) {
+        resolvedProjection.push(Number(col.index));
+      } else {
+        unresolved++;
+        errors.push(`SELECT列を解決できません: ${item}`);
+      }
+    }
+
+    projection = wildcard ? [] : [...new Set(resolvedProjection)];
+    if (!wildcard && !projection.length && unresolved === 0 && !derivedPreviewAliases.length) {
+      errors.push("SELECT列を解決できませんでした。列名を確認してください。");
+    }
   }
   const filters = [];
   if (wherePart) {
@@ -14336,7 +14476,7 @@ function parseSqlToGraphPlan(sql, columns) {
     if (c) sort = { columnIndex: Number(c.index), direction: String(om[2] || "asc").toLowerCase() === "desc" ? "desc" : "asc" };
     else errors.push(`ORDER BY列を解決できません: ${orderPart}`);
   }
-  return { filters, sort, maxRows: Number(limitPart || 0), projection, errors };
+  return { filters, sort, maxRows: Number(limitPart || 0), projection, derivedPreviewAliases, errors };
 }
 
 
@@ -14867,7 +15007,25 @@ function GraphQueryEditor({ columns, datasets=[], manifest=null, nodes, setNodes
     const parsed = parseSqlToGraphPlan(sqlText, columns);
     setSqlErrors(parsed.errors || []);
     if (parsed.errors?.length) return;
-    onApply(parsed, { source: "sql" });
+
+    const previewAliases = new Set((parsed.derivedPreviewAliases || []).map((name) => String(name).toLowerCase()));
+    const graphDerived = normalizeGraphDerivedColumns(plan.derivedColumns || []);
+    const derivedColumns = previewAliases.size
+      ? graphDerived.filter((d) => previewAliases.has(String(d.newColumnName).toLowerCase()))
+      : [];
+
+    onApply({
+      ...plan,
+      ...parsed,
+      mode: plan.mode || "single",
+      sources: plan.sources || [],
+      joins: plan.joins || [],
+      selectedFields: plan.selectedFields || [],
+      derivedColumns,
+      subqueries: plan.subqueries || [],
+      edges: plan.edges || [],
+      sql: sqlText,
+    }, { source: "sql" });
   };
 
   const runFromGraph = () => {
@@ -17053,7 +17211,15 @@ function App() {
       ? "WorkerでGraphResultSurfaceを直接reduceし、D3用Surfaceを集約しています..."
       : "WorkerでColumnar Tileを全件走査し、D3用Surfaceを集約しています...");
     setD3VizTime("");
-    post({ type: "BUILD_D3_VIZ_SURFACE", ...plan, surfaceId: source === "graph" ? (graphResultSurface?.id || null) : null });
+    const graphCtx = source === "graph" ? (graphExecutionRef.current || {}) : {};
+    post({
+      type: "BUILD_D3_VIZ_SURFACE",
+      ...plan,
+      surfaceId: source === "graph" ? (graphResultSurface?.id || null) : null,
+      graphReadColumns: source === "graph" ? (graphCtx.readColumns || []) : [],
+      graphOutputColumnNames: source === "graph" ? (graphCtx.outputColumnNames || null) : null,
+      derivedColumns: source === "graph" ? (graphCtx.derivedColumns || []) : [],
+    });
   }
 
   function addDataQueryFilter() {
