@@ -119,13 +119,13 @@ let state = {
   hyperTensor:{enabled:true,version:2,lastPlan:null},
   externalDataset:null,
   runtime:{
-    kernelVersion:2,
+    kernelVersion:4,
     bootedAt:new Date().toISOString(),
     commandCount:0,
     failureCount:0,
     fallbackCount:0,
     lastCommandType:"",
-    lastStrategy:"legacy",
+    lastStrategy:"olap-kernel-v4",
     lastError:null
   },
   cancelled:false
@@ -458,7 +458,15 @@ function integrityFeatureFlags(base={}){
     chunkWorkerPool:true,
     distributedAggregateReduce:true,
     remoteExecutionAdapter:true,
-    browserExternalStorageAdapter:true
+    browserExternalStorageAdapter:true,
+    browserOlapKernel:true,
+    vectorOperators:true,
+    bitsetFilterEngine:true,
+    virtualDerivedColumns:true,
+    d3CubeCache:true,
+    chunkPack:true,
+    stagingCommit:true,
+    writeQueue:true
   };
 }
 
@@ -584,18 +592,41 @@ async function validateAndRepairDatasetDir(id,dir,options={}){
     const inferred=[];
     const dictCache=new Map();
 
-    for (const col of columns){
+    if (isPackedChunkMeta(meta)){
+      let packIndex=null;
       try{
-        const bytes=await fileByteLength(chunkDir,colFileName(col.index,col.type));
-        const rc=rowCountFromBytes(bytes,col.type);
-        if (rc == null){ issues.push(`chunk ${i} ${col.name || col.index} has invalid byte length ${bytes}`); continue; }
-        inferred.push(rc);
-        if (col.type === "string"){
-          const dict=await readDictArray(chunkDir,col);
-          dictCache.set(col.index,dict);
+        packIndex=await readJson(chunkDir, meta.indexFile || WRITE_KERNEL_INDEX_FILE);
+        const packBytes=await fileByteLength(chunkDir, packIndex.packFile || meta.packFile || WRITE_KERNEL_PACK_FILE);
+        for (const col of columns){
+          const dataSection=packIndex.sections?.[`col:${col.index}:data`];
+          if (!dataSection) { issues.push(`chunk ${i} packed column ${col.name || col.index} data section missing`); continue; }
+          const rc=rowCountFromBytes(Number(dataSection.length || 0), col.type);
+          if (rc == null){ issues.push(`chunk ${i} packed column ${col.name || col.index} has invalid byte length ${dataSection.length}`); continue; }
+          if (Number(dataSection.offset || 0) + Number(dataSection.length || 0) > packBytes) issues.push(`chunk ${i} packed column ${col.name || col.index} exceeds pack bounds`);
+          inferred.push(rc);
+          if (col.type === "string"){
+            const dictSection=packIndex.sections?.[`col:${col.index}:dict`];
+            if (!dictSection) { issues.push(`chunk ${i} packed dictionary ${col.name || col.index} is missing`); continue; }
+            if (Number(dictSection.offset || 0) + Number(dictSection.length || 0) > packBytes) issues.push(`chunk ${i} packed dictionary ${col.name || col.index} exceeds pack bounds`);
+          }
         }
       }catch(e){
-        issues.push(`chunk ${i} column ${col.name || col.index} unreadable: ${issueText(e)}`);
+        issues.push(`chunk ${i} packed chunk unreadable: ${issueText(e)}`);
+      }
+    } else {
+      for (const col of columns){
+        try{
+          const bytes=await fileByteLength(chunkDir,colFileName(col.index,col.type));
+          const rc=rowCountFromBytes(bytes,col.type);
+          if (rc == null){ issues.push(`chunk ${i} ${col.name || col.index} has invalid byte length ${bytes}`); continue; }
+          inferred.push(rc);
+          if (col.type === "string"){
+            const dict=await readDictArray(chunkDir,col);
+            dictCache.set(col.index,dict);
+          }
+        }catch(e){
+          issues.push(`chunk ${i} column ${col.name || col.index} unreadable: ${issueText(e)}`);
+        }
       }
     }
     if (issues.length) continue;
@@ -618,7 +649,8 @@ async function validateAndRepairDatasetDir(id,dir,options={}){
       let raw=meta.columnStats[key] || meta.stats[col.index] || null;
       let stat=normalizeColumnStat(raw,rowCount);
       let mustRebuild=!isColumnStatUsable(stat,col,rowCount);
-      if (col.type === "string" && rebuildStats && stat && !stat.lowerHashComplete && (dictCache.get(col.index)?.length || 0) <= 8192) mustRebuild=true;
+      if (!isPackedChunkMeta(meta) && col.type === "string" && rebuildStats && stat && !stat.lowerHashComplete && (dictCache.get(col.index)?.length || 0) <= 8192) mustRebuild=true;
+      if (isPackedChunkMeta(meta) && mustRebuild && rebuildStats) mustRebuild=false;
 
       if (mustRebuild && rebuildStats){
         stat=await rebuildColumnStatFromFiles(chunkDir,col,rowCount);
@@ -663,6 +695,7 @@ async function validateAndRepairDatasetDir(id,dir,options={}){
 async function loadValidatedDataset(id,options={}){
   const root=await rootDir();
   const dir=await root.getDirectoryHandle(id);
+  if (!(await isDatasetCommitted(dir))) throw new Error(`Dataset is not committed: ${id}`);
   const checked=await validateAndRepairDatasetDir(id,dir,{repair:true,rebuildStats:!!options.rebuildStats});
   if (!checked.ok){
     const msg=(checked.issues || []).slice(0,3).join(" / ") || "unknown integrity error";
@@ -674,6 +707,7 @@ async function loadValidatedDataset(id,options={}){
 async function loadDatasetForWorkerReadOnly(id){
   const root=await rootDir();
   const dir=await root.getDirectoryHandle(id);
+  if (!(await isDatasetCommitted(dir))) throw new Error(`Dataset is not committed: ${id}`);
   const checked=await validateAndRepairDatasetDir(id,dir,{repair:false,rebuildStats:false});
   if (!checked.ok){
     const msg=(checked.issues || []).slice(0,3).join(" / ") || "unknown integrity error";
@@ -734,6 +768,368 @@ async function openVirtualDatasetForWorkerReadOnly(ids, name){
 
 function colFileName(index, type){ return `col_${String(index).padStart(4,"0")}.${type === "number" ? "f64" : "i32"}.bin`; }
 function dictFileName(index){ return `col_${String(index).padStart(4,"0")}.dict.json`; }
+
+/*
+ * =========================================================
+ * OLAP KERNEL v4 + WRITE KERNEL v4
+ * =========================================================
+ * Row arrays are no longer the execution unit. The cold surface is a packed
+ * column tile, filters are bitset surfaces, derived values are virtual columns,
+ * D3 receives cubes/marks, and durable writes use packed chunks with commit
+ * markers. Display may materialize only the active window.
+ */
+const OLAP_KERNEL_VERSION = 4;
+const WRITE_KERNEL_VERSION = 4;
+const WRITE_KERNEL_PACK_FILE = "data.pack";
+const WRITE_KERNEL_INDEX_FILE = "index.json";
+const WRITE_KERNEL_COMMIT_FILE = "_COMMITTED";
+const textEncoderUtf8 = new TextEncoder();
+const textDecoderUtf8 = new TextDecoder();
+
+const olapKernelRuntime = {
+  masks:new Map(),
+  cubes:new Map(),
+  compiledPlans:new Map(),
+  packIndexCache:new Map(),
+  metrics:{
+    vectorBatches:0,
+    bitsetAnd:0,
+    bitsetOr:0,
+    bitsetNot:0,
+    filterMaskHits:0,
+    filterMaskWrites:0,
+    cubeHits:0,
+    cubeWrites:0,
+    virtualColumnEvaluations:0,
+    rowObjectsAvoided:0,
+    packReads:0,
+    packSliceReads:0,
+    packBytesRead:0,
+    packedChunksWritten:0,
+    packBytesWritten:0,
+    writeQueueFlushes:0,
+    writeQueueMaxPending:0,
+    committedDatasets:0
+  }
+};
+
+function olapKernelStatus(){
+  return {
+    version:OLAP_KERNEL_VERSION,
+    writeKernelVersion:WRITE_KERNEL_VERSION,
+    masks:olapKernelRuntime.masks.size,
+    cubes:olapKernelRuntime.cubes.size,
+    compiledPlans:olapKernelRuntime.compiledPlans.size,
+    packIndexCache:olapKernelRuntime.packIndexCache.size,
+    metrics:{...olapKernelRuntime.metrics}
+  };
+}
+
+function isPackedChunkMeta(meta){
+  return String(meta?.storageLayout || "") === "chunk-pack-v4" ||
+    String(meta?.packFile || "") === WRITE_KERNEL_PACK_FILE ||
+    String(meta?.indexFile || "") === WRITE_KERNEL_INDEX_FILE;
+}
+
+function writeKernelChunkDirName(chunkIndex){
+  return `chunk_${String(chunkIndex).padStart(6,"0")}`;
+}
+
+function uint8FromBufferLike(value){
+  if (value instanceof Uint8Array) return value;
+  if (value instanceof ArrayBuffer) return new Uint8Array(value);
+  if (ArrayBuffer.isView(value)) return new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
+  return new Uint8Array(0);
+}
+
+function alignOffset(offset, alignment=8){
+  const n=Number(offset || 0);
+  const a=Math.max(1, Number(alignment || 8));
+  return Math.ceil(n / a) * a;
+}
+
+function writeKernelBuildPackParts(chunk, columns){
+  const parts=[];
+  const sections={};
+  let offset=0;
+
+  function pushSection(key, bytes, meta={}){
+    const aligned=alignOffset(offset, 8);
+    if (aligned > offset) {
+      parts.push(new Uint8Array(aligned - offset));
+      offset = aligned;
+    }
+    const view=uint8FromBufferLike(bytes);
+    sections[key]={offset, length:view.byteLength, ...meta};
+    parts.push(view);
+    offset += view.byteLength;
+  }
+
+  for (const col of columns){
+    if (col.type === "number"){
+      const arr=new Float64Array(chunk.numeric[col.index]);
+      pushSection(`col:${col.index}:data`, arr.buffer, {
+        columnIndex:col.index,
+        kind:"data",
+        type:"f64",
+        rowCount:chunk.rows
+      });
+    } else {
+      const ids=new Int32Array(chunk.stringIds[col.index]);
+      const dictJson=JSON.stringify(chunk.dictValues[col.index] || []);
+      const dictBytes=textEncoderUtf8.encode(dictJson);
+      pushSection(`col:${col.index}:data`, ids.buffer, {
+        columnIndex:col.index,
+        kind:"data",
+        type:"i32",
+        rowCount:chunk.rows
+      });
+      pushSection(`col:${col.index}:dict`, dictBytes, {
+        columnIndex:col.index,
+        kind:"dict",
+        type:"json",
+        entries:(chunk.dictValues[col.index] || []).length
+      });
+    }
+  }
+
+  const totalBytes=offset;
+  const pack=new Uint8Array(totalBytes);
+  let cursor=0;
+  for (const part of parts){
+    pack.set(part, cursor);
+    cursor += part.byteLength;
+  }
+
+  return {
+    buffer:pack.buffer,
+    index:{
+      version:WRITE_KERNEL_VERSION,
+      storageLayout:"chunk-pack-v4",
+      packFile:WRITE_KERNEL_PACK_FILE,
+      rowCount:chunk.rows,
+      byteLength:pack.byteLength,
+      sections
+    }
+  };
+}
+
+async function readFileSliceBuffer(dir, name, offset, length){
+  const handle=await dir.getFileHandle(name);
+  const file=await handle.getFile();
+  const start=Math.max(0, Number(offset || 0));
+  const end=Math.min(Number(file.size || 0), start + Math.max(0, Number(length || 0)));
+  return await file.slice(start, end).arrayBuffer();
+}
+
+function packIndexCacheKey(target){
+  return `${target.datasetId || "dataset"}\u001f${Number(target.physicalChunkIndex || 0)}\u001fpack-index`;
+}
+
+async function readChunkPackIndex(target){
+  const key=packIndexCacheKey(target);
+  const cached=olapKernelRuntime.packIndexCache.get(key);
+  if (cached) return cached;
+  const chunkPath=`${target.externalBase}/chunk_${String(target.physicalChunkIndex).padStart(6,"0")}`;
+  const index=target.external
+    ? await externalReadJson(`${chunkPath}/${WRITE_KERNEL_INDEX_FILE}`)
+    : await readJson(target.chunkDir, WRITE_KERNEL_INDEX_FILE);
+  olapKernelRuntime.packIndexCache.set(key,index);
+  while (olapKernelRuntime.packIndexCache.size > 128){
+    const first=olapKernelRuntime.packIndexCache.keys().next().value;
+    olapKernelRuntime.packIndexCache.delete(first);
+  }
+  return index;
+}
+
+async function readPackSectionBuffer(target, sectionKey){
+  const index=await readChunkPackIndex(target);
+  const section=index?.sections?.[sectionKey];
+  if (!section) throw new Error(`Packed chunk section is missing: ${sectionKey}`);
+  const chunkPath=`${target.externalBase}/chunk_${String(target.physicalChunkIndex).padStart(6,"0")}`;
+  let buffer;
+  if (target.external){
+    const full=await externalReadBuffer(`${chunkPath}/${index.packFile || WRITE_KERNEL_PACK_FILE}`);
+    buffer=full.slice(Number(section.offset || 0), Number(section.offset || 0) + Number(section.length || 0));
+  } else {
+    buffer=await readFileSliceBuffer(target.chunkDir, index.packFile || WRITE_KERNEL_PACK_FILE, section.offset, section.length);
+  }
+  olapKernelRuntime.metrics.packSliceReads++;
+  olapKernelRuntime.metrics.packBytesRead += Number(buffer.byteLength || 0);
+  return buffer;
+}
+
+async function readPackedColumn(target, col){
+  const dataKey=`col:${col.index}:data`;
+  if (col.type === "number"){
+    const buf=await readPackSectionBuffer(target,dataKey);
+    return {type:"number", data:new Float64Array(buf)};
+  }
+  const [idsBuf, dictBuf]=await Promise.all([
+    readPackSectionBuffer(target,dataKey),
+    readPackSectionBuffer(target,`col:${col.index}:dict`)
+  ]);
+  const dict=JSON.parse(textDecoderUtf8.decode(new Uint8Array(dictBuf)));
+  return {type:"string", ids:new Int32Array(idsBuf), dict:Array.isArray(dict) ? dict : []};
+}
+
+function olapMaskCacheKey(chunk, predicateOrPlan, suffix="mask"){
+  const s=chunk?.surface || {};
+  const datasetId=s.datasetId || activeSurfaceDatasetId();
+  const physicalChunkIndex=s.physicalChunkIndex ?? s.chunkIndex ?? 0;
+  return `${datasetId}\u001f${physicalChunkIndex}\u001f${hashText32(JSON.stringify(predicateOrPlan || {}))}\u001f${suffix}\u001fkernel-v4`;
+}
+
+function olapMaskGet(key, rowCount){
+  const hit=olapKernelRuntime.masks.get(key);
+  if (!hit || Number(hit.rowCount || 0) !== Number(rowCount || 0)) return null;
+  hit.lastUsed=now();
+  olapKernelRuntime.metrics.filterMaskHits++;
+  return hit.mask;
+}
+
+function olapMaskSet(key, rowCount, mask){
+  if (!key || !mask) return mask;
+  olapKernelRuntime.masks.set(key,{rowCount:Number(rowCount || 0), mask, bytes:Number(mask.byteLength || 0), lastUsed:now()});
+  olapKernelRuntime.metrics.filterMaskWrites++;
+  const max=256;
+  while (olapKernelRuntime.masks.size > max){
+    let oldestKey=null, oldest=Infinity;
+    for (const [k,v] of olapKernelRuntime.masks.entries()){
+      const t=Number(v.lastUsed || 0);
+      if (t < oldest){ oldest=t; oldestKey=k; }
+    }
+    if (!oldestKey) break;
+    olapKernelRuntime.masks.delete(oldestKey);
+  }
+  return mask;
+}
+
+function olapEvaluateQueryPlanMask(chunk, oplan){
+  const rowCount=Number(chunk?.rowCount || 0);
+  const key=olapMaskCacheKey(chunk, {
+    predicates:oplan?.predicates || [],
+    filterGroups:oplan?.filterGroups || []
+  }, "query-plan-mask");
+  const cached=olapMaskGet(key,rowCount);
+  if (cached) return cached;
+  olapKernelRuntime.metrics.vectorBatches++;
+  const mask=evaluateQueryPlanBitset(chunk, oplan);
+  return olapMaskSet(key,rowCount,mask);
+}
+
+function bitsetToWindowRowIds(mask, baseRow=0, startMatch=0, limit=1000){
+  const out=[];
+  const start=Math.max(0, Number(startMatch || 0));
+  const max=Math.max(0, Number(limit || 0));
+  let seen=0;
+  for (let wordIndex=0; wordIndex<mask.length; wordIndex++){
+    let word=mask[wordIndex] >>> 0;
+    while(word){
+      const bit = 31 - Math.clz32(word & -word);
+      if (seen >= start && out.length < max) out.push(Number(baseRow || 0) + wordIndex * 32 + bit);
+      seen++;
+      if (out.length >= max) return {rowIds:out, seen};
+      word &= word - 1;
+    }
+  }
+  return {rowIds:out, seen};
+}
+
+function createWriteKernelQueue(datasetDir, columns, options={}){
+  const concurrency=Math.max(1, Math.min(4, Number(options.concurrency || 2)));
+  const maxPending=Math.max(concurrency, Math.min(8, Number(options.maxPending || 3)));
+  const active=new Set();
+  const results=[];
+  const errors=[];
+  let maxObserved=0;
+
+  async function enqueue(chunkIndex, chunk){
+    if (errors.length) throw errors[0];
+    const p=(async()=>{
+      try{
+        const meta=await flushChunk(datasetDir, chunkIndex, chunk, columns);
+        results[chunkIndex]=meta;
+        olapKernelRuntime.metrics.writeQueueFlushes++;
+      }catch(error){
+        errors.push(error);
+        throw error;
+      }
+    })();
+    active.add(p);
+    p.then(()=>active.delete(p),()=>active.delete(p));
+    maxObserved=Math.max(maxObserved, active.size);
+    olapKernelRuntime.metrics.writeQueueMaxPending=Math.max(olapKernelRuntime.metrics.writeQueueMaxPending, maxObserved);
+    while (active.size >= concurrency){
+      try{ await Promise.race(active); }catch(error){ errors.push(error); throw error; }
+    }
+  }
+
+  async function drain(){
+    if (active.size) await Promise.all([...active]);
+    if (errors.length) throw errors[0];
+    return results.filter(Boolean);
+  }
+
+  return {enqueue, drain, stats:()=>({concurrency,maxPending,maxObserved,pending:active.size})};
+}
+
+async function commitDatasetManifest(dir, manifest, chunkMetas, extra={}){
+  const committedAt=new Date().toISOString();
+  const finalManifest={
+    ...manifest,
+    formatVersion:Math.max(6, Number(manifest.formatVersion || 0)),
+    storageLayout:"chunk-pack-v4",
+    writeKernelVersion:WRITE_KERNEL_VERSION,
+    olapKernelVersion:OLAP_KERNEL_VERSION,
+    committedAt,
+    features:integrityFeatureFlags({
+      ...(manifest.features || {}),
+      chunkPack:true,
+      stagingCommit:true,
+      writeQueue:true,
+      browserOlapKernel:true
+    }),
+    writeMetrics:{
+      ...(manifest.writeMetrics || {}),
+      ...(extra.writeMetrics || {}),
+      kernel:"write-kernel-v4",
+      committedAt
+    }
+  };
+  await writeJson(dir,"chunks.pending.json",chunkMetas);
+  await writeJson(dir,"manifest.pending.json",finalManifest);
+  await writeJson(dir,"chunks.json",chunkMetas);
+  await writeJson(dir,"manifest.json",finalManifest);
+  await writeText(dir,WRITE_KERNEL_COMMIT_FILE,JSON.stringify({ok:true,committedAt,writeKernelVersion:WRITE_KERNEL_VERSION}));
+  olapKernelRuntime.metrics.committedDatasets++;
+  return finalManifest;
+}
+
+async function isDatasetCommitted(dir){
+  try{
+    await readText(dir,WRITE_KERNEL_COMMIT_FILE);
+    return true;
+  }catch{
+    try{
+      const manifest=await readJson(dir,"manifest.json");
+      return Number(manifest?.writeKernelVersion || 0) < 4;
+    }catch{
+      return false;
+    }
+  }
+}
+
+async function cleanupUncommittedDatasetDirs(){
+  const root=await rootDir();
+  for await (const [id,h] of root.entries()){
+    if (h.kind !== "directory") continue;
+    try{
+      if (!(await isDatasetCommitted(h))) await root.removeEntry(id,{recursive:true});
+    }catch{}
+  }
+}
+
 
 
 function hashString32(value){
@@ -1444,7 +1840,7 @@ async function executeObservationPlan(plan, options={}){
 
     const chunk=await readChunkColumns(chunkIndex, oplan.requiredColumns, {surfacePlan});
     const base=chunkBaseRow(chunkIndex);
-    const bitset=evaluateQueryPlanBitset(chunk, oplan);
+    const bitset=olapEvaluateQueryPlanMask(chunk, oplan);
     const chunkMatched=countBits(bitset);
     scanned += chunk.rowCount;
     matched += chunkMatched;
@@ -3259,27 +3655,40 @@ async function runLimitedConcurrency(items, limit, worker){
 }
 
 async function flushChunk(datasetDir, chunkIndex, chunk, columns){
-  const chunkDir=await datasetDir.getDirectoryHandle(`chunk_${String(chunkIndex).padStart(6,"0")}`, {create:true});
+  const chunkDir=await datasetDir.getDirectoryHandle(writeKernelChunkDirName(chunkIndex), {create:true});
   const columnStats={};
 
-  await runLimitedConcurrency(columns, 4, async (col) => {
-    if (col.type === "number"){
-      const arr=new Float64Array(chunk.numeric[col.index]);
-      await writeBuffer(chunkDir, colFileName(col.index,col.type), arr.buffer);
-      columnStats[String(col.index)] = makeColumnStatForMeta(chunk.stats[col.index], chunk.rows);
-    } else {
-      const arr=new Int32Array(chunk.stringIds[col.index]);
+  for (const col of columns){
+    if (col.type !== "number"){
       chunk.stats[col.index].distinct = chunk.dictValues[col.index].length;
-      await Promise.all([
-        writeBuffer(chunkDir, colFileName(col.index,col.type), arr.buffer),
-        writeJson(chunkDir, dictFileName(col.index), chunk.dictValues[col.index])
-      ]);
       columnStats[String(col.index)] = makeColumnStatForMeta(chunk.stats[col.index], chunk.rows, chunk.dictValues[col.index]);
+    } else {
+      columnStats[String(col.index)] = makeColumnStatForMeta(chunk.stats[col.index], chunk.rows);
     }
-  });
+  }
 
-  const meta={chunkIndex,rowCount:chunk.rows,stats:chunk.stats,columnStats,indexVersion:2,flushStrategy:"parallel-column-writes-v2"};
+  const packed=writeKernelBuildPackParts(chunk, columns);
+  await Promise.all([
+    writeBuffer(chunkDir, WRITE_KERNEL_PACK_FILE, packed.buffer),
+    writeJson(chunkDir, WRITE_KERNEL_INDEX_FILE, packed.index)
+  ]);
+
+  const meta={
+    chunkIndex,
+    rowCount:chunk.rows,
+    stats:chunk.stats,
+    columnStats,
+    indexVersion:4,
+    storageLayout:"chunk-pack-v4",
+    writeKernelVersion:WRITE_KERNEL_VERSION,
+    packFile:WRITE_KERNEL_PACK_FILE,
+    indexFile:WRITE_KERNEL_INDEX_FILE,
+    packBytes:Number(packed.index.byteLength || packed.buffer.byteLength || 0),
+    flushStrategy:"chunk-pack-write-kernel-v4"
+  };
   await writeJson(chunkDir,"meta.json",meta);
+  olapKernelRuntime.metrics.packedChunksWritten++;
+  olapKernelRuntime.metrics.packBytesWritten += Number(meta.packBytes || 0);
   return meta;
 }
 
@@ -3595,6 +4004,7 @@ async function syntheticGenerateColumnarDataset(rawPlan){
     let chunkIndex = 0;
     let totalRows = 0;
     const chunkMetas = [];
+    const writeQueue=createWriteKernelQueue(dir, columns, {concurrency:2, maxPending:3});
     const recent = [];
     postProgress(1, `Synthetic dataset generation started: ${fmt(plan.rows)} rows / ${fmt(plan.columns)} columns`);
 
@@ -3610,8 +4020,7 @@ async function syntheticGenerateColumnarDataset(rawPlan){
       totalRows++;
 
       if (chunk.rows >= plan.chunkSize){
-        const meta = await flushChunk(dir, chunkIndex, chunk, columns);
-        chunkMetas.push(meta);
+        await writeQueue.enqueue(chunkIndex, chunk);
         chunkIndex++;
         chunk = initChunk(columns);
         const pct = Math.min(98, Math.floor((totalRows / plan.rows) * 100));
@@ -3624,10 +4033,12 @@ async function syntheticGenerateColumnarDataset(rawPlan){
     }
 
     if (chunk.rows > 0){
-      const meta = await flushChunk(dir, chunkIndex, chunk, columns);
-      chunkMetas.push(meta);
+      await writeQueue.enqueue(chunkIndex, chunk);
       chunkIndex++;
     }
+
+    const flushedChunkMetas=await writeQueue.drain();
+    chunkMetas.push(...flushedChunkMetas);
 
     const cleanReport = {
       sourceRows:plan.rows,
@@ -3655,8 +4066,11 @@ async function syntheticGenerateColumnarDataset(rawPlan){
       sourceFiles:[{name:`${tableName}.csv`,size:plan.estimatedBytes,sourceRows:plan.rows,totalRows,skippedRows:0,malformedRows:0,synthetic:true}],
       createdAt:new Date().toISOString(),
       mode:"synthetic-columnar",
-      formatVersion:5,
-      features:integrityFeatureFlags({syntheticData:true}),
+      formatVersion:6,
+      storageLayout:"chunk-pack-v4",
+      writeKernelVersion:WRITE_KERNEL_VERSION,
+      olapKernelVersion:OLAP_KERNEL_VERSION,
+      features:integrityFeatureFlags({syntheticData:true,chunkPack:true,stagingCommit:true,writeQueue:true,browserOlapKernel:true}),
       encoding:"utf-8",
       delimiter:",",
       fileSize:plan.estimatedBytes,
@@ -3670,16 +4084,15 @@ async function syntheticGenerateColumnarDataset(rawPlan){
       cleanReport
     };
 
-    await writeJson(dir,"manifest.json",manifest);
-    await writeJson(dir,"chunks.json",chunkMetas);
+    const committedManifest=await commitDatasetManifest(dir,manifest,chunkMetas,{writeMetrics:{queue:writeQueue.stats(), storageLayout:"chunk-pack-v4", synthetic:true}});
 
-    state.dataset={id,manifest,chunks:chunkMetas};
-    state.virtual=null; state.memory=null; state.externalDataset=null; state.manifest=manifest; state.dir=dir;
+    state.dataset={id,manifest:committedManifest,chunks:chunkMetas};
+    state.virtual=null; state.memory=null; state.externalDataset=null; state.manifest=committedManifest; state.dir=dir;
     state.searchMatches=[]; state.dataQueryMatches=null; state.dataQueryMeta=null; state.pivotTable=null; state.pivotTileIndex=null; state.timeTable=null;
 
     return {
       outputMode:plan.output.mode,
-      manifest,
+      manifest:committedManifest,
       chunks:chunkMetas,
       ms:now()-t0,
       metrics:{
@@ -3934,6 +4347,7 @@ async function buildSingleColumnarCache(msg){
     let chunk=initChunk(columns);
     let chunkIndex=0, totalRows=0, sourceRows=0, skippedRows=0, malformedRows=0;
     const chunkMetas=[];
+    const writeQueue=createWriteKernelQueue(dir, columns, {concurrency:2, maxPending:3});
 
     for await (const line of iter){
       if (state.cancelled) throw new Error("Cancelled");
@@ -3948,8 +4362,7 @@ async function buildSingleColumnarCache(msg){
       totalRows++;
 
       if (chunk.rows >= chunkSize){
-        const meta=await flushChunk(dir,chunkIndex,chunk,columns);
-        chunkMetas.push(meta);
+        await writeQueue.enqueue(chunkIndex,chunk);
         chunkIndex++;
         chunk=initChunk(columns);
         postProgress(progressCurrentValue, `Writing chunk ${fmt(chunkIndex)}... rows ${fmt(totalRows)}`);
@@ -3959,11 +4372,12 @@ async function buildSingleColumnarCache(msg){
       }
     }
     if (chunk.rows > 0){
-      const meta=await flushChunk(dir,chunkIndex,chunk,columns);
-      chunkMetas.push(meta);
+      await writeQueue.enqueue(chunkIndex,chunk);
       chunkIndex++;
     }
 
+    const flushedChunkMetas=await writeQueue.drain();
+    chunkMetas.push(...flushedChunkMetas);
     postProgress(88, `Finalizing columnar cache... ${fmt(totalRows)} rows / ${fmt(chunkIndex)} chunks`);
 
     const cleanReport={
@@ -3984,18 +4398,16 @@ async function buildSingleColumnarCache(msg){
       originalFileName:msg.file.name,
       sourceFiles:[{name:msg.file.name,size:msg.file.size,sourceRows,totalRows,skippedRows,malformedRows}],
       createdAt:new Date().toISOString(), mode:"columnar-clean",
-      formatVersion:5, features:integrityFeatureFlags({}),
+      formatVersion:6, storageLayout:"chunk-pack-v4", writeKernelVersion:WRITE_KERNEL_VERSION, olapKernelVersion:OLAP_KERNEL_VERSION, features:integrityFeatureFlags({chunkPack:true,stagingCommit:true,writeQueue:true,browserOlapKernel:true}),
       encoding:msg.encoding, delimiter:msg.delimiter, fileSize:msg.file.size,
       chunkSize,totalRows,sourceRows,chunks:chunkIndex,
       columns, rules, cleanReport
     };
-    postProgress(94, "Writing manifest and chunk metadata...");
-    await writeJson(dir,"manifest.json",manifest);
-    await writeJson(dir,"chunks.json",chunkMetas);
-
-    state.dataset={id,manifest,chunks:chunkMetas};
-    state.virtual=null; state.memory=null; state.manifest=manifest; state.dir=dir; state.searchMatches=[]; state.dataQueryMatches=null; state.dataQueryMeta=null; state.pivotTable=null; state.pivotTileIndex=null; state.timeTable=null;
-    return {manifest,chunks:chunkMetas,ms:now()-t0};
+    postProgress(94, "Committing packed OLAP dataset...");
+    const committedManifest=await commitDatasetManifest(dir,manifest,chunkMetas,{writeMetrics:{queue:writeQueue.stats(), storageLayout:"chunk-pack-v4"}});
+    state.dataset={id,manifest:committedManifest,chunks:chunkMetas};
+    state.virtual=null; state.memory=null; state.manifest=committedManifest; state.dir=dir; state.searchMatches=[]; state.dataQueryMatches=null; state.dataQueryMeta=null; state.pivotTable=null; state.pivotTileIndex=null; state.timeTable=null;
+    return {manifest:committedManifest,chunks:chunkMetas,ms:now()-t0,olapKernel:olapKernelStatus()};
   }catch(err){
     await cleanupDatasetDir(root,id);
     throw err;
@@ -4024,6 +4436,7 @@ async function buildMergedColumnarCache(msg){
     let chunkIndex=0, totalRows=0, sourceRows=0, skippedRows=0, malformedRows=0;
     const sourceFiles=[];
     const chunkMetas=[];
+    const writeQueue=createWriteKernelQueue(dir, columns, {concurrency:2, maxPending:3});
 
     for (let f=0; f<files.length; f++){
       const file=files[f];
@@ -4045,8 +4458,7 @@ async function buildMergedColumnarCache(msg){
         totalRows++; fileTotalRows++;
 
         if (chunk.rows >= chunkSize){
-          const meta=await flushChunk(dir,chunkIndex,chunk,columns);
-          chunkMetas.push(meta);
+          await writeQueue.enqueue(chunkIndex,chunk);
           chunkIndex++;
           chunk=initChunk(columns);
         }
@@ -4058,11 +4470,12 @@ async function buildMergedColumnarCache(msg){
     }
 
     if (chunk.rows > 0){
-      const meta=await flushChunk(dir,chunkIndex,chunk,columns);
-      chunkMetas.push(meta);
+      await writeQueue.enqueue(chunkIndex,chunk);
       chunkIndex++;
     }
 
+    const flushedChunkMetas=await writeQueue.drain();
+    chunkMetas.push(...flushedChunkMetas);
     postProgress(88, `Finalizing merged cache... ${fmt(totalRows)} rows / ${fmt(chunkIndex)} chunks`);
 
     const cleanReport={
@@ -4084,17 +4497,16 @@ async function buildMergedColumnarCache(msg){
       originalFileName:files.map(f=>f.name).join(" + "),
       sourceFiles,
       createdAt:new Date().toISOString(), mode:"columnar-clean-merged-csv",
-      formatVersion:5, features:integrityFeatureFlags({}),
+      formatVersion:6, storageLayout:"chunk-pack-v4", writeKernelVersion:WRITE_KERNEL_VERSION, olapKernelVersion:OLAP_KERNEL_VERSION, features:integrityFeatureFlags({chunkPack:true,stagingCommit:true,writeQueue:true,browserOlapKernel:true}),
       encoding:msg.encoding, delimiter:msg.delimiter, fileSize:files.reduce((a,f)=>a+(f.size||0),0),
       chunkSize,totalRows,sourceRows,chunks:chunkIndex,
       columns, rules, cleanReport
     };
-    await writeJson(dir,"manifest.json",manifest);
-    await writeJson(dir,"chunks.json",chunkMetas);
+    const committedManifest=await commitDatasetManifest(dir,manifest,chunkMetas,{writeMetrics:{queue:writeQueue.stats(), storageLayout:"chunk-pack-v4", mergedFiles:files.length}});
 
-    state.dataset={id,manifest,chunks:chunkMetas};
-    state.virtual=null; state.memory=null; state.manifest=manifest; state.dir=dir; state.searchMatches=[]; state.dataQueryMatches=null; state.dataQueryMeta=null; state.pivotTable=null; state.pivotTileIndex=null; state.timeTable=null;
-    return {manifest,chunks:chunkMetas,ms:now()-t0,typeWarnings:analyzed.typeWarnings};
+    state.dataset={id,manifest:committedManifest,chunks:chunkMetas};
+    state.virtual=null; state.memory=null; state.manifest=committedManifest; state.dir=dir; state.searchMatches=[]; state.dataQueryMatches=null; state.dataQueryMeta=null; state.pivotTable=null; state.pivotTileIndex=null; state.timeTable=null;
+    return {manifest:committedManifest,chunks:chunkMetas,ms:now()-t0,typeWarnings:analyzed.typeWarnings,olapKernel:olapKernelStatus()};
   }catch(err){
     await cleanupDatasetDir(root,id);
     throw err;
@@ -4112,6 +4524,7 @@ async function listDatasets(){
   for await (const [id,h] of root.entries()){
     if (h.kind !== "directory") continue;
     try{
+      if (!(await isDatasetCommitted(h))) continue;
       const checked=await validateAndRepairDatasetDir(id,h,{repair:true,rebuildStats:false});
       if (!checked.ok) continue;
       const m=checked.manifest;
@@ -4536,14 +4949,19 @@ async function readCachedColumn(target, col){
 
   chunkColumnCache.misses++;
   let value;
-  const chunkPath=`${target.externalBase}/chunk_${String(target.physicalChunkIndex).padStart(6,"0")}`;
-  if (col.type === "number"){
-    const buf=target.external ? await externalReadBuffer(`${chunkPath}/${colFileName(col.index,col.type)}`) : await readBuffer(target.chunkDir,colFileName(col.index,col.type));
-    value={type:"number", data:new Float64Array(buf)};
+  if (isPackedChunkMeta(target.meta)){
+    value=await readPackedColumn(target,col);
+    olapKernelRuntime.metrics.packReads++;
   } else {
-    const buf=target.external ? await externalReadBuffer(`${chunkPath}/${colFileName(col.index,col.type)}`) : await readBuffer(target.chunkDir,colFileName(col.index,col.type));
-    const dict=target.external ? await externalReadJson(`${chunkPath}/${dictFileName(col.index)}`) : await readJson(target.chunkDir,dictFileName(col.index));
-    value={type:"string", ids:new Int32Array(buf), dict};
+    const chunkPath=`${target.externalBase}/chunk_${String(target.physicalChunkIndex).padStart(6,"0")}`;
+    if (col.type === "number"){
+      const buf=target.external ? await externalReadBuffer(`${chunkPath}/${colFileName(col.index,col.type)}`) : await readBuffer(target.chunkDir,colFileName(col.index,col.type));
+      value={type:"number", data:new Float64Array(buf)};
+    } else {
+      const buf=target.external ? await externalReadBuffer(`${chunkPath}/${colFileName(col.index,col.type)}`) : await readBuffer(target.chunkDir,colFileName(col.index,col.type));
+      const dict=target.external ? await externalReadJson(`${chunkPath}/${dictFileName(col.index)}`) : await readJson(target.chunkDir,dictFileName(col.index));
+      value={type:"string", ids:new Int32Array(buf), dict};
+    }
   }
   return putChunkCacheEntry(key, value, estimateColumnDataBytes(value));
 }
@@ -8834,20 +9252,28 @@ function d3VizSurfaceCacheKey(msg, adapter){
 }
 
 function d3VizSurfaceCacheGet(key){
-  const cached = d3VizSurfaceFastCache.get(key);
+  const cached = d3VizSurfaceFastCache.get(key) || olapKernelRuntime.cubes.get(key);
   if (!cached) return null;
   d3VizSurfaceFastCache.delete(key);
   d3VizSurfaceFastCache.set(key, cached);
+  olapKernelRuntime.metrics.cubeHits++;
   return cached;
 }
 
 function d3VizSurfaceCachePut(key, value){
   if (!key || !value) return value;
   d3VizSurfaceFastCache.set(key, value);
+  olapKernelRuntime.cubes.set(key, value);
+  olapKernelRuntime.metrics.cubeWrites++;
   while (d3VizSurfaceFastCache.size > D3_VIZ_SURFACE_FAST_CACHE_MAX){
     const first = d3VizSurfaceFastCache.keys().next().value;
     if (first === undefined) break;
     d3VizSurfaceFastCache.delete(first);
+  }
+  while (olapKernelRuntime.cubes.size > D3_VIZ_SURFACE_FAST_CACHE_MAX){
+    const first = olapKernelRuntime.cubes.keys().next().value;
+    if (first === undefined) break;
+    olapKernelRuntime.cubes.delete(first);
   }
   return value;
 }
