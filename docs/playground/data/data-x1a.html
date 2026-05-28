@@ -10299,16 +10299,23 @@ function v8TopEntries(map, topN){
 }
 
 function v8MakeD3Plan({ chartType, xColumn, yColumn=-1, groupColumn=-1, aggregation="Count", dataSource="active" }){
+  const x = Number(xColumn);
+  const y = Number(yColumn);
+  const z = Number(groupColumn);
   return {
-    dataSource,
-    chartType,
-    xColumn:Number(xColumn),
-    yColumn:Number(yColumn),
-    groupColumn:Number(groupColumn),
-    aggregation,
+    dataSource:String(dataSource || "active") === "graph" ? "graph" : "active",
+    chartType:d3VizNormalizeChartType(chartType || "bar"),
+    xColumnIndex:Number.isFinite(x) ? x : -1,
+    yColumnIndex:Number.isFinite(y) ? y : -1,
+    secondaryColumnIndex:Number.isFinite(z) ? z : -1,
+    groupColumnIndex:Number.isFinite(z) ? z : -1,
+    zColumnIndex:Number.isFinite(z) ? z : -1,
+    aggregation:d3VizNormalizeAggregation(aggregation || "Count"),
     maxRows:0,
     topN:50,
     buckets:120,
+    categoryLimit:50000,
+    chunkRows:10000,
   };
 }
 
@@ -13480,7 +13487,7 @@ function ProjectionDataTablePanel({ table, open, onToggle, onCopyCsv, onExportCs
   );
 }
 
-function D3VisualizationPanel({ manifest, columns, graphColumns = [], graphResultCount = 0, graphResultMode = "data", result, status, time, csvExportEncoding = "utf-8", onRun, onClear }) {
+function D3VisualizationPanel({ manifest, columns, graphColumns = [], graphResultCount = 0, graphResultMode = "data", result, status, time, csvExportEncoding = "utf-8", appliedPlan = null, onRun, onClear }) {
   const svgRef = useRef(null);
   const activeColumnOptions = useMemo(() => d3VizColumnOptions(columns), [columns]);
   const graphColumnOptions = useMemo(() => d3VizColumnOptions(graphColumns), [graphColumns]);
@@ -13525,6 +13532,32 @@ function D3VisualizationPanel({ manifest, columns, graphColumns = [], graphResul
   const [buckets, setBuckets] = useState("240");
   const [categoryLimit, setCategoryLimit] = useState("50000");
   const [chunkRows, setChunkRows] = useState("10000");
+
+  useEffect(() => {
+    if (!appliedPlan) return;
+
+    const source = String(appliedPlan.dataSource || "active") === "graph" ? "graph" : "active";
+    const x = Number(appliedPlan.xColumnIndex ?? appliedPlan.xColumn);
+    const y = Number(appliedPlan.yColumnIndex ?? appliedPlan.yColumn ?? -1);
+    const secondary = Number(
+      appliedPlan.secondaryColumnIndex ??
+      appliedPlan.groupColumnIndex ??
+      appliedPlan.zColumnIndex ??
+      appliedPlan.groupColumn ??
+      -1
+    );
+
+    setDataSource(source);
+    setChartType(d3VizNormalizeChartType(appliedPlan.chartType || "bar"));
+    if (Number.isFinite(x) && x >= 0) setXColumn(String(x));
+    setYColumn(Number.isFinite(y) ? String(y) : "-1");
+    setSecondaryColumn(Number.isFinite(secondary) && secondary >= 0 ? String(secondary) : "-1");
+    setAggregation(d3VizNormalizeAggregation(appliedPlan.aggregation || "Count"));
+    setTopN(String(clampD3VizNumber(appliedPlan.topN, 1, 1000, 80)));
+    setBuckets(String(clampD3VizNumber(appliedPlan.buckets, 8, 2400, 240)));
+    setCategoryLimit(String(clampD3VizNumber(appliedPlan.categoryLimit, 100, 200000, 50000)));
+    setChunkRows(String(clampD3VizNumber(appliedPlan.chunkRows, 500, 50000, 10000)));
+  }, [appliedPlan?.appliedAt]);
 
   const guide = chartGuides[chartType] || chartGuides.bar;
   const needsNumericX = ["histogram","line","area","scatter","bubble"].includes(chartType);
@@ -17520,6 +17553,7 @@ function App() {
   const [d3VizResult, setD3VizResult] = useState(null);
   const [d3VizStatus, setD3VizStatus] = useState("Storage Datasetを開くと、D3用の全件集約Surfaceを作れます。");
   const [d3VizTime, setD3VizTime] = useState("");
+  const [d3VizAppliedPlan, setD3VizAppliedPlan] = useState(null);
   const [autonomousInsights, setAutonomousInsights] = useState(null);
   const [autonomousInsightsStatus, setAutonomousInsightsStatus] = useState("Storage Datasetを開くと、v8 Autonomous Insightsを実行できます。");
   const [autonomousInsightsTime, setAutonomousInsightsTime] = useState("");
@@ -18828,15 +18862,48 @@ function App() {
     });
   }
 
+  function normalizeD3VisualizationPlan(plan) {
+    const raw = plan && typeof plan === "object" ? plan : {};
+    const dataSource = String(raw.dataSource || "active") === "graph" ? "graph" : "active";
+    const x = Number(raw.xColumnIndex ?? raw.xColumn ?? -1);
+    const y = Number(raw.yColumnIndex ?? raw.yColumn ?? -1);
+    const secondary = Number(
+      raw.secondaryColumnIndex ??
+      raw.groupColumnIndex ??
+      raw.zColumnIndex ??
+      raw.groupColumn ??
+      -1
+    );
+
+    return {
+      ...raw,
+      dataSource,
+      chartType:d3VizNormalizeChartType(raw.chartType || "bar"),
+      xColumnIndex:Number.isFinite(x) ? x : -1,
+      yColumnIndex:Number.isFinite(y) ? y : -1,
+      secondaryColumnIndex:Number.isFinite(secondary) ? secondary : -1,
+      groupColumnIndex:Number.isFinite(secondary) ? secondary : -1,
+      zColumnIndex:Number.isFinite(secondary) ? secondary : -1,
+      aggregation:d3VizNormalizeAggregation(raw.aggregation || "Count"),
+      topN:clampD3VizNumber(raw.topN, 1, 1000, 80),
+      buckets:clampD3VizNumber(raw.buckets, 8, 2400, 240),
+      categoryLimit:clampD3VizNumber(raw.categoryLimit, 100, 200000, 50000),
+      chunkRows:clampD3VizNumber(raw.chunkRows, 500, 50000, 10000),
+    };
+  }
+
   function applyAutonomousD3Plan(plan) {
     if (!plan) return;
+    const normalized = normalizeD3VisualizationPlan(plan);
+    setD3VizAppliedPlan({ ...normalized, appliedAt: Date.now() });
     setTab("visualize");
-    setD3VizStatus("v8 Insight候補からD3 Projectionを実行しています...");
-    runD3Visualization(plan);
+    setD3VizStatus("v8 Insight候補をD3 Infinite Surface Planへ反映し、Projectionを実行しています...");
+    runD3Visualization(normalized);
   }
 
   function runD3Visualization(plan) {
-    const source = String(plan?.dataSource || "active");
+    const normalizedPlan = normalizeD3VisualizationPlan(plan);
+    const source = String(normalizedPlan?.dataSource || "active");
     if (source === "graph") {
       if (!graphResultCount || !graphResultColumns.length) {
         setD3VizStatus("Graph Query Resultがありません。先にGraph Queryを実行してください。");
@@ -18854,7 +18921,7 @@ function App() {
     const graphCtx = source === "graph" ? (graphExecutionRef.current || {}) : {};
     post({
       type: "BUILD_D3_VIZ_SURFACE",
-      ...plan,
+      ...normalizedPlan,
       surfaceId: source === "graph" ? (graphResultSurface?.id || null) : null,
       graphReadColumns: source === "graph" ? (graphCtx.readColumns || []) : [],
       graphOutputColumnNames: source === "graph" ? (graphCtx.outputColumnNames || null) : null,
@@ -20232,6 +20299,7 @@ function App() {
               status={d3VizStatus}
               time={d3VizTime}
               csvExportEncoding={csvExportEncoding}
+              appliedPlan={d3VizAppliedPlan}
               onRun={runD3Visualization}
               onClear={() => {
                 setD3VizResult(null);
