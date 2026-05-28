@@ -11214,7 +11214,21 @@ function renderD3WorkerSurface(svgNode, surface) {
 const D3_PROJECTION_TABLE_VISIBLE_ROWS = 500;
 const D3_PROJECTION_TABLE_MAX_ROWS = 2500;
 const D3_PROJECTION_TEXT_MAX = 180;
+const D3_PROJECTION_TABLE_TILE_HEIGHT = 34;
+const D3_PROJECTION_TABLE_TILE_OVERSCAN = 10;
+const D3_PROJECTION_TABLE_VIEWPORT_HEIGHT = 420;
 const D3_PROJECTION_TABLE_HEADERS = ["#", "type", "label", "group", "x", "y", "value", "count", "sourcePreview"];
+const D3_PROJECTION_TABLE_COLUMN_WIDTHS = {
+  "#": 58,
+  type: 104,
+  label: 220,
+  group: 160,
+  x: 160,
+  y: 160,
+  value: 150,
+  count: 110,
+  sourcePreview: 460,
+};
 
 function d3ProjectionText(value, max = D3_PROJECTION_TEXT_MAX) {
   if (value == null) return "";
@@ -11460,7 +11474,24 @@ function buildD3ProjectionTable(surface) {
 
 function ProjectionDataTable({ table }) {
   const rows = Array.isArray(table?.rows) ? table.rows : [];
-  const visibleRows = rows.slice(0, D3_PROJECTION_TABLE_VISIBLE_ROWS);
+  const [scrollTop, setScrollTop] = useState(0);
+
+  useEffect(() => {
+    setScrollTop(0);
+  }, [table?.kind, table?.totalRows, rows.length]);
+
+  const totalRows = rows.length;
+  const viewportHeight = D3_PROJECTION_TABLE_VIEWPORT_HEIGHT;
+  const rowHeight = D3_PROJECTION_TABLE_TILE_HEIGHT;
+  const visibleCount = Math.ceil(viewportHeight / rowHeight) + D3_PROJECTION_TABLE_TILE_OVERSCAN * 2;
+  const startIndex = Math.max(0, Math.floor(scrollTop / rowHeight) - D3_PROJECTION_TABLE_TILE_OVERSCAN);
+  const endIndex = Math.min(totalRows, startIndex + visibleCount);
+  const visibleRows = rows.slice(startIndex, endIndex);
+  const gridTemplateColumns = D3_PROJECTION_TABLE_HEADERS
+    .map((header) => `${D3_PROJECTION_TABLE_COLUMN_WIDTHS[header] || 160}px`)
+    .join(" ");
+  const tableWidth = D3_PROJECTION_TABLE_HEADERS
+    .reduce((sum, header) => sum + (D3_PROJECTION_TABLE_COLUMN_WIDTHS[header] || 160), 0);
 
   if (!rows.length) {
     return (
@@ -11470,53 +11501,168 @@ function ProjectionDataTable({ table }) {
     );
   }
 
+  const renderCell = (row, key, rowNumber) => {
+    const value = key === "#" ? rowNumber : row[key];
+    const text = String(value ?? "");
+    const isNumeric = ["value", "count", "x", "y"].includes(key);
+    return (
+      <Box
+        key={key}
+        title={text}
+        sx={{
+          px: 1,
+          py: 0.75,
+          borderRight: "1px solid",
+          borderBottom: "1px solid",
+          borderColor: "divider",
+          overflow: "hidden",
+          textOverflow: "ellipsis",
+          whiteSpace: "nowrap",
+          minWidth: 0,
+          fontVariantNumeric: isNumeric ? "tabular-nums" : "normal",
+          color: key === "sourcePreview" ? "text.secondary" : "text.primary",
+        }}
+      >
+        {text}
+      </Box>
+    );
+  };
+
   return (
     <Box sx={{ mt: 1 }}>
-      <TableContainer sx={{ maxHeight: 360, border: "1px solid", borderColor: "divider", borderRadius: 1.5 }}>
-        <Table size="small" stickyHeader aria-label="D3 Projection Data Table">
-          <TableHead>
-            <TableRow>
+      <Box
+        sx={{
+          border: "1px solid",
+          borderColor: "divider",
+          borderRadius: 1.5,
+          overflow: "hidden",
+          bgcolor: "background.paper",
+        }}
+      >
+        <Box sx={{ overflowX: "auto" }}>
+          <Box sx={{ minWidth: tableWidth }}>
+            <Box
+              role="row"
+              sx={{
+                display: "grid",
+                gridTemplateColumns,
+                position: "sticky",
+                top: 0,
+                zIndex: 2,
+                bgcolor: "background.paper",
+                borderBottom: "1px solid",
+                borderColor: "divider",
+              }}
+            >
               {D3_PROJECTION_TABLE_HEADERS.map((header) => (
-                <TableCell key={header} sx={{ fontWeight: 800, whiteSpace: "nowrap", bgcolor: "background.paper" }}>
+                <Box
+                  key={header}
+                  role="columnheader"
+                  sx={{
+                    px: 1,
+                    py: 0.9,
+                    fontSize: 12,
+                    fontWeight: 900,
+                    color: "text.secondary",
+                    borderRight: "1px solid",
+                    borderColor: "divider",
+                    whiteSpace: "nowrap",
+                  }}
+                >
                   {header}
-                </TableCell>
+                </Box>
               ))}
-            </TableRow>
-          </TableHead>
-          <TableBody>
-            {visibleRows.map((row, index) => (
-              <TableRow key={`${row.type}-${row.label}-${row.group}-${index}`} hover>
-                <TableCell sx={{ whiteSpace: "nowrap" }}>{index + 1}</TableCell>
-                {D3_PROJECTION_TABLE_HEADERS.slice(1).map((key) => (
-                  <TableCell
-                    key={key}
-                    title={String(row[key] ?? "")}
-                    sx={{
-                      maxWidth: key === "sourcePreview" ? 360 : 180,
-                      whiteSpace: "nowrap",
-                      overflow: "hidden",
-                      textOverflow: "ellipsis",
-                      fontVariantNumeric: ["value", "count", "x", "y"].includes(key) ? "tabular-nums" : "normal",
-                    }}
-                  >
-                    {String(row[key] ?? "")}
-                  </TableCell>
-                ))}
-              </TableRow>
-            ))}
-          </TableBody>
-        </Table>
-      </TableContainer>
+            </Box>
 
-      {(rows.length > visibleRows.length || table?.capped) && (
+            <Box
+              role="table"
+              aria-label="D3 Projection Data Tile Table"
+              onScroll={(event) => setScrollTop(event.currentTarget.scrollTop)}
+              sx={{
+                height: viewportHeight,
+                overflowY: "auto",
+                position: "relative",
+                overscrollBehavior: "contain",
+              }}
+            >
+              <Box sx={{ height: totalRows * rowHeight, position: "relative" }}>
+                {visibleRows.map((row, offset) => {
+                  const absoluteIndex = startIndex + offset;
+                  return (
+                    <Box
+                      key={`${row.type}-${row.label}-${row.group}-${absoluteIndex}`}
+                      role="row"
+                      sx={{
+                        display: "grid",
+                        gridTemplateColumns,
+                        position: "absolute",
+                        top: absoluteIndex * rowHeight,
+                        left: 0,
+                        right: 0,
+                        height: rowHeight,
+                        bgcolor: absoluteIndex % 2 ? "background.default" : "background.paper",
+                        "&:hover": { bgcolor: "action.hover" },
+                      }}
+                    >
+                      {D3_PROJECTION_TABLE_HEADERS.map((key) => renderCell(row, key, absoluteIndex + 1))}
+                    </Box>
+                  );
+                })}
+              </Box>
+            </Box>
+          </Box>
+        </Box>
+      </Box>
+
+      <Stack direction="row" spacing={0.75} useFlexGap flexWrap="wrap" sx={{ mt: 0.75 }}>
+        <Chip size="small" label={`tile window ${fmt(startIndex + 1)}-${fmt(Math.max(startIndex, endIndex))}`} />
+        <Chip size="small" label={`rendered ${fmt(visibleRows.length)} / ${fmt(totalRows)}`} />
+        {table?.capped && <Chip size="small" color="warning" label={`internal cap ${fmt(D3_PROJECTION_TABLE_MAX_ROWS)}`} />}
+      </Stack>
+
+      {(table?.totalRows > rows.length || table?.capped) && (
         <Typography variant="caption" color="text.secondary" sx={{ display: "block", mt: 0.75 }}>
-          表示は先頭{fmt(visibleRows.length)}件です。CSV出力には生成済み{fmt(rows.length)}件を含めます{table?.capped ? `（内部上限 ${fmt(D3_PROJECTION_TABLE_MAX_ROWS)} 件で制限）` : ""}。
+          表示とCSVは生成済み{fmt(rows.length)}件を対象にします。Projection表はD3 Surfaceから作るため、元CSV全件は再走査しません{table?.capped ? `（内部上限 ${fmt(D3_PROJECTION_TABLE_MAX_ROWS)} 件で制限）` : ""}。
         </Typography>
       )}
     </Box>
   );
 }
 
+function ProjectionDataTablePanel({ table, open, onToggle, onCopyCsv, onExportCsv }) {
+  const rows = Array.isArray(table?.rows) ? table.rows : [];
+
+  return (
+    <Section title="Projection Data Table" icon={<TableChart />} hint="D3 Projectionと同じSurfaceから生成した検算用の投影テーブルです。元CSV全件は再読込しません。">
+      <Stack direction="row" spacing={0.75} alignItems="center" useFlexGap flexWrap="wrap">
+        <Chip size="small" label={`surface ${table?.kind || "none"}`} />
+        <Chip size="small" label={`rows ${fmt(table?.totalRows || 0)}`} />
+        <Chip size="small" label={`generated ${fmt(rows.length)}`} />
+        <Chip size="small" color="success" label="tilemap table" />
+        {table?.capped && <Chip size="small" color="warning" label="capped" />}
+        <Button size="small" onClick={onToggle} disabled={!rows.length}>
+          {open ? "Hide" : "Show"}
+        </Button>
+        <Button size="small" onClick={onCopyCsv} disabled={!rows.length}>
+          Copy CSV
+        </Button>
+        <Button size="small" startIcon={<Download />} onClick={onExportCsv} disabled={!rows.length}>
+          Export CSV
+        </Button>
+      </Stack>
+
+      <Collapse in={open} timeout="auto" unmountOnExit>
+        <ProjectionDataTable table={table} />
+      </Collapse>
+
+      {!rows.length && (
+        <Alert severity="info" sx={{ mt: 1 }}>
+          D3 SurfaceをBuildすると、この別パネルにD3 mark対応のProjection Data Tableを表示します。
+        </Alert>
+      )}
+    </Section>
+  );
+}
 
 function D3VisualizationPanel({ manifest, columns, graphColumns = [], graphResultCount = 0, graphResultMode = "data", result, status, time, csvExportEncoding = "utf-8", onRun, onClear }) {
   const svgRef = useRef(null);
@@ -11749,41 +11895,29 @@ function D3VisualizationPanel({ manifest, columns, graphColumns = [], graphResul
         </Stack>
       </Section>
 
-      <Section title="D3 Projection" icon={<Timeline />} hint="SVGは集約済みSurfaceだけを描画します。raw rowsはUIへ渡しません。">
-        <Box sx={{ overflow: "auto", border: "1px solid", borderColor: "divider", borderRadius: 1.5, p: 1, bgcolor: "background.paper" }}>
-          <svg ref={svgRef} style={{ width: "100%", minWidth: 760, height: 560, display: "block" }} />
-        </Box>
-        <Stack direction="row" spacing={0.75} useFlexGap flexWrap="wrap" sx={{ mt: 1 }}>
-          <Chip size="small" label={`source ${result?.dataSourceLabel || sourceLabel}`} />
-          <Chip size="small" label={`surface ${result?.kind || "none"}`} />
-          <Chip size="small" label={`rows ${fmt(result?.totalRows || sourceRows)}`} />
-          <Chip size="small" label={`marks ${fmt(markCount)}`} />
-          {result?.overflowed && <Chip size="small" color="warning" label="category overflow grouped" />}
-          {result?.bucketCount && <Chip size="small" label={`buckets ${fmt(result.bucketCount)}`} />}
-        </Stack>
+      <Box sx={{ display: "grid", gap: 1, minWidth: 0 }}>
+        <Section title="D3 Projection" icon={<Timeline />} hint="SVGは集約済みSurfaceだけを描画します。raw rowsはUIへ渡しません。">
+          <Box sx={{ overflow: "auto", border: "1px solid", borderColor: "divider", borderRadius: 1.5, p: 1, bgcolor: "background.paper" }}>
+            <svg ref={svgRef} style={{ width: "100%", minWidth: 760, height: 560, display: "block" }} />
+          </Box>
+          <Stack direction="row" spacing={0.75} useFlexGap flexWrap="wrap" sx={{ mt: 1 }}>
+            <Chip size="small" label={`source ${result?.dataSourceLabel || sourceLabel}`} />
+            <Chip size="small" label={`surface ${result?.kind || "none"}`} />
+            <Chip size="small" label={`rows ${fmt(result?.totalRows || sourceRows)}`} />
+            <Chip size="small" label={`marks ${fmt(markCount)}`} />
+            {result?.overflowed && <Chip size="small" color="warning" label="category overflow grouped" />}
+            {result?.bucketCount && <Chip size="small" label={`buckets ${fmt(result.bucketCount)}`} />}
+          </Stack>
+        </Section>
 
-        <Divider sx={{ my: 1.25 }} />
-
-        <Stack direction="row" spacing={0.75} alignItems="center" useFlexGap flexWrap="wrap">
-          <TableChart fontSize="small" />
-          <Typography variant="subtitle2" sx={{ fontWeight: 900 }}>Projection Data Table</Typography>
-          <Chip size="small" label={`table rows ${fmt(projectionTable.totalRows || 0)}`} />
-          {projectionTable.capped && <Chip size="small" color="warning" label={`capped ${fmt(projectionTable.rows.length)}`} />}
-          <Button size="small" onClick={() => setProjectionTableOpen((open) => !open)} disabled={!projectionTable.rows.length}>
-            {projectionTableOpen ? "Hide" : "Show"}
-          </Button>
-          <Button size="small" onClick={copyProjectionTableCsv} disabled={!projectionTable.rows.length}>
-            Copy CSV
-          </Button>
-          <Button size="small" startIcon={<Download />} onClick={exportProjectionTableCsv} disabled={!projectionTable.rows.length}>
-            Export CSV
-          </Button>
-        </Stack>
-
-        <Collapse in={projectionTableOpen} timeout="auto" unmountOnExit>
-          <ProjectionDataTable table={projectionTable} />
-        </Collapse>
-      </Section>
+        <ProjectionDataTablePanel
+          table={projectionTable}
+          open={projectionTableOpen}
+          onToggle={() => setProjectionTableOpen((open) => !open)}
+          onCopyCsv={copyProjectionTableCsv}
+          onExportCsv={exportProjectionTableCsv}
+        />
+      </Box>
     </Box>
   );
 }
