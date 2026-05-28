@@ -10588,6 +10588,711 @@ function v8BuildInsights(sample, input){
   return { insights:rankedInsights, suggestedCharts:rankedSuggestions };
 }
 
+async 
+
+function v8SafeNumber(value){
+  if (typeof value === "number" && Number.isFinite(value)) return value;
+  const parsed = numberCandidate(value, { numericSymbols:true });
+  return parsed?.ok && Number.isFinite(parsed.value) ? parsed.value : null;
+}
+
+function v8ParseDateTime(value){
+  if (value == null || value === "") return null;
+  if (value instanceof Date) {
+    const t = value.getTime();
+    return Number.isFinite(t) ? t : null;
+  }
+  const s = String(value).trim();
+  if (!s) return null;
+  const t = Date.parse(s);
+  return Number.isFinite(t) ? t : null;
+}
+
+function v8DayBucket(value){
+  const t = v8ParseDateTime(value);
+  if (t == null) return "";
+  const d = new Date(t);
+  const y = d.getUTCFullYear();
+  const m = String(d.getUTCMonth() + 1).padStart(2, "0");
+  const day = String(d.getUTCDate()).padStart(2, "0");
+  return `${y}-${m}-${day}`;
+}
+
+function v8MonthBucket(value){
+  const t = v8ParseDateTime(value);
+  if (t == null) return "";
+  const d = new Date(t);
+  const y = d.getUTCFullYear();
+  const m = String(d.getUTCMonth() + 1).padStart(2, "0");
+  return `${y}-${m}`;
+}
+
+function v8Bump(map, key, delta=1){
+  map.set(key, Number(map.get(key) || 0) + Number(delta || 0));
+}
+
+function v8StatAdd(stat, value){
+  const n = Number(value);
+  if (!Number.isFinite(n)) return;
+  stat.count = Number(stat.count || 0) + 1;
+  stat.sum = Number(stat.sum || 0) + n;
+  stat.sumSq = Number(stat.sumSq || 0) + n * n;
+  stat.min = Math.min(Number.isFinite(stat.min) ? stat.min : n, n);
+  stat.max = Math.max(Number.isFinite(stat.max) ? stat.max : n, n);
+}
+
+function v8StatMean(stat){
+  return Number(stat?.count || 0) ? Number(stat.sum || 0) / Number(stat.count || 1) : null;
+}
+
+function v8StatStd(stat){
+  const mean = v8StatMean(stat);
+  if (mean == null || !Number(stat?.count)) return null;
+  return Math.sqrt(Math.max(0, Number(stat.sumSq || 0) / Number(stat.count || 1) - mean * mean));
+}
+
+function v8InsightRows(rows){
+  return (rows || []).filter(Boolean).map((row)=>{
+    if (Array.isArray(row)) return [String(row[0] ?? ""), String(row[1] ?? "")];
+    return [String(row?.label ?? ""), String(row?.value ?? "")];
+  });
+}
+
+function v8ColumnLabel(profile){
+  return profile ? `${profile.name}` : "";
+}
+
+function v8MethodScore(signal, confidence=0.65, novelty=0.82, cost=0.9){
+  return v8ScoreInsight({ signal, confidence, novelty, cost });
+}
+
+function v8SelectMethodColumns(sample, input){
+  const cols = sample?.columns || [];
+  const maxMeasures = Math.max(2, Math.min(8, Number(input?.maxMethodMeasures || 6)));
+  const maxCategories = Math.max(2, Math.min(10, Number(input?.maxMethodCategories || 8)));
+  const measures = cols
+    .filter((c)=>c.semanticType === "measure" && Number(c.numeric?.count || 0) > 0)
+    .sort((a,b)=>Number(b.numeric?.count || 0) - Number(a.numeric?.count || 0))
+    .slice(0, maxMeasures);
+  const categories = cols
+    .filter((c)=>["category","email","url"].includes(c.semanticType) && Number(c.distinct || 0) > 1 && Number(c.distinct || 0) <= Math.max(2000, Number(c.sampleRows || 1) * 0.5))
+    .sort((a,b)=>Number(b.topShare || 0) - Number(a.topShare || 0))
+    .slice(0, maxCategories);
+  const dates = cols
+    .filter((c)=>c.semanticType === "date" && Number(c.nonNull || 0) > 0)
+    .slice(0, 4);
+  const ids = cols.filter((c)=>c.semanticType === "id").slice(0, 5);
+  const text = cols
+    .filter((c)=>!["measure","date"].includes(c.semanticType))
+    .slice(0, 12);
+
+  const selected = new Map();
+  for (const c of [...measures, ...categories, ...dates, ...ids, ...text]) {
+    if (c && Number.isFinite(Number(c.index))) selected.set(Number(c.index), c);
+  }
+  return { measures, categories, dates, ids, text, selectedProfiles:[...selected.values()], selectedIndices:[...selected.keys()] };
+}
+
+function v8RunMiniBatchKMeans(rows, featureNames){
+  const n = rows.length;
+  const dim = featureNames.length;
+  if (n < 100 || dim < 2) return null;
+
+  const means = Array(dim).fill(0);
+  const counts = Array(dim).fill(0);
+  for (const r of rows) {
+    for (let j=0; j<dim; j++) {
+      const v = r.values[j];
+      if (Number.isFinite(v)) {
+        means[j] += v;
+        counts[j]++;
+      }
+    }
+  }
+  for (let j=0; j<dim; j++) means[j] = counts[j] ? means[j] / counts[j] : 0;
+
+  const stds = Array(dim).fill(0);
+  for (const r of rows) {
+    for (let j=0; j<dim; j++) {
+      const v = Number.isFinite(r.values[j]) ? r.values[j] : means[j];
+      stds[j] += (v - means[j]) * (v - means[j]);
+    }
+  }
+  for (let j=0; j<dim; j++) stds[j] = Math.sqrt(stds[j] / Math.max(1, n)) || 1;
+
+  const norm = rows.map((r)=>r.values.map((v,j)=>(Number.isFinite(v) ? v : means[j]) - means[j]).map((v,j)=>v / stds[j]));
+  const k = Math.max(3, Math.min(7, Math.round(Math.sqrt(n / 1800)) + 2));
+  const centers = [];
+  for (let i=0; i<k; i++) {
+    centers.push(norm[Math.floor((i + 0.5) * n / k)]?.slice() || norm[i % n].slice());
+  }
+
+  let assignments = Array(n).fill(0);
+  for (let iter=0; iter<10; iter++) {
+    const sums = Array.from({ length:k }, ()=>Array(dim).fill(0));
+    const clusterCounts = Array(k).fill(0);
+    for (let i=0; i<n; i++) {
+      let best = 0;
+      let bestDist = Infinity;
+      for (let c=0; c<k; c++) {
+        let dist = 0;
+        for (let j=0; j<dim; j++) {
+          const d = norm[i][j] - centers[c][j];
+          dist += d * d;
+        }
+        if (dist < bestDist) {
+          bestDist = dist;
+          best = c;
+        }
+      }
+      assignments[i] = best;
+      clusterCounts[best]++;
+      for (let j=0; j<dim; j++) sums[best][j] += norm[i][j];
+    }
+    for (let c=0; c<k; c++) {
+      if (!clusterCounts[c]) continue;
+      for (let j=0; j<dim; j++) centers[c][j] = sums[c][j] / clusterCounts[c];
+    }
+  }
+
+  const profiles = Array.from({ length:k }, (_, clusterId)=>({
+    clusterId,
+    count:0,
+    means:Array(dim).fill(0),
+    rawMeans:Array(dim).fill(0),
+    distance:0,
+  }));
+
+  for (let i=0; i<n; i++) {
+    const c = assignments[i];
+    const p = profiles[c];
+    p.count++;
+    for (let j=0; j<dim; j++) {
+      p.means[j] += norm[i][j];
+      p.rawMeans[j] += Number.isFinite(rows[i].values[j]) ? rows[i].values[j] : means[j];
+    }
+  }
+
+  for (const p of profiles) {
+    if (!p.count) continue;
+    for (let j=0; j<dim; j++) {
+      p.means[j] /= p.count;
+      p.rawMeans[j] /= p.count;
+      p.distance += Math.abs(p.means[j]);
+    }
+    p.distance = p.distance / dim;
+  }
+
+  const best = profiles
+    .filter((p)=>p.count >= Math.max(20, n * 0.01))
+    .sort((a,b)=>Number(b.distance || 0) - Number(a.distance || 0))[0];
+
+  if (!best) return null;
+  const topFeatures = best.means
+    .map((v,i)=>({ name:featureNames[i], z:v, raw:best.rawMeans[i] }))
+    .sort((a,b)=>Math.abs(b.z) - Math.abs(a.z))
+    .slice(0, 4);
+
+  return { k, rows:n, best, topFeatures };
+}
+
+async function v8BuildInsightMethodPack(sample, input){
+  const selected = v8SelectMethodColumns(sample, input);
+  const insights = [];
+  const suggestions = [];
+  const metrics = {
+    methodPack:"v8-expanded",
+    scannedRows:0,
+    scannedChunks:0,
+    generated:{
+      dataQuality:0,
+      anomaly:0,
+      segmentDifference:0,
+      timeSeries:0,
+      association:0,
+      ruleMining:0,
+      cohort:0,
+      funnel:0,
+      cluster:0,
+    }
+  };
+
+  if (!selected.selectedIndices.length) return { insights, suggestedCharts:suggestions, metrics };
+
+  const profilesByIndex = new Map((sample.columns || []).map((c)=>[Number(c.index), c]));
+  const namesByIndex = new Map((sample.columns || []).map((c)=>[Number(c.index), String(c.name || `Column ${Number(c.index)+1}`)]));
+  const totalRows = Number(state.manifest?.totalRows || 0);
+  const sampleRowsTarget = Math.max(3000, Math.min(90000, Math.floor(Number(input?.sampleRows || 120000) * 0.65)));
+
+  const catCounts = new Map(selected.categories.map((c)=>[Number(c.index), new Map()]));
+  const textQuality = new Map(selected.text.map((c)=>[Number(c.index), { count:0, totalLen:0, maxLen:0, control:0, veryLong:0 }]));
+
+  const catMeasure = [];
+  for (const cat of selected.categories.slice(0, 8)) {
+    for (const measure of selected.measures.slice(0, 6)) {
+      if (cat.index === measure.index) continue;
+      catMeasure.push({
+        cat,
+        measure,
+        global:{ count:0, sum:0, sumSq:0, min:Infinity, max:-Infinity },
+        groups:new Map()
+      });
+    }
+  }
+
+  const catPairs = [];
+  for (let i=0; i<Math.min(5, selected.categories.length); i++) {
+    for (let j=i+1; j<Math.min(6, selected.categories.length); j++) {
+      catPairs.push({ a:selected.categories[i], b:selected.categories[j], pairs:new Map() });
+    }
+  }
+
+  const dateSeries = [];
+  for (const date of selected.dates.slice(0, 3)) {
+    dateSeries.push({ date, measure:null, buckets:new Map(), monthBuckets:new Map() });
+    for (const measure of selected.measures.slice(0, 3)) {
+      if (date.index !== measure.index) {
+        dateSeries.push({ date, measure, buckets:new Map(), monthBuckets:new Map() });
+      }
+    }
+  }
+
+  const ruleCombos = [];
+  const firstMeasures = selected.measures.slice(0, 3);
+  for (let i=0; i<Math.min(4, selected.categories.length); i++) {
+    for (let j=i+1; j<Math.min(5, selected.categories.length); j++) {
+      for (const measure of firstMeasures) {
+        ruleCombos.push({
+          cats:[selected.categories[i], selected.categories[j]],
+          measure,
+          global:{ count:0, sum:0, sumSq:0, min:Infinity, max:-Infinity },
+          groups:new Map()
+        });
+      }
+    }
+  }
+
+  const clusterFeatures = selected.measures.slice(0, 6);
+  const clusterRows = [];
+  const clusterFeatureNames = clusterFeatures.map((c)=>c.name);
+
+  const chunkCount = activeIsMemory()
+    ? Number(state.memory?.chunks?.length || 0)
+    : activeIsVirtual()
+      ? Number(state.virtual?.globalChunks?.length || 0)
+      : Number(state.dataset?.chunks?.length || 0);
+  const rowsPerChunk = Math.max(50, Math.ceil(sampleRowsTarget / Math.max(1, chunkCount)));
+  let sampledRows = 0;
+
+  for (let chunkIndex=0; chunkIndex<chunkCount; chunkIndex++) {
+    if (state.cancelled) throw new Error("Cancelled");
+    const chunk = await readChunkColumns(chunkIndex, selected.selectedIndices, {
+      surfacePlan:{ hotColumns:selected.selectedIndices, label:"v8-method-pack" }
+    });
+    const rowCount = Number(chunk.rowCount || 0);
+    if (!rowCount) continue;
+    const stride = Math.max(1, Math.floor(rowCount / rowsPerChunk));
+    metrics.scannedChunks++;
+
+    for (let row=0; row<rowCount && sampledRows < sampleRowsTarget; row += stride) {
+      sampledRows++;
+      const values = new Map();
+      for (const idx of selected.selectedIndices) {
+        values.set(idx, valueFromColumn(chunk.columns.get(idx), row));
+      }
+
+      for (const cat of selected.categories) {
+        const raw = values.get(Number(cat.index));
+        if (v8IsBlank(raw)) continue;
+        const key = v8CellString(raw);
+        if (!key) continue;
+        const m = catCounts.get(Number(cat.index));
+        if (m) v8Bump(m, key, 1);
+      }
+
+      for (const [idx, q] of textQuality.entries()) {
+        const raw = values.get(idx);
+        if (v8IsBlank(raw)) continue;
+        const s = String(raw);
+        q.count++;
+        q.totalLen += s.length;
+        q.maxLen = Math.max(q.maxLen, s.length);
+        if (s.length >= 500) q.veryLong++;
+        if (/[\u0000-\u0008\u000B\u000C\u000E-\u001F]/.test(s)) q.control++;
+      }
+
+      for (const cm of catMeasure) {
+        const catValue = values.get(Number(cm.cat.index));
+        const num = v8SafeNumber(values.get(Number(cm.measure.index)));
+        if (v8IsBlank(catValue) || !Number.isFinite(num)) continue;
+        const key = v8CellString(catValue);
+        v8StatAdd(cm.global, num);
+        let g = cm.groups.get(key);
+        if (!g) {
+          g = { count:0, sum:0, sumSq:0, min:Infinity, max:-Infinity };
+          cm.groups.set(key, g);
+        }
+        v8StatAdd(g, num);
+      }
+
+      for (const cp of catPairs) {
+        const av = values.get(Number(cp.a.index));
+        const bv = values.get(Number(cp.b.index));
+        if (v8IsBlank(av) || v8IsBlank(bv)) continue;
+        const key = `${v8CellString(av)}\u0001${v8CellString(bv)}`;
+        v8Bump(cp.pairs, key, 1);
+      }
+
+      for (const ts of dateSeries) {
+        const dateRaw = values.get(Number(ts.date.index));
+        const day = v8DayBucket(dateRaw);
+        if (!day) continue;
+        const month = v8MonthBucket(dateRaw);
+        const val = ts.measure ? v8SafeNumber(values.get(Number(ts.measure.index))) : 1;
+        if (!Number.isFinite(val)) continue;
+        let b = ts.buckets.get(day);
+        if (!b) {
+          b = { count:0, sum:0, sumSq:0, min:Infinity, max:-Infinity };
+          ts.buckets.set(day, b);
+        }
+        v8StatAdd(b, val);
+        if (month) {
+          let mb = ts.monthBuckets.get(month);
+          if (!mb) {
+            mb = { count:0, sum:0, sumSq:0, min:Infinity, max:-Infinity };
+            ts.monthBuckets.set(month, mb);
+          }
+          v8StatAdd(mb, val);
+        }
+      }
+
+      for (const rc of ruleCombos) {
+        const a = values.get(Number(rc.cats[0].index));
+        const b = values.get(Number(rc.cats[1].index));
+        const num = v8SafeNumber(values.get(Number(rc.measure.index)));
+        if (v8IsBlank(a) || v8IsBlank(b) || !Number.isFinite(num)) continue;
+        const key = `${v8CellString(a)} ∧ ${v8CellString(b)}`;
+        v8StatAdd(rc.global, num);
+        let g = rc.groups.get(key);
+        if (!g) {
+          g = { count:0, sum:0, sumSq:0, min:Infinity, max:-Infinity };
+          rc.groups.set(key, g);
+        }
+        v8StatAdd(g, num);
+      }
+
+      if (clusterFeatures.length >= 2 && clusterRows.length < 24000) {
+        const vals = clusterFeatures.map((c)=>v8SafeNumber(values.get(Number(c.index))));
+        if (vals.filter(Number.isFinite).length >= 2) clusterRows.push({ values:vals });
+      }
+    }
+
+    if (sampledRows >= sampleRowsTarget) break;
+    if (chunkIndex % 10 === 0) {
+      post("AUTONOMOUS_INSIGHTS_PROGRESS", {
+        sampledRows,
+        totalRows,
+        stage:"method-pack",
+        progress:Math.min(96, 88 + Math.round((sampledRows / sampleRowsTarget) * 8))
+      });
+    }
+  }
+
+  metrics.scannedRows = sampledRows;
+
+  // Data Quality Insight
+  for (const idCol of selected.ids) {
+    if (Number(idCol.sampleRows || 0) >= 1000 && Number(idCol.cardinalityRate || 0) < 0.92) {
+      const duplicateRate = Math.max(0, 1 - Number(idCol.cardinalityRate || 0));
+      insights.push({
+        id:`dq-duplicate-key-${idCol.index}`,
+        severity:duplicateRate >= 0.15 ? "High" : "Medium",
+        kind:"data_quality",
+        method:"Data Quality Insight",
+        title:`${idCol.name} に重複キーの可能性`,
+        detail:`ID候補列ですが、sample上の一意率が ${Math.round(Number(idCol.cardinalityRate || 0) * 1000) / 10}% です。JOINキーとして使う前に重複確認が必要です。`,
+        score:v8MethodScore(Math.min(1.8, duplicateRate * 5), 0.76, 0.75, 0.45),
+        columns:[idCol.name],
+        evidence:v8InsightRows([["distinct/sample", `${fmt(idCol.distinct)} / ${fmt(idCol.sampleRows)}`], ["duplicate estimate", `${Math.round(duplicateRate * 1000) / 10}%`]]),
+        action:"Inspect duplicate keys"
+      });
+      metrics.generated.dataQuality++;
+    }
+  }
+
+  for (const [idx, q] of textQuality.entries()) {
+    const profile = profilesByIndex.get(idx);
+    if (!profile || !q.count) continue;
+    const controlRate = q.control / q.count;
+    const longRate = q.veryLong / q.count;
+    if (controlRate >= 0.005 || longRate >= 0.05 || q.maxLen >= 2000) {
+      insights.push({
+        id:`dq-text-${idx}`,
+        severity:controlRate >= 0.02 || q.maxLen >= 5000 ? "High" : "Medium",
+        kind:"data_quality",
+        method:"Data Quality Insight",
+        title:`${profile.name} に文字品質の注意点`,
+        detail:"制御文字・極端に長い文字列・貼り付け崩れが含まれる可能性があります。",
+        score:v8MethodScore(Math.min(1.5, controlRate * 20 + longRate * 6 + Math.min(0.6, q.maxLen / 5000)), 0.7, 0.72, 0.5),
+        columns:[profile.name],
+        evidence:v8InsightRows([["sampled", fmt(q.count)], ["max length", fmt(q.maxLen)], ["control chars", fmt(q.control)], ["very long", fmt(q.veryLong)]]),
+        action:"Clean / normalize text"
+      });
+      metrics.generated.dataQuality++;
+    }
+  }
+
+  // Segment Difference Insight
+  for (const cm of catMeasure) {
+    const globalMean = v8StatMean(cm.global);
+    if (globalMean == null || !Number.isFinite(globalMean) || Math.abs(globalMean) < 1e-12) continue;
+    const minCount = Math.max(30, Math.floor(sampledRows * 0.004));
+    const best = [...cm.groups.entries()]
+      .filter(([,s])=>Number(s.count || 0) >= minCount)
+      .map(([value, stat])=>{
+        const mean = v8StatMean(stat);
+        const ratio = mean == null ? 1 : mean / globalMean;
+        const diff = Math.abs(Math.log(Math.max(1e-9, Math.abs(ratio))));
+        return { value, stat, mean, ratio, diff };
+      })
+      .sort((a,b)=>Number(b.diff || 0) - Number(a.diff || 0))[0];
+    if (!best || best.diff < 0.45) continue;
+    const signal = Math.min(2, best.diff);
+    const score = v8MethodScore(signal, Math.min(0.92, best.stat.count / 2000 + 0.55), 0.9, 0.75);
+    insights.push({
+      id:`segment-diff-${cm.cat.index}-${cm.measure.index}-${hashText32(best.value)}`,
+      severity:score >= 85 ? "High" : "Medium",
+      kind:"segment_difference",
+      method:"Segment Difference Insight",
+      title:`${cm.cat.name}=${best.value} で ${cm.measure.name} が平均との差を持つ`,
+      detail:`${best.value} の平均は ${Math.round(best.mean * 1000) / 1000}、全体sample平均は ${Math.round(globalMean * 1000) / 1000} です。`,
+      score,
+      columns:[cm.cat.name, cm.measure.name],
+      evidence:v8InsightRows([["segment", best.value], ["segment count", fmt(best.stat.count)], ["segment avg", String(Math.round(best.mean * 1000) / 1000)], ["sample avg", String(Math.round(globalMean * 1000) / 1000)], ["ratio", String(Math.round(best.ratio * 1000) / 1000)]]),
+      action:"Run segment chart",
+      d3Plan:v8MakeD3Plan({ chartType:"bar", xColumn:cm.cat.index, yColumn:cm.measure.index, aggregation:"Avg" })
+    });
+    suggestions.push({
+      id:`method-segment-chart-${cm.cat.index}-${cm.measure.index}`,
+      title:`${cm.cat.name} 別 ${cm.measure.name}`,
+      reason:"セグメント差分を検証",
+      score,
+      plan:v8MakeD3Plan({ chartType:"bar", xColumn:cm.cat.index, yColumn:cm.measure.index, aggregation:"Avg" })
+    });
+    metrics.generated.segmentDifference++;
+  }
+
+  // Association Insight
+  for (const cp of catPairs) {
+    const aCounts = catCounts.get(Number(cp.a.index)) || new Map();
+    const bCounts = catCounts.get(Number(cp.b.index)) || new Map();
+    const minPair = Math.max(20, Math.floor(sampledRows * 0.003));
+    const best = [...cp.pairs.entries()]
+      .filter(([,count])=>Number(count || 0) >= minPair)
+      .map(([key,count])=>{
+        const [av,bv] = key.split("\u0001");
+        const expected = (Number(aCounts.get(av) || 0) * Number(bCounts.get(bv) || 0)) / Math.max(1, sampledRows);
+        const lift = expected > 0 ? Number(count || 0) / expected : 0;
+        return { av, bv, count:Number(count || 0), expected, lift };
+      })
+      .filter((x)=>x.lift >= 1.8)
+      .sort((a,b)=>Number(b.lift || 0) - Number(a.lift || 0))[0];
+    if (!best) continue;
+    const score = v8MethodScore(Math.min(2, Math.log2(best.lift + 1)), Math.min(0.9, best.count / 1000 + 0.55), 0.86, 0.8);
+    insights.push({
+      id:`association-${cp.a.index}-${cp.b.index}-${hashText32(best.av + "|" + best.bv)}`,
+      severity:best.lift >= 4 ? "High" : "Medium",
+      kind:"association",
+      method:"Correlation / Association Insight",
+      title:`${cp.a.name}=${best.av} と ${cp.b.name}=${best.bv} が共起`,
+      detail:`期待値 ${Math.round(best.expected * 10) / 10} に対し、sampleでは ${fmt(best.count)} 件あります。lift=${Math.round(best.lift * 100) / 100}`,
+      score,
+      columns:[cp.a.name, cp.b.name],
+      evidence:v8InsightRows([["A", `${cp.a.name}=${best.av}`], ["B", `${cp.b.name}=${best.bv}`], ["observed", fmt(best.count)], ["expected", String(Math.round(best.expected * 10) / 10)], ["lift", String(Math.round(best.lift * 100) / 100)]]),
+      action:"Show co-occurrence heatmap",
+      d3Plan:v8MakeD3Plan({ chartType:"heatmap", xColumn:cp.a.index, groupColumn:cp.b.index, aggregation:"Count" })
+    });
+    suggestions.push({
+      id:`method-assoc-heat-${cp.a.index}-${cp.b.index}`,
+      title:`${cp.a.name} × ${cp.b.name} 共起`,
+      reason:"カテゴリ間の強い組み合わせを確認",
+      score,
+      plan:v8MakeD3Plan({ chartType:"heatmap", xColumn:cp.a.index, groupColumn:cp.b.index, aggregation:"Count" })
+    });
+    metrics.generated.association++;
+  }
+
+  // Time Series / Spike + Cohort Insight
+  for (const ts of dateSeries) {
+    const bucketValues = [...ts.buckets.entries()]
+      .map(([bucket, stat])=>({ bucket, stat, value:ts.measure ? Number(stat.sum || 0) : Number(stat.count || 0) }))
+      .filter((x)=>Number.isFinite(x.value));
+    if (bucketValues.length >= 5) {
+      const avg = bucketValues.reduce((s,x)=>s + x.value, 0) / bucketValues.length;
+      const max = bucketValues.reduce((a,b)=>b.value > a.value ? b : a, bucketValues[0]);
+      const ratio = avg > 0 ? max.value / avg : 0;
+      if (ratio >= 3) {
+        const score = v8MethodScore(Math.min(2, Math.log2(ratio)), 0.68, 0.9, 0.65);
+        insights.push({
+          id:`time-spike-${ts.date.index}-${ts.measure?.index ?? "count"}-${max.bucket}`,
+          severity:ratio >= 6 ? "High" : "Medium",
+          kind:"time_series",
+          method:"Time Series / Spike Insight",
+          title:`${ts.date.name} でスパイク候補`,
+          detail:`${max.bucket} が日次平均の ${Math.round(ratio * 100) / 100} 倍です。`,
+          score,
+          columns:[ts.date.name].concat(ts.measure ? [ts.measure.name] : []),
+          evidence:v8InsightRows([["bucket", max.bucket], ["peak", String(Math.round(max.value * 1000) / 1000)], ["bucket avg", String(Math.round(avg * 1000) / 1000)], ["ratio", String(Math.round(ratio * 100) / 100)]]),
+          action:"Show time surface",
+          d3Plan:v8MakeD3Plan({ chartType:"calendar", xColumn:ts.date.index, yColumn:ts.measure?.index ?? -1, aggregation:ts.measure ? "Sum" : "Count" })
+        });
+        suggestions.push({
+          id:`method-time-${ts.date.index}-${ts.measure?.index ?? "count"}`,
+          title:`${ts.date.name} の時間変化`,
+          reason:"スパイク・周期を確認",
+          score,
+          plan:v8MakeD3Plan({ chartType:"calendar", xColumn:ts.date.index, yColumn:ts.measure?.index ?? -1, aggregation:ts.measure ? "Sum" : "Count" })
+        });
+        metrics.generated.timeSeries++;
+      }
+    }
+
+    const months = [...ts.monthBuckets.entries()].map(([month, stat])=>({ month, value:ts.measure ? Number(stat.sum || 0) : Number(stat.count || 0), count:Number(stat.count || 0) }));
+    if (!ts.measure && months.length >= 4) {
+      const max = months.reduce((a,b)=>b.value > a.value ? b : a, months[0]);
+      const min = months.reduce((a,b)=>b.value < a.value ? b : a, months[0]);
+      const ratio = min.value > 0 ? max.value / min.value : 0;
+      if (ratio >= 2.5) {
+        const score = v8MethodScore(Math.min(1.6, Math.log2(ratio)), 0.62, 0.78, 0.6);
+        insights.push({
+          id:`cohort-month-${ts.date.index}`,
+          severity:"Medium",
+          kind:"cohort",
+          method:"Cohort Insight",
+          title:`${ts.date.name} の月別 cohort 差分候補`,
+          detail:`${max.month} の件数は ${min.month} の ${Math.round(ratio * 100) / 100} 倍です。月別の獲得・登録・発生差分を見る価値があります。`,
+          score,
+          columns:[ts.date.name],
+          evidence:v8InsightRows([["high month", `${max.month}: ${fmt(max.value)}`], ["low month", `${min.month}: ${fmt(min.value)}`], ["ratio", String(Math.round(ratio * 100) / 100)]]),
+          action:"Show cohort calendar",
+          d3Plan:v8MakeD3Plan({ chartType:"calendar", xColumn:ts.date.index, aggregation:"Count" })
+        });
+        metrics.generated.cohort++;
+      }
+    }
+  }
+
+  // Rule Mining Insight
+  for (const rc of ruleCombos) {
+    const globalMean = v8StatMean(rc.global);
+    if (globalMean == null || Math.abs(globalMean) < 1e-12) continue;
+    const minCount = Math.max(25, Math.floor(sampledRows * 0.0025));
+    const best = [...rc.groups.entries()]
+      .filter(([,stat])=>Number(stat.count || 0) >= minCount)
+      .map(([combo, stat])=>{
+        const mean = v8StatMean(stat);
+        const ratio = mean == null ? 1 : mean / globalMean;
+        return { combo, stat, mean, ratio, strength:Math.abs(Math.log(Math.max(1e-9, Math.abs(ratio)))) };
+      })
+      .filter((x)=>x.strength >= 0.55)
+      .sort((a,b)=>Number(b.strength || 0) - Number(a.strength || 0))[0];
+    if (!best) continue;
+    const score = v8MethodScore(Math.min(2, best.strength), Math.min(0.86, best.stat.count / 1500 + 0.5), 0.95, 0.95);
+    insights.push({
+      id:`rule-${rc.cats[0].index}-${rc.cats[1].index}-${rc.measure.index}-${hashText32(best.combo)}`,
+      severity:score >= 82 ? "High" : "Medium",
+      kind:"rule_mining",
+      method:"Rule Mining Insight",
+      title:`${best.combo} のとき ${rc.measure.name} が変化`,
+      detail:`条件一致時の平均は全体sample平均の ${Math.round(best.ratio * 1000) / 1000} 倍です。`,
+      score,
+      columns:[rc.cats[0].name, rc.cats[1].name, rc.measure.name],
+      evidence:v8InsightRows([["rule", best.combo], ["match count", fmt(best.stat.count)], ["rule avg", String(Math.round(best.mean * 1000) / 1000)], ["sample avg", String(Math.round(globalMean * 1000) / 1000)], ["ratio", String(Math.round(best.ratio * 1000) / 1000)]]),
+      action:"Validate rule with filter + chart",
+      d3Plan:v8MakeD3Plan({ chartType:"heatmap", xColumn:rc.cats[0].index, groupColumn:rc.cats[1].index, yColumn:rc.measure.index, aggregation:"Avg" })
+    });
+    metrics.generated.ruleMining++;
+  }
+
+  // Funnel / Transition candidate Insight
+  for (const cat of selected.categories) {
+    const name = String(cat.name || "").toLowerCase();
+    const values = (cat.top || []).map((x)=>String(x.value || "").toLowerCase());
+    const hasFunnelName = /(status|stage|state|step|phase|funnel|transition|進捗|状態|ステータス)/i.test(name);
+    const hasFunnelValues = values.some((v)=>/(new|start|open|visit|signup|trial|active|paid|purchase|complete|success|fail|cancel|churn|離脱|失敗|完了)/i.test(v));
+    if ((hasFunnelName || hasFunnelValues) && Number(cat.distinct || 0) >= 3 && Number(cat.distinct || 0) <= 30) {
+      const score = v8MethodScore(Math.min(1.3, 0.5 + Number(cat.topShare || 0)), 0.64, 0.82, 0.45);
+      insights.push({
+        id:`funnel-candidate-${cat.index}`,
+        severity:"Medium",
+        kind:"funnel_transition",
+        method:"Funnel / Transition Insight",
+        title:`${cat.name} はファネル/状態遷移分析に使える可能性`,
+        detail:"状態・ステージ・成功/失敗を表す列の可能性があります。件数分布や他列との遷移/離脱差分を確認できます。",
+        score,
+        columns:[cat.name],
+        evidence:v8InsightRows((cat.top || []).slice(0, 8).map((x)=>[x.value, fmt(x.count)])),
+        action:"Show funnel distribution",
+        d3Plan:v8MakeD3Plan({ chartType:"bar", xColumn:cat.index, aggregation:"Count" })
+      });
+      suggestions.push({
+        id:`method-funnel-${cat.index}`,
+        title:`${cat.name} の状態分布`,
+        reason:"ファネル・遷移分析候補",
+        score,
+        plan:v8MakeD3Plan({ chartType:"bar", xColumn:cat.index, aggregation:"Count" })
+      });
+      metrics.generated.funnel++;
+    }
+  }
+
+  // Cluster Insight
+  const cluster = v8RunMiniBatchKMeans(clusterRows, clusterFeatureNames);
+  if (cluster && cluster.best?.distance >= 0.65) {
+    const xCol = clusterFeatures[0];
+    const yCol = clusterFeatures[1];
+    const score = v8MethodScore(Math.min(2, cluster.best.distance), Math.min(0.88, cluster.rows / 24000 + 0.45), 0.95, 1.1);
+    insights.push({
+      id:`cluster-numeric-${hashText32(clusterFeatureNames.join("|"))}`,
+      severity:cluster.best.distance >= 1.1 ? "High" : "Medium",
+      kind:"cluster",
+      method:"Cluster Insight Kernel",
+      title:`数値特徴から特徴的なクラスタ候補`,
+      detail:`sample ${fmt(cluster.rows)} 行を ${cluster.k} クラスタに分けたところ、cluster ${cluster.best.clusterId} が平均との差を持ちます。`,
+      score,
+      columns:clusterFeatureNames,
+      evidence:v8InsightRows([
+        ["cluster", String(cluster.best.clusterId)],
+        ["cluster size", fmt(cluster.best.count)],
+        ["distance", String(Math.round(cluster.best.distance * 1000) / 1000)],
+        ...cluster.topFeatures.map((f)=>[f.name, `z=${Math.round(f.z * 1000) / 1000}, avg=${Math.round(f.raw * 1000) / 1000}`])
+      ]),
+      action:"Show numeric scatter / inspect cluster profile",
+      d3Plan:xCol && yCol ? v8MakeD3Plan({ chartType:"scatter", xColumn:xCol.index, yColumn:yCol.index, aggregation:"Count" }) : null
+    });
+    if (xCol && yCol) {
+      suggestions.push({
+        id:`method-cluster-scatter-${xCol.index}-${yCol.index}`,
+        title:`${xCol.name} × ${yCol.name} クラスタ確認`,
+        reason:"数値クラスタと外れ値群を確認",
+        score,
+        plan:v8MakeD3Plan({ chartType:"scatter", xColumn:xCol.index, yColumn:yCol.index, aggregation:"Count" })
+      });
+    }
+    metrics.generated.cluster++;
+  }
+
+  const rankedInsights = insights
+    .sort((a,b)=>Number(b.score || 0) - Number(a.score || 0))
+    .slice(0, 48);
+  const rankedSuggestions = suggestions
+    .sort((a,b)=>Number(b.score || 0) - Number(a.score || 0))
+    .slice(0, 18);
+
+  return { insights:rankedInsights, suggestedCharts:rankedSuggestions, metrics };
+}
+
+
 async function runAutonomousAnalysisKernelV8(input){
   const started = now();
   const sample = await v8SampleProfiles(input);
@@ -10597,7 +11302,27 @@ async function runAutonomousAnalysisKernelV8(input){
     stage:"rank",
     progress:88
   });
-  const generated = v8BuildInsights(sample, input);
+
+  const baseGenerated = v8BuildInsights(sample, input);
+
+  post("AUTONOMOUS_INSIGHTS_PROGRESS", {
+    sampledRows:sample.metrics.sampledRows,
+    totalRows:sample.metrics.totalRows,
+    stage:"method-pack",
+    progress:90
+  });
+
+  const methodPack = await v8BuildInsightMethodPack(sample, input);
+  const generated = {
+    insights:[...(baseGenerated.insights || []), ...(methodPack.insights || [])]
+      .sort((a,b)=>Number(b.score || 0) - Number(a.score || 0))
+      .slice(0, 72),
+    suggestedCharts:[...(baseGenerated.suggestedCharts || []), ...(methodPack.suggestedCharts || [])]
+      .sort((a,b)=>Number(b.score || 0) - Number(a.score || 0))
+      .slice(0, 30),
+  };
+
+  const methodCounts = methodPack.metrics?.generated || {};
   const result = {
     version:AUTONOMOUS_ANALYSIS_KERNEL_VERSION,
     dataset:{
@@ -10613,6 +11338,8 @@ async function runAutonomousAnalysisKernelV8(input){
       sampledRows:sample.metrics.sampledRows,
       sampleRatio:sample.metrics.sampleRatio,
       topSeverity:generated.insights[0]?.severity || "None",
+      methodPack:"expanded",
+      methodCounts,
     },
     columns:sample.columns.map((c)=>({
       ...c,
@@ -10622,9 +11349,10 @@ async function runAutonomousAnalysisKernelV8(input){
     suggestedCharts:generated.suggestedCharts,
     metrics:{
       ...sample.metrics,
+      methodPack:methodPack.metrics,
       ms:Math.round(now() - started),
       cache:"miss",
-      kernel:"Autonomous Analysis Kernel v8",
+      kernel:"Autonomous Analysis Kernel v8 Expanded Method Pack",
     }
   };
   return result;
@@ -10722,8 +11450,17 @@ function v9HypothesisTypeFromInsight(insight){
   const kind = String(insight?.kind || "");
   const id = String(insight?.id || "");
   if (kind === "quality" || id.startsWith("null-")) return "missingness";
+  if (kind === "data_quality") return "data_quality";
   if (kind === "distribution" || id.startsWith("imbalance-")) return "imbalance";
   if (kind === "outlier" || id.startsWith("spread-")) return "outlier";
+  if (kind === "anomaly") return "anomaly";
+  if (kind === "segment_difference") return "segment_difference";
+  if (kind === "time_series") return "time_series";
+  if (kind === "association") return "association";
+  if (kind === "rule_mining") return "rule_mining";
+  if (kind === "cohort") return "cohort";
+  if (kind === "funnel_transition") return "funnel_transition";
+  if (kind === "cluster") return "cluster";
   if (kind === "semantic" || id.startsWith("id-")) return "semantic_key";
   return "research_candidate";
 }
