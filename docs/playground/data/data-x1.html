@@ -11075,6 +11075,313 @@ function renderD3WorkerSurface(svgNode, surface) {
   return clearD3Svg(svg, width, height, "Unsupported D3 surface");
 }
 
+const D3_PROJECTION_TABLE_VISIBLE_ROWS = 500;
+const D3_PROJECTION_TABLE_MAX_ROWS = 2500;
+const D3_PROJECTION_TEXT_MAX = 180;
+const D3_PROJECTION_TABLE_HEADERS = ["#", "type", "label", "group", "x", "y", "value", "count", "sourcePreview"];
+
+function d3ProjectionText(value, max = D3_PROJECTION_TEXT_MAX) {
+  if (value == null) return "";
+  const text = String(value);
+  if (text.length <= max) return text;
+  return `${text.slice(0, Math.max(0, max - 1))}…`;
+}
+
+function d3ProjectionNumber(value) {
+  const n = Number(value);
+  return Number.isFinite(n) ? formatD3VizNumber(n) : d3ProjectionText(value);
+}
+
+function d3ProjectionCsvEscape(value) {
+  let s = value == null ? "" : String(value);
+  if (/^[=+\-@\t\r]/.test(s)) s = `'${s}`;
+  s = s.replaceAll('"', '""');
+  return /[",\r\n]/.test(s) ? `"${s}"` : s;
+}
+
+function d3ProjectionTableToCsv(table) {
+  const rows = Array.isArray(table?.rows) ? table.rows : [];
+  if (!rows.length) return "";
+  const headers = D3_PROJECTION_TABLE_HEADERS;
+  return [
+    headers.map(d3ProjectionCsvEscape).join(","),
+    ...rows.map((row, index) => headers.map((key) => {
+      if (key === "#") return d3ProjectionCsvEscape(index + 1);
+      return d3ProjectionCsvEscape(row[key]);
+    }).join(",")),
+  ].join("\n");
+}
+
+function buildD3ProjectionTable(surface) {
+  const s = surface || {};
+  const rows = [];
+  let totalRows = 0;
+
+  const add = (row) => {
+    totalRows += 1;
+    if (rows.length >= D3_PROJECTION_TABLE_MAX_ROWS) return;
+    rows.push({
+      type:d3ProjectionText(row.type),
+      label:d3ProjectionText(row.label),
+      group:d3ProjectionText(row.group),
+      x:d3ProjectionText(row.x),
+      y:d3ProjectionText(row.y),
+      value:d3ProjectionText(row.value),
+      count:d3ProjectionText(row.count),
+      sourcePreview:d3ProjectionText(row.sourcePreview, 260),
+    });
+  };
+
+  const xName = s.xLabel || s.xColumnName || "X";
+  const yName = s.yLabel || s.yColumnName || "Y";
+  const groupName = s.secondaryLabel || s.secondaryColumnName || "Group";
+
+  if (!s.kind || s.kind === "empty") {
+    return {
+      kind:"empty",
+      headers:D3_PROJECTION_TABLE_HEADERS,
+      rows:[],
+      totalRows:0,
+      capped:false,
+      csv:"",
+      sourceLabel:s.dataSourceLabel || "",
+    };
+  }
+
+  if (s.kind === "bar") {
+    for (const row of Array.isArray(s.rows) ? s.rows : []) {
+      add({
+        type:"bar",
+        label:row.key,
+        group:row.overflow ? "overflow" : "",
+        x:row.key,
+        y:"",
+        value:d3ProjectionNumber(row.value),
+        count:d3ProjectionNumber(row.count),
+        sourcePreview:`${xName}=${row.key}; ${yName}=${d3ProjectionNumber(row.value)}; rows=${d3ProjectionNumber(row.count)}`,
+      });
+    }
+  } else if (s.kind === "histogram") {
+    for (const bin of Array.isArray(s.bins) ? s.bins : []) {
+      const label = `[${d3ProjectionNumber(bin.x0)}, ${d3ProjectionNumber(bin.x1)})`;
+      add({
+        type:"bin",
+        label,
+        group:"",
+        x:label,
+        y:"",
+        value:d3ProjectionNumber(bin.count),
+        count:d3ProjectionNumber(bin.count),
+        sourcePreview:`${xName} in ${label}; rows=${d3ProjectionNumber(bin.count)}`,
+      });
+    }
+  } else if (s.kind === "line" || s.kind === "area") {
+    for (const point of Array.isArray(s.points) ? s.points : []) {
+      const bucket = point.x0 != null && point.x1 != null
+        ? `[${d3ProjectionNumber(point.x0)}, ${d3ProjectionNumber(point.x1)})`
+        : d3ProjectionNumber(point.x);
+      add({
+        type:s.kind === "area" ? "area-point" : "line-point",
+        label:bucket,
+        group:"",
+        x:d3ProjectionNumber(point.x),
+        y:d3ProjectionNumber(point.y),
+        value:d3ProjectionNumber(point.y),
+        count:d3ProjectionNumber(point.count),
+        sourcePreview:`${xName}=${bucket}; ${yName}=${d3ProjectionNumber(point.y)}; rows=${d3ProjectionNumber(point.count)}`,
+      });
+    }
+  } else if (s.kind === "scatter" || s.kind === "bubble") {
+    for (const point of Array.isArray(s.points) ? s.points : []) {
+      add({
+        type:s.kind === "bubble" ? "bubble" : "point",
+        label:`${d3ProjectionNumber(point.x)}, ${d3ProjectionNumber(point.y)}`,
+        group:`cell ${point.xi ?? ""}:${point.yi ?? ""}`,
+        x:d3ProjectionNumber(point.x),
+        y:d3ProjectionNumber(point.y),
+        value:d3ProjectionNumber(point.count),
+        count:d3ProjectionNumber(point.count),
+        sourcePreview:`${xName}=${d3ProjectionNumber(point.x)}; ${yName}=${d3ProjectionNumber(point.y)}; rows=${d3ProjectionNumber(point.count)}`,
+      });
+    }
+  } else if (s.kind === "heatmap") {
+    for (const cell of Array.isArray(s.cells) ? s.cells : []) {
+      add({
+        type:"cell",
+        label:`${cell.xKey} × ${cell.yKey}`,
+        group:cell.yKey,
+        x:cell.xKey,
+        y:cell.yKey,
+        value:d3ProjectionNumber(cell.value),
+        count:d3ProjectionNumber(cell.count),
+        sourcePreview:`${xName}=${cell.xKey}; ${groupName}=${cell.yKey}; ${yName}=${d3ProjectionNumber(cell.value)}; rows=${d3ProjectionNumber(cell.count)}`,
+      });
+    }
+  } else if (s.kind === "stackedbar") {
+    const stackKeys = Array.isArray(s.stackKeys) ? s.stackKeys : [];
+    for (const row of Array.isArray(s.rows) ? s.rows : []) {
+      const stacks = row.stacks && typeof row.stacks === "object" ? row.stacks : {};
+      const keys = stackKeys.length ? stackKeys : Object.keys(stacks);
+      for (const stackKey of keys) {
+        const value = stacks[stackKey];
+        if (value == null || Number(value) === 0) continue;
+        add({
+          type:"stack",
+          label:row.key,
+          group:stackKey,
+          x:row.key,
+          y:stackKey,
+          value:d3ProjectionNumber(value),
+          count:"",
+          sourcePreview:`${xName}=${row.key}; ${groupName}=${stackKey}; ${yName}=${d3ProjectionNumber(value)}`,
+        });
+      }
+    }
+  } else if (s.kind === "boxplot") {
+    for (const box of Array.isArray(s.boxes) ? s.boxes : []) {
+      add({
+        type:"box",
+        label:box.key,
+        group:"",
+        x:box.key,
+        y:d3ProjectionNumber(box.median),
+        value:d3ProjectionNumber(box.median),
+        count:d3ProjectionNumber(box.count),
+        sourcePreview:`${box.key}; min=${d3ProjectionNumber(box.min)}, q1=${d3ProjectionNumber(box.q1)}, median=${d3ProjectionNumber(box.median)}, q3=${d3ProjectionNumber(box.q3)}, max=${d3ProjectionNumber(box.max)}, rows=${d3ProjectionNumber(box.count)}`,
+      });
+    }
+  } else if (s.kind === "treemap") {
+    const walk = (node, path = []) => {
+      if (!node || typeof node !== "object") return;
+      const nextPath = node.name && node.name !== "root" ? [...path, node.name] : path;
+      const children = Array.isArray(node.children) ? node.children : [];
+      if (children.length) {
+        for (const child of children) walk(child, nextPath);
+        return;
+      }
+      add({
+        type:"leaf",
+        label:nextPath.join(" / ") || node.name || "",
+        group:path[path.length - 1] || "",
+        x:nextPath[0] || node.name || "",
+        y:nextPath.slice(1).join(" / "),
+        value:d3ProjectionNumber(node.value),
+        count:d3ProjectionNumber(node.count),
+        sourcePreview:`path=${nextPath.join(" / ") || node.name || ""}; value=${d3ProjectionNumber(node.value)}; rows=${d3ProjectionNumber(node.count)}`,
+      });
+    };
+    walk(s.root || { name:"root", children:[] });
+  } else if (s.kind === "calendar") {
+    for (const day of Array.isArray(s.days) ? s.days : []) {
+      add({
+        type:"day",
+        label:day.date,
+        group:String(day.date || "").slice(0, 7),
+        x:day.date,
+        y:"",
+        value:d3ProjectionNumber(day.value),
+        count:d3ProjectionNumber(day.count),
+        sourcePreview:`${xName}=${day.date}; ${yName}=${d3ProjectionNumber(day.value)}; rows=${d3ProjectionNumber(day.count)}`,
+      });
+    }
+  } else if (s.kind === "sankey" || s.kind === "network") {
+    for (const link of Array.isArray(s.links) ? s.links : []) {
+      add({
+        type:"link",
+        label:`${link.source} → ${link.target}`,
+        group:link.source,
+        x:link.source,
+        y:link.target,
+        value:d3ProjectionNumber(link.value),
+        count:d3ProjectionNumber(link.count),
+        sourcePreview:`source=${link.source}; target=${link.target}; value=${d3ProjectionNumber(link.value)}; rows=${d3ProjectionNumber(link.count)}`,
+      });
+    }
+    for (const node of Array.isArray(s.nodes) ? s.nodes : []) {
+      add({
+        type:"node",
+        label:node.id,
+        group:node.side || "",
+        x:node.side || "",
+        y:node.id,
+        value:d3ProjectionNumber(node.value),
+        count:"",
+        sourcePreview:`node=${node.id}; side=${node.side || ""}; value=${d3ProjectionNumber(node.value)}`,
+      });
+    }
+  }
+
+  return {
+    kind:s.kind || "surface",
+    headers:D3_PROJECTION_TABLE_HEADERS,
+    rows,
+    totalRows,
+    capped:totalRows > rows.length,
+    sourceLabel:s.dataSourceLabel || "",
+    csv:d3ProjectionTableToCsv({ rows }),
+  };
+}
+
+function ProjectionDataTable({ table }) {
+  const rows = Array.isArray(table?.rows) ? table.rows : [];
+  const visibleRows = rows.slice(0, D3_PROJECTION_TABLE_VISIBLE_ROWS);
+
+  if (!rows.length) {
+    return (
+      <Alert severity="info" sx={{ mt: 1 }}>
+        D3 ProjectionのSurfaceを作成すると、ここに描画markと対応する投影済みデータ表を表示します。
+      </Alert>
+    );
+  }
+
+  return (
+    <Box sx={{ mt: 1 }}>
+      <TableContainer sx={{ maxHeight: 360, border: "1px solid", borderColor: "divider", borderRadius: 1.5 }}>
+        <Table size="small" stickyHeader aria-label="D3 Projection Data Table">
+          <TableHead>
+            <TableRow>
+              {D3_PROJECTION_TABLE_HEADERS.map((header) => (
+                <TableCell key={header} sx={{ fontWeight: 800, whiteSpace: "nowrap", bgcolor: "background.paper" }}>
+                  {header}
+                </TableCell>
+              ))}
+            </TableRow>
+          </TableHead>
+          <TableBody>
+            {visibleRows.map((row, index) => (
+              <TableRow key={`${row.type}-${row.label}-${row.group}-${index}`} hover>
+                <TableCell sx={{ whiteSpace: "nowrap" }}>{index + 1}</TableCell>
+                {D3_PROJECTION_TABLE_HEADERS.slice(1).map((key) => (
+                  <TableCell
+                    key={key}
+                    title={String(row[key] ?? "")}
+                    sx={{
+                      maxWidth: key === "sourcePreview" ? 360 : 180,
+                      whiteSpace: "nowrap",
+                      overflow: "hidden",
+                      textOverflow: "ellipsis",
+                      fontVariantNumeric: ["value", "count", "x", "y"].includes(key) ? "tabular-nums" : "normal",
+                    }}
+                  >
+                    {String(row[key] ?? "")}
+                  </TableCell>
+                ))}
+              </TableRow>
+            ))}
+          </TableBody>
+        </Table>
+      </TableContainer>
+
+      {(rows.length > visibleRows.length || table?.capped) && (
+        <Typography variant="caption" color="text.secondary" sx={{ display: "block", mt: 0.75 }}>
+          表示は先頭{fmt(visibleRows.length)}件です。CSV出力には生成済み{fmt(rows.length)}件を含めます{table?.capped ? `（内部上限 ${fmt(D3_PROJECTION_TABLE_MAX_ROWS)} 件で制限）` : ""}。
+        </Typography>
+      )}
+    </Box>
+  );
+}
+
+
 function D3VisualizationPanel({ manifest, columns, graphColumns = [], graphResultCount = 0, graphResultMode = "data", result, status, time, onRun, onClear }) {
   const svgRef = useRef(null);
   const activeColumnOptions = useMemo(() => d3VizColumnOptions(columns), [columns]);
@@ -11155,10 +11462,38 @@ function D3VisualizationPanel({ manifest, columns, graphColumns = [], graphResul
     }
   }, [chartType, yColumn, xColumn, numericOptions.map((column) => `${column.index}:${column.name}`).join("|")]);
 
+  const projectionTable = useMemo(() => buildD3ProjectionTable(result), [result]);
+  const [projectionTableOpen, setProjectionTableOpen] = useState(false);
+
   useEffect(() => {
     if (!svgRef.current) return;
     renderD3WorkerSurface(svgRef.current, result);
   }, [result]);
+
+  useEffect(() => {
+    if (!result || !projectionTable.totalRows) {
+      setProjectionTableOpen(false);
+      return;
+    }
+    setProjectionTableOpen(projectionTable.totalRows <= D3_PROJECTION_TABLE_VISIBLE_ROWS);
+  }, [result?.kind, result?.builtAt, projectionTable.totalRows]);
+
+  async function copyProjectionTableCsv() {
+    const csv = projectionTable.csv || d3ProjectionTableToCsv(projectionTable);
+    if (!csv) return;
+    try {
+      if (!navigator?.clipboard?.writeText) throw new Error("Clipboard is not available");
+      await navigator.clipboard.writeText(csv);
+    } catch {
+      downloadText(`d3_projection_${result?.kind || "surface"}.csv`, csv);
+    }
+  }
+
+  function exportProjectionTableCsv() {
+    const csv = projectionTable.csv || d3ProjectionTableToCsv(projectionTable);
+    if (!csv) return;
+    downloadText(`d3_projection_${result?.kind || "surface"}.csv`, csv);
+  }
 
   function runSurfacePlan() {
     const sourceAvailable = dataSource === "graph" ? canUseGraphSource : canUseActiveSource;
@@ -11290,6 +11625,28 @@ function D3VisualizationPanel({ manifest, columns, graphColumns = [], graphResul
           {result?.overflowed && <Chip size="small" color="warning" label="category overflow grouped" />}
           {result?.bucketCount && <Chip size="small" label={`buckets ${fmt(result.bucketCount)}`} />}
         </Stack>
+
+        <Divider sx={{ my: 1.25 }} />
+
+        <Stack direction="row" spacing={0.75} alignItems="center" useFlexGap flexWrap="wrap">
+          <TableChart fontSize="small" />
+          <Typography variant="subtitle2" sx={{ fontWeight: 900 }}>Projection Data Table</Typography>
+          <Chip size="small" label={`table rows ${fmt(projectionTable.totalRows || 0)}`} />
+          {projectionTable.capped && <Chip size="small" color="warning" label={`capped ${fmt(projectionTable.rows.length)}`} />}
+          <Button size="small" onClick={() => setProjectionTableOpen((open) => !open)} disabled={!projectionTable.rows.length}>
+            {projectionTableOpen ? "Hide" : "Show"}
+          </Button>
+          <Button size="small" onClick={copyProjectionTableCsv} disabled={!projectionTable.rows.length}>
+            Copy CSV
+          </Button>
+          <Button size="small" startIcon={<Download />} onClick={exportProjectionTableCsv} disabled={!projectionTable.rows.length}>
+            Export CSV
+          </Button>
+        </Stack>
+
+        <Collapse in={projectionTableOpen} timeout="auto" unmountOnExit>
+          <ProjectionDataTable table={projectionTable} />
+        </Collapse>
       </Section>
     </Box>
   );
