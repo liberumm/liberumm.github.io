@@ -104,6 +104,8 @@ let state = {
   dataQueryMatches:null,
   dataQueryMeta:null,
   graphJoinResult:null,
+  graphResultSurfaces:{activeId:null,activeDataId:null,activeJoinId:null,sequence:0,map:Object.create(null),maxSurfaces:8},
+  graphResultSearch:null,
   pivotTable:null,
   pivotTileIndex:null,
   timeTable:null,
@@ -6384,6 +6386,676 @@ async function buildGraphResultTime(msg={}){
 }
 
 
+/*
+ * =========================================================
+ * GRAPH RESULT SURFACE LAYER v1
+ * =========================================================
+ * Graph Query Result is promoted from an ad-hoc table/window into a reusable
+ * result surface. Visual / Search / Pivot / Time / Export can consume the same
+ * surfaceId and avoid rematerializing raw result windows.
+ */
+const GRAPH_RESULT_SURFACE_VERSION = 1;
+
+function ensureGraphResultSurfaceStore(){
+  if (!state.graphResultSurfaces || typeof state.graphResultSurfaces !== "object"){
+    state.graphResultSurfaces = {
+      activeId:null,
+      activeDataId:null,
+      activeJoinId:null,
+      sequence:0,
+      map:Object.create(null),
+      maxSurfaces:8
+    };
+  }
+  if (!state.graphResultSurfaces.map) state.graphResultSurfaces.map = Object.create(null);
+  return state.graphResultSurfaces;
+}
+
+function graphResultSurfaceNextId(mode){
+  const store = ensureGraphResultSurfaceStore();
+  store.sequence = Number(store.sequence || 0) + 1;
+  const datasetId = safeId(state.manifest?.id || state.manifest?.name || "dataset");
+  return `grs_${mode}_${datasetId}_${Date.now().toString(36)}_${store.sequence.toString(36)}`;
+}
+
+function graphResultSurfaceDataProjection(projection=null){
+  const manifestColumns = Array.isArray(state.manifest?.columns) ? state.manifest.columns : [];
+  const raw = Array.isArray(projection) && projection.length
+    ? projection
+    : Array.isArray(state.dataQueryMeta?.projection) && state.dataQueryMeta.projection.length
+      ? state.dataQueryMeta.projection
+      : manifestColumns.map((c, i) => Number(c.index ?? i));
+
+  const seen = new Set();
+  const out = [];
+  for (const value of raw){
+    const idx = Number(value);
+    if (Number.isFinite(idx) && idx >= 0 && manifestColumns[idx] && !seen.has(idx)){
+      seen.add(idx);
+      out.push(idx);
+    }
+  }
+  return out;
+}
+
+function graphResultSurfaceColumnsForData(projection=null){
+  return graphResultSurfaceDataProjection(projection).map((actualIndex, sourceIndex) => {
+    const col = state.manifest.columns[actualIndex] || {};
+    return {
+      index:sourceIndex,
+      sourceIndex,
+      actualIndex,
+      columnIndex:actualIndex,
+      name:col.name || `Column ${actualIndex + 1}`,
+      type:col.type || "string"
+    };
+  });
+}
+
+function graphResultSurfaceColumnsForJoin(header=[]){
+  return (Array.isArray(header) ? header : []).map((name, index) => ({
+    index,
+    sourceIndex:index,
+    actualIndex:null,
+    columnIndex:index,
+    name:String(name || `Column ${index + 1}`),
+    type:"string"
+  }));
+}
+
+function graphResultSurfaceInvalidate(kind="all"){
+  const store = ensureGraphResultSurfaceStore();
+  if (kind === "all" || kind === "data") {
+    if (store.activeDataId && store.map[store.activeDataId]) delete store.map[store.activeDataId];
+    store.activeDataId = null;
+  }
+  if (kind === "all" || kind === "join") {
+    if (store.activeJoinId && store.map[store.activeJoinId]) delete store.map[store.activeJoinId];
+    store.activeJoinId = null;
+  }
+  if (kind === "all") {
+    store.map = Object.create(null);
+    store.activeId = null;
+    store.activeDataId = null;
+    store.activeJoinId = null;
+  }
+  if (typeof d3VizSurfaceCacheClear === "function") {
+    try { d3VizSurfaceCacheClear(); } catch {}
+  }
+}
+
+function graphResultSurfacePrune(){
+  const store = ensureGraphResultSurfaceStore();
+  const ids = Object.keys(store.map || {});
+  const keep = Math.max(2, Number(store.maxSurfaces || 8));
+  if (ids.length <= keep) return;
+  ids
+    .sort((a,b) => Number(store.map[a]?.createdAtMs || 0) - Number(store.map[b]?.createdAtMs || 0))
+    .slice(0, Math.max(0, ids.length - keep))
+    .forEach((id) => {
+      if (id !== store.activeId && id !== store.activeDataId && id !== store.activeJoinId) delete store.map[id];
+    });
+}
+
+function registerGraphResultSurface({mode="data", projection=null, reason="", result=null}={}){
+  const store = ensureGraphResultSurfaceStore();
+  const normalizedMode = String(mode || "data") === "join" ? "join" : "data";
+  const id = graphResultSurfaceNextId(normalizedMode);
+  const createdAt = new Date().toISOString();
+  const createdAtMs = Date.now();
+
+  let surface;
+  if (normalizedMode === "join"){
+    const header = Array.isArray(result?.header) ? result.header : Array.isArray(state.graphJoinResult?.header) ? state.graphJoinResult.header : [];
+    const rows = Array.isArray(result?.allRows) ? result.allRows : Array.isArray(state.graphJoinResult?.rows) ? state.graphJoinResult.rows : [];
+    surface = {
+      version:GRAPH_RESULT_SURFACE_VERSION,
+      id,
+      mode:"join",
+      source:"graph-join-result",
+      sourceDatasetId:state.manifest?.id || null,
+      header:header.map(String),
+      columns:graphResultSurfaceColumnsForJoin(header),
+      projection:null,
+      projectionMap:null,
+      rowIds:null,
+      rows,
+      rowCount:rows.length,
+      totalRows:rows.length,
+      stats:{ materializedRows:rows.length, columnCount:header.length },
+      domainCache:Object.create(null),
+      aggregateCache:Object.create(null),
+      visualSurfaceCache:Object.create(null),
+      invalidationKey:`join:${createdAtMs}:${rows.length}:${header.length}`,
+      createdAt,
+      createdAtMs,
+      reason
+    };
+    store.activeJoinId = id;
+  } else {
+    const projectionList = graphResultSurfaceDataProjection(projection);
+    const columns = graphResultSurfaceColumnsForData(projectionList);
+    const rowIds = Array.isArray(state.dataQueryMatches) ? state.dataQueryMatches : null;
+    const rowCount = rowIds ? rowIds.length : Number(state.manifest?.totalRows || 0);
+    const projectionMap = {};
+    columns.forEach((c) => { projectionMap[String(c.sourceIndex)] = c.actualIndex; });
+    surface = {
+      version:GRAPH_RESULT_SURFACE_VERSION,
+      id,
+      mode:"data",
+      source:rowIds ? "data-query-rowid-index" : "active-dataset-all-rows",
+      sourceDatasetId:state.manifest?.id || null,
+      header:columns.map((c) => c.name),
+      columns,
+      projection:projectionList,
+      projectionMap,
+      rowIds,
+      rowCount,
+      totalRows:rowCount,
+      activeQuery:!!rowIds,
+      queryMeta:state.dataQueryMeta ? {
+        capped:!!state.dataQueryMeta.capped,
+        filters:state.dataQueryMeta.filters || [],
+        filterGroups:state.dataQueryMeta.filterGroups || [],
+        sort:state.dataQueryMeta.sort || null,
+        executionEngine:state.dataQueryMeta.executionEngine || null
+      } : null,
+      stats:{ materializedRows:0, columnCount:columns.length },
+      domainCache:Object.create(null),
+      aggregateCache:Object.create(null),
+      visualSurfaceCache:Object.create(null),
+      invalidationKey:`data:${state.manifest?.id || "dataset"}:${createdAtMs}:${rowCount}:${projectionList.join(".")}`,
+      createdAt,
+      createdAtMs,
+      reason
+    };
+    store.activeDataId = id;
+  }
+
+  store.map[id] = surface;
+  store.activeId = id;
+  graphResultSurfacePrune();
+  return surface;
+}
+
+function getGraphResultSurface(input={}){
+  const store = ensureGraphResultSurfaceStore();
+  const mode = typeof input === "string" ? input : String(input?.mode || input?.sourceMode || "data");
+  const requestedId = typeof input === "object" ? input.surfaceId : "";
+  if (requestedId && store.map[requestedId]) return store.map[requestedId];
+  const activeId = mode === "join" ? store.activeJoinId : store.activeDataId;
+  if (activeId && store.map[activeId]) return store.map[activeId];
+
+  if (mode === "join" && state.graphJoinResult) return registerGraphResultSurface({mode:"join", reason:"lazy-join-surface"});
+  if (mode !== "join" && state.manifest) return registerGraphResultSurface({mode:"data", reason:"lazy-data-surface"});
+  return null;
+}
+
+function graphResultSurfaceSummary(surface){
+  if (!surface) return null;
+  return {
+    version:surface.version,
+    id:surface.id,
+    mode:surface.mode,
+    source:surface.source,
+    sourceDatasetId:surface.sourceDatasetId,
+    rowCount:Number(surface.rowCount || surface.totalRows || 0),
+    totalRows:Number(surface.totalRows || surface.rowCount || 0),
+    columns:(surface.columns || []).map((c) => ({
+      index:c.index,
+      sourceIndex:c.sourceIndex,
+      actualIndex:c.actualIndex,
+      columnIndex:c.columnIndex,
+      name:c.name,
+      type:c.type
+    })),
+    activeQuery:!!surface.activeQuery,
+    stats:surface.stats || {},
+    invalidationKey:surface.invalidationKey,
+    createdAt:surface.createdAt
+  };
+}
+
+function graphResultSurfaceColumn(surface, index){
+  const idx = Number(index);
+  if (!surface || !Number.isFinite(idx) || idx < 0) return null;
+  return (surface.columns || [])[idx] || null;
+}
+
+function graphResultSurfaceActualIndex(surface, sourceIndex){
+  const col = graphResultSurfaceColumn(surface, sourceIndex);
+  const actual = Number(col?.actualIndex ?? col?.columnIndex);
+  return Number.isFinite(actual) ? actual : null;
+}
+
+function graphResultSurfaceValueFromJoin(surface, row, sourceIndex){
+  return row?.[Number(sourceIndex)];
+}
+
+function graphResultSurfaceValueFromDataChunk(surface, chunk, sourceIndex, localRow){
+  const actual = graphResultSurfaceActualIndex(surface, sourceIndex);
+  if (!Number.isFinite(actual)) return null;
+  return valueFromColumn(chunk.columns.get(actual), localRow);
+}
+
+function graphResultSurfaceRequiredSourceIndices(surface, indices){
+  const requested = Array.isArray(indices) ? indices : [];
+  const seen = new Set();
+  const out = [];
+  for (const raw of requested){
+    const idx = Number(raw);
+    if (Number.isFinite(idx) && idx >= 0 && graphResultSurfaceColumn(surface, idx) && !seen.has(idx)){
+      seen.add(idx);
+      out.push(idx);
+    }
+  }
+  return out;
+}
+
+function graphResultSurfaceAllSourceIndices(surface){
+  return (surface?.columns || []).map((c, i) => Number(c.sourceIndex ?? i)).filter(Number.isFinite);
+}
+
+function graphResultSurfaceRequiredActualColumns(surface, sourceIndices){
+  const seen = new Set();
+  const out = [];
+  for (const sourceIdx of sourceIndices){
+    const actual = graphResultSurfaceActualIndex(surface, sourceIdx);
+    if (Number.isFinite(actual) && !seen.has(actual)) {
+      seen.add(actual);
+      out.push(actual);
+    }
+  }
+  return out;
+}
+
+function graphResultSurfaceBucketRowIds(surface){
+  if (!surface || surface.mode !== "data") return { buckets:new Map(), ranges:[] };
+  if (Array.isArray(surface.rowIds)) return d3VizBucketRowIdsByChunkFast(surface.rowIds);
+  const ranges = d3VizChunkRangesForActiveDataset();
+  const buckets = new Map();
+  for (const range of ranges) buckets.set(range.chunkIndex, null);
+  return { buckets, ranges };
+}
+
+async function forEachGraphResultSurfaceRow(surface, sourceIndices, {
+  label="GraphResultSurface scan",
+  progressBase=0,
+  progressSpan=99,
+  chunkYieldEvery=4,
+  rowLimit=Number.POSITIVE_INFINITY,
+  visit
+}={}){
+  if (!surface) throw new Error("GraphResultSurface is not active");
+  if (typeof visit !== "function") throw new Error("GraphResultSurface scan requires visit()");
+
+  const requiredSource = graphResultSurfaceRequiredSourceIndices(surface, sourceIndices);
+  const limit = normalizePlanLimit(rowLimit);
+  let scanned = 0;
+  let chunkCount = 0;
+  let stopped = false;
+  const total = Math.min(Number(surface.rowCount || surface.totalRows || 0), Number.isFinite(limit) ? limit : Number(surface.rowCount || surface.totalRows || 0));
+
+  if (surface.mode === "join"){
+    const rows = Array.isArray(surface.rows) ? surface.rows : [];
+    const end = Math.min(rows.length, Number.isFinite(limit) ? limit : rows.length);
+    for (let i = 0; i < end; i++){
+      if (state.cancelled) throw new Error("Cancelled");
+      const row = rows[i] || [];
+      const keepGoing = await visit((sourceIdx) => graphResultSurfaceValueFromJoin(surface, row, sourceIdx), scanned, row);
+      scanned++;
+      if (keepGoing === false) { stopped = true; break; }
+      if (scanned % 5000 === 0) {
+        postProgress(Math.min(99, progressBase + Math.floor((scanned / Math.max(1, total)) * progressSpan)), `${label}: surface join scan ${fmt(scanned)}/${fmt(total)}`);
+        await workerYield();
+      }
+    }
+    return { scanned, chunks:Math.ceil(scanned / 5000), total:Number(surface.rowCount || rows.length || 0), strategy:"graph-result-surface-join", stopped };
+  }
+
+  const requiredActual = graphResultSurfaceRequiredActualColumns(surface, requiredSource);
+  if (!requiredSource.length || !requiredActual.length) return { scanned:0, chunks:0, total:Number(surface.rowCount || 0), strategy:"graph-result-surface-empty" };
+
+  const { buckets } = graphResultSurfaceBucketRowIds(surface);
+
+  const scanChunk = async (chunkIndex, refs=null) => {
+    if (state.cancelled) throw new Error("Cancelled");
+    const chunk = await readChunkColumns(chunkIndex, requiredActual, {
+      surfacePlan:{
+        version:GRAPH_RESULT_SURFACE_VERSION,
+        surface:"graph-result-surface",
+        surfaceId:surface.id,
+        requiredColumns:requiredActual,
+        warmColumns:requiredActual,
+        hotColumns:requiredActual
+      }
+    });
+
+    if (Array.isArray(refs)){
+      refs.sort((a,b) => a.localRow - b.localRow);
+      for (let i = 0; i < refs.length; i++){
+        if (scanned >= limit || stopped) break;
+        const localRow = refs[i].localRow;
+        if (localRow >= 0 && localRow < chunk.rowCount){
+          const keepGoing = await visit((sourceIdx) => graphResultSurfaceValueFromDataChunk(surface, chunk, sourceIdx, localRow), scanned, refs[i]);
+          scanned++;
+          if (keepGoing === false) stopped = true;
+        }
+      }
+    } else {
+      for (let localRow = 0; localRow < chunk.rowCount; localRow++){
+        if (scanned >= limit || stopped) break;
+        const keepGoing = await visit((sourceIdx) => graphResultSurfaceValueFromDataChunk(surface, chunk, sourceIdx, localRow), scanned, {localRow});
+        scanned++;
+        if (keepGoing === false) stopped = true;
+      }
+    }
+
+    chunkCount++;
+    if (chunkCount % 2 === 0 || scanned >= total || scanned >= limit) {
+      postProgress(
+        Math.min(99, progressBase + Math.floor((scanned / Math.max(1, total)) * progressSpan)),
+        `${label}: surface rowid tile scan ${fmt(scanned)}/${fmt(total)}`
+      );
+    }
+    if (chunkCount % Math.max(1, chunkYieldEvery) === 0) await workerYield();
+  };
+
+  for (const [chunkIndex, refs] of buckets.entries()){
+    if (scanned >= limit || stopped) break;
+    await scanChunk(chunkIndex, refs);
+  }
+
+  return { scanned, chunks:chunkCount, total:Number(surface.rowCount || 0), strategy:"graph-result-surface-rowid-columnar", stopped };
+}
+
+function graphResultSurfaceMaterializeValueArray(valueGetter, sourceIndices){
+  return sourceIndices.map((idx) => valueGetter(idx));
+}
+
+function graphResultSurfaceHeader(surface, sourceIndices=null){
+  const indices = Array.isArray(sourceIndices) && sourceIndices.length ? sourceIndices : graphResultSurfaceAllSourceIndices(surface);
+  return indices.map((idx) => graphResultSurfaceColumn(surface, idx)?.name || `Column ${Number(idx) + 1}`);
+}
+
+/*
+ * Last-definition overrides for Graph Query Result utilities.
+ * These preserve the existing command/response names while routing work through
+ * GraphResultSurface whenever possible.
+ */
+function graphResultTotalRows(mode, surfaceId=null){
+  const surface = getGraphResultSurface({mode, surfaceId});
+  if (surface) return Number(surface.rowCount || surface.totalRows || 0);
+  if (mode === "join") return Number(state.graphJoinResult?.rows?.length || 0);
+  if (Array.isArray(state.dataQueryMatches)) return Number(state.dataQueryMatches.length || 0);
+  return Number(state.manifest?.totalRows || 0);
+}
+
+async function readGraphResultWindow({mode="data", surfaceId=null, page=1, pageSize=1000, columns=[], derivedColumns=[], outputColumnNames=null}={}){
+  const surface = getGraphResultSurface({mode, surfaceId});
+  if (!surface) throw new Error("Graph Query Result surface is not active");
+
+  const safePage = Math.max(1, Number(page || 1));
+  const safePageSize = Math.max(1, Math.min(50000, Number(pageSize || 1000)));
+  const start = Math.max(0, (safePage - 1) * safePageSize);
+  const limit = safePageSize;
+  const allIndices = graphResultSurfaceAllSourceIndices(surface);
+  const selected = Array.isArray(columns) && columns.length
+    ? graphResultSurfaceRequiredSourceIndices(surface, columns)
+    : allIndices;
+
+  const rows = [];
+  let skipped = 0;
+  await forEachGraphResultSurfaceRow(surface, selected, {
+    label:"GraphResultSurface page",
+    progressBase:0,
+    progressSpan:1,
+    rowLimit:start + limit,
+    chunkYieldEvery:8,
+    visit:(value) => {
+      if (skipped < start) { skipped++; return; }
+      if (rows.length < limit) rows.push(graphResultSurfaceMaterializeValueArray(value, selected));
+    }
+  });
+
+  const header = graphResultSurfaceHeader(surface, selected);
+  const applied = graphApplyDerivedRows(header, rows, derivedColumns, outputColumnNames);
+  return {
+    ...applied,
+    surface:graphResultSurfaceSummary(surface),
+    surfaceId:surface.id,
+    startRow:start,
+    totalMatches:Number(surface.rowCount || surface.totalRows || 0),
+    page:safePage,
+    pageSize:safePageSize
+  };
+}
+
+async function runGraphResultSearch(msg={}){
+  const surface = getGraphResultSurface(msg);
+  if (!surface) throw new Error("Graph Query Result surface is not active");
+  const colIndex = Number(msg.columnIndex || 0);
+  const op = msg.op || "contains";
+  const value = msg.value ?? "";
+  const cap = normalizePlanLimit(msg.maxMatches || 100000);
+  const allIndices = graphResultSurfaceAllSourceIndices(surface);
+  const required = [...new Set([colIndex, ...allIndices])];
+  const matched = [];
+  const t0 = now();
+
+  const scan = await forEachGraphResultSurfaceRow(surface, required, {
+    label:"GraphResultSurface search",
+    progressBase:0,
+    progressSpan:99,
+    rowLimit:Number.POSITIVE_INFINITY,
+    visit:(getValue, rowOrder) => {
+      const col = graphResultSurfaceColumn(surface, colIndex);
+      const type = col?.type || "string";
+      if (compareValue(getValue(colIndex), op, value, type)){
+        matched.push({ rowNumber:rowOrder + 1, row:graphResultSurfaceMaterializeValueArray(getValue, allIndices) });
+      }
+      return matched.length < cap;
+    }
+  });
+
+  const capped = matched.length >= cap;
+  const finalRows = capped ? matched.slice(0, cap) : matched;
+  state.graphResultSearch = {
+    header:["Result Row", ...graphResultSurfaceHeader(surface, allIndices)],
+    rows:finalRows.map((x) => [x.rowNumber, ...x.row]),
+    totalSourceRows:Number(surface.rowCount || 0),
+    capped,
+    surfaceId:surface.id,
+    ms:now() - t0
+  };
+  return {
+    matches:finalRows.length,
+    totalSourceRows:Number(surface.rowCount || 0),
+    capped,
+    surface:graphResultSurfaceSummary(surface),
+    header:state.graphResultSearch.header,
+    rows:state.graphResultSearch.rows.slice(0, Math.min(500, Number(msg.pageSize || 500))),
+    scanned:scan.scanned,
+    strategy:scan.strategy,
+    ms:state.graphResultSearch.ms
+  };
+}
+
+function readGraphResultSearchPage(page=1,pageSize=500){
+  if (!state.graphResultSearch) throw new Error("Graph Result search is not active");
+  const safePage=Math.max(1,Number(page||1));
+  const safeSize=Math.max(1,Number(pageSize||500));
+  const start=(safePage-1)*safeSize;
+  return {
+    header:state.graphResultSearch.header,
+    rows:state.graphResultSearch.rows.slice(start,start+safeSize),
+    page:safePage,
+    pageSize:safeSize,
+    totalMatches:state.graphResultSearch.rows.length,
+    startRow:start,
+    surfaceId:state.graphResultSearch.surfaceId || null,
+    ms:state.graphResultSearch.ms
+  };
+}
+
+async function buildGraphResultPivot(msg={}){
+  const surface = getGraphResultSurface(msg);
+  if (!surface) throw new Error("Graph Query Result surface is not active");
+  const rowFields=(msg.rowFields||[]).map(Number).filter((i) => Number.isFinite(i) && graphResultSurfaceColumn(surface, i));
+  const columnFields=(msg.columnFields||[]).map(Number).filter((i) => Number.isFinite(i) && graphResultSurfaceColumn(surface, i));
+  const valIdx=Number(msg.valueField);
+  const hasValue=Number.isFinite(valIdx) && valIdx >= 0 && graphResultSurfaceColumn(surface, valIdx);
+  const countMode=!hasValue;
+  const aggMode=countMode ? "Count" : (msg.aggregation || "Count");
+  const rowLimit=Math.max(1,Number(msg.maxRows||10000));
+  const colLimit=Math.max(1,Number(msg.maxCols||1000));
+  const required=[...new Set([...rowFields, ...columnFields, ...(hasValue ? [valIdx] : [])])];
+
+  const rowKeys=[], colKeys=[], rowSet=new Set(), colSet=new Set(), cells=new Map(), rowTotals=new Map(), colTotals=new Map();
+  const grand=makeAgg();
+  let limitHit=false;
+  const t0=now();
+
+  const scan = await forEachGraphResultSurfaceRow(surface, required, {
+    label:"GraphResultSurface pivot",
+    progressBase:0,
+    progressSpan:99,
+    visit:(getValue) => {
+      const rParts=rowFields.length ? rowFields.map((i) => getValue(i)) : ["(All)"];
+      const cParts=columnFields.length ? columnFields.map((i) => getValue(i)) : ["Value"];
+      const rk=keyOf(rParts), ck=keyOf(cParts);
+      if (!rowSet.has(rk)){
+        if (rowKeys.length >= rowLimit){ limitHit=true; return; }
+        rowSet.add(rk); rowKeys.push(rk);
+      }
+      if (!colSet.has(ck)){
+        if (colKeys.length >= colLimit){ limitHit=true; return; }
+        colSet.add(ck); colKeys.push(ck);
+      }
+      if (!cells.has(rk)) cells.set(rk,new Map());
+      const rowMap=cells.get(rk);
+      if (!rowMap.has(ck)) rowMap.set(ck,makeAgg());
+      if (!rowTotals.has(rk)) rowTotals.set(rk,makeAgg());
+      if (!colTotals.has(ck)) colTotals.set(ck,makeAgg());
+      const v=countMode ? null : getValue(valIdx);
+      addAgg(rowMap.get(ck),v,countMode);
+      addAgg(rowTotals.get(rk),v,countMode);
+      addAgg(colTotals.get(ck),v,countMode);
+      addAgg(grand,v,countMode);
+    }
+  });
+
+  const rowHeaderNames=rowFields.length ? rowFields.map((i)=>graphResultSurfaceColumn(surface, i)?.name || `Field ${i+1}`) : ["Rows"];
+  const colLabels=colKeys.map(k=>pivotColumnLabel(k, columnFields));
+  const outHeader=[...rowHeaderNames, ...colLabels, "Grand Total"];
+  const outRows=[];
+  for (const rk of rowKeys){
+    const labels=pivotRowLabelParts(rk);
+    while(labels.length < rowHeaderNames.length) labels.push("");
+    const row=[...labels];
+    const rowMap=cells.get(rk) || new Map();
+    for (const ck of colKeys) row.push(aggValue(rowMap.get(ck) || makeAgg(), aggMode));
+    row.push(aggValue(rowTotals.get(rk) || makeAgg(), aggMode));
+    outRows.push(row);
+  }
+  const totalRow=[rowHeaderNames.length ? "Grand Total" : "Grand Total"];
+  while(totalRow.length < rowHeaderNames.length) totalRow.push("");
+  for (const ck of colKeys) totalRow.push(aggValue(colTotals.get(ck) || makeAgg(), aggMode));
+  totalRow.push(aggValue(grand, aggMode));
+  outRows.push(totalRow);
+
+  state.graphResultPivot={header:outHeader, rows:outRows, scanned:scan.scanned, limitHit, surfaceId:surface.id, strategy:scan.strategy, ms:now()-t0};
+  return {...state.graphResultPivot, surface:graphResultSurfaceSummary(surface)};
+}
+
+async function buildGraphResultTime(msg={}){
+  const surface = getGraphResultSurface(msg);
+  if (!surface) throw new Error("Graph Query Result surface is not active");
+  const timeIdx=Number(msg.timeField);
+  const groupIdx=Number(msg.groupField);
+  const valIdx=Number(msg.valueField);
+  const hasTime=Number.isFinite(timeIdx) && timeIdx >= 0 && graphResultSurfaceColumn(surface, timeIdx);
+  if (!hasTime) throw new Error("Time column is required for Graph Result Time");
+  const hasGroup=Number.isFinite(groupIdx) && groupIdx >= 0 && graphResultSurfaceColumn(surface, groupIdx);
+  const hasValue=Number.isFinite(valIdx) && valIdx >= 0 && graphResultSurfaceColumn(surface, valIdx);
+  const countMode=!hasValue;
+  const aggMode=countMode ? "Count" : (msg.aggregation || "Count");
+  const bucket=msg.bucket || "month";
+  const bucketLimit=Math.max(1,Number(msg.maxBuckets||10000));
+  const required=[...new Set([timeIdx, ...(hasGroup ? [groupIdx] : []), ...(hasValue ? [valIdx] : [])])];
+  const states=new Map();
+  let invalidTime=0, limitHit=false;
+  const t0=now();
+
+  const scan = await forEachGraphResultSurfaceRow(surface, required, {
+    label:"GraphResultSurface time",
+    progressBase:0,
+    progressSpan:99,
+    visit:(getValue) => {
+      const b=parseTimeBucket(getValue(timeIdx), bucket);
+      if (!b){ invalidTime++; return; }
+      const g=hasGroup ? keyCellValue(getValue(groupIdx)) : "";
+      const key=JSON.stringify([b,g]);
+      if (!states.has(key)){
+        if (states.size >= bucketLimit){ limitHit=true; return; }
+        states.set(key,makeAgg());
+      }
+      addAgg(states.get(key), countMode ? null : getValue(valIdx), countMode);
+    }
+  });
+
+  const outHeader=hasGroup ? ["Time", "Group", aggMode] : ["Time", aggMode];
+  const outRows=[...states.entries()].sort((a,b)=>a[0].localeCompare(b[0])).map(([key,agg])=>{
+    let b="", g=""; try{ [b,g]=JSON.parse(key); }catch{ [b,g]=String(key).split("\u001f"); }
+    return hasGroup ? [b,g,aggValue(agg,aggMode)] : [b,aggValue(agg,aggMode)];
+  });
+  state.graphResultTime={header:outHeader, rows:outRows, scanned:scan.scanned, invalidTime, limitHit, surfaceId:surface.id, strategy:scan.strategy, ms:now()-t0};
+  return {...state.graphResultTime, surface:graphResultSurfaceSummary(surface)};
+}
+
+async function exportGraphQueryCsv(msg={}){
+  const surface = getGraphResultSurface(msg);
+  if (!surface) throw new Error("Graph Query Result surface is not active");
+  const derivedColumns = normalizeGraphDerivedColumnsForWorker(msg.derivedColumns || []);
+  const outputColumnNames = Array.isArray(msg.outputColumnNames) ? msg.outputColumnNames.map(String).filter(Boolean) : null;
+  const maxRows = normalizeExportLimit(msg.maxRows);
+  const allIndices = graphResultSurfaceAllSourceIndices(surface);
+  const selected = Array.isArray(msg.columns) && msg.columns.length
+    ? graphResultSurfaceRequiredSourceIndices(surface, msg.columns)
+    : allIndices;
+  const header = graphResultSurfaceHeader(surface, selected);
+  const lines = [];
+  const t0 = now();
+  let exportedRows = 0;
+
+  lines.push(graphExportHeader(header, derivedColumns, outputColumnNames).map(csvEscape).join(","));
+
+  const scan = await forEachGraphResultSurfaceRow(surface, selected, {
+    label:"GraphResultSurface CSV export",
+    progressBase:0,
+    progressSpan:99,
+    rowLimit:maxRows,
+    visit:(getValue) => {
+      const row = graphResultSurfaceMaterializeValueArray(getValue, selected);
+      appendRowsToCsvLines(lines, header, [row], derivedColumns, outputColumnNames);
+      exportedRows++;
+    }
+  });
+
+  return {
+    csv:lines.join("\n"),
+    rows:exportedRows,
+    totalRows:Number(surface.rowCount || 0),
+    mode:surface.mode,
+    surfaceId:surface.id,
+    surface:graphResultSurfaceSummary(surface),
+    strategy:scan.strategy,
+    ms:now()-t0
+  };
+}
+
+
+
 
 /*
  * =========================================================
@@ -7722,6 +8394,413 @@ async function buildD3VisualizationSurface(msg){
 }
 
 
+
+
+/*
+ * D3 Visualization Surface v4
+ * ---------------------------------------------------------
+ * Graph Result fast path.
+ *
+ * Previous graph visualization reduced by repeatedly materializing
+ * Graph Result windows. That is correct but slow because it builds
+ * temporary row arrays only to throw them away after aggregation.
+ *
+ * v4 keeps the same UI contract and Surface shapes, but for
+ * Graph Query Result / data it scans the row-id surface directly:
+ *
+ *   state.dataQueryMatches or full active dataset
+ *     -> bucket by physical chunk
+ *     -> read only required column tiles
+ *     -> aggregate immediately
+ *
+ * Raw rows still never cross into the UI.
+ */
+const d3VizSurfaceFastCache = new Map();
+const D3_VIZ_SURFACE_FAST_CACHE_MAX = 24;
+
+function d3VizSurfaceCacheKey(msg, adapter){
+  const chartType = d3VizNormalizeChartType(msg.chartType);
+  const sourceMode = adapter?.sourceMode || d3VizNormalizeGraphMode(msg.sourceMode || msg.graphMode);
+  const projection = Array.isArray(state.dataQueryMeta?.projection) ? state.dataQueryMeta.projection.join(",") : "";
+  const matches = Array.isArray(state.dataQueryMatches) ? state.dataQueryMatches : null;
+  const sample = matches && matches.length
+    ? `${matches[0]}:${matches[Math.floor(matches.length / 2)]}:${matches[matches.length - 1]}`
+    : "full";
+  return JSON.stringify({
+    v:4,
+    datasetId:state.manifest?.id || state.dataset?.id || "",
+    source:adapter?.dataSource || d3VizNormalizeDataSource(msg.dataSource),
+    sourceMode,
+    total:adapter?.totalRows?.() || 0,
+    matches:matches ? matches.length : -1,
+    sample,
+    projection,
+    chartType,
+    x:d3VizColumnIndex(msg.xColumnIndex),
+    y:d3VizColumnIndex(msg.yColumnIndex),
+    z:d3VizColumnIndex(msg.secondaryColumnIndex ?? msg.zColumnIndex ?? msg.groupColumnIndex),
+    agg:d3VizNormalizeAggregation(msg.aggregation),
+    topN:d3VizSafeInt(msg.topN, 1, D3_VIZ_MAX_TOP_N, 80),
+    buckets:d3VizSafeInt(msg.buckets, 8, D3_VIZ_MAX_BUCKETS, 240),
+    categoryLimit:d3VizSafeInt(msg.categoryLimit, 1, D3_VIZ_MAX_CATEGORY_KEYS, 50000)
+  });
+}
+
+function d3VizSurfaceCacheGet(key){
+  const cached = d3VizSurfaceFastCache.get(key);
+  if (!cached) return null;
+  d3VizSurfaceFastCache.delete(key);
+  d3VizSurfaceFastCache.set(key, cached);
+  return cached;
+}
+
+function d3VizSurfaceCachePut(key, value){
+  if (!key || !value) return value;
+  d3VizSurfaceFastCache.set(key, value);
+  while (d3VizSurfaceFastCache.size > D3_VIZ_SURFACE_FAST_CACHE_MAX){
+    const first = d3VizSurfaceFastCache.keys().next().value;
+    if (first === undefined) break;
+    d3VizSurfaceFastCache.delete(first);
+  }
+  return value;
+}
+
+function d3VizGraphDataProjectionMap(sourceColumns){
+  const surface = getGraphResultSurface({mode:"data"});
+  if (surface?.mode === "data") {
+    const map = new Map();
+    for (const col of surface.columns || []) {
+      if (Number.isFinite(Number(col.sourceIndex)) && Number.isFinite(Number(col.actualIndex))) {
+        map.set(Number(col.sourceIndex), Number(col.actualIndex));
+      }
+    }
+    if (map.size) return map;
+  }
+
+  const columns = d3VizSourceColumnList(sourceColumns);
+  const manifestColumns = Array.isArray(state.manifest?.columns) ? state.manifest.columns : [];
+  const byName = new Map();
+  for (const col of manifestColumns){
+    if (!byName.has(String(col.name))) byName.set(String(col.name), Number(col.index));
+  }
+
+  const projection = Array.isArray(state.dataQueryMeta?.projection) && state.dataQueryMeta.projection.length
+    ? state.dataQueryMeta.projection.map(Number)
+    : [];
+
+  const map = new Map();
+  for (let i = 0; i < columns.length; i++){
+    const source = columns[i] || {};
+    const sourceIndex = Number(source.index ?? i);
+    let actual = Number.NaN;
+
+    if (Number.isFinite(Number(source.actualIndex))) actual = Number(source.actualIndex);
+    else if (Number.isFinite(Number(source.columnIndex)) && manifestColumns[Number(source.columnIndex)]) actual = Number(source.columnIndex);
+    else if (projection.length && Number.isFinite(projection[sourceIndex]) && manifestColumns[projection[sourceIndex]]) actual = projection[sourceIndex];
+    else if (projection.length && Number.isFinite(projection[i]) && manifestColumns[projection[i]]) actual = projection[i];
+    else if (byName.has(String(source.name))) actual = byName.get(String(source.name));
+    else if (manifestColumns[sourceIndex] && String(manifestColumns[sourceIndex].name) === String(source.name)) actual = sourceIndex;
+
+    if (Number.isFinite(actual) && manifestColumns[actual]) map.set(sourceIndex, actual);
+  }
+
+  return map;
+}
+
+function d3VizChunkRangesForActiveDataset(){
+  const chunks = activeIsMemory()
+    ? (state.memory?.chunks || [])
+    : activeIsVirtual()
+      ? (state.virtual?.globalChunks || [])
+      : (state.dataset?.chunks || []);
+
+  const ranges = [];
+  let cursor = 0;
+  for (let i = 0; i < chunks.length; i++){
+    const meta = chunks[i] || {};
+    const start = Number.isFinite(Number(meta.rowStart)) ? Number(meta.rowStart) : cursor;
+    const rowCount = Number(meta.rowCount || Math.max(0, Number(meta.rowEnd || 0) - start) || 0);
+    const end = Number.isFinite(Number(meta.rowEnd)) ? Number(meta.rowEnd) : start + rowCount;
+    ranges.push({ chunkIndex:i, start, end, rowCount:Math.max(0, end - start) });
+    cursor = end;
+  }
+  return ranges;
+}
+
+function d3VizFindChunkRange(ranges, rowId, cursorHint=0){
+  const target = Number(rowId);
+  let cursor = Math.max(0, Math.min(Number(cursorHint || 0), Math.max(0, ranges.length - 1)));
+  for (let i = cursor; i < ranges.length; i++){
+    const r = ranges[i];
+    if (target >= r.start && target < r.end) return { range:r, index:i };
+    if (target < r.start) break;
+  }
+  let lo = 0, hi = ranges.length - 1;
+  while (lo <= hi){
+    const mid = (lo + hi) >> 1;
+    const r = ranges[mid];
+    if (target < r.start) hi = mid - 1;
+    else if (target >= r.end) lo = mid + 1;
+    else return { range:r, index:mid };
+  }
+  return null;
+}
+
+function d3VizBucketRowIdsByChunkFast(rowIds){
+  const ranges = d3VizChunkRangesForActiveDataset();
+  const ids = Array.isArray(rowIds) ? rowIds : [];
+  const buckets = new Map();
+  let cursor = 0;
+  for (let order = 0; order < ids.length; order++){
+    const global = Number(ids[order]);
+    if (!Number.isFinite(global)) continue;
+    const found = d3VizFindChunkRange(ranges, global, cursor);
+    if (!found) continue;
+    cursor = found.index;
+    const ref = {
+      order,
+      global,
+      localRow:global - found.range.start
+    };
+    let bucket = buckets.get(found.range.chunkIndex);
+    if (!bucket) {
+      bucket = [];
+      buckets.set(found.range.chunkIndex, bucket);
+    }
+    bucket.push(ref);
+  }
+  return { buckets, ranges };
+}
+
+function d3VizRequiredActualColumnsFromSource(indices, projectionMap){
+  const out = [];
+  const seen = new Set();
+  for (const sourceIdx of Array.isArray(indices) ? indices : []){
+    const actual = projectionMap.get(Number(sourceIdx));
+    if (Number.isFinite(actual) && !seen.has(actual)) {
+      seen.add(actual);
+      out.push(actual);
+    }
+  }
+  return out;
+}
+
+function d3VizMakeSurfaceAdapterGraphFast(sourceColumns, sourceMode, chunkRows){
+  const surface = getGraphResultSurface({mode:sourceMode});
+  const projectionMap = d3VizGraphDataProjectionMap(sourceColumns);
+  const manifestColumns = Array.isArray(state.manifest?.columns) ? state.manifest.columns : [];
+
+  return {
+    dataSource:"graph",
+    dataSourceLabel:`Graph Query Result / ${sourceMode}`,
+    sourceMode,
+    surfaceId:surface?.id || null,
+    strategy:"worker-graph-result-surface-rowid-columnar-v5",
+    totalRows:() => graphResultTotalRows(sourceMode, surface?.id || null),
+    hasColumn:(idx) => {
+      const sourceIdx = Number(idx);
+      if (surface) return !!graphResultSurfaceColumn(surface, sourceIdx);
+      const actual = projectionMap.get(sourceIdx);
+      return Number.isFinite(actual) && !!manifestColumns[actual];
+    },
+    name:(idx) => {
+      const sourceIdx = Number(idx);
+      if (surface) return graphResultSurfaceColumn(surface, sourceIdx)?.name || d3VizGraphColumnName(sourceColumns, sourceIdx);
+      const actual = projectionMap.get(sourceIdx);
+      return manifestColumns[actual]?.name || d3VizGraphColumnName(sourceColumns, sourceIdx);
+    },
+    type:(idx) => {
+      const sourceIdx = Number(idx);
+      if (surface) return graphResultSurfaceColumn(surface, sourceIdx)?.type || "string";
+      const actual = projectionMap.get(sourceIdx);
+      return manifestColumns[actual]?.type || "string";
+    },
+    resolveDomains:async (indices, label) => {
+      const domains = new Map();
+      const valid = d3VizValidColumnList(indices, {
+        hasColumn:(i) => surface ? !!graphResultSurfaceColumn(surface, i) : Number.isFinite(projectionMap.get(Number(i)))
+      });
+      for (const idx of valid){
+        domains.set(Number(idx), { min:Infinity, max:-Infinity, found:false, source:"graph-result-surface-domain" });
+      }
+      if (!domains.size) return domains;
+
+      await d3VizMakeSurfaceAdapterGraphFast(sourceColumns, sourceMode, chunkRows)
+        .scan([...domains.keys()], label, (value) => {
+          for (const idx of domains.keys()){
+            const n = d3VizParseNumber(value(idx));
+            if (n == null) continue;
+            const domain = domains.get(idx);
+            domain.min = Math.min(domain.min, n);
+            domain.max = Math.max(domain.max, n);
+            domain.found = true;
+          }
+        });
+
+      for (const [idx, domain] of [...domains.entries()]){
+        if (!domain.found) {
+          domains.delete(idx);
+          continue;
+        }
+        if (domain.min === domain.max) {
+          domain.min -= 0.5;
+          domain.max += 0.5;
+        }
+      }
+      return domains;
+    },
+    scan:async (indices, label, visit) => {
+      const currentSurface = surface || getGraphResultSurface({mode:sourceMode});
+      if (currentSurface && currentSurface.mode === "data") {
+        return await forEachGraphResultSurfaceRow(currentSurface, indices, {
+          label:label || "D3 GraphResultSurface",
+          progressBase:45,
+          progressSpan:54,
+          chunkYieldEvery:4,
+          visit:(value) => visit((sourceIdx) => value(sourceIdx))
+        });
+      }
+
+      const requiredSource = d3VizValidColumnList(indices, {
+        hasColumn:(i) => Number.isFinite(projectionMap.get(Number(i)))
+      });
+      const requiredActual = d3VizRequiredActualColumnsFromSource(requiredSource, projectionMap);
+      if (!requiredSource.length || !requiredActual.length) return { scanned:0, chunks:0, total:graphResultTotalRows(sourceMode) };
+
+      const matches = Array.isArray(state.dataQueryMatches) ? state.dataQueryMatches : null;
+      let scanned = 0;
+      let chunkCount = 0;
+
+      const scanChunk = async (chunkIndex, refs=null) => {
+        if (state.cancelled) throw new Error("Cancelled");
+        const chunk = await readChunkColumns(chunkIndex, requiredActual, {
+          surfacePlan:{
+            version:5,
+            surface:"d3-graph-rowid-columnar-reduce",
+            requiredColumns:requiredActual,
+            warmColumns:requiredActual,
+            hotColumns:requiredActual
+          }
+        });
+
+        const sourceValue = (sourceIdx, localRow) => {
+          const actual = projectionMap.get(Number(sourceIdx));
+          return valueFromColumn(chunk.columns.get(actual), localRow);
+        };
+
+        if (Array.isArray(refs)){
+          refs.sort((a,b) => a.localRow - b.localRow);
+          for (let i = 0; i < refs.length; i++){
+            const localRow = refs[i].localRow;
+            if (localRow >= 0 && localRow < chunk.rowCount) {
+              visit((sourceIdx) => sourceValue(sourceIdx, localRow));
+              scanned++;
+            }
+          }
+        } else {
+          for (let localRow = 0; localRow < chunk.rowCount; localRow++){
+            visit((sourceIdx) => sourceValue(sourceIdx, localRow));
+            scanned++;
+          }
+        }
+
+        chunkCount++;
+        if (chunkCount % 2 === 0 || scanned === graphResultTotalRows(sourceMode)) {
+          const total = Math.max(1, graphResultTotalRows(sourceMode));
+          postProgress(
+            Math.min(99, 45 + Math.floor((scanned / total) * 54)),
+            `${label}: graph rowid tile reduce ${fmt(scanned)}/${fmt(total)}`
+          );
+        }
+        if (chunkCount % 4 === 0) await workerYield();
+      };
+
+      if (matches){
+        const { buckets } = d3VizBucketRowIdsByChunkFast(matches);
+        for (const [chunkIndex, refs] of buckets.entries()) await scanChunk(chunkIndex, refs);
+      } else {
+        const ranges = d3VizChunkRangesForActiveDataset();
+        for (const range of ranges) await scanChunk(range.chunkIndex, null);
+      }
+
+      return { scanned, chunks:chunkCount, total:graphResultTotalRows(sourceMode), projectionMap:[...projectionMap.entries()] };
+    }
+  };
+}
+
+function d3VizGraphFastRequiredSourceIndices(msg, sourceColumns){
+  const chartType = d3VizNormalizeChartType(msg.chartType);
+  const xIdx = d3VizColumnIndex(msg.xColumnIndex);
+  const yIdx = d3VizColumnIndex(msg.yColumnIndex);
+  const zIdx = d3VizColumnIndex(msg.secondaryColumnIndex ?? msg.zColumnIndex ?? msg.groupColumnIndex);
+  const aggregation = d3VizNormalizeAggregation(msg.aggregation);
+  const numericYRequired = ["scatter","bubble","boxplot"].includes(chartType);
+  const countMode = numericYRequired ? false : (aggregation === "Count" || yIdx < 0 || !d3VizGraphColumn(sourceColumns, yIdx));
+  const required = [xIdx];
+  if (d3VizRequiresSecondaryColumn(chartType)) required.push(zIdx);
+  if (!countMode || numericYRequired) required.push(yIdx);
+  return [...new Set(required.map(Number).filter((idx) => Number.isFinite(idx) && idx >= 0))];
+}
+
+function d3VizCanUseGraphFastPath(sourceColumns, sourceMode, msg={}){
+  if (sourceMode !== "data") return false;
+  if (!state.manifest || !d3VizActiveChunkCount()) return false;
+  const projectionMap = d3VizGraphDataProjectionMap(sourceColumns);
+  const required = d3VizGraphFastRequiredSourceIndices(msg, sourceColumns);
+  return required.length > 0 && required.every((idx) => Number.isFinite(projectionMap.get(Number(idx))));
+}
+
+async function buildD3GraphResultVisualizationSurface(msg){
+  const sourceMode = d3VizNormalizeGraphMode(msg.sourceMode || msg.graphMode);
+  const sourceColumns = d3VizSourceColumnList(msg.sourceColumns);
+  const chunkRows = d3VizSafeInt(msg.chunkRows, 500, 50000, 10000);
+  const adapter = d3VizCanUseGraphFastPath(sourceColumns, sourceMode, msg)
+    ? d3VizMakeSurfaceAdapterGraphFast(sourceColumns, sourceMode, chunkRows)
+    : d3VizMakeSurfaceAdapterGraph(sourceColumns, sourceMode, chunkRows);
+
+  const key = d3VizSurfaceCacheKey(msg, adapter);
+  const cached = d3VizSurfaceCacheGet(key);
+  if (cached) {
+    const surface = {
+      ...cached.surface,
+      cacheHit:true,
+      strategy:`${cached.surface?.strategy || adapter.strategy}+cache`
+    };
+    postProgress(100, `D3 Surface cache hit: ${surface.kind || "surface"} / ${fmt(surface.reducedRows || 0)} marks`);
+    return { ...cached, surface, ms:0, cacheHit:true };
+  }
+
+  const result = await d3VizBuildSurfaceFromAdapter(msg, adapter);
+  result.surface = {
+    ...result.surface,
+    cacheHit:false,
+    projectionFastPath:adapter.strategy === "worker-graph-rowid-columnar-reduce-v4"
+  };
+  return d3VizSurfaceCachePut(key, result);
+}
+
+async function buildD3VisualizationSurface(msg){
+  const dataSource = d3VizNormalizeDataSource(msg.dataSource);
+  if (dataSource === "graph") return await buildD3GraphResultVisualizationSurface(msg);
+  if (!state.manifest || !d3VizActiveChunkCount()) throw new Error("Open a Storage dataset before building D3 visualization.");
+  const adapter = d3VizMakeSurfaceAdapterActive();
+  const key = d3VizSurfaceCacheKey(msg, adapter);
+  const cached = d3VizSurfaceCacheGet(key);
+  if (cached) {
+    const surface = {
+      ...cached.surface,
+      cacheHit:true,
+      strategy:`${cached.surface?.strategy || adapter.strategy}+cache`
+    };
+    postProgress(100, `D3 Surface cache hit: ${surface.kind || "surface"} / ${fmt(surface.reducedRows || 0)} marks`);
+    return { ...cached, surface, ms:0, cacheHit:true };
+  }
+  const result = await d3VizBuildSurfaceFromAdapter(msg, adapter);
+  result.surface = { ...result.surface, cacheHit:false };
+  return d3VizSurfaceCachePut(key, result);
+}
+
+
 async function legacyWorkerMessageRouter(e){
   const msg=e.data||{};
   state.__lastRouterError = null;
@@ -7748,6 +8827,12 @@ async function legacyWorkerMessageRouter(e){
       const result=await buildD3VisualizationSurface(msg);
       post("D3_VIZ_SURFACE_DONE", result);
       postProgress(100, `D3 Surface ready: ${result.surface?.kind || "surface"} / ${fmt(result.surface?.reducedRows || 0)} marks / scanned ${fmt(result.surface?.scanned || 0)} rows`);
+      return;
+    }
+
+    if (msg.type==="GRAPH_RESULT_SURFACE_STATUS"){
+      const surface=getGraphResultSurface(msg);
+      post("GRAPH_RESULT_SURFACE_READY", {surface:graphResultSurfaceSummary(surface), origin:msg.origin || "status"});
       return;
     }
 
@@ -8042,7 +9127,12 @@ async function legacyWorkerMessageRouter(e){
       state.cancelled=false;
       post("PROGRESS",{value:0,text:"Building global filter/sort row index..."});
       const result=await runDataQuery(msg);
-      post("DATA_QUERY_DONE",{...result,origin:msg.origin || ""});
+      let graphResultSurface=null;
+      if (msg.origin === "graph") {
+        graphResultSurface = registerGraphResultSurface({mode:"data", projection:result.projection || msg.projection || [], reason:"RUN_DATA_QUERY:graph", result});
+        post("GRAPH_RESULT_SURFACE_READY", {surface:graphResultSurfaceSummary(graphResultSurface), origin:"graph"});
+      }
+      post("DATA_QUERY_DONE",{...result,origin:msg.origin || "", graphResultSurface:graphResultSurfaceSummary(graphResultSurface), surfaceId:graphResultSurface?.id || null});
       post("PROGRESS",{value:100,text:result.active ? `Global data query complete: ${fmt(result.matches || 0)} rows` : "Global data query cleared"});
       return;
     }
@@ -8061,7 +9151,9 @@ async function legacyWorkerMessageRouter(e){
       state.cancelled=false;
       post("PROGRESS",{value:0,text:"Running Graph JOIN query..."});
       const result=await runGraphJoinQuery({plan:msg.plan,pageSize:Number(msg.pageSize||500)});
-      post("GRAPH_JOIN_DONE",result);
+      const graphResultSurface = registerGraphResultSurface({mode:"join", reason:"RUN_GRAPH_JOIN_QUERY", result});
+      post("GRAPH_RESULT_SURFACE_READY", {surface:graphResultSurfaceSummary(graphResultSurface), origin:"graph"});
+      post("GRAPH_JOIN_DONE",{...result, graphResultSurface:graphResultSurfaceSummary(graphResultSurface), surfaceId:graphResultSurface.id});
       post("PROGRESS",{value:100,text:"Graph JOIN query complete"});
       return;
     }
@@ -8120,6 +9212,7 @@ async function legacyWorkerMessageRouter(e){
     if (msg.type==="CLEAR_DATA_QUERY"){
       state.dataQueryMatches=null;
       state.dataQueryMeta=null;
+      graphResultSurfaceInvalidate("data");
       post("DATA_QUERY_CLEARED",{});
       return;
     }
@@ -13464,6 +14557,7 @@ function App() {
   const [graphResultPage, setGraphResultPage] = useState(1);
   const [graphResultStatus, setGraphResultStatus] = useState("Graph Queryを実行してください。");
   const [graphResultTime, setGraphResultTime] = useState("");
+  const [graphResultSurface, setGraphResultSurface] = useState(null);
   const [graphResultViewMode, setGraphResultViewMode] = useState("tile");
   const [graphResultPageSize, setGraphResultPageSize] = useState(initialSettings.graphResultPageSize || "1000");
   const [graphResultSearchTable, setGraphResultSearchTable] = useState(null);
@@ -14255,7 +15349,8 @@ function App() {
           setGraphResultMode("data");
           setGraphResultCount(msg.matches || 0);
           setGraphResultPage(1);
-          setGraphResultStatus(`Graph Queryを実行しました。結果ページを読み込み中...${projection ? ` / SELECT ${fmt(projection.length)}列` : ""}${derived.length ? ` / 計算列 ${fmt(derived.length)}列` : ""}`);
+          setGraphResultSurface(msg.graphResultSurface || null);
+          setGraphResultStatus(`Graph Queryを実行しました。結果ページを読み込み中...${projection ? ` / SELECT ${fmt(projection.length)}列` : ""}${derived.length ? ` / 計算列 ${fmt(derived.length)}列` : ""}${msg.graphResultSurface ? ` / Surface ${fmt(msg.graphResultSurface.rowCount || 0)} rows` : ""}`);
           setGraphResultTime(ms(msg.ms));
           graphExecutionRef.current.readMode = msg.active ? "dataQuery" : "page";
           if (!msg.active) {
@@ -14314,7 +15409,8 @@ function App() {
         setGraphResultTableWithDerived({ header: msg.header, rows: msg.rows, page: 1, pageSize: graphResultPageSizeRef.current, startRow: 0, totalMatches: msg.totalMatches || msg.matches || 0 }, derived);
         setGraphResultCount(msg.totalMatches || msg.matches || 0);
         setGraphResultPage(1);
-        setGraphResultStatus(`JOIN result: ${fmt(msg.totalMatches || msg.matches || 0)} rows / scanned ${fmt(msg.scanned || 0)} / right indexed ${fmt(msg.rightIndexed || 0)}${derived.length ? ` / 計算列 ${fmt(derived.length)}列` : ""}${msg.capped ? " / limitで打ち切り" : ""}`);
+        setGraphResultSurface(msg.graphResultSurface || null);
+        setGraphResultStatus(`JOIN result: ${fmt(msg.totalMatches || msg.matches || 0)} rows / scanned ${fmt(msg.scanned || 0)} / right indexed ${fmt(msg.rightIndexed || 0)}${derived.length ? ` / 計算列 ${fmt(derived.length)}列` : ""}${msg.graphResultSurface ? ` / Surface ${fmt(msg.graphResultSurface.rowCount || 0)} rows` : ""}${msg.capped ? " / limitで打ち切り" : ""}`);
         setGraphResultTime(ms(msg.ms));
         return;
       },
@@ -14326,6 +15422,14 @@ function App() {
         setGraphResultPage(msg.page || 1);
         setGraphResultStatus(`JOIN rows ${fmt(msg.startRow + 1)} - ${fmt(msg.startRow + msg.rows.length)} / ${fmt(msg.totalMatches)} / page ${fmt(msg.page)}${derived.length ? ` / 計算列 ${fmt(derived.length)}列` : ""}`);
         setGraphResultTime(ms(msg.ms));
+        return;
+      },
+
+      "GRAPH_RESULT_SURFACE_READY"(msg) {
+        setGraphResultSurface(msg.surface || null);
+        if (msg.surface) {
+          setGraphResultStatus(`GraphResultSurface ready: ${msg.surface.mode || "data"} / ${fmt(msg.surface.rowCount || 0)} rows / ${fmt(msg.surface.columns?.length || 0)} columns`);
+        }
         return;
       },
 
@@ -14742,10 +15846,10 @@ function App() {
     }
     setD3VizResult(null);
     setD3VizStatus(source === "graph"
-      ? "WorkerでGraph Query Result Windowをチャンク走査し、D3用Surfaceを集約しています..."
+      ? "WorkerでGraphResultSurfaceを直接reduceし、D3用Surfaceを集約しています..."
       : "WorkerでColumnar Tileを全件走査し、D3用Surfaceを集約しています...");
     setD3VizTime("");
-    post({ type: "BUILD_D3_VIZ_SURFACE", ...plan });
+    post({ type: "BUILD_D3_VIZ_SURFACE", ...plan, surfaceId: source === "graph" ? (graphResultSurface?.id || null) : null });
   }
 
   function addDataQueryFilter() {
@@ -15099,6 +16203,7 @@ function App() {
     post({
       type: "EXPORT_GRAPH_QUERY_CSV",
       mode: graphResultMode === "join" ? "join" : "data",
+      surfaceId: graphResultSurface?.id || null,
       columns: ctx.readColumns || selectedColumnsForPost(),
       outputColumnNames: ctx.outputColumnNames || null,
       derivedColumns: ctx.derivedColumns || [],
@@ -15111,6 +16216,7 @@ function App() {
     const ctx = graphExecutionRef.current || {};
     return {
       mode: graphResultMode === "join" ? "join" : "data",
+      surfaceId: graphResultSurface?.id || null,
       columns: ctx.readColumns || selectedColumnsForPost(),
       outputColumnNames: ctx.outputColumnNames || null,
       derivedColumns: ctx.derivedColumns || [],
