@@ -2,7 +2,7 @@
 <html lang="ja">
 <head>
   <meta charset="UTF-8" />
-  <title>Quantum CSV Grid - Visual All Surfaces Build</title>
+  <title>Quantum CSV Grid - v11 Agent Knowledge Build</title>
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Roboto:wght@300;400;600;700&display=swap" />
   <link rel="stylesheet" href="https://fonts.googleapis.com/icon?family=Material+Icons" />
@@ -11833,6 +11833,587 @@ registerRuntimeCommand("RUN_AUTONOMOUS_RESEARCH", {
 
 
 
+/*
+ * =========================================================
+ * Collaborative Agent Kernel v10
+ * =========================================================
+ * v10 is a local deterministic orchestration layer:
+ * goal -> intent -> action plan -> v8/v9/D3 evidence surfaces -> report draft.
+ */
+const COLLABORATIVE_AGENT_KERNEL_VERSION = 10;
+const COLLABORATIVE_AGENT_CACHE_LIMIT = 12;
+
+if (!olapKernelRuntime.agent) olapKernelRuntime.agent = new Map();
+
+function v10AgentCacheKey(input){
+  const manifestKey = `${state.manifest?.id || ""}:${state.manifest?.totalRows || 0}:${state.manifest?.columns?.length || 0}`;
+  const cfg = [
+    String(input?.goal || "").trim().toLowerCase(),
+    Number(input?.sampleRows || 0),
+    Number(input?.maxColumns || 0),
+    Number(input?.topN || 0)
+  ].join("|");
+  return hashText32(`v10|${manifestKey}|${cfg}`);
+}
+
+function v10RememberAgent(key, value){
+  const cache = olapKernelRuntime.agent;
+  if (!cache) return;
+  if (cache.has(key)) cache.delete(key);
+  cache.set(key, { at:now(), value });
+  while (cache.size > COLLABORATIVE_AGENT_CACHE_LIMIT) {
+    const first = cache.keys().next().value;
+    cache.delete(first);
+  }
+}
+
+function v10ParseAgentIntent(goal){
+  const raw = String(goal || "").trim();
+  const text = raw.toLowerCase();
+  const intent = {
+    goal: raw || "データの重要な傾向を見つける",
+    domain: "general",
+    task: "exploratory_analysis",
+    metrics: [],
+    dimensions: [],
+    riskTolerance: "conservative",
+  };
+
+  if (/売上|revenue|sales|amount|金額|価格|price|cost|total/.test(text)) {
+    intent.domain = "sales";
+    intent.task = /異常|anomaly|外れ値|outlier|急増|spike/.test(text) ? "sales_anomaly_detection" : "sales_summary";
+    intent.metrics = ["amount", "revenue", "sales", "price", "cost", "total", "qty", "quantity"];
+    intent.dimensions = ["date", "category", "customer", "region", "product", "status"];
+  } else if (/解約|churn|離脱|退会|cancel/.test(text)) {
+    intent.domain = "customer";
+    intent.task = "churn_analysis";
+    intent.metrics = ["churn", "cancel", "active", "score", "usage", "amount"];
+    intent.dimensions = ["date", "plan", "segment", "region", "status", "customer"];
+  } else if (/品質|quality|欠損|重複|duplicate|missing|null|型/.test(text)) {
+    intent.domain = "data_quality";
+    intent.task = "data_quality_audit";
+    intent.metrics = ["null", "missing", "duplicate", "count"];
+    intent.dimensions = ["column", "status", "type", "category"];
+  } else if (/時系列|trend|推移|スパイク|spike|date|time/.test(text)) {
+    intent.domain = "time_series";
+    intent.task = "trend_and_spike_detection";
+    intent.metrics = ["count", "amount", "score", "value"];
+    intent.dimensions = ["date", "time", "category", "status"];
+  } else if (/クラスタ|cluster|セグメント|segment/.test(text)) {
+    intent.domain = "segmentation";
+    intent.task = "cluster_and_segment_discovery";
+    intent.metrics = ["amount", "score", "count", "value"];
+    intent.dimensions = ["category", "region", "status", "segment"];
+  }
+  return intent;
+}
+
+function v10BuildAgentSteps(intent, research){
+  const hypotheses = Array.isArray(research?.hypotheses) ? research.hypotheses : [];
+  const top = hypotheses[0] || null;
+  const steps = [
+    {
+      id:"step-v8",
+      type:"run_insights",
+      label:"v8 Insight Method Packで見るべき状態面を抽出する",
+      status:"done",
+      output:`${fmt(research?.summary?.insightCount || research?.sourceInsights?.length || 0)} insights`
+    },
+    {
+      id:"step-v9",
+      type:"run_research",
+      label:"v9 Researchで仮説・根拠・反証を構成する",
+      status:"done",
+      output:`${fmt(hypotheses.length)} hypotheses`
+    },
+    {
+      id:"step-d3",
+      type:"create_d3",
+      label:top ? `上位仮説「${String(top.title || "").slice(0, 80)}」をD3で検証する` : "上位仮説をD3で検証する",
+      status:top?.actions?.some((a)=>a.type === "d3") ? "ready" : "blocked",
+      chartPlan:top?.actions?.find((a)=>a.type === "d3")?.plan || top?.d3Plan || null,
+    },
+    {
+      id:"step-evidence",
+      type:"inspect_evidence",
+      label:"根拠Surfaceと反証チェックを確認する",
+      status:hypotheses.length ? "ready" : "blocked",
+    },
+    {
+      id:"step-report",
+      type:"draft_report",
+      label:"確認済みFindingからレポート下書きを作る",
+      status:"done",
+    }
+  ];
+
+  if (intent.task === "data_quality_audit") {
+    steps.splice(2, 0, {
+      id:"step-quality",
+      type:"quality_audit",
+      label:"欠損・重複・型崩れ・ID候補を優先して確認する",
+      status:"ready",
+    });
+  }
+  return steps;
+}
+
+function v10FindingStatusForHypothesis(h, index){
+  if (Number(h?.confidence || 0) >= 0.76 && Number(h?.score || 0) >= 50) return "candidate_confirm";
+  if (index < 3) return "needs_review";
+  return "pending";
+}
+
+function v10BuildFindingsMemory(research){
+  const hypotheses = Array.isArray(research?.hypotheses) ? research.hypotheses : [];
+  const pending = hypotheses.slice(0, 10).map((h, i)=>({
+    id:h.id || `finding-${i}`,
+    title:h.title || h.claim || "Finding",
+    status:v10FindingStatusForHypothesis(h, i),
+    confidence:Number(h.confidence || 0),
+    score:Number(h.score || 0),
+    hypothesisType:h.type || h.kind || "hypothesis",
+    evidence:h.evidence || {},
+    counterChecks:Array.isArray(h.counterChecks) ? h.counterChecks : [],
+    chartPlan:h.actions?.find((a)=>a.type === "d3")?.plan || h.d3Plan || null,
+  }));
+
+  return {
+    confirmedFindings: pending.filter((f)=>f.status === "candidate_confirm"),
+    pendingFindings: pending.filter((f)=>f.status !== "candidate_confirm"),
+    rejectedFindings: [],
+  };
+}
+
+function v10BuildReportDraft({ goal, intent, research, memory }){
+  const confirmed = Array.isArray(memory?.confirmedFindings) ? memory.confirmedFindings : [];
+  const pending = Array.isArray(memory?.pendingFindings) ? memory.pendingFindings : [];
+  const hypotheses = Array.isArray(research?.hypotheses) ? research.hypotheses : [];
+  const top = confirmed.concat(pending).slice(0, 5);
+  const lines = [];
+  lines.push(`# Agent Analysis Draft`);
+  lines.push("");
+  lines.push(`目的: ${goal || intent.goal || "データの重要な傾向を見つける"}`);
+  lines.push(`推定タスク: ${intent.task} / domain: ${intent.domain}`);
+  lines.push("");
+  lines.push(`## 主要Finding`);
+  if (!top.length) {
+    lines.push("- まだ十分なFindingがありません。Run v8/v9を実行してください。");
+  } else {
+    for (const f of top) {
+      const confidence = Math.round(Number(f.confidence || 0) * 1000) / 10;
+      lines.push(`- ${f.title}（confidence ${confidence}% / score ${Math.round(Number(f.score || 0) * 10) / 10}）`);
+    }
+  }
+  lines.push("");
+  lines.push(`## 反証・注意`);
+  const checks = hypotheses.flatMap((h)=>Array.isArray(h.counterChecks) ? h.counterChecks : []).slice(0, 6);
+  if (checks.length) {
+    for (const c of checks) lines.push(`- ${c.label || c.type || "check"}: ${c.result || "pending"}`);
+  } else {
+    lines.push("- サンプルサイズ・外れ値支配・欠損影響を確認してください。");
+  }
+  lines.push("");
+  lines.push(`## 次アクション`);
+  lines.push("- 上位仮説のD3を実行して分布/時系列/差分を確認する。");
+  lines.push("- Evidence Surfaceで根拠行と集計根拠を確認する。");
+  lines.push("- 必要ならExport Evidenceで証跡化する。");
+  return lines.join("\n");
+}
+
+async function runCollaborativeAgentKernelV10(input){
+  if (!state.manifest || !Array.isArray(state.manifest.columns) || !state.manifest.columns.length) {
+    throw new Error("Storage Datasetを開いてからAgentを実行してください。");
+  }
+  const started = now();
+  const goal = String(input?.goal || "").trim() || "データの重要な傾向を見つける";
+  const intent = v10ParseAgentIntent(goal);
+
+  post("AGENT_PLAN_PROGRESS", {
+    stage:"intent",
+    progress:8,
+    goal,
+    totalRows:Number(state.manifest.totalRows || 0),
+  });
+
+  post("AGENT_PLAN_PROGRESS", {
+    stage:"research",
+    progress:18,
+    goal,
+    totalRows:Number(state.manifest.totalRows || 0),
+  });
+
+  const research = await runAutonomousResearchKernelV9({
+    sampleRows:Number(input?.sampleRows || 220000),
+    maxColumns:Number(input?.maxColumns || 128),
+    topN:Number(input?.topN || 12),
+    mode:"agent",
+    force:Boolean(input?.force),
+  });
+
+  post("AGENT_PLAN_PROGRESS", {
+    stage:"plan",
+    progress:78,
+    goal,
+    totalRows:Number(state.manifest.totalRows || 0),
+  });
+
+  const steps = v10BuildAgentSteps(intent, research);
+  const memory = v10BuildFindingsMemory(research);
+  const reportDraft = v10BuildReportDraft({ goal, intent, research, memory });
+
+  const result = {
+    version:COLLABORATIVE_AGENT_KERNEL_VERSION,
+    dataset:research.dataset,
+    goal,
+    intent,
+    plan:{
+      id:`agent-plan-${hashText32(`${goal}|${state.manifest?.id || ""}|${Date.now()}`)}`,
+      status:"ready",
+      cursor:steps.findIndex((s)=>s.status === "ready"),
+      steps,
+    },
+    memory,
+    findings:[...memory.confirmedFindings, ...memory.pendingFindings],
+    research,
+    reportDraft,
+    summary:{
+      stepCount:steps.length,
+      findingCount:memory.confirmedFindings.length + memory.pendingFindings.length,
+      confirmedCount:memory.confirmedFindings.length,
+      pendingCount:memory.pendingFindings.length,
+      hypothesisCount:research.hypotheses?.length || 0,
+      insightCount:research.sourceInsights?.length || research.summary?.insightCount || 0,
+    },
+    metrics:{
+      ms:Math.round(now() - started),
+      kernel:"Collaborative Agent Kernel v10",
+      cache:"miss",
+      sampledRows:research.summary?.sampledRows || research.metrics?.sampledRows || 0,
+    }
+  };
+  return result;
+}
+
+registerRuntimeCommand("RUN_COLLABORATIVE_AGENT", {
+  validate(msg){
+    return {
+      goal:String(msg.goal || ""),
+      sampleRows:Number(msg.sampleRows || 220000),
+      maxColumns:Number(msg.maxColumns || 128),
+      topN:Number(msg.topN || 12),
+      force:Boolean(msg.force),
+    };
+  },
+  plan(input){
+    return {
+      kind:"collaborative-agent",
+      strategy:"goal-to-research-v10",
+      estimatedRows:Math.min(Number(state.manifest?.totalRows || 0), Number(input.sampleRows || 0)),
+      input,
+    };
+  },
+  async execute(plan){
+    const key = v10AgentCacheKey(plan.input);
+    const cached = !plan.input.force && olapKernelRuntime.agent?.get(key);
+    if (cached?.value) {
+      return {
+        ...cached.value,
+        metrics:{...(cached.value.metrics || {}), cache:"hit", ms:0}
+      };
+    }
+    const result = await runCollaborativeAgentKernelV10(plan.input);
+    v10RememberAgent(key, result);
+    return result;
+  },
+  project(result){ return result; },
+  doneType:"AGENT_PLAN_DONE",
+});
+
+
+/*
+ * =========================================================
+ * Knowledge Graph Kernel v11
+ * =========================================================
+ * v11 turns a single dataset into a local explainable knowledge graph:
+ * dataset -> columns -> semantic types -> entity candidates -> relation candidates.
+ */
+const KNOWLEDGE_GRAPH_KERNEL_VERSION = 11;
+const KNOWLEDGE_GRAPH_CACHE_LIMIT = 8;
+
+if (!olapKernelRuntime.knowledgeGraph) olapKernelRuntime.knowledgeGraph = new Map();
+
+function v11KnowledgeGraphCacheKey(input){
+  const manifestKey = `${state.manifest?.id || ""}:${state.manifest?.totalRows || 0}:${state.manifest?.columns?.length || 0}`;
+  const cfg = [
+    Number(input?.sampleRows || 0),
+    Number(input?.maxColumns || 0),
+    Number(input?.topN || 0),
+    String(input?.mode || "knowledge")
+  ].join("|");
+  return hashText32(`v11|${manifestKey}|${cfg}`);
+}
+
+function v11RememberKnowledgeGraph(key, value){
+  const cache = olapKernelRuntime.knowledgeGraph;
+  if (!cache) return;
+  if (cache.has(key)) cache.delete(key);
+  cache.set(key, { at:now(), value });
+  while (cache.size > KNOWLEDGE_GRAPH_CACHE_LIMIT) {
+    const first = cache.keys().next().value;
+    cache.delete(first);
+  }
+}
+
+function v11Node(id, label, type, extra = {}){
+  return {
+    id:String(id),
+    label:String(label || id),
+    type:String(type || "node"),
+    weight:Number(extra.weight || 1),
+    ...extra,
+  };
+}
+
+function v11Edge(source, target, label, type, extra = {}){
+  return {
+    id:`${String(source)}->${String(target)}:${String(type || label || "edge")}`,
+    source:String(source),
+    target:String(target),
+    label:String(label || type || "related"),
+    type:String(type || label || "related"),
+    weight:Number(extra.weight || 1),
+    ...extra,
+  };
+}
+
+function v11ColumnAffinityScore(a, b){
+  const asem = String(a?.semanticType || "");
+  const bsem = String(b?.semanticType || "");
+  if (asem === "id" && ["category","email","url"].includes(bsem)) return 0.52;
+  if (bsem === "id" && ["category","email","url"].includes(asem)) return 0.52;
+  if (asem === "date" && bsem === "measure") return 0.9;
+  if (bsem === "date" && asem === "measure") return 0.9;
+  if (["category","email","url"].includes(asem) && bsem === "measure") return 0.86;
+  if (["category","email","url"].includes(bsem) && asem === "measure") return 0.86;
+  if (asem === "category" && bsem === "category") return 0.45;
+  if (asem === "measure" && bsem === "measure") return 0.35;
+  return 0.18;
+}
+
+function v11BuildKnowledgeGraph(sample, input){
+  const columns = Array.isArray(sample?.columns) ? sample.columns : [];
+  const topN = Math.max(5, Math.min(50, Number(input?.topN || 16)));
+  const nodes = [];
+  const edges = [];
+  const entities = [];
+  const relationships = [];
+  const suggestedCharts = [];
+
+  const datasetId = `dataset:${state.manifest?.id || "active"}`;
+  nodes.push(v11Node(datasetId, state.manifest?.name || "Active Dataset", "dataset", {
+    rows:Number(state.manifest?.totalRows || 0),
+    columns:Number(state.manifest?.columns?.length || columns.length || 0),
+    weight:4,
+  }));
+
+  const typeSet = new Set();
+  for (const c of columns) {
+    const colId = `column:${c.index}`;
+    const sem = String(c.semanticType || "unknown");
+    const quality = v8ColumnQuality(c);
+    nodes.push(v11Node(colId, c.name, "column", {
+      columnIndex:Number(c.index),
+      semanticType:sem,
+      nullRate:Number(c.nullRate || 0),
+      distinct:Number(c.distinct || 0),
+      weight:Math.max(0.5, Math.min(4, quality * 3)),
+    }));
+    edges.push(v11Edge(datasetId, colId, "has column", "has_column", { weight:1 }));
+
+    const typeId = `type:${sem}`;
+    if (!typeSet.has(typeId)) {
+      typeSet.add(typeId);
+      nodes.push(v11Node(typeId, sem, "semantic_type", { weight:2 }));
+    }
+    edges.push(v11Edge(colId, typeId, "typed as", "semantic_type", { weight:0.7 }));
+
+    if (["id","email","url"].includes(sem) || (c.cardinalityRate > 0.65 && c.distinct > 20)) {
+      const entity = {
+        id:`entity:${c.index}`,
+        columnIndex:Number(c.index),
+        columnName:c.name,
+        entityType:sem === "id" ? "key" : sem,
+        confidence:Math.min(0.98, 0.45 + Number(c.cardinalityRate || 0) * 0.55),
+        reason:sem === "id" ? "ID/key-like high cardinality column" : `${sem}-like identifier surface`,
+      };
+      entities.push(entity);
+      nodes.push(v11Node(entity.id, `${c.name} entity`, "entity", {
+        columnIndex:Number(c.index),
+        confidence:entity.confidence,
+        weight:2.5,
+      }));
+      edges.push(v11Edge(colId, entity.id, "identifies", "entity_candidate", { weight:entity.confidence }));
+    }
+  }
+
+  const categories = columns.filter((c)=>["category","email","url","date"].includes(c.semanticType) && c.distinct > 1);
+  const measures = columns.filter((c)=>c.semanticType === "measure" && c.numeric?.count > 0);
+  const dates = columns.filter((c)=>c.semanticType === "date");
+
+  for (const cat of categories.slice(0, 16)) {
+    for (const m of measures.slice(0, 12)) {
+      if (cat.index === m.index) continue;
+      const score = v11ColumnAffinityScore(cat, m) * Math.max(0.3, v8ColumnQuality(cat)) * Math.max(0.3, v8ColumnQuality(m));
+      if (score < 0.2) continue;
+      const rel = {
+        id:`rel:${cat.index}:${m.index}`,
+        sourceColumnIndex:Number(cat.index),
+        sourceColumnName:cat.name,
+        targetColumnIndex:Number(m.index),
+        targetColumnName:m.name,
+        type:cat.semanticType === "date" ? "time_measure" : "segment_measure",
+        score:Math.round(score * 1000) / 1000,
+        description:`${cat.name} で ${m.name} を分解すると差分/傾向が見える可能性があります。`,
+        d3Plan:v8MakeD3Plan({
+          chartType:cat.semanticType === "date" ? "line" : "bar",
+          xColumn:cat.index,
+          yColumn:m.index,
+          aggregation:cat.semanticType === "date" ? "Sum" : "Avg",
+        })
+      };
+      relationships.push(rel);
+      edges.push(v11Edge(`column:${cat.index}`, `column:${m.index}`, rel.type, "relationship_candidate", {
+        weight:rel.score,
+        relationId:rel.id,
+      }));
+      suggestedCharts.push({
+        id:`kg-chart-${cat.index}-${m.index}`,
+        title:`${cat.name} × ${m.name}`,
+        reason:rel.description,
+        score:Math.round(score * 100),
+        plan:rel.d3Plan,
+      });
+    }
+  }
+
+  for (const d of dates.slice(0, 6)) {
+    if (!measures.length) {
+      suggestedCharts.push({
+        id:`kg-time-count-${d.index}`,
+        title:`${d.name} の件数推移`,
+        reason:"日付列から時系列件数を確認",
+        score:78,
+        plan:v8MakeD3Plan({ chartType:"line", xColumn:d.index, aggregation:"Count" }),
+      });
+    }
+  }
+
+  const relationTop = relationships
+    .sort((a,b)=>Number(b.score || 0) - Number(a.score || 0))
+    .slice(0, topN);
+
+  return {
+    nodes:nodes.slice(0, 240),
+    edges:edges.slice(0, 480),
+    entities:entities.sort((a,b)=>Number(b.confidence || 0) - Number(a.confidence || 0)).slice(0, topN),
+    relationships:relationTop,
+    suggestedCharts:suggestedCharts
+      .sort((a,b)=>Number(b.score || 0) - Number(a.score || 0))
+      .slice(0, topN),
+    summary:{
+      nodeCount:nodes.length,
+      edgeCount:edges.length,
+      entityCount:entities.length,
+      relationshipCount:relationships.length,
+      chartCount:suggestedCharts.length,
+    }
+  };
+}
+
+async function runKnowledgeGraphKernelV11(input){
+  if (!state.manifest || !Array.isArray(state.manifest.columns) || !state.manifest.columns.length) {
+    throw new Error("Storage Datasetを開いてからKnowledge Graphを実行してください。");
+  }
+  const started = now();
+  post("KNOWLEDGE_GRAPH_PROGRESS", {
+    stage:"profile",
+    progress:8,
+    totalRows:Number(state.manifest.totalRows || 0),
+  });
+
+  const sample = await v8SampleProfiles({
+    sampleRows:Number(input?.sampleRows || 180000),
+    maxColumns:Number(input?.maxColumns || 160),
+    topN:Number(input?.topN || 16),
+    mode:"knowledge",
+  });
+
+  post("KNOWLEDGE_GRAPH_PROGRESS", {
+    stage:"graph-build",
+    progress:82,
+    sampledRows:sample.metrics.sampledRows,
+    totalRows:sample.metrics.totalRows,
+  });
+
+  const graph = v11BuildKnowledgeGraph(sample, input);
+  const result = {
+    version:KNOWLEDGE_GRAPH_KERNEL_VERSION,
+    dataset:{
+      id:state.manifest?.id || "",
+      name:state.manifest?.name || "",
+      rows:Number(state.manifest?.totalRows || 0),
+      columns:Number(state.manifest?.columns?.length || 0),
+    },
+    columns:sample.columns,
+    ...graph,
+    metrics:{
+      ...sample.metrics,
+      ms:Math.round(now() - started),
+      cache:"miss",
+      kernel:"Knowledge Graph Kernel v11",
+    }
+  };
+  return result;
+}
+
+registerRuntimeCommand("RUN_KNOWLEDGE_GRAPH", {
+  validate(msg){
+    return {
+      sampleRows:Number(msg.sampleRows || 180000),
+      maxColumns:Number(msg.maxColumns || 160),
+      topN:Number(msg.topN || 16),
+      mode:String(msg.mode || "knowledge"),
+      force:Boolean(msg.force),
+    };
+  },
+  plan(input){
+    return {
+      kind:"knowledge-graph",
+      strategy:"semantic-entity-relation-v11",
+      estimatedRows:Math.min(Number(state.manifest?.totalRows || 0), Number(input.sampleRows || 0)),
+      input,
+    };
+  },
+  async execute(plan){
+    const key = v11KnowledgeGraphCacheKey(plan.input);
+    const cached = !plan.input.force && olapKernelRuntime.knowledgeGraph?.get(key);
+    if (cached?.value) {
+      return {
+        ...cached.value,
+        metrics:{...(cached.value.metrics || {}), cache:"hit", ms:0}
+      };
+    }
+    const result = await runKnowledgeGraphKernelV11(plan.input);
+    v11RememberKnowledgeGraph(key, result);
+    return result;
+  },
+  project(result){ return result; },
+  doneType:"KNOWLEDGE_GRAPH_DONE",
+});
+
+
+
 const runtimeKernel = createRuntimeKernel({
   runtimeState: state,
   post,
@@ -19086,6 +19667,398 @@ function AutonomousResearchPanel({
 
 
 
+function CollaborativeAgentPanel({
+  manifest,
+  goal,
+  setGoal,
+  result,
+  status,
+  time,
+  busy,
+  onRun,
+  onRunFresh,
+  onApplyChart,
+  onExportReport,
+  onGoResearch,
+}) {
+  const steps = Array.isArray(result?.plan?.steps) ? result.plan.steps : [];
+  const findings = Array.isArray(result?.findings) ? result.findings : [];
+  const summary = result?.summary || {};
+  const intent = result?.intent || {};
+  const reportDraft = String(result?.reportDraft || "");
+  const stepRows = steps.map((s, i) => [
+    i + 1,
+    s.status || "",
+    s.type || "",
+    s.label || "",
+    s.output || "",
+  ]);
+
+  return (
+    <Section
+      title="Collaborative Agent"
+      icon={<Analytics />}
+      hint="v10: ユーザー目的からv8/v9/D3/Table/Reportをつなぐローカル決定論Agentです。外部送信はしません。"
+    >
+      <Stack spacing={1}>
+        <Stack direction={{ xs:"column", md:"row" }} spacing={1} alignItems={{ xs:"stretch", md:"center" }}>
+          <TextField
+            label="Goal"
+            size="small"
+            value={goal}
+            onChange={(e) => setGoal(e.target.value)}
+            placeholder="例: 売上異常を見たい / データ品質を確認したい / クラスタの特徴を見たい"
+            sx={{ flex: 1, minWidth: 260 }}
+          />
+          <Button variant="contained" disabled={!manifest || busy} onClick={onRun}>Run v10 Agent</Button>
+          <Button variant="outlined" disabled={!manifest || busy} onClick={onRunFresh}>Force Agent Rescan</Button>
+          <Button variant="outlined" disabled={!result} onClick={onExportReport}>Export Report</Button>
+        </Stack>
+
+        <Alert severity={manifest ? "info" : "warning"}>
+          {status}
+          {time ? ` / ${time}` : ""}
+        </Alert>
+
+        {result && (
+          <>
+            <Stack direction="row" useFlexGap flexWrap="wrap" spacing={0.75}>
+              <Chip color="primary" label={`steps ${fmt(summary.stepCount || steps.length)}`} />
+              <Chip color="secondary" label={`findings ${fmt(summary.findingCount || findings.length)}`} />
+              <Chip color="success" label={`confirmed candidates ${fmt(summary.confirmedCount || 0)}`} />
+              <Chip label={`task ${intent.task || "n/a"}`} />
+              <Chip label={`domain ${intent.domain || "general"}`} />
+              <Chip label={`cache ${result.metrics?.cache || "miss"}`} />
+            </Stack>
+
+            <Box sx={{ display:"grid", gridTemplateColumns:{ xs:"1fr", lg:"1fr 1fr" }, gap:1, alignItems:"start" }}>
+              <Paper variant="outlined" sx={{ p:1, minWidth:0 }}>
+                <Typography variant="subtitle1" sx={{ fontWeight:900, mb:0.75 }}>Agent Plan</Typography>
+                <DataTable
+                  table={{
+                    header:["#", "status", "type", "step", "output"],
+                    rows:stepRows,
+                    page:1,
+                    pageSize:stepRows.length || 1,
+                    startRow:0,
+                    totalMatches:stepRows.length,
+                  }}
+                  tableId="agent-plan-steps"
+                  height={320}
+                />
+              </Paper>
+
+              <Paper variant="outlined" sx={{ p:1, minWidth:0 }}>
+                <Typography variant="subtitle1" sx={{ fontWeight:900, mb:0.75 }}>Findings Memory</Typography>
+                <Stack spacing={0.75}>
+                  {findings.length ? findings.slice(0, 8).map((f) => (
+                    <Paper key={f.id || f.title} variant="outlined" sx={{ p:0.9 }}>
+                      <Stack direction="row" justifyContent="space-between" alignItems="center" spacing={1}>
+                        <Box sx={{ minWidth:0 }}>
+                          <Typography variant="body2" sx={{ fontWeight:800 }}>{f.title || "Finding"}</Typography>
+                          <Typography variant="caption" color="text.secondary">
+                            {f.hypothesisType || "hypothesis"} / confidence {Math.round(Number(f.confidence || 0) * 1000) / 10}% / score {Math.round(Number(f.score || 0) * 10) / 10}
+                          </Typography>
+                        </Box>
+                        <Stack direction="row" spacing={0.5}>
+                          <Chip size="small" label={f.status || "pending"} color={f.status === "candidate_confirm" ? "success" : "default"} />
+                          <Button size="small" disabled={!f.chartPlan} onClick={() => onApplyChart?.(f.chartPlan)}>Run D3</Button>
+                        </Stack>
+                      </Stack>
+                    </Paper>
+                  )) : (
+                    <Typography color="text.secondary">Agentを実行するとFindingが表示されます。</Typography>
+                  )}
+                </Stack>
+              </Paper>
+            </Box>
+
+            <Paper variant="outlined" sx={{ p:1 }}>
+              <Stack direction="row" justifyContent="space-between" alignItems="center" spacing={1} sx={{ mb:0.75 }}>
+                <Typography variant="subtitle1" sx={{ fontWeight:900 }}>Report Draft</Typography>
+                <Stack direction="row" spacing={0.5}>
+                  <Button size="small" disabled={!result?.research} onClick={onGoResearch}>Open Research</Button>
+                  <Button size="small" disabled={!reportDraft} onClick={onExportReport}>Export Markdown</Button>
+                </Stack>
+              </Stack>
+              <TextField
+                value={reportDraft}
+                multiline
+                minRows={10}
+                fullWidth
+                InputProps={{ readOnly:true }}
+              />
+            </Paper>
+          </>
+        )}
+      </Stack>
+    </Section>
+  );
+}
+
+function KnowledgeGraphPanel({
+  manifest,
+  result,
+  status,
+  time,
+  busy,
+  onRun,
+  onRunFresh,
+  onApplyChart,
+}) {
+  const summary = result?.summary || {};
+  const entities = Array.isArray(result?.entities) ? result.entities : [];
+  const relationships = Array.isArray(result?.relationships) ? result.relationships : [];
+  const nodes = Array.isArray(result?.nodes) ? result.nodes : [];
+  const edges = Array.isArray(result?.edges) ? result.edges : [];
+  const charts = Array.isArray(result?.suggestedCharts) ? result.suggestedCharts : [];
+
+  const entityRows = entities.map((e) => [
+    e.columnName || "",
+    e.entityType || "",
+    `${Math.round(Number(e.confidence || 0) * 1000) / 10}%`,
+    e.reason || "",
+  ]);
+
+  const relationRows = relationships.map((r) => [
+    r.sourceColumnName || "",
+    r.type || "",
+    r.targetColumnName || "",
+    Math.round(Number(r.score || 0) * 1000) / 1000,
+    r.description || "",
+  ]);
+
+  const nodeRows = nodes.slice(0, 160).map((n) => [
+    n.id,
+    n.label,
+    n.type,
+    n.semanticType || "",
+    Math.round(Number(n.weight || 0) * 100) / 100,
+  ]);
+
+  const edgeRows = edges.slice(0, 220).map((e) => [
+    e.source,
+    e.label,
+    e.target,
+    e.type,
+    Math.round(Number(e.weight || 0) * 100) / 100,
+  ]);
+
+  return (
+    <Section
+      title="Knowledge Graph"
+      icon={<Schema />}
+      hint="v11: active datasetを、列・意味型・Entity候補・関係候補の知識グラフとして測定します。"
+    >
+      <Stack spacing={1}>
+        <Stack direction={{ xs:"column", md:"row" }} spacing={1} alignItems={{ xs:"stretch", md:"center" }}>
+          <Button variant="contained" disabled={!manifest || busy} onClick={onRun}>Run v11 Knowledge Graph</Button>
+          <Button variant="outlined" disabled={!manifest || busy} onClick={onRunFresh}>Force Graph Rescan</Button>
+          <Chip label={`nodes ${fmt(summary.nodeCount || nodes.length || 0)}`} />
+          <Chip label={`edges ${fmt(summary.edgeCount || edges.length || 0)}`} />
+          <Chip color="secondary" label={`entities ${fmt(summary.entityCount || entities.length || 0)}`} />
+          <Chip color="primary" label={`relations ${fmt(summary.relationshipCount || relationships.length || 0)}`} />
+        </Stack>
+
+        <Alert severity={manifest ? "info" : "warning"}>
+          {status}
+          {time ? ` / ${time}` : ""}
+        </Alert>
+
+        {result && (
+          <>
+            <Box sx={{ display:"grid", gridTemplateColumns:{ xs:"1fr", lg:"1fr 1fr" }, gap:1 }}>
+              <Paper variant="outlined" sx={{ p:1, minWidth:0 }}>
+                <Typography variant="subtitle1" sx={{ fontWeight:900, mb:0.75 }}>Entity Candidates</Typography>
+                <DataTable
+                  table={{
+                    header:["column", "entity", "confidence", "reason"],
+                    rows:entityRows,
+                    page:1,
+                    pageSize:entityRows.length || 1,
+                    startRow:0,
+                    totalMatches:entityRows.length,
+                  }}
+                  tableId="knowledge-entities"
+                  height={320}
+                />
+              </Paper>
+
+              <Paper variant="outlined" sx={{ p:1, minWidth:0 }}>
+                <Typography variant="subtitle1" sx={{ fontWeight:900, mb:0.75 }}>Relationship Candidates</Typography>
+                <DataTable
+                  table={{
+                    header:["source", "relation", "target", "score", "description"],
+                    rows:relationRows,
+                    page:1,
+                    pageSize:relationRows.length || 1,
+                    startRow:0,
+                    totalMatches:relationRows.length,
+                  }}
+                  tableId="knowledge-relationships"
+                  height={320}
+                />
+              </Paper>
+            </Box>
+
+            <Paper variant="outlined" sx={{ p:1 }}>
+              <Typography variant="subtitle1" sx={{ fontWeight:900, mb:0.75 }}>v11 Suggested Visualizations</Typography>
+              <Stack spacing={0.75}>
+                {charts.length ? charts.slice(0, 10).map((c) => (
+                  <Paper key={c.id || c.title} variant="outlined" sx={{ p:0.9 }}>
+                    <Stack direction={{ xs:"column", md:"row" }} justifyContent="space-between" alignItems={{ xs:"stretch", md:"center" }} spacing={1}>
+                      <Box sx={{ minWidth:0 }}>
+                        <Typography variant="body2" sx={{ fontWeight:800 }}>{c.title || "Chart"}</Typography>
+                        <Typography variant="caption" color="text.secondary">{c.reason || ""}</Typography>
+                      </Box>
+                      <Stack direction="row" spacing={0.5}>
+                        <Chip size="small" label={`score ${Math.round(Number(c.score || 0) * 10) / 10}`} />
+                        <Button size="small" onClick={() => onApplyChart?.(c.plan)}>Run D3</Button>
+                      </Stack>
+                    </Stack>
+                  </Paper>
+                )) : (
+                  <Typography color="text.secondary">Knowledge GraphからD3候補が生成されると表示されます。</Typography>
+                )}
+              </Stack>
+            </Paper>
+
+            <Box sx={{ display:"grid", gridTemplateColumns:{ xs:"1fr", lg:"1fr 1fr" }, gap:1 }}>
+              <Paper variant="outlined" sx={{ p:1, minWidth:0 }}>
+                <Typography variant="subtitle1" sx={{ fontWeight:900, mb:0.75 }}>Graph Nodes</Typography>
+                <DataTable
+                  table={{
+                    header:["id", "label", "type", "semantic", "weight"],
+                    rows:nodeRows,
+                    page:1,
+                    pageSize:nodeRows.length || 1,
+                    startRow:0,
+                    totalMatches:nodes.length,
+                  }}
+                  tableId="knowledge-nodes"
+                  height={360}
+                />
+              </Paper>
+              <Paper variant="outlined" sx={{ p:1, minWidth:0 }}>
+                <Typography variant="subtitle1" sx={{ fontWeight:900, mb:0.75 }}>Graph Edges</Typography>
+                <DataTable
+                  table={{
+                    header:["source", "edge", "target", "type", "weight"],
+                    rows:edgeRows,
+                    page:1,
+                    pageSize:edgeRows.length || 1,
+                    startRow:0,
+                    totalMatches:edges.length,
+                  }}
+                  tableId="knowledge-edges"
+                  height={360}
+                />
+              </Paper>
+            </Box>
+          </>
+        )}
+      </Stack>
+    </Section>
+  );
+}
+
+
+
+function ReliabilityDiagnosticsPanel({
+  manifest,
+  autonomousInsights,
+  autonomousResearch,
+  agentResult,
+  knowledgeGraph,
+  d3VizResult,
+  runtimeMetrics,
+}) {
+  const checks = [
+    ["Worker command", "RUN_AUTONOMOUS_INSIGHTS", "registered via runtime command", Boolean(autonomousInsights) ? "observed" : "ready"],
+    ["Worker command", "RUN_AUTONOMOUS_RESEARCH", "registered via runtime command", Boolean(autonomousResearch) ? "observed" : "ready"],
+    ["Worker command", "RUN_COLLABORATIVE_AGENT", "v10 command available after this build", Boolean(agentResult) ? "observed" : "ready"],
+    ["Worker command", "RUN_KNOWLEDGE_GRAPH", "v11 command available after this build", Boolean(knowledgeGraph) ? "observed" : "ready"],
+    ["Runtime split", "legacy monolith removed", "Babel対象はJSX chunkのみ", "ok"],
+    ["D3", "normalizer", "Visualize / v8 / v11のPlan反映で使用", "ok"],
+    ["Security", "unsafe eval", "unsafe dynamic execution not used in generated build", "ok"],
+    ["Dataset", "active manifest", manifest ? `${fmt(manifest.totalRows || 0)} rows / ${fmt(manifest.columns?.length || 0)} cols` : "not opened", manifest ? "ok" : "waiting"],
+    ["D3 Surface", "latest", d3VizResult ? `${d3VizResult.kind || "surface"} / marks ${fmt(d3VizResult.reducedRows || 0)}` : "not built", d3VizResult ? "ok" : "waiting"],
+  ];
+
+  const rows = checks.map((c) => [
+    c[0],
+    c[1],
+    c[2],
+    c[3],
+  ]);
+
+  const metricRows = Object.entries(runtimeMetrics || {})
+    .filter(([, v]) => typeof v === "number" || typeof v === "string")
+    .slice(0, 24)
+    .map(([k, v]) => [k, typeof v === "number" ? fmt(v) : String(v)]);
+
+  return (
+    <Section
+      title="Diagnostics"
+      icon={<Article />}
+      hint="Reliability Kernel v1: v8/v9/v10/v11追加後の主要経路・Runtime分離・D3反映面を一画面で確認します。"
+    >
+      <Stack spacing={1}>
+        <Alert severity="info">
+          このDiagnosticsは外部送信せず、現在のRuntime状態だけを表示します。赤い失敗を待つのではなく、壊れやすい境界を先に観測します。
+        </Alert>
+
+        <Box sx={{ display:"grid", gridTemplateColumns:{ xs:"1fr", lg:"1fr 1fr" }, gap:1 }}>
+          <Paper variant="outlined" sx={{ p:1, minWidth:0 }}>
+            <Typography variant="subtitle1" sx={{ fontWeight:900, mb:0.75 }}>Self Checks</Typography>
+            <DataTable
+              table={{
+                header:["area", "check", "detail", "status"],
+                rows,
+                page:1,
+                pageSize:rows.length || 1,
+                startRow:0,
+                totalMatches:rows.length,
+              }}
+              tableId="diagnostics-self-checks"
+              height={360}
+            />
+          </Paper>
+
+          <Paper variant="outlined" sx={{ p:1, minWidth:0 }}>
+            <Typography variant="subtitle1" sx={{ fontWeight:900, mb:0.75 }}>Runtime Metrics</Typography>
+            <DataTable
+              table={{
+                header:["metric", "value"],
+                rows:metricRows,
+                page:1,
+                pageSize:metricRows.length || 1,
+                startRow:0,
+                totalMatches:metricRows.length,
+              }}
+              tableId="diagnostics-runtime-metrics"
+              height={360}
+            />
+          </Paper>
+        </Box>
+
+        <Paper variant="outlined" sx={{ p:1 }}>
+          <Typography variant="subtitle1" sx={{ fontWeight:900, mb:0.75 }}>Kernel Stack</Typography>
+          <Stack direction="row" useFlexGap flexWrap="wrap" spacing={0.75}>
+            <Chip label="Reliability v1" color="success" />
+            <Chip label="Autonomous Analysis v8" color={autonomousInsights ? "success" : "default"} />
+            <Chip label="Autonomous Research v9" color={autonomousResearch ? "success" : "default"} />
+            <Chip label="Collaborative Agent v10" color={agentResult ? "success" : "default"} />
+            <Chip label="Knowledge Graph v11" color={knowledgeGraph ? "success" : "default"} />
+          </Stack>
+        </Paper>
+      </Stack>
+    </Section>
+  );
+}
+
+
+
 function App() {
   const workerRef = useRef(null);
   const workerGatewayRef = useRef(null);
@@ -19254,6 +20227,14 @@ function App() {
   const [autonomousResearchStatus, setAutonomousResearchStatus] = useState("Storage Datasetを開くと、v9 Autonomous Researchを実行できます。");
   const [autonomousResearchTime, setAutonomousResearchTime] = useState("");
 
+  const [agentGoal, setAgentGoal] = useState(initialSettings.agentGoal || "売上異常を見たい");
+  const [agentResult, setAgentResult] = useState(null);
+  const [agentStatus, setAgentStatus] = useState("Storage Datasetを開くと、v10 Collaborative Agentを実行できます。");
+  const [agentTime, setAgentTime] = useState("");
+  const [knowledgeGraph, setKnowledgeGraph] = useState(null);
+  const [knowledgeGraphStatus, setKnowledgeGraphStatus] = useState("Storage Datasetを開くと、v11 Knowledge Graphを実行できます。");
+  const [knowledgeGraphTime, setKnowledgeGraphTime] = useState("");
+
 
   const [syntheticPreviewTable, setSyntheticPreviewTable] = useState(null);
   const [syntheticReport, setSyntheticReport] = useState([]);
@@ -19321,6 +20302,16 @@ function App() {
       ? "Storage Datasetを開きました。Run v9 Researchで仮説検証を開始できます。"
       : "Storage Datasetを開くと、v9 Autonomous Researchを実行できます。");
     setAutonomousResearchTime("");
+    setAgentResult(null);
+    setAgentStatus(manifest
+      ? "Storage Datasetを開きました。Run v10 Agentで目的ベース分析を開始できます。"
+      : "Storage Datasetを開くと、v10 Collaborative Agentを実行できます。");
+    setAgentTime("");
+    setKnowledgeGraph(null);
+    setKnowledgeGraphStatus(manifest
+      ? "Storage Datasetを開きました。Run v11 Knowledge Graphで関係面を測定できます。"
+      : "Storage Datasetを開くと、v11 Knowledge Graphを実行できます。");
+    setKnowledgeGraphTime("");
   }, [manifest?.id]);
 
   useEffect(() => { searchPageRef.current = searchPage; }, [searchPage]);
@@ -19353,9 +20344,10 @@ function App() {
       s3Bucket,
       mainPanel,
       tab,
+      agentGoal,
       rules,
     });
-  }, [themeMode, tableDensity, previewRows, encoding, csvExportEncoding, delimiter, chunkSize, sampleRows, pageSize, graphResultPageSize, storageWorkspace, storageCollection, memoryMaxMB, memoryMaxRows, externalProvider, externalEndpoint, externalPrefix, externalAuthMode, s3Region, s3Bucket, mainPanel, tab, rules]);
+  }, [themeMode, tableDensity, previewRows, encoding, csvExportEncoding, delimiter, chunkSize, sampleRows, pageSize, graphResultPageSize, storageWorkspace, storageCollection, memoryMaxMB, memoryMaxRows, externalProvider, externalEndpoint, externalPrefix, externalAuthMode, s3Region, s3Bucket, mainPanel, tab, agentGoal, rules]);
 
   function appendLog(text) {
     const line = `[${new Date().toLocaleTimeString()}] ${text}`;
@@ -19494,6 +20486,12 @@ function App() {
     setAutonomousResearch(null);
     setAutonomousResearchStatus("Storage Datasetを開くと、v9 Autonomous Researchを実行できます。");
     setAutonomousResearchTime("");
+    setAgentResult(null);
+    setAgentStatus("Storage Datasetを開くと、v10 Collaborative Agentを実行できます。");
+    setAgentTime("");
+    setKnowledgeGraph(null);
+    setKnowledgeGraphStatus("Storage Datasetを開くと、v11 Knowledge Graphを実行できます。");
+    setKnowledgeGraphTime("");
     resetColumnState([]);
     if (list.length) {
       const defaultName = list.length > 1 ? `merged_${list.length}_csv` : list[0].name.replace(/\.[^.]+$/, "");
@@ -19985,6 +20983,18 @@ function App() {
         setD3VizResult(null);
         setD3VizStatus("Storage Datasetを開くと、D3用の全件集約Surfaceを作れます。");
         setD3VizTime("");
+        setAutonomousInsights(null);
+        setAutonomousInsightsStatus("Storage Datasetを開くと、v8 Autonomous Insightsを実行できます。");
+        setAutonomousInsightsTime("");
+        setAutonomousResearch(null);
+        setAutonomousResearchStatus("Storage Datasetを開くと、v9 Autonomous Researchを実行できます。");
+        setAutonomousResearchTime("");
+        setAgentResult(null);
+        setAgentStatus("Storage Datasetを開くと、v10 Collaborative Agentを実行できます。");
+        setAgentTime("");
+        setKnowledgeGraph(null);
+        setKnowledgeGraphStatus("Storage Datasetを開くと、v11 Knowledge Graphを実行できます。");
+        setKnowledgeGraphTime("");
         setVisibleCols([]);
         setPurgeConfirm("");
         setStatus("現在セッションを破棄しました。OPFS内の保存済みデータセットは残っています。");
@@ -20258,6 +21268,67 @@ function App() {
         return;
       },
 
+      "AGENT_PLAN_PROGRESS"(msg) {
+        const stage = msg.stage || "agent";
+        setAgentStatus(`v10 Agent ${stage}: ${msg.goal || agentGoal || ""}`);
+        if (Number.isFinite(Number(msg.progress))) {
+          setProgress(Math.max(1, Math.min(99, Number(msg.progress))));
+        }
+        return;
+      },
+
+      "AGENT_PLAN_DONE"(msg) {
+        setAgentResult(msg);
+        if (msg.research) {
+          setAutonomousResearch(msg.research);
+          setAutonomousResearchStatus(`v9 Research ready via Agent: ${fmt(msg.research?.hypotheses?.length || 0)} hypotheses`);
+          setAutonomousResearchTime(ms(msg.research?.metrics?.ms));
+          if (msg.research?.sourceInsights?.length) {
+            setAutonomousInsights((prev) => prev || {
+              version: 8,
+              dataset: msg.research.dataset,
+              summary: {
+                insightCount: msg.research.sourceInsights.length,
+                chartCount: msg.research.suggestedCharts?.length || 0,
+                sampledRows: msg.research.summary?.sampledRows || msg.research.metrics?.sampledRows || 0,
+                analyzedColumns: msg.research.summary?.analyzedColumns || 0,
+              },
+              columns: msg.research.columns || [],
+              insights: msg.research.sourceInsights || [],
+              suggestedCharts: msg.research.suggestedCharts || [],
+              metrics: msg.research.metrics || {},
+            });
+          }
+        }
+        setAgentStatus(`v10 Agent ready: ${fmt(msg.summary?.findingCount || msg.findings?.length || 0)} findings / ${fmt(msg.summary?.stepCount || msg.plan?.steps?.length || 0)} steps`);
+        setAgentTime(ms(msg.metrics?.ms));
+        setBusy(false);
+        setBusyLabel("");
+        setProgress(100);
+        setProgressText("v10 Collaborative Agent完了");
+        return;
+      },
+
+      "KNOWLEDGE_GRAPH_PROGRESS"(msg) {
+        const stage = msg.stage || "knowledge";
+        setKnowledgeGraphStatus(`v11 Knowledge Graph ${stage}: sample ${fmt(msg.sampledRows || 0)} / ${fmt(msg.totalRows || 0)} rows`);
+        if (Number.isFinite(Number(msg.progress))) {
+          setProgress(Math.max(1, Math.min(99, Number(msg.progress))));
+        }
+        return;
+      },
+
+      "KNOWLEDGE_GRAPH_DONE"(msg) {
+        setKnowledgeGraph(msg);
+        setKnowledgeGraphStatus(`v11 Knowledge Graph ready: ${fmt(msg.summary?.nodeCount || msg.nodes?.length || 0)} nodes / ${fmt(msg.summary?.edgeCount || msg.edges?.length || 0)} edges / ${fmt(msg.summary?.relationshipCount || msg.relationships?.length || 0)} relations`);
+        setKnowledgeGraphTime(ms(msg.metrics?.ms));
+        setBusy(false);
+        setBusyLabel("");
+        setProgress(100);
+        setProgressText("v11 Knowledge Graph完了");
+        return;
+      },
+
       "SYNTHETIC_PREVIEW_DONE"(msg) {
         setSyntheticPreviewTable({ header: msg.header || [], rows: msg.rows || [] });
         setSyntheticReport(Object.entries(msg.report || {}).map(([k, v]) => [k, typeof v === "number" ? fmt(v) : String(v)]));
@@ -20453,6 +21524,8 @@ function App() {
       BUILD_D3_VIZ_SURFACE: "D3全件集約Surface作成",
       RUN_AUTONOMOUS_INSIGHTS: "v8 Autonomous Insights解析",
       RUN_AUTONOMOUS_RESEARCH: "v9 Autonomous Research解析",
+      RUN_COLLABORATIVE_AGENT: "v10 Collaborative Agent解析",
+      RUN_KNOWLEDGE_GRAPH: "v11 Knowledge Graph解析",
       GENERATE_SYNTHETIC_PREVIEW: "Synthetic Preview生成",
       GENERATE_SYNTHETIC_DATASET: "Synthetic Dataset生成",
       CANCEL_SYNTHETIC_GENERATION: "Synthetic生成キャンセル",
@@ -20616,6 +21689,50 @@ function App() {
       mode:"research",
       force,
     });
+  }
+
+  function runCollaborativeAgent(force = false) {
+    if (!manifestRef.current) {
+      setAgentStatus("Storage Datasetを開いてからv10 Agentを実行してください。");
+      return;
+    }
+    const goal = String(agentGoal || "").trim() || "データの重要な傾向を見つける";
+    setAgentStatus(force ? "v10 Agentを再スキャンしています..." : "v10 Agent Planを生成しています...");
+    setAgentTime("");
+    post({
+      type:"RUN_COLLABORATIVE_AGENT",
+      goal,
+      sampleRows:240000,
+      maxColumns:140,
+      topN:12,
+      force,
+    });
+  }
+
+  function runKnowledgeGraph(force = false) {
+    if (!manifestRef.current) {
+      setKnowledgeGraphStatus("Storage Datasetを開いてからv11 Knowledge Graphを実行してください。");
+      return;
+    }
+    setKnowledgeGraphStatus(force ? "v11 Knowledge Graphを再スキャンしています..." : "v11 Knowledge Graphを構築しています...");
+    setKnowledgeGraphTime("");
+    post({
+      type:"RUN_KNOWLEDGE_GRAPH",
+      sampleRows:200000,
+      maxColumns:160,
+      topN:18,
+      mode:"knowledge",
+      force,
+    });
+  }
+
+  function exportAgentReport() {
+    const text = String(agentResult?.reportDraft || "");
+    if (!text) {
+      setAgentStatus("ExportできるAgent Reportがありません。先にRun v10 Agentを実行してください。");
+      return;
+    }
+    downloadText("agent_report.md", text, { encoding:"utf-8" });
   }
 
   function applyResearchFilterAction(action) {
@@ -21911,12 +23028,15 @@ function App() {
               <Tab value="visualize" icon={<Timeline />} iconPosition="start" label="Visualize" />
               <Tab value="insights" icon={<Analytics />} iconPosition="start" label="Insights" />
               <Tab value="research" icon={<Analytics />} iconPosition="start" label="Research" />
+              <Tab value="agent" icon={<Analytics />} iconPosition="start" label="Agent" />
+              <Tab value="knowledge" icon={<Schema />} iconPosition="start" label="Knowledge" />
               <Tab value="search" icon={<Search />} iconPosition="start" label="Search" />
               <Tab value="pivot" icon={<TableChart />} iconPosition="start" label="Pivot" />
               <Tab value="time" icon={<Timeline />} iconPosition="start" label="Time" />
               <Tab value="storage" icon={<Storage />} iconPosition="start" label="Storage" />
               <Tab value="schema" icon={<Schema />} iconPosition="start" label="Schema" />
               <Tab value="synthetic" icon={<Article />} iconPosition="start" label="Synthetic" />
+              <Tab value="diagnostics" icon={<Article />} iconPosition="start" label="Diagnostics" />
               <Tab value="log" icon={<Article />} iconPosition="start" label="Log" />
             </Tabs>
           </Paper>
@@ -22135,6 +23255,36 @@ function App() {
               onApplyChart={applyAutonomousD3Plan}
               onApplyFilter={applyResearchFilterAction}
               onExportEvidence={exportResearchEvidence}
+            />
+          )}
+
+          {tab === "agent" && (
+            <CollaborativeAgentPanel
+              manifest={manifest}
+              goal={agentGoal}
+              setGoal={setAgentGoal}
+              result={agentResult}
+              status={agentStatus}
+              time={agentTime}
+              busy={busy}
+              onRun={() => runCollaborativeAgent(false)}
+              onRunFresh={() => runCollaborativeAgent(true)}
+              onApplyChart={applyAutonomousD3Plan}
+              onExportReport={exportAgentReport}
+              onGoResearch={() => setTab("research")}
+            />
+          )}
+
+          {tab === "knowledge" && (
+            <KnowledgeGraphPanel
+              manifest={manifest}
+              result={knowledgeGraph}
+              status={knowledgeGraphStatus}
+              time={knowledgeGraphTime}
+              busy={busy}
+              onRun={() => runKnowledgeGraph(false)}
+              onRunFresh={() => runKnowledgeGraph(true)}
+              onApplyChart={applyAutonomousD3Plan}
             />
           )}
 
@@ -22425,6 +23575,18 @@ function App() {
               onCancel={cancelSyntheticGeneration}
               onClear={clearSyntheticSurface}
               onDownloadFile={downloadSyntheticFile}
+            />
+          )}
+
+          {tab === "diagnostics" && (
+            <ReliabilityDiagnosticsPanel
+              manifest={manifest}
+              autonomousInsights={autonomousInsights}
+              autonomousResearch={autonomousResearch}
+              agentResult={agentResult}
+              knowledgeGraph={knowledgeGraph}
+              d3VizResult={d3VizResult}
+              runtimeMetrics={runtimeMetricsRef.current}
             />
           )}
 
