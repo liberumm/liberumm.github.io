@@ -6487,60 +6487,6 @@ function normalizeExportLimit(value){
   return Number.isFinite(n) && n > 0 ? Math.floor(n) : Number.POSITIVE_INFINITY;
 }
 
-async function exportGraphQueryCsv(msg={}){
-  const mode = String(msg.mode || "data");
-  const derivedColumns = normalizeGraphDerivedColumnsForWorker(msg.derivedColumns || []);
-  const outputColumnNames = Array.isArray(msg.outputColumnNames) ? msg.outputColumnNames.map(String).filter(Boolean) : null;
-  const maxRows = normalizeExportLimit(msg.maxRows);
-  const chunkRows = Math.max(100, Math.min(10000, Number(msg.chunkRows || 3000)));
-  const lines = [];
-  let exportedRows = 0;
-  const t0 = now();
-
-  if (mode === "join"){
-    if (!state.graphJoinResult) throw new Error("Graph JOIN result is not active");
-    const header = state.graphJoinResult.header || [];
-    lines.push(graphExportHeader(header, derivedColumns, outputColumnNames).map(csvEscape).join(","));
-    const rows = state.graphJoinResult.rows || [];
-    const total = Math.min(rows.length, maxRows);
-    for (let start=0; start<total; start+=chunkRows){
-      if (state.cancelled) throw new Error("Cancelled");
-      appendRowsToCsvLines(lines, header, rows.slice(start, Math.min(total, start + chunkRows)), derivedColumns, outputColumnNames);
-      exportedRows = Math.min(total, start + chunkRows);
-      post("PROGRESS", {value:Math.min(99, Math.floor((exportedRows / Math.max(1,total)) * 100)), text:`Exporting Graph JOIN CSV... ${fmt(exportedRows)}/${fmt(total)} rows`});
-    }
-    return {csv:lines.join("\n"), rows:exportedRows, totalRows:rows.length, mode, ms:now()-t0};
-  }
-
-  const selected = normalizeCols(Array.isArray(msg.columns) && msg.columns.length ? msg.columns : (state.dataQueryMeta?.projection || []));
-  const header = selected.map(i => state.manifest.columns[i].name);
-  lines.push(graphExportHeader(header, derivedColumns, outputColumnNames).map(csvEscape).join(","));
-
-  if (Array.isArray(state.dataQueryMatches)){
-    const total = Math.min(state.dataQueryMatches.length, maxRows);
-    for (let start=0; start<total; start+=chunkRows){
-      if (state.cancelled) throw new Error("Cancelled");
-      const ids = state.dataQueryMatches.slice(start, Math.min(total, start + chunkRows));
-      const table = await readRowsByGlobal(ids, selected);
-      appendRowsToCsvLines(lines, table.header, table.rows, derivedColumns, outputColumnNames);
-      exportedRows = Math.min(total, start + chunkRows);
-      post("PROGRESS", {value:Math.min(99, Math.floor((exportedRows / Math.max(1,total)) * 100)), text:`Exporting Graph Query CSV... ${fmt(exportedRows)}/${fmt(total)} rows`});
-    }
-    return {csv:lines.join("\n"), rows:exportedRows, totalRows:state.dataQueryMatches.length, mode, ms:now()-t0};
-  }
-
-  const totalRows = Math.min(Number(state.manifest?.totalRows || 0), maxRows);
-  for (let start=0; start<totalRows; start+=chunkRows){
-    if (state.cancelled) throw new Error("Cancelled");
-    const page = Math.floor(start / chunkRows) + 1;
-    const table = await readPage(page, Math.min(chunkRows, totalRows - start), selected);
-    appendRowsToCsvLines(lines, table.header, table.rows, derivedColumns, outputColumnNames);
-    exportedRows = Math.min(totalRows, start + chunkRows);
-    post("PROGRESS", {value:Math.min(99, Math.floor((exportedRows / Math.max(1,totalRows)) * 100)), text:`Exporting Graph Query CSV... ${fmt(exportedRows)}/${fmt(totalRows)} rows`});
-  }
-  return {csv:lines.join("\n"), rows:exportedRows, totalRows:Number(state.manifest?.totalRows || 0), mode, ms:now()-t0};
-}
-
 
 
 // Graph Query Result as a temporary, non-persisted dataset for Search / Pivot / Time.
@@ -6564,200 +6510,6 @@ function graphApplyDerivedRows(header, rows, derivedColumns=[], outputColumnName
   }
   return {header: useProjection ? outHeader : fullHeader, rows:outRows};
 }
-
-function graphResultTotalRows(mode){
-  if (mode === "join") return Number(state.graphJoinResult?.rows?.length || 0);
-  if (Array.isArray(state.dataQueryMatches)) return Number(state.dataQueryMatches.length || 0);
-  return Number(state.manifest?.totalRows || 0);
-}
-
-async function readGraphResultWindow({mode="data", page=1, pageSize=1000, columns=[], derivedColumns=[], outputColumnNames=null}={}){
-  const safePage=Math.max(1, Number(page || 1));
-  const safePageSize=Math.max(1, Math.min(50000, Number(pageSize || 1000)));
-  const start=Math.max(0,(safePage-1)*safePageSize);
-  const total=graphResultTotalRows(mode);
-  let header=[], rows=[];
-  if (mode === "join"){
-    if (!state.graphJoinResult) throw new Error("Graph JOIN result is not active");
-    header=state.graphJoinResult.header || [];
-    rows=(state.graphJoinResult.rows || []).slice(start, start + safePageSize);
-  } else {
-    if (!state.manifest) throw new Error("Active dataset is not open");
-    const selected=normalizeCols(Array.isArray(columns) && columns.length ? columns : (state.dataQueryMeta?.projection || []));
-    if (Array.isArray(state.dataQueryMatches)){
-      const ids=state.dataQueryMatches.slice(start, start + safePageSize);
-      const table=await readRowsByGlobal(ids, selected);
-      header=table.header; rows=table.rows;
-    } else {
-      const table=await readPage(safePage, safePageSize, selected);
-      header=table.header; rows=table.rows;
-    }
-  }
-  const applied=graphApplyDerivedRows(header, rows, derivedColumns, outputColumnNames);
-  return {...applied, startRow:start, totalMatches:total, page:safePage, pageSize:safePageSize};
-}
-
-async function runGraphResultSearch(msg={}){
-  const mode=String(msg.mode || "data");
-  const colIndex=Number(msg.columnIndex || 0);
-  const op=msg.op || "contains";
-  const value=msg.value ?? "";
-  const cap=normalizePlanLimit(msg.maxMatches || 100000);
-  const chunkRows=Math.max(500, Math.min(20000, Number(msg.chunkRows || 5000)));
-  const total=graphResultTotalRows(mode);
-  const matched=[];
-  let header=[];
-  const t0=now();
-  for (let start=0; start<total; start+=chunkRows){
-    if (state.cancelled) throw new Error("Cancelled");
-    const page=Math.floor(start/chunkRows)+1;
-    const table=await readGraphResultWindow({...msg, mode, page, pageSize:Math.min(chunkRows, total-start)});
-    if (!header.length) header=table.header;
-    const type="string";
-    for (let i=0;i<table.rows.length;i++){
-      const row=table.rows[i] || [];
-      if (compareValue(row[colIndex], op, value, type)){
-        matched.push({rowNumber:start+i+1,row});
-        if (matched.length >= cap) break;
-      }
-    }
-    post("PROGRESS", {value:Math.min(99, Math.floor(((start+table.rows.length)/Math.max(1,total))*100)), text:`Graph Result search... ${fmt(start+table.rows.length)}/${fmt(total)} / matches ${fmt(matched.length)}`});
-    if (matched.length >= cap) break;
-    if (start % (chunkRows*4) === 0) await workerYield();
-  }
-  state.graphResultSearch={header:["Result Row", ...header], rows:matched.map(x=>[x.rowNumber, ...x.row]), totalSourceRows:total, capped:matched.length >= cap, ms:now()-t0};
-  return {matches:matched.length,totalSourceRows:total,capped:matched.length >= cap,header:state.graphResultSearch.header,rows:state.graphResultSearch.rows.slice(0,Math.min(500,Number(msg.pageSize||500))),ms:state.graphResultSearch.ms};
-}
-
-function readGraphResultSearchPage(page=1,pageSize=500){
-  if (!state.graphResultSearch) throw new Error("Graph Result search is not active");
-  const safePage=Math.max(1,Number(page||1));
-  const safeSize=Math.max(1,Number(pageSize||500));
-  const start=(safePage-1)*safeSize;
-  return {header:state.graphResultSearch.header, rows:state.graphResultSearch.rows.slice(start,start+safeSize), page:safePage, pageSize:safeSize, totalMatches:state.graphResultSearch.rows.length, startRow:start, ms:state.graphResultSearch.ms};
-}
-
-async function buildGraphResultPivot(msg={}){
-  const mode=String(msg.mode || "data");
-  const rowFields=(msg.rowFields||[]).map(Number).filter(Number.isFinite);
-  const columnFields=(msg.columnFields||[]).map(Number).filter(Number.isFinite);
-  const valIdx=Number(msg.valueField);
-  const countMode=!Number.isFinite(valIdx) || valIdx < 0;
-  const aggMode=countMode ? "Count" : (msg.aggregation || "Count");
-  const rowLimit=Math.max(1,Number(msg.maxRows||10000));
-  const colLimit=Math.max(1,Number(msg.maxCols||1000));
-  const chunkRows=Math.max(500, Math.min(20000, Number(msg.chunkRows || 5000)));
-  const total=graphResultTotalRows(mode);
-  let header=[];
-  const rowKeys=[], colKeys=[], rowSet=new Set(), colSet=new Set(), cells=new Map(), rowTotals=new Map(), colTotals=new Map();
-  const grand=makeAgg();
-  let limitHit=false, scanned=0;
-  const t0=now();
-  for (let start=0; start<total; start+=chunkRows){
-    if (state.cancelled) throw new Error("Cancelled");
-    const page=Math.floor(start/chunkRows)+1;
-    const table=await readGraphResultWindow({...msg, mode, page, pageSize:Math.min(chunkRows,total-start)});
-    if (!header.length) header=table.header;
-    for (const row of table.rows){
-      scanned++;
-      const rParts=rowFields.length ? rowFields.map(i=>row?.[i]) : ["(All)"];
-      const cParts=columnFields.length ? columnFields.map(i=>row?.[i]) : ["Value"];
-      const rk=keyOf(rParts), ck=keyOf(cParts);
-      if (!rowSet.has(rk)){
-        if (rowKeys.length >= rowLimit){ limitHit=true; continue; }
-        rowSet.add(rk); rowKeys.push(rk);
-      }
-      if (!colSet.has(ck)){
-        if (colKeys.length >= colLimit){ limitHit=true; continue; }
-        colSet.add(ck); colKeys.push(ck);
-      }
-      if (!cells.has(rk)) cells.set(rk,new Map());
-      const rowMap=cells.get(rk);
-      if (!rowMap.has(ck)) rowMap.set(ck,makeAgg());
-      if (!rowTotals.has(rk)) rowTotals.set(rk,makeAgg());
-      if (!colTotals.has(ck)) colTotals.set(ck,makeAgg());
-      const v=countMode ? null : row?.[valIdx];
-      addAgg(rowMap.get(ck),v,countMode); addAgg(rowTotals.get(rk),v,countMode); addAgg(colTotals.get(ck),v,countMode); addAgg(grand,v,countMode);
-    }
-    post("PROGRESS", {value:Math.min(99, Math.floor(((start+table.rows.length)/Math.max(1,total))*100)), text:`Graph Result pivot... ${fmt(start+table.rows.length)}/${fmt(total)} rows / groups ${fmt(rowKeys.length)} x ${fmt(colKeys.length)}`});
-    if (start % (chunkRows*4) === 0) await workerYield();
-  }
-  const rowHeaderNames=rowFields.length ? rowFields.map(i=>header[i] || `Field ${i+1}`) : ["Rows"];
-  const colLabels=colKeys.map(k=>pivotColumnLabel(k, columnFields));
-  const outHeader=[...rowHeaderNames, ...colLabels, "Grand Total"];
-  const outRows=[];
-  for (const rk of rowKeys){
-    const labels=pivotRowLabelParts(rk);
-    while(labels.length < rowHeaderNames.length) labels.push("");
-    const row=[...labels];
-    const rowMap=cells.get(rk) || new Map();
-    for (const ck of colKeys) row.push(aggValue(rowMap.get(ck),aggMode));
-    row.push(aggValue(rowTotals.get(rk),aggMode));
-    outRows.push(row);
-  }
-  const grandRow=["Grand Total"];
-  while(grandRow.length < rowHeaderNames.length) grandRow.push("");
-  for (const ck of colKeys) grandRow.push(aggValue(colTotals.get(ck),aggMode));
-  grandRow.push(aggValue(grand,aggMode));
-  outRows.push(grandRow);
-  state.graphResultPivot={header:outHeader, rows:outRows, scanned, limitHit, ms:now()-t0};
-  return state.graphResultPivot;
-}
-
-async function buildGraphResultTime(msg={}){
-  const mode=String(msg.mode || "data");
-  const timeIdx=Number(msg.timeField);
-  const groupIdx=Number(msg.groupField);
-  const valIdx=Number(msg.valueField);
-  const hasGroup=Number.isFinite(groupIdx) && groupIdx >= 0;
-  const countMode=!Number.isFinite(valIdx) || valIdx < 0;
-  const aggMode=countMode ? "Count" : (msg.aggregation || "Count");
-  const bucket=msg.bucket || "month";
-  const bucketLimit=Math.max(1,Number(msg.maxBuckets||10000));
-  const chunkRows=Math.max(500, Math.min(20000, Number(msg.chunkRows || 5000)));
-  const total=graphResultTotalRows(mode);
-  const states=new Map();
-  let header=[], scanned=0, invalidTime=0, limitHit=false;
-  const t0=now();
-  for (let start=0; start<total; start+=chunkRows){
-    if (state.cancelled) throw new Error("Cancelled");
-    const page=Math.floor(start/chunkRows)+1;
-    const table=await readGraphResultWindow({...msg, mode, page, pageSize:Math.min(chunkRows,total-start)});
-    if (!header.length) header=table.header;
-    for (const row of table.rows){
-      scanned++;
-      const b=parseTimeBucket(row?.[timeIdx], bucket);
-      if (!b){ invalidTime++; continue; }
-      const g=hasGroup ? keyCellValue(row?.[groupIdx]) : "";
-      const key=JSON.stringify([b,g]);
-      if (!states.has(key)){
-        if (states.size >= bucketLimit){ limitHit=true; continue; }
-        states.set(key,makeAgg());
-      }
-      addAgg(states.get(key), countMode ? null : row?.[valIdx], countMode);
-    }
-    post("PROGRESS", {value:Math.min(99, Math.floor(((start+table.rows.length)/Math.max(1,total))*100)), text:`Graph Result time... ${fmt(start+table.rows.length)}/${fmt(total)} rows / buckets ${fmt(states.size)}`});
-    if (start % (chunkRows*4) === 0) await workerYield();
-  }
-  const outHeader=hasGroup ? ["Time", "Group", aggMode] : ["Time", aggMode];
-  const outRows=[...states.entries()].sort((a,b)=>a[0].localeCompare(b[0])).map(([key,agg])=>{
-    let b="", g=""; try{ [b,g]=JSON.parse(key); }catch{ [b,g]=String(key).split("\u001f"); }
-    return hasGroup ? [b,g,aggValue(agg,aggMode)] : [b,aggValue(agg,aggMode)];
-  });
-  state.graphResultTime={header:outHeader, rows:outRows, scanned, invalidTime, limitHit, ms:now()-t0};
-  return state.graphResultTime;
-}
-
-
-/*
- * =========================================================
- * GRAPH RESULT SURFACE LAYER v1
- * =========================================================
- * Graph Query Result is promoted from an ad-hoc table/window into a reusable
- * result surface. Visual / Search / Pivot / Time / Export can consume the same
- * surfaceId and avoid rematerializing raw result windows.
- */
-const GRAPH_RESULT_SURFACE_VERSION = 1;
 
 function ensureGraphResultSurfaceStore(){
   if (!state.graphResultSurfaces || typeof state.graphResultSurfaces !== "object"){
@@ -7677,7 +7429,7 @@ function registerRuntimeCommand(type, command){
  * UI does not receive raw rows. Worker reads columnar tiles, reduces them into a bounded
  * visualization surface, and D3 only paints the compact projection.
  */
-const D3_VIZ_SURFACE_VERSION = 2;
+const D3_VIZ_SURFACE_VERSION = 4;
 const D3_VIZ_MAX_BUCKETS = 2400;
 const D3_VIZ_MAX_TOP_N = 1000;
 const D3_VIZ_MAX_CATEGORY_KEYS = 200000;
@@ -7700,11 +7452,6 @@ function d3VizColumn(index){
 
 function d3VizColumnName(index){
   return d3VizColumn(index)?.name || `Column ${Number(index) + 1}`;
-}
-
-function d3VizNormalizeChartType(value){
-  const type = String(value || "bar").toLowerCase();
-  return ["bar","line","scatter","histogram"].includes(type) ? type : "bar";
 }
 
 function d3VizNormalizeAggregation(value){
@@ -7972,343 +7719,6 @@ async function d3VizResolveGraphDomains({ columns, indices, mode, chunkRows, lab
   return domains;
 }
 
-async function buildD3GraphResultVisualizationSurface(msg){
-  const startedAt = now();
-  const chartType = d3VizNormalizeChartType(msg.chartType);
-  const sourceMode = d3VizNormalizeGraphMode(msg.sourceMode || msg.graphMode);
-  const sourceColumns = d3VizSourceColumnList(msg.sourceColumns);
-  const xIdx = d3VizColumnIndex(msg.xColumnIndex);
-  const yIdx = d3VizColumnIndex(msg.yColumnIndex);
-  const aggregation = d3VizNormalizeAggregation(msg.aggregation);
-  const topN = d3VizSafeInt(msg.topN, 1, D3_VIZ_MAX_TOP_N, 80);
-  const buckets = d3VizSafeInt(msg.buckets, 8, D3_VIZ_MAX_BUCKETS, 240);
-  const categoryLimit = d3VizSafeInt(msg.categoryLimit, topN, D3_VIZ_MAX_CATEGORY_KEYS, 50000);
-  const chunkRows = d3VizSafeInt(msg.chunkRows, 500, 50000, 10000);
-  const countMode = chartType === "scatter" ? false : (aggregation === "Count" || yIdx < 0 || !d3VizGraphColumn(sourceColumns, yIdx));
-  const totalRows = graphResultTotalRows(sourceMode);
-  const xLabel = d3VizGraphColumnName(sourceColumns, xIdx);
-  const yLabel = countMode ? "Count" : `${aggregation}(${d3VizGraphColumnName(sourceColumns, yIdx)})`;
-  const metadata = {
-    version:D3_VIZ_SURFACE_VERSION,
-    strategy:"worker-graph-result-window-reduce",
-    dataSource:"graph",
-    dataSourceLabel:`Graph Query Result / ${sourceMode}`,
-    sourceMode,
-    chartType,
-    aggregation,
-    xColumnIndex:xIdx,
-    xColumnName:xLabel,
-    yColumnIndex:countMode ? -1 : yIdx,
-    yColumnName:countMode ? "Rows" : d3VizGraphColumnName(sourceColumns, yIdx),
-    xLabel,
-    yLabel,
-    totalRows,
-    bucketCount:buckets,
-    topN,
-    categoryLimit,
-    builtAt:new Date().toISOString()
-  };
-
-  if (!d3VizGraphColumn(sourceColumns, xIdx)) throw new Error("Select a valid Graph Result X column.");
-  if (chartType === "scatter" && (countMode || !d3VizGraphColumn(sourceColumns, yIdx))) throw new Error("Scatter requires numeric X and numeric Y columns.");
-  if (!totalRows) throw new Error("Graph Query Result is empty. Run Graph Query first.");
-
-  postProgress(1, `D3 Surface Plan: Graph Result / ${chartType} / ${fmt(totalRows)} rows / ${xLabel}`);
-
-  if (chartType === "bar"){
-    const groups = new Map();
-    const overflow = d3VizAggInit();
-    let overflowed = false;
-    const exec = await d3VizForEachGraphResultRow({
-      mode:sourceMode,
-      chunkRows,
-      label:"D3 graph bar surface",
-      visit:(row) => {
-        const key = d3VizCategory(d3VizGraphValue(row, xIdx));
-        let acc = groups.get(key);
-        if (!acc) {
-          if (groups.size >= categoryLimit) {
-            overflowed = true;
-            d3VizAggAdd(overflow, countMode ? null : d3VizGraphValue(row, yIdx), countMode);
-            return;
-          }
-          acc = d3VizAggInit();
-          groups.set(key, acc);
-        }
-        d3VizAggAdd(acc, countMode ? null : d3VizGraphValue(row, yIdx), countMode);
-      }
-    });
-
-    let rows = [...groups.entries()].map(([key, acc]) => ({
-      key,
-      value:d3VizAggValue(acc, aggregation),
-      count:acc.count,
-      valid:acc.valid
-    }));
-    if (overflowed) rows.push({ key:"(other categories)", value:d3VizAggValue(overflow, aggregation), count:overflow.count, valid:overflow.valid, overflow:true });
-    rows.sort((a,b) => Math.abs(Number(b.value || 0)) - Math.abs(Number(a.value || 0)));
-    rows = rows.slice(0, topN);
-
-    return {
-      surface:{ ...metadata, kind:"bar", rows, reducedRows:rows.length, categoriesTracked:groups.size, overflowed, scanned:exec.scanned, chunks:exec.chunks },
-      ms:now() - startedAt
-    };
-  }
-
-  if (chartType === "histogram"){
-    const domains = await d3VizResolveGraphDomains({ columns:sourceColumns, indices:[xIdx], mode:sourceMode, chunkRows, label:"D3 graph histogram surface" });
-    const domain = domains.get(xIdx);
-    if (!domain) throw new Error("Histogram requires a numeric X column.");
-    const bins = Array.from({ length:buckets }, (_, i) => ({
-      x0:domain.min + (domain.max - domain.min) * (i / buckets),
-      x1:domain.min + (domain.max - domain.min) * ((i + 1) / buckets),
-      count:0
-    }));
-    const exec = await d3VizForEachGraphResultRow({
-      mode:sourceMode,
-      chunkRows,
-      label:"D3 graph histogram surface",
-      visit:(row) => {
-        const n = d3VizParseNumber(d3VizGraphValue(row, xIdx));
-        if (n == null) return;
-        bins[d3VizBucketIndex(n, domain.min, domain.max, buckets)].count++;
-      }
-    });
-
-    return {
-      surface:{ ...metadata, kind:"histogram", bins, domain, reducedRows:bins.length, scanned:exec.scanned, chunks:exec.chunks },
-      ms:now() - startedAt
-    };
-  }
-
-  if (chartType === "line"){
-    const domains = await d3VizResolveGraphDomains({ columns:sourceColumns, indices:[xIdx], mode:sourceMode, chunkRows, label:"D3 graph line surface" });
-    const domain = domains.get(xIdx);
-    if (!domain) throw new Error("Line chart requires a numeric X column.");
-    const bins = Array.from({ length:buckets }, (_, i) => ({
-      x0:domain.min + (domain.max - domain.min) * (i / buckets),
-      x1:domain.min + (domain.max - domain.min) * ((i + 1) / buckets),
-      agg:d3VizAggInit()
-    }));
-    const exec = await d3VizForEachGraphResultRow({
-      mode:sourceMode,
-      chunkRows,
-      label:"D3 graph line surface",
-      visit:(row) => {
-        const x = d3VizParseNumber(d3VizGraphValue(row, xIdx));
-        if (x == null) return;
-        const bin = bins[d3VizBucketIndex(x, domain.min, domain.max, buckets)];
-        d3VizAggAdd(bin.agg, countMode ? null : d3VizGraphValue(row, yIdx), countMode);
-      }
-    });
-    const points = bins
-      .map((bin) => ({ x:(bin.x0 + bin.x1) / 2, y:d3VizAggValue(bin.agg, aggregation), count:bin.agg.count, x0:bin.x0, x1:bin.x1 }))
-      .filter((point) => point.count > 0);
-
-    return {
-      surface:{ ...metadata, kind:"line", points, domain, reducedRows:points.length, scanned:exec.scanned, chunks:exec.chunks },
-      ms:now() - startedAt
-    };
-  }
-
-  const domains = await d3VizResolveGraphDomains({ columns:sourceColumns, indices:[xIdx, yIdx], mode:sourceMode, chunkRows, label:"D3 graph scatter density surface" });
-  const xDomain = domains.get(xIdx);
-  const yDomain = domains.get(yIdx);
-  if (!xDomain || !yDomain) throw new Error("Scatter requires numeric X and numeric Y columns.");
-  const grid = Math.max(4, Math.min(160, Math.ceil(Math.sqrt(buckets))));
-  const cells = new Map();
-  const exec = await d3VizForEachGraphResultRow({
-    mode:sourceMode,
-    chunkRows,
-    label:"D3 graph scatter density surface",
-    visit:(row) => {
-      const x = d3VizParseNumber(d3VizGraphValue(row, xIdx));
-      const y = d3VizParseNumber(d3VizGraphValue(row, yIdx));
-      if (x == null || y == null) return;
-      const xi = d3VizBucketIndex(x, xDomain.min, xDomain.max, grid);
-      const yi = d3VizBucketIndex(y, yDomain.min, yDomain.max, grid);
-      const key = `${xi}\u001f${yi}`;
-      let cell = cells.get(key);
-      if (!cell) {
-        cell = { count:0, xSum:0, ySum:0, xi, yi };
-        cells.set(key, cell);
-      }
-      cell.count++;
-      cell.xSum += x;
-      cell.ySum += y;
-    }
-  });
-
-  const points = [...cells.values()]
-    .map((cell) => ({ x:cell.xSum / cell.count, y:cell.ySum / cell.count, count:cell.count, xi:cell.xi, yi:cell.yi }))
-    .sort((a,b) => b.count - a.count)
-    .slice(0, buckets);
-
-  return {
-    surface:{ ...metadata, kind:"scatter", points, xDomain, yDomain, grid, reducedRows:points.length, scanned:exec.scanned, chunks:exec.chunks },
-    ms:now() - startedAt
-  };
-}
-
-async function buildD3VisualizationSurface(msg){
-  const dataSource = d3VizNormalizeDataSource(msg.dataSource);
-  if (dataSource === "graph") return await buildD3GraphResultVisualizationSurface(msg);
-  if (!state.manifest || !d3VizActiveChunkCount()) throw new Error("Open a Storage dataset before building D3 visualization.");
-  const startedAt = now();
-  const chartType = d3VizNormalizeChartType(msg.chartType);
-  const xIdx = d3VizColumnIndex(msg.xColumnIndex);
-  const yIdx = d3VizColumnIndex(msg.yColumnIndex);
-  const aggregation = d3VizNormalizeAggregation(msg.aggregation);
-  const topN = d3VizSafeInt(msg.topN, 1, D3_VIZ_MAX_TOP_N, 80);
-  const buckets = d3VizSafeInt(msg.buckets, 8, D3_VIZ_MAX_BUCKETS, 240);
-  const categoryLimit = d3VizSafeInt(msg.categoryLimit, topN, D3_VIZ_MAX_CATEGORY_KEYS, 50000);
-  const countMode = chartType === "scatter" ? false : (aggregation === "Count" || yIdx < 0 || !d3VizColumn(yIdx));
-  const yLabel = countMode ? "Count" : `${aggregation}(${d3VizColumnName(yIdx)})`;
-  const xLabel = d3VizColumnName(xIdx);
-  const totalRows = d3VizTotalRows();
-  const metadata = {
-    version:D3_VIZ_SURFACE_VERSION,
-    strategy:"worker-columnar-tile-reduce",
-    dataSource:"active",
-    dataSourceLabel:"Active Dataset",
-    sourceMode:"columnar",
-    chartType,
-    aggregation,
-    xColumnIndex:xIdx,
-    xColumnName:xLabel,
-    yColumnIndex:countMode ? -1 : yIdx,
-    yColumnName:countMode ? "Rows" : d3VizColumnName(yIdx),
-    xLabel,
-    yLabel,
-    totalRows,
-    bucketCount:buckets,
-    topN,
-    categoryLimit,
-    builtAt:new Date().toISOString()
-  };
-
-  if (!d3VizColumn(xIdx)) throw new Error("Select a valid X column.");
-  if ((chartType === "line" || chartType === "scatter") && !countMode && !d3VizColumn(yIdx)) throw new Error("Select a valid Y column.");
-  if (chartType === "scatter" && (countMode || !d3VizColumn(yIdx))) throw new Error("Scatter requires numeric X and numeric Y columns.");
-
-  postProgress(1, `D3 Surface Plan: ${chartType} / ${fmt(totalRows)} rows / ${xLabel}`);
-
-  if (chartType === "bar"){
-    const required = d3VizUniqueColumns([xIdx, ...(countMode ? [] : [yIdx])]);
-    const groups = new Map();
-    const overflow = d3VizAggInit();
-    let overflowed = false;
-    const exec = await d3VizForEachRow(required, "D3 bar surface", (columns, localRow) => {
-      const key = d3VizCategory(valueFromColumn(columns.get(xIdx), localRow));
-      let acc = groups.get(key);
-      if (!acc) {
-        if (groups.size >= categoryLimit) {
-          overflowed = true;
-          d3VizAggAdd(overflow, countMode ? null : valueFromColumn(columns.get(yIdx), localRow), countMode);
-          return;
-        }
-        acc = d3VizAggInit();
-        groups.set(key, acc);
-      }
-      d3VizAggAdd(acc, countMode ? null : valueFromColumn(columns.get(yIdx), localRow), countMode);
-    });
-
-    let rows = [...groups.entries()].map(([key, acc]) => ({
-      key,
-      value:d3VizAggValue(acc, aggregation),
-      count:acc.count,
-      valid:acc.valid
-    }));
-    if (overflowed) rows.push({ key:"(other categories)", value:d3VizAggValue(overflow, aggregation), count:overflow.count, valid:overflow.valid, overflow:true });
-    rows.sort((a,b) => Math.abs(Number(b.value || 0)) - Math.abs(Number(a.value || 0)));
-    rows = rows.slice(0, topN);
-
-    return {
-      surface:{ ...metadata, kind:"bar", rows, reducedRows:rows.length, categoriesTracked:groups.size, overflowed, scanned:exec.scanned, chunks:exec.chunks },
-      ms:now() - startedAt
-    };
-  }
-
-  if (chartType === "histogram"){
-    const domains = await d3VizResolveDomains([xIdx], "D3 histogram surface");
-    const domain = domains.get(xIdx);
-    if (!domain) throw new Error("Histogram requires a numeric X column.");
-    const bins = Array.from({ length:buckets }, (_, i) => ({
-      x0:domain.min + (domain.max - domain.min) * (i / buckets),
-      x1:domain.min + (domain.max - domain.min) * ((i + 1) / buckets),
-      count:0
-    }));
-    const exec = await d3VizForEachRow([xIdx], "D3 histogram surface", (columns, localRow) => {
-      const n = d3VizParseNumber(valueFromColumn(columns.get(xIdx), localRow));
-      if (n == null) return;
-      bins[d3VizBucketIndex(n, domain.min, domain.max, buckets)].count++;
-    });
-
-    return {
-      surface:{ ...metadata, kind:"histogram", bins, domain, reducedRows:bins.length, scanned:exec.scanned, chunks:exec.chunks },
-      ms:now() - startedAt
-    };
-  }
-
-  if (chartType === "line"){
-    const domains = await d3VizResolveDomains([xIdx], "D3 line surface");
-    const domain = domains.get(xIdx);
-    if (!domain) throw new Error("Line chart requires a numeric X column.");
-    const required = d3VizUniqueColumns([xIdx, ...(countMode ? [] : [yIdx])]);
-    const bins = Array.from({ length:buckets }, (_, i) => ({
-      x0:domain.min + (domain.max - domain.min) * (i / buckets),
-      x1:domain.min + (domain.max - domain.min) * ((i + 1) / buckets),
-      agg:d3VizAggInit()
-    }));
-    const exec = await d3VizForEachRow(required, "D3 line surface", (columns, localRow) => {
-      const x = d3VizParseNumber(valueFromColumn(columns.get(xIdx), localRow));
-      if (x == null) return;
-      const bin = bins[d3VizBucketIndex(x, domain.min, domain.max, buckets)];
-      d3VizAggAdd(bin.agg, countMode ? null : valueFromColumn(columns.get(yIdx), localRow), countMode);
-    });
-    const points = bins
-      .map((bin) => ({ x:(bin.x0 + bin.x1) / 2, y:d3VizAggValue(bin.agg, aggregation), count:bin.agg.count, x0:bin.x0, x1:bin.x1 }))
-      .filter((point) => point.count > 0);
-
-    return {
-      surface:{ ...metadata, kind:"line", points, domain, reducedRows:points.length, scanned:exec.scanned, chunks:exec.chunks },
-      ms:now() - startedAt
-    };
-  }
-
-  const domains = await d3VizResolveDomains([xIdx, yIdx], "D3 scatter density surface");
-  const xDomain = domains.get(xIdx);
-  const yDomain = domains.get(yIdx);
-  if (!xDomain || !yDomain) throw new Error("Scatter requires numeric X and numeric Y columns.");
-  const grid = Math.max(4, Math.min(160, Math.ceil(Math.sqrt(buckets))));
-  const cells = new Map();
-  const exec = await d3VizForEachRow(d3VizUniqueColumns([xIdx, yIdx]), "D3 scatter density surface", (columns, localRow) => {
-    const x = d3VizParseNumber(valueFromColumn(columns.get(xIdx), localRow));
-    const y = d3VizParseNumber(valueFromColumn(columns.get(yIdx), localRow));
-    if (x == null || y == null) return;
-    const xi = d3VizBucketIndex(x, xDomain.min, xDomain.max, grid);
-    const yi = d3VizBucketIndex(y, yDomain.min, yDomain.max, grid);
-    const key = `${xi}\u001f${yi}`;
-    let cell = cells.get(key);
-    if (!cell) {
-      cell = { count:0, xSum:0, ySum:0, xi, yi };
-      cells.set(key, cell);
-    }
-    cell.count++;
-    cell.xSum += x;
-    cell.ySum += y;
-  });
-
-  const points = [...cells.values()]
-    .map((cell) => ({ x:cell.xSum / cell.count, y:cell.ySum / cell.count, count:cell.count, xi:cell.xi, yi:cell.yi }))
-    .sort((a,b) => b.count - a.count)
-    .slice(0, buckets);
-
-  return {
-    surface:{ ...metadata, kind:"scatter", points, xDomain, yDomain, grid, reducedRows:points.length, scanned:exec.scanned, chunks:exec.chunks },
-    ms:now() - startedAt
-  };
-}
 
 
 /*
@@ -8741,20 +8151,7 @@ async function d3VizBuildSurfaceFromAdapter(msg, adapter){
   throw new Error(`Unsupported D3 surface: ${chartType}`);
 }
 
-async function buildD3GraphResultVisualizationSurface(msg){
-  const sourceMode = d3VizNormalizeGraphMode(msg.sourceMode || msg.graphMode);
-  const sourceColumns = d3VizSourceColumnList(msg.sourceColumns);
-  const chunkRows = d3VizSafeInt(msg.chunkRows, 500, 50000, 10000);
-  const adapter = d3VizMakeSurfaceAdapterGraph(sourceColumns, sourceMode, chunkRows);
-  return await d3VizBuildSurfaceFromAdapter(msg, adapter);
-}
 
-async function buildD3VisualizationSurface(msg){
-  const dataSource = d3VizNormalizeDataSource(msg.dataSource);
-  if (dataSource === "graph") return await buildD3GraphResultVisualizationSurface(msg);
-  if (!state.manifest || !d3VizActiveChunkCount()) throw new Error("Open a Storage dataset before building D3 visualization.");
-  return await d3VizBuildSurfaceFromAdapter(msg, d3VizMakeSurfaceAdapterActive());
-}
 
 
 
@@ -11428,19 +10825,6 @@ function renderD3WorkerScatter(svg, surface, options) {
   svg.append("text").attr("x", 16).attr("y", 18).attr("font-size", 12).attr("fill", "currentColor").text(surface.yLabel || "Y");
 }
 
-function renderD3WorkerSurface(svgNode, surface) {
-  const svg = d3.select(svgNode);
-  svg.selectAll("*").remove();
-  const width = 1080;
-  const height = 560;
-  const s = surface || D3_VIZ_EMPTY_SURFACE;
-  if (!s.kind || s.kind === "empty") return clearD3Svg(svg, width, height, "Build a visualization surface first");
-  if (s.kind === "bar") return renderD3WorkerBar(svg, s, { width, height });
-  if (s.kind === "histogram") return renderD3WorkerHistogram(svg, s, { width, height });
-  if (s.kind === "line") return renderD3WorkerLine(svg, s, { width, height });
-  if (s.kind === "scatter") return renderD3WorkerScatter(svg, s, { width, height });
-  return clearD3Svg(svg, width, height, "Unsupported D3 surface");
-}
 
 
 
@@ -14342,18 +13726,28 @@ function GraphQueryEditor({ columns, datasets=[], manifest=null, nodes, setNodes
     setNodes((prev) => autoArrangeGraphNodesNoOverlap(prev));
   };
 
+  const showGraphEditorWarning = (message) => {
+    setSqlErrors([String(message || "Graph editor warning")]);
+  };
+
   const downloadFlowImage = async () => {
     try {
-      if (!htmlToImageToPng) { alert("画像出力ライブラリを読み込めませんでした。"); return; }
+      if (!htmlToImageToPng) {
+        showGraphEditorWarning("画像出力ライブラリを読み込めませんでした。");
+        return;
+      }
       const target = flowPanelRef.current?.querySelector?.(".react-flow__viewport") || flowPanelRef.current;
-      if (!target) { alert("フローキャンバスが見つかりません。"); return; }
+      if (!target) {
+        showGraphEditorWarning("フローキャンバスが見つかりません。");
+        return;
+      }
       const dataUrl = await htmlToImageToPng(target, { cacheBust: true, backgroundColor: "#ffffff", pixelRatio: 2 });
       const a = document.createElement("a");
       a.download = `graph_query_flow_${new Date().toISOString().replace(/[:.]/g,"-")}.png`;
       a.href = dataUrl;
       a.click();
     } catch (e) {
-      alert(`画像出力に失敗しました: ${e?.message || e}`);
+      showGraphEditorWarning(`画像出力に失敗しました: ${e?.message || e}`);
     }
   };
 
@@ -18350,7 +17744,7 @@ root.render(
     });
 
     // Babelの変換結果は、この同一HTML内のapp-codeだけを対象にする。
-    // 任意文字列をnew Functionで実行せず、必要な依存をwindowへ固定してからclassic scriptとして起動する。
+    // 任意文字列を動的実行せず、必要な依存をwindowへ固定してからclassic scriptとして起動する。
     Object.assign(window, {
       React,
       createRoot,
