@@ -19,6 +19,7 @@
 
   <!-- Babel Standalone: JSX -> JS -->
   <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/encoding-japanese@2.2.0/encoding.min.js"></script>
 
   <!--
 Quantum CSV Grid / Columnar Runtime Constitution
@@ -3365,7 +3366,8 @@ function validateSyntheticPlan(rawPlan = {}){
     },
     output:{
       mode,
-      datasetName:syntheticSafeDatasetName(rawPlan.output?.datasetName || rawPlan.datasetName || `synthetic_${preset}_${rows}_seed${seed}`)
+      datasetName:syntheticSafeDatasetName(rawPlan.output?.datasetName || rawPlan.datasetName || `synthetic_${preset}_${rows}_seed${seed}`),
+      encoding:normalizeCsvExportEncodingMode(rawPlan.output?.encoding || "utf-8")
     }
   };
   plan.estimatedBytes = syntheticEstimateBytes(plan);
@@ -3669,7 +3671,7 @@ async function syntheticGenerateCsvBlob(rawPlan){
   const rng = createSeededRandom(plan.seed);
   const t0 = now();
   const parts = [];
-  const encoder = new TextEncoder();
+  const outputEncoding = normalizeCsvExportEncodingMode(plan.output?.encoding || "utf-8");
   const recent = [];
   let generated = 0;
   let bytes = 0;
@@ -3686,7 +3688,7 @@ async function syntheticGenerateCsvBlob(rawPlan){
       if (recent.length > 128) recent.shift();
       rows.push(row);
     }
-    const encoded = encoder.encode(syntheticRowsToCsv(header, rows, start === 0));
+    const encoded = encodeCsvTextForDownload(syntheticRowsToCsv(header, rows, start === 0), outputEncoding, { bom:start === 0 });
     parts.push(encoded);
     bytes += encoded.byteLength;
     generated = end;
@@ -3697,12 +3699,13 @@ async function syntheticGenerateCsvBlob(rawPlan){
     await workerYield();
   }
 
-  const blob = new Blob(parts, {type:"text/csv;charset=utf-8"});
+  const blob = new Blob(parts, {type:csvBlobTypeForEncoding(outputEncoding)});
   return {
     outputMode:"download",
     fileName:`${plan.output.datasetName}.csv`,
     blob,
     bytes:blob.size,
+    encoding:outputEncoding,
     rows:plan.rows,
     columns:plan.columns,
     ms:now()-t0,
@@ -3716,7 +3719,7 @@ async function syntheticGenerateCsvBlob(rawPlan){
 }
 
 function graphPlanForTable(basePlan, table, rows){
-  const p = validateSyntheticPlan({...basePlan, preset:"graph", rows, columns:8, output:{mode:"download", datasetName:`${basePlan.output.datasetName}_${table}`}});
+  const p = validateSyntheticPlan({...basePlan, preset:"graph", rows, columns:8, output:{mode:"download", datasetName:`${basePlan.output.datasetName}_${table}`, encoding:basePlan.output?.encoding || "utf-8"}});
   p.graphTable = table;
   return p;
 }
@@ -3751,14 +3754,14 @@ async function syntheticGenerateGraphSet(rawPlan){
     const header = columns.map(c=>c.name);
     const rng = createSeededRandom(basePlan.seed + table.length * 101);
     const parts = [];
-    const encoder = new TextEncoder();
+    const outputEncoding = normalizeCsvExportEncodingMode(basePlan.output?.encoding || "utf-8");
 
     for (let start=0; start<plan.rows; start+=plan.chunkSize){
       if (state.cancelled) throw new Error("Cancelled");
       const end = Math.min(plan.rows, start + plan.chunkSize);
       const rows = [];
       for (let i=start;i<end;i++) rows.push(createSyntheticRow(columns, i, rng, plan));
-      parts.push(encoder.encode(syntheticRowsToCsv(header, rows, start === 0)));
+      parts.push(encodeCsvTextForDownload(syntheticRowsToCsv(header, rows, start === 0), outputEncoding, { bom:start === 0 }));
       doneRows += rows.length;
       const pct = Math.min(99, Math.floor((doneRows / totalRows) * 100));
       const payload = { generatedRows:doneRows, totalRows, percent:pct, elapsedMs:now()-t0, chunkCount:files.length + 1 };
@@ -3767,8 +3770,8 @@ async function syntheticGenerateGraphSet(rawPlan){
       await workerYield();
     }
 
-    const blob = new Blob(parts, {type:"text/csv;charset=utf-8"});
-    files.push({ name:`${basePlan.output.datasetName}_${table}.csv`, blob, bytes:blob.size, rows:plan.rows, columns:columns.length });
+    const blob = new Blob(parts, {type:csvBlobTypeForEncoding(outputEncoding)});
+    files.push({ name:`${basePlan.output.datasetName}_${table}.csv`, blob, bytes:blob.size, encoding:outputEncoding, rows:plan.rows, columns:columns.length });
   }
 
   return {
@@ -6005,6 +6008,59 @@ function csvEscape(v){
   s = s.replaceAll('"', '""');
 
   return /[",\r\n]/.test(s) ? `"${s}"` : s;
+}
+
+
+function normalizeCsvExportEncodingMode(value){
+  const s = String(value || "utf-8").trim().toLowerCase().replace(/_/g, "-");
+  if (["shift-jis", "shift-jis/cp932", "sjis", "cp932", "jis"].includes(s)) return "shift_jis";
+  if (["utf-8-bom", "utf8-bom", "bom"].includes(s)) return "utf-8-bom";
+  return "utf-8";
+}
+
+function csvBlobTypeForEncoding(encoding){
+  return normalizeCsvExportEncodingMode(encoding) === "shift_jis"
+    ? "text/csv;charset=shift_jis"
+    : "text/csv;charset=utf-8";
+}
+
+let workerEncodingJapaneseLoadAttempted = false;
+function getWorkerEncodingJapanese(){
+  if (self.Encoding && typeof self.Encoding.convert === "function") return self.Encoding;
+  if (!workerEncodingJapaneseLoadAttempted && typeof importScripts === "function") {
+    workerEncodingJapaneseLoadAttempted = true;
+    try {
+      importScripts("https://cdn.jsdelivr.net/npm/encoding-japanese@2.2.0/encoding.min.js");
+    } catch {}
+  }
+  return self.Encoding && typeof self.Encoding.convert === "function" ? self.Encoding : null;
+}
+
+function encodeCsvTextForDownload(text, encoding, options = {}){
+  const source = String(text ?? "");
+  const mode = normalizeCsvExportEncodingMode(encoding);
+
+  if (mode === "shift_jis") {
+    const EncodingLib = getWorkerEncodingJapanese();
+    if (EncodingLib) {
+      const unicodeArray = typeof EncodingLib.stringToCode === "function"
+        ? EncodingLib.stringToCode(source)
+        : Array.from(source, (ch) => ch.charCodeAt(0));
+      const sjisArray = EncodingLib.convert(unicodeArray, { to: "SJIS", from: "UNICODE" });
+      return new Uint8Array(sjisArray);
+    }
+    return new TextEncoder().encode(source);
+  }
+
+  if (mode === "utf-8-bom" && options.bom) {
+    const body = new TextEncoder().encode(source);
+    const out = new Uint8Array(body.byteLength + 3);
+    out.set([0xEF, 0xBB, 0xBF], 0);
+    out.set(body, 3);
+    return out;
+  }
+
+  return new TextEncoder().encode(source);
 }
 
 
@@ -9353,8 +9409,88 @@ function withExportTimestamp(filename, date = new Date()) {
   return `${safe}_${stamp}`;
 }
 
-function downloadText(filename, text, type = "text/csv;charset=utf-8") {
-  const blob = new Blob([text], { type });
+const CSV_EXPORT_ENCODING_OPTIONS = [
+  { value:"utf-8", label:"UTF-8" },
+  { value:"utf-8-bom", label:"UTF-8 BOM" },
+  { value:"shift_jis", label:"JIS / Shift_JIS" },
+];
+
+function normalizeCsvExportEncoding(value) {
+  const s = String(value || "utf-8").trim().toLowerCase().replace(/_/g, "-");
+  if (["shift-jis", "shift-jis/cp932", "sjis", "cp932", "jis"].includes(s)) return "shift_jis";
+  if (["utf-8-bom", "utf8-bom", "bom"].includes(s)) return "utf-8-bom";
+  return "utf-8";
+}
+
+function csvExportEncodingLabel(value) {
+  const normalized = normalizeCsvExportEncoding(value);
+  return CSV_EXPORT_ENCODING_OPTIONS.find((option) => option.value === normalized)?.label || "UTF-8";
+}
+
+function setCsvExportEncodingPreference(value) {
+  window.__quantumCsvGridCsvExportEncoding = normalizeCsvExportEncoding(value);
+}
+
+function getCsvExportEncodingPreference() {
+  return normalizeCsvExportEncoding(window.__quantumCsvGridCsvExportEncoding || "utf-8");
+}
+
+function getEncodingJapaneseRuntime() {
+  const runtime = window.Encoding || window.EncodingJapanese || null;
+  return runtime && typeof runtime.convert === "function" ? runtime : null;
+}
+
+function encodeCsvDownloadParts(text, encoding) {
+  const source = String(text ?? "");
+  const mode = normalizeCsvExportEncoding(encoding);
+
+  if (mode === "shift_jis") {
+    const EncodingLib = getEncodingJapaneseRuntime();
+    if (EncodingLib) {
+      const unicodeArray = typeof EncodingLib.stringToCode === "function"
+        ? EncodingLib.stringToCode(source)
+        : Array.from(source, (ch) => ch.charCodeAt(0));
+      const sjisArray = EncodingLib.convert(unicodeArray, { to: "SJIS", from: "UNICODE" });
+      return {
+        parts: [new Uint8Array(sjisArray)],
+        type: "text/csv;charset=shift_jis",
+        actualEncoding: "shift_jis",
+        fallback: false,
+      };
+    }
+
+    return {
+      parts: [source],
+      type: "text/csv;charset=utf-8",
+      actualEncoding: "utf-8",
+      fallback: true,
+    };
+  }
+
+  if (mode === "utf-8-bom") {
+    return {
+      parts: [new Uint8Array([0xEF, 0xBB, 0xBF]), source],
+      type: "text/csv;charset=utf-8",
+      actualEncoding: "utf-8-bom",
+      fallback: false,
+    };
+  }
+
+  return {
+    parts: [source],
+    type: "text/csv;charset=utf-8",
+    actualEncoding: "utf-8",
+    fallback: false,
+  };
+}
+
+function downloadText(filename, text, options = {}) {
+  const requestedEncoding = typeof options === "string"
+    ? options
+    : options?.encoding || getCsvExportEncodingPreference();
+
+  const encoded = encodeCsvDownloadParts(text, requestedEncoding);
+  const blob = new Blob(encoded.parts, { type: encoded.type });
   const url = URL.createObjectURL(blob);
   const a = document.createElement("a");
   a.href = url;
@@ -11382,7 +11518,7 @@ function ProjectionDataTable({ table }) {
 }
 
 
-function D3VisualizationPanel({ manifest, columns, graphColumns = [], graphResultCount = 0, graphResultMode = "data", result, status, time, onRun, onClear }) {
+function D3VisualizationPanel({ manifest, columns, graphColumns = [], graphResultCount = 0, graphResultMode = "data", result, status, time, csvExportEncoding = "utf-8", onRun, onClear }) {
   const svgRef = useRef(null);
   const activeColumnOptions = useMemo(() => d3VizColumnOptions(columns), [columns]);
   const graphColumnOptions = useMemo(() => d3VizColumnOptions(graphColumns), [graphColumns]);
@@ -11485,14 +11621,14 @@ function D3VisualizationPanel({ manifest, columns, graphColumns = [], graphResul
       if (!navigator?.clipboard?.writeText) throw new Error("Clipboard is not available");
       await navigator.clipboard.writeText(csv);
     } catch {
-      downloadText(`d3_projection_${result?.kind || "surface"}.csv`, csv);
+      downloadText(`d3_projection_${result?.kind || "surface"}.csv`, csv, { encoding:csvExportEncoding });
     }
   }
 
   function exportProjectionTableCsv() {
     const csv = projectionTable.csv || d3ProjectionTableToCsv(projectionTable);
     if (!csv) return;
-    downloadText(`d3_projection_${result?.kind || "surface"}.csv`, csv);
+    downloadText(`d3_projection_${result?.kind || "surface"}.csv`, csv, { encoding:csvExportEncoding });
   }
 
   function runSurfacePlan() {
@@ -14938,6 +15074,7 @@ function SyntheticDatasetPanel({ busy, previewTable, reportRows, progress, statu
                   <Chip label={file.name} />
                   <Chip label={`${fmt(file.rows || 0)} rows`} />
                   <Chip label={humanBytes(file.bytes || 0)} />
+                  {file.encoding ? <Chip label={`CSV: ${csvExportEncodingLabel(file.encoding)}`} /> : null}
                   <Button size="small" startIcon={<Download />} onClick={() => onDownloadFile?.(file)}>Download</Button>
                 </Stack>
               ))}
@@ -14975,6 +15112,7 @@ function App() {
   const [activeFileIndex, setActiveFileIndex] = useState(0);
   const file = files[activeFileIndex] || null;
   const [encoding, setEncoding] = useState(initialSettings.encoding || "utf-8");
+  const [csvExportEncoding, setCsvExportEncoding] = useState(normalizeCsvExportEncoding(initialSettings.csvExportEncoding || "utf-8"));
   const [delimiter, setDelimiter] = useState(initialSettings.delimiter || ",");
   const [chunkSize, setChunkSize] = useState(initialSettings.chunkSize || "100000");
   const [sampleRows, setSampleRows] = useState(initialSettings.sampleRows || "20000");
@@ -15166,6 +15304,7 @@ function App() {
     if (String(graphResultPageSize) !== String(normalized)) setGraphResultPageSize(String(normalized));
   }, [graphResultPageSize]);
   useEffect(() => { visibleColsRef.current = visibleCols; }, [visibleCols]);
+  useEffect(() => { setCsvExportEncodingPreference(csvExportEncoding); }, [csvExportEncoding]);
   useEffect(() => { manifestRef.current = manifest; }, [manifest]);
   useEffect(() => { searchPageRef.current = searchPage; }, [searchPage]);
   useEffect(() => { pageRef.current = page; }, [page]);
@@ -15179,6 +15318,7 @@ function App() {
       tableDensity,
       previewRows,
       encoding,
+      csvExportEncoding,
       delimiter,
       chunkSize,
       sampleRows,
@@ -15198,7 +15338,7 @@ function App() {
       tab,
       rules,
     });
-  }, [themeMode, tableDensity, previewRows, encoding, delimiter, chunkSize, sampleRows, pageSize, graphResultPageSize, storageWorkspace, storageCollection, memoryMaxMB, memoryMaxRows, externalProvider, externalEndpoint, externalPrefix, externalAuthMode, s3Region, s3Bucket, mainPanel, tab, rules]);
+  }, [themeMode, tableDensity, previewRows, encoding, csvExportEncoding, delimiter, chunkSize, sampleRows, pageSize, graphResultPageSize, storageWorkspace, storageCollection, memoryMaxMB, memoryMaxRows, externalProvider, externalEndpoint, externalPrefix, externalAuthMode, s3Region, s3Bucket, mainPanel, tab, rules]);
 
   function appendLog(text) {
     const line = `[${new Date().toLocaleTimeString()}] ${text}`;
@@ -15525,7 +15665,10 @@ function App() {
     setBusyLabel("Synthetic generation");
     setProgress(1);
     setProgressText("Synthetic dataset generation...");
-    postWorkerCommand({ type: "GENERATE_SYNTHETIC_DATASET", plan });
+    postWorkerCommand({
+      type: "GENERATE_SYNTHETIC_DATASET",
+      plan: { ...plan, output: { ...(plan?.output || {}), encoding:csvExportEncoding } },
+    });
   }
 
   function cancelSyntheticGeneration() {
@@ -17421,9 +17564,12 @@ function App() {
                     />
                     </Box>
                     <Stack direction="row" useFlexGap flexWrap="wrap" spacing={0.6} alignItems="center" sx={{ mt: 0.75 }}>
-                      <TextField select label="Encoding" size="small" value={encoding} onChange={(e) => setEncoding(e.target.value)} sx={{ width: 145 }}>
+                      <TextField select label="Read Encoding" size="small" value={encoding} onChange={(e) => setEncoding(e.target.value)} sx={{ width: 145 }}>
                         <MenuItem value="utf-8">UTF-8</MenuItem>
                         <MenuItem value="shift_jis">Shift-JIS / CP932</MenuItem>
+                      </TextField>
+                      <TextField select label="CSV Export" size="small" value={csvExportEncoding} onChange={(e) => setCsvExportEncoding(normalizeCsvExportEncoding(e.target.value))} sx={{ width: 165 }}>
+                        {CSV_EXPORT_ENCODING_OPTIONS.map((option) => <MenuItem key={option.value} value={option.value}>{option.label}</MenuItem>)}
                       </TextField>
                       <TextField label="Delimiter" size="small" value={delimiter} onChange={(e) => setDelimiter(e.target.value.slice(0, 1) || ",")} sx={{ width: 72 }} />
                       <SmallNumberField label="Chunk rows" value={chunkSize} onChange={setChunkSize} min="1000" step="1000" />
@@ -17672,6 +17818,7 @@ function App() {
               result={d3VizResult}
               status={d3VizStatus}
               time={d3VizTime}
+              csvExportEncoding={csvExportEncoding}
               onRun={runD3Visualization}
               onClear={() => {
                 setD3VizResult(null);
@@ -18003,9 +18150,12 @@ function App() {
               </Section>
               <Section title="CSV / Performance Defaults" icon={<Storage />} hint="大容量CSVではChunk rowsを小さめにするとメモリ負荷を抑えられます。">
                 <Stack direction="row" spacing={0.75} useFlexGap flexWrap="wrap">
-                  <TextField select label="Default Encoding" size="small" value={encoding} onChange={(e) => setEncoding(e.target.value)} sx={{ width: 170 }}>
+                  <TextField select label="Default Read Encoding" size="small" value={encoding} onChange={(e) => setEncoding(e.target.value)} sx={{ width: 190 }}>
                     <MenuItem value="utf-8">UTF-8</MenuItem>
                     <MenuItem value="shift_jis">Shift-JIS / CP932</MenuItem>
+                  </TextField>
+                  <TextField select label="Default CSV Export" size="small" value={csvExportEncoding} onChange={(e) => setCsvExportEncoding(normalizeCsvExportEncoding(e.target.value))} sx={{ width: 190 }}>
+                    {CSV_EXPORT_ENCODING_OPTIONS.map((option) => <MenuItem key={option.value} value={option.value}>{option.label}</MenuItem>)}
                   </TextField>
                   <TextField label="Delimiter" size="small" value={delimiter} onChange={(e) => setDelimiter(e.target.value.slice(0, 1) || ",")} sx={{ width: 92 }} />
                   <SmallNumberField label="Chunk rows" value={chunkSize} onChange={setChunkSize} min="1000" step="1000" />
@@ -18014,7 +18164,7 @@ function App() {
                   <SmallNumberField label="Memory max rows" value={memoryMaxRows} onChange={setMemoryMaxRows} min="0" step="10000" />
                 </Stack>
                 <Alert severity="info" sx={{ mt: 1 }}>
-                  Storage上のTableはIn-memory化しなくても扱えます。標準はStorage-backed lazy readです。In-memoryは必要なTableだけを明示的にメモリへ載せる高速化オプションで、上限MB/行数で制御します。
+                  Storage上のTableはIn-memory化しなくても扱えます。標準はStorage-backed lazy readです。In-memoryは必要なTableだけを明示的にメモリへ載せる高速化オプションで、上限MB/行数で制御します。CSV出力は {csvExportEncodingLabel(csvExportEncoding)} で保存します。
                 </Alert>
               </Section>
               <Section title="Memory Policy" icon={<Article />} hint="要件として固定する運用ルールです。">
