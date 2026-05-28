@@ -10200,7 +10200,8 @@ function v8InsightCacheKey(input){
     Number(input?.sampleRows || 0),
     Number(input?.maxColumns || 0),
     Number(input?.topN || 0),
-    String(input?.mode || "auto")
+    String(input?.mode || "auto"),
+    semanticOverrideHashForWorker(input?.semanticOverrides)
   ].join("|");
   return hashText32(`v8|${manifestKey}|${cfg}`);
 }
@@ -10271,6 +10272,61 @@ function v8SemanticValueHint(samples, columnType){
   if (columnType === "number" || numericLike / n >= 0.85) return "measure";
   if (idLike / n >= 0.75) return "id";
   return "category";
+}
+
+
+const SEMANTIC_OVERRIDE_WORKER_VALUES = new Set(["id","entity","category","status","dimension","measure","date","email","url","text","boolean","ignore"]);
+
+function normalizeSemanticOverrideValueForWorker(value){
+  const v = String(value || "").trim().toLowerCase();
+  if (!v || v === "auto") return "";
+  return SEMANTIC_OVERRIDE_WORKER_VALUES.has(v) ? v : "";
+}
+
+function normalizeSemanticOverridesForWorker(input){
+  const out = {};
+  const source = input && typeof input === "object" && !Array.isArray(input) ? input : {};
+  for (const [rawKey, rawValue] of Object.entries(source)) {
+    const value = normalizeSemanticOverrideValueForWorker(rawValue);
+    if (value) out[String(rawKey)] = value;
+  }
+  return out;
+}
+
+function semanticOverrideHashForWorker(input){
+  const normalized = normalizeSemanticOverridesForWorker(input);
+  return Object.entries(normalized)
+    .sort((a,b)=>String(a[0]).localeCompare(String(b[0])))
+    .map(([k,v])=>`${k}:${v}`)
+    .join("|");
+}
+
+function semanticOverrideForProfile(profile, overrides){
+  if (!profile) return "";
+  const byIndex = overrides?.[String(profile.index)];
+  const byName = overrides?.[`name:${profile.name}`];
+  return normalizeSemanticOverrideValueForWorker(byIndex || byName);
+}
+
+function applySemanticOverridesToProfiles(profiles, inputOverrides){
+  const overrides = normalizeSemanticOverridesForWorker(inputOverrides);
+  const count = Object.keys(overrides).length;
+  const columns = (profiles || []).map((profile) => {
+    const autoSemantic = profile.autoSemanticType || profile.autoSemantic || profile.semanticType || "text";
+    const overrideSemantic = semanticOverrideForProfile(profile, overrides);
+    const effectiveSemantic = overrideSemantic || autoSemantic;
+    return {
+      ...profile,
+      autoSemantic,
+      autoSemanticType: autoSemantic,
+      overrideSemantic,
+      overrideSemanticType: overrideSemantic,
+      effectiveSemantic,
+      effectiveSemanticType: effectiveSemantic,
+      semanticType: effectiveSemantic,
+    };
+  });
+  return { columns, count };
 }
 
 function v8ColumnQuality(profile){
@@ -10399,18 +10455,24 @@ async function v8SampleProfiles(input){
     }
   }
 
-  const finalized = profiles.map((p)=>{
+  const finalizedRaw = profiles.map((p)=>{
     const nonNull = Math.max(0, Number(p.sampled || 0) - Number(p.nulls || 0));
     const avg = p.numeric.count ? p.numeric.sum / p.numeric.count : null;
     const variance = p.numeric.count ? Math.max(0, (p.numeric.sumSq / p.numeric.count) - (avg * avg)) : null;
-    const semanticType = p.nameHint || v8SemanticValueHint(p.examples.concat([...p.topCounts.keys()].slice(0, 50)), p.declaredType);
+    const autoSemantic = p.nameHint || v8SemanticValueHint(p.examples.concat([...p.topCounts.keys()].slice(0, 50)), p.declaredType);
     const top = v8TopEntries(p.topCounts, topN);
     const topShare = top[0] && nonNull ? top[0].count / nonNull : 0;
     return {
       index:p.index,
       name:p.name,
       declaredType:p.declaredType,
-      semanticType,
+      autoSemantic,
+      autoSemanticType:autoSemantic,
+      semanticType:autoSemantic,
+      effectiveSemantic:autoSemantic,
+      effectiveSemanticType:autoSemantic,
+      overrideSemantic:"",
+      overrideSemanticType:"",
       sampleRows:p.sampled,
       nonNull,
       nulls:p.nulls,
@@ -10429,6 +10491,8 @@ async function v8SampleProfiles(input){
       }
     };
   });
+  const semanticResult = applySemanticOverridesToProfiles(finalizedRaw, input?.semanticOverrides);
+  const finalized = semanticResult.columns;
 
   return {
     columns:finalized,
@@ -10439,6 +10503,8 @@ async function v8SampleProfiles(input){
       totalRows,
       totalColumns:state.manifest.columns.length,
       analyzedColumns:finalized.length,
+      semanticOverrideCount:semanticResult.count,
+      semanticOverrideHash:semanticOverrideHashForWorker(input?.semanticOverrides),
       sampleRatio:totalRows ? sampledRows / totalRows : 0,
     }
   };
@@ -10682,7 +10748,7 @@ function v8SelectMethodColumns(sample, input){
     .slice(0, 4);
   const ids = cols.filter((c)=>c.semanticType === "id").slice(0, 5);
   const text = cols
-    .filter((c)=>!["measure","date"].includes(c.semanticType))
+    .filter((c)=>!["measure","date","ignore"].includes(c.semanticType))
     .slice(0, 12);
 
   const selected = new Map();
@@ -11365,6 +11431,7 @@ registerRuntimeCommand("RUN_AUTONOMOUS_INSIGHTS", {
       topN:Number(msg.topN || 8),
       mode:String(msg.mode || "auto"),
       force:Boolean(msg.force),
+      semanticOverrides:normalizeSemanticOverridesForWorker(msg.semanticOverrides),
     };
   },
   plan(input){
@@ -11415,7 +11482,8 @@ function v9ResearchCacheKey(input){
     Number(input?.sampleRows || 0),
     Number(input?.maxColumns || 0),
     Number(input?.topN || 0),
-    String(input?.mode || "research")
+    String(input?.mode || "research"),
+    semanticOverrideHashForWorker(input?.semanticOverrides)
   ].join("|");
   return hashText32(`v9|${manifestKey}|${cfg}`);
 }
@@ -11747,6 +11815,7 @@ async function runAutonomousResearchKernelV9(input){
     maxColumns:Number(input?.maxColumns || 120),
     topN:Number(input?.topN || 10),
     mode:"research",
+    semanticOverrides:normalizeSemanticOverridesForWorker(input?.semanticOverrides),
   });
 
   post("AUTONOMOUS_RESEARCH_PROGRESS", {
@@ -11799,6 +11868,7 @@ registerRuntimeCommand("RUN_AUTONOMOUS_RESEARCH", {
       topN:Number(msg.topN || 12),
       mode:String(msg.mode || "research"),
       force:Boolean(msg.force),
+      semanticOverrides:normalizeSemanticOverridesForWorker(msg.semanticOverrides),
     };
   },
   plan(input){
@@ -11851,7 +11921,8 @@ function v10AgentCacheKey(input){
     String(input?.goal || "").trim().toLowerCase(),
     Number(input?.sampleRows || 0),
     Number(input?.maxColumns || 0),
-    Number(input?.topN || 0)
+    Number(input?.topN || 0),
+    semanticOverrideHashForWorker(input?.semanticOverrides)
   ].join("|");
   return hashText32(`v10|${manifestKey}|${cfg}`);
 }
@@ -12049,6 +12120,7 @@ async function runCollaborativeAgentKernelV10(input){
     topN:Number(input?.topN || 12),
     mode:"agent",
     force:Boolean(input?.force),
+    semanticOverrides:normalizeSemanticOverridesForWorker(input?.semanticOverrides),
   });
 
   post("AGENT_PLAN_PROGRESS", {
@@ -12103,6 +12175,7 @@ registerRuntimeCommand("RUN_COLLABORATIVE_AGENT", {
       maxColumns:Number(msg.maxColumns || 128),
       topN:Number(msg.topN || 12),
       force:Boolean(msg.force),
+      semanticOverrides:normalizeSemanticOverridesForWorker(msg.semanticOverrides),
     };
   },
   plan(input){
@@ -12149,7 +12222,8 @@ function v11KnowledgeGraphCacheKey(input){
     Number(input?.sampleRows || 0),
     Number(input?.maxColumns || 0),
     Number(input?.topN || 0),
-    String(input?.mode || "knowledge")
+    String(input?.mode || "knowledge"),
+    semanticOverrideHashForWorker(input?.semanticOverrides)
   ].join("|");
   return hashText32(`v11|${manifestKey}|${cfg}`);
 }
@@ -12347,6 +12421,7 @@ async function runKnowledgeGraphKernelV11(input){
     maxColumns:Number(input?.maxColumns || 160),
     topN:Number(input?.topN || 16),
     mode:"knowledge",
+    semanticOverrides:normalizeSemanticOverridesForWorker(input?.semanticOverrides),
   });
 
   post("KNOWLEDGE_GRAPH_PROGRESS", {
@@ -12385,6 +12460,7 @@ registerRuntimeCommand("RUN_KNOWLEDGE_GRAPH", {
       topN:Number(msg.topN || 16),
       mode:String(msg.mode || "knowledge"),
       force:Boolean(msg.force),
+      semanticOverrides:normalizeSemanticOverridesForWorker(msg.semanticOverrides),
     };
   },
   plan(input){
@@ -15989,6 +16065,127 @@ function loadSettings() {
 function saveSettings(settings) {
   writeJsonStorageSafe(SETTINGS_KEY, settings && typeof settings === "object" ? settings : {});
 }
+
+const SEMANTIC_OVERRIDE_STORAGE_KEY = "quantumCsvGrid.semanticOverrides.v1";
+const SEMANTIC_OVERRIDE_OPTIONS = [
+  { value: "auto", label: "Auto" },
+  { value: "id", label: "ID" },
+  { value: "entity", label: "Entity" },
+  { value: "category", label: "Category" },
+  { value: "status", label: "Status" },
+  { value: "dimension", label: "Dimension" },
+  { value: "measure", label: "Measure" },
+  { value: "date", label: "Date / Time" },
+  { value: "email", label: "Email" },
+  { value: "url", label: "URL" },
+  { value: "text", label: "Text" },
+  { value: "boolean", label: "Boolean" },
+  { value: "ignore", label: "Ignore" },
+];
+const SEMANTIC_OVERRIDE_VALUES = new Set(SEMANTIC_OVERRIDE_OPTIONS.map((x) => x.value));
+
+function normalizeSemanticOverrideValue(value) {
+  const v = String(value || "auto").trim().toLowerCase();
+  if (!v || v === "auto") return "";
+  return SEMANTIC_OVERRIDE_VALUES.has(v) ? v : "";
+}
+
+function inferAutoSemanticFromColumn(column) {
+  const name = String(column?.name || "").toLowerCase();
+  const type = String(column?.type || column?.declaredType || "").toLowerCase();
+  if (/(mail|email|e-mail)/.test(name)) return "email";
+  if (/(url|uri|link|href|website|site)/.test(name)) return "url";
+  if (/(date|time|timestamp|created|updated|year|month|day|日時|日付)/.test(name)) return "date";
+  if (/(amount|price|cost|sales|revenue|total|sum|qty|quantity|score|rate|ratio|金額|売上|価格|数量|点数)/.test(name)) return "measure";
+  if (/(status|state|stage|type|category|class|segment|group|region|country|city|状態|区分|カテゴリ|分類)/.test(name)) return "category";
+  if (/(^id$|_id$|id$|uuid|guid|key|code|no|number|番号|コード)$/i.test(name)) return "id";
+  if (type === "number" || type === "numeric" || type === "integer" || type === "float") return "measure";
+  if (type === "boolean" || type === "bool") return "boolean";
+  if (type === "date" || type === "datetime") return "date";
+  return "text";
+}
+
+function semanticOverrideHashText32(text) {
+  let h = 2166136261;
+  const s = String(text || "");
+  for (let i = 0; i < s.length; i++) {
+    h ^= s.charCodeAt(i);
+    h = Math.imul(h, 16777619);
+  }
+  return (h >>> 0).toString(36);
+}
+
+function semanticOverrideDatasetKey(manifest, schema) {
+  const source = manifest || schema || {};
+  const columns = source?.columns || [];
+  const id = manifest?.id || schema?.fileKey || schema?.name || "active-schema";
+  const signature = columns.map((c) => `${c.index}:${c.name}:${c.type || ""}`).join("|");
+  return semanticOverrideHashText32(`${id}|${manifest?.totalRows || schema?.sampleRows || 0}|${signature}`);
+}
+
+function loadAllSemanticOverrides() {
+  return readJsonStorageSafe(
+    SEMANTIC_OVERRIDE_STORAGE_KEY,
+    {},
+    (v) => v && typeof v === "object" && !Array.isArray(v),
+    { maxBytes: 500000 }
+  );
+}
+
+function loadSemanticOverridesForDataset(manifest, schema) {
+  const all = loadAllSemanticOverrides();
+  const key = semanticOverrideDatasetKey(manifest, schema);
+  const map = all?.[key];
+  return map && typeof map === "object" && !Array.isArray(map) ? map : {};
+}
+
+function saveSemanticOverridesForDataset(manifest, schema, overrides) {
+  const key = semanticOverrideDatasetKey(manifest, schema);
+  const all = loadAllSemanticOverrides();
+  const compact = {};
+  for (const [rawKey, rawValue] of Object.entries(overrides || {})) {
+    const value = normalizeSemanticOverrideValue(rawValue);
+    if (value) compact[String(rawKey)] = value;
+  }
+  if (Object.keys(compact).length) all[key] = compact;
+  else delete all[key];
+  return writeJsonStorageSafe(SEMANTIC_OVERRIDE_STORAGE_KEY, all);
+}
+
+function compactSemanticOverrides(overrides) {
+  const out = {};
+  for (const [rawKey, rawValue] of Object.entries(overrides || {})) {
+    const value = normalizeSemanticOverrideValue(rawValue);
+    if (value) out[String(rawKey)] = value;
+  }
+  return out;
+}
+
+function semanticOverrideForColumn(column, overrides) {
+  if (!column) return "";
+  const byIndex = overrides?.[String(column.index)];
+  const byName = overrides?.[`name:${column.name}`];
+  return normalizeSemanticOverrideValue(byIndex || byName);
+}
+
+function applySemanticOverridesToColumns(columns, overrides) {
+  return (columns || []).map((column) => {
+    const autoSemantic = column.autoSemanticType || column.autoSemantic || column.semanticType || inferAutoSemanticFromColumn(column);
+    const overrideSemantic = semanticOverrideForColumn(column, overrides);
+    const effectiveSemantic = overrideSemantic || autoSemantic || "text";
+    return {
+      ...column,
+      autoSemantic,
+      autoSemanticType: autoSemantic,
+      overrideSemantic,
+      overrideSemanticType: overrideSemantic,
+      effectiveSemantic,
+      effectiveSemanticType: effectiveSemantic,
+      semanticType: effectiveSemantic,
+    };
+  });
+}
+
 
 
 const GRAPH_QUERY_SESSIONS_KEY = "quantumCsvGrid.graphQuery.sessions.v1";
@@ -20275,8 +20472,12 @@ function App() {
   const [externalDatasets, setExternalDatasets] = useState([]);
   const [externalSelectedDataset, setExternalSelectedDataset] = useState("");
   const [externalStatus, setExternalStatus] = useState("未接続。APIキーは保存されず、このページのメモリ上だけで使います。");
+  const [semanticOverrides, setSemanticOverrides] = useState({});
 
-  const columns = useMemo(() => manifest?.columns || schema?.columns || [], [manifest, schema]);
+  const rawColumns = useMemo(() => manifest?.columns || schema?.columns || [], [manifest, schema]);
+  const rawColumnSignature = useMemo(() => rawColumns.map((c) => `${c.index}:${c.name}:${c.type || ""}`).join("|"), [rawColumns]);
+  const columns = useMemo(() => applySemanticOverridesToColumns(rawColumns, semanticOverrides), [rawColumns, semanticOverrides]);
+  const semanticOverrideCount = useMemo(() => Object.keys(compactSemanticOverrides(semanticOverrides)).length, [semanticOverrides]);
   const normalPageMax = manifest?.totalRows ? Math.ceil(manifest.totalRows / Number(pageSize || 500)) : 0;
   const dataQueryPageMax = dataQueryActive && dataQueryCount ? Math.ceil(dataQueryCount / Number(pageSize || 500)) : 0;
   const pageMax = dataQueryActive ? dataQueryPageMax : normalPageMax;
@@ -20291,6 +20492,9 @@ function App() {
   useEffect(() => { visibleColsRef.current = visibleCols; }, [visibleCols]);
   useEffect(() => { setCsvExportEncodingPreference(csvExportEncoding); }, [csvExportEncoding]);
   useEffect(() => { manifestRef.current = manifest; }, [manifest]);
+  useEffect(() => {
+    setSemanticOverrides(loadSemanticOverridesForDataset(manifest, schema));
+  }, [manifest?.id, schema?.fileKey, rawColumnSignature]);
   useEffect(() => {
     setAutonomousInsights(null);
     setAutonomousInsightsStatus(manifest
@@ -20533,6 +20737,40 @@ function App() {
     setValueField("-1");
     setRowFields([]);
     setColumnFields([]);
+  }
+
+  function invalidateSemanticDependentSurfaces(reason = "Semantic Overrideを更新しました。") {
+    setAutonomousInsights(null);
+    setAutonomousResearch(null);
+    setAgentResult(null);
+    setKnowledgeGraph(null);
+    setD3VizAppliedPlan(null);
+    setAutonomousInsightsStatus(`${reason} Run v8 Insightsで再分析してください。`);
+    setAutonomousResearchStatus(`${reason} Run v9 Researchで再検証してください。`);
+    setAgentStatus(`${reason} Run v10 Agentで再計画してください。`);
+    setKnowledgeGraphStatus(`${reason} Run v11 Knowledge Graphで再構築してください。`);
+  }
+
+  function setColumnSemanticOverride(column, value) {
+    const normalized = normalizeSemanticOverrideValue(value);
+    const key = String(column?.index ?? "");
+    if (!key) return;
+    setSemanticOverrides((prev) => {
+      const next = { ...(prev || {}) };
+      if (normalized) next[key] = normalized;
+      else delete next[key];
+      saveSemanticOverridesForDataset(manifestRef.current, schema, next);
+      return next;
+    });
+    invalidateSemanticDependentSurfaces(`Semantic Overrideを更新しました: ${column?.name || key}`);
+    setStatus(`Semantic Override: ${column?.name || key} → ${normalized || "Auto"}`);
+  }
+
+  function resetSemanticOverrides() {
+    setSemanticOverrides({});
+    saveSemanticOverridesForDataset(manifestRef.current, schema, {});
+    invalidateSemanticDependentSurfaces("Semantic Overrideを全解除しました。");
+    setStatus("Semantic OverrideをすべてAutoへ戻しました。");
   }
 
   function selectedColumnsForPost(m = manifestRef.current, visible = visibleColsRef.current) {
@@ -21671,6 +21909,7 @@ function App() {
       topN:8,
       mode:"auto",
       force,
+      semanticOverrides:compactSemanticOverrides(semanticOverrides),
     });
   }
 
@@ -21688,6 +21927,7 @@ function App() {
       topN:12,
       mode:"research",
       force,
+      semanticOverrides:compactSemanticOverrides(semanticOverrides),
     });
   }
 
@@ -21706,6 +21946,7 @@ function App() {
       maxColumns:140,
       topN:12,
       force,
+      semanticOverrides:compactSemanticOverrides(semanticOverrides),
     });
   }
 
@@ -21723,6 +21964,7 @@ function App() {
       topN:18,
       mode:"knowledge",
       force,
+      semanticOverrides:compactSemanticOverrides(semanticOverrides),
     });
   }
 
@@ -22600,17 +22842,21 @@ function App() {
   ] : [];
 
   const schemaTable = columns.length ? {
-    header: ["#", "Column", "Type", "Numeric ratio", "Sample non-null", "Sample nulls", "Examples"],
+    header: ["#", "Column", "Type", "Auto Semantic", "Override", "Effective", "Numeric ratio", "Sample non-null", "Sample nulls", "Examples"],
     rows: columns.map((c) => [
       c.index + 1,
       c.name,
       c.type,
+      c.autoSemantic || c.autoSemanticType || inferAutoSemanticFromColumn(c),
+      c.overrideSemantic || "Auto",
+      c.effectiveSemantic || c.semanticType || inferAutoSemanticFromColumn(c),
       c.numericRatio == null ? "" : Math.round(c.numericRatio * 1000) / 1000,
       fmt(c.sampleNonNull),
       fmt(c.sampleNulls),
       (c.examples || []).join(" / "),
     ]),
   } : null;
+
 
   const hierarchicalDatasets = useMemo(() => datasets.map((d) => ({
     ...d,
@@ -23552,11 +23798,74 @@ function App() {
 
           {tab === "schema" && (
             <Box sx={{ display: "grid", gridTemplateColumns: { xs: "minmax(0, 1fr)", md: "340px minmax(0, 1fr)" }, gap: 0.5, minWidth: 0, maxWidth: "100%" }}>
-              <Section title="Manifest" icon={<Schema />}>
-                <KeyValue rows={manifestRows} />
-              </Section>
+              <Stack spacing={0.5}>
+                <Section title="Manifest" icon={<Schema />}>
+                  <KeyValue rows={manifestRows} />
+                </Section>
+                <Section title="Semantic Override" icon={<Schema />} hint="自動判定が違う列はここで補正します。v8/v9/v10/v11/Insight Visualizeはeffective semanticを使います。">
+                  <Stack spacing={0.75}>
+                    <Stack direction="row" useFlexGap flexWrap="wrap" spacing={0.75} alignItems="center">
+                      <Chip color={semanticOverrideCount ? "warning" : "default"} label={`Overrides ${fmt(semanticOverrideCount)}`} />
+                      <Button size="small" variant="outlined" disabled={!semanticOverrideCount} onClick={resetSemanticOverrides}>Reset all to Auto</Button>
+                      <Typography variant="caption" color="text.secondary">
+                        変更後はv8/v9/v10/v11を再実行すると反映されます。
+                      </Typography>
+                    </Stack>
+                    <TableContainer sx={{ maxHeight: 520, border: "1px solid", borderColor: "divider", borderRadius: 1 }}>
+                      <Table size="small" stickyHeader>
+                        <TableHead>
+                          <TableRow>
+                            <TableCell>#</TableCell>
+                            <TableCell>Column</TableCell>
+                            <TableCell>Auto</TableCell>
+                            <TableCell>Override</TableCell>
+                            <TableCell>Effective</TableCell>
+                          </TableRow>
+                        </TableHead>
+                        <TableBody>
+                          {columns.map((c) => {
+                            const autoSemantic = c.autoSemantic || c.autoSemanticType || inferAutoSemanticFromColumn(c);
+                            const overrideSemantic = c.overrideSemantic || "";
+                            const effectiveSemantic = c.effectiveSemantic || c.semanticType || autoSemantic;
+                            return (
+                              <TableRow key={`semantic-${c.index}-${c.name}`}>
+                                <TableCell>{c.index + 1}</TableCell>
+                                <TableCell>
+                                  <Typography variant="body2" sx={{ fontWeight: 700 }}>{c.name}</Typography>
+                                  <Typography variant="caption" color="text.secondary">{c.type || ""}</Typography>
+                                </TableCell>
+                                <TableCell><Chip size="small" label={autoSemantic || "text"} /></TableCell>
+                                <TableCell>
+                                  <TextField
+                                    select
+                                    size="small"
+                                    value={overrideSemantic || "auto"}
+                                    onChange={(event) => setColumnSemanticOverride(c, event.target.value)}
+                                    sx={{ minWidth: 150 }}
+                                  >
+                                    {SEMANTIC_OVERRIDE_OPTIONS.map((option) => (
+                                      <MenuItem key={option.value} value={option.value}>{option.label}</MenuItem>
+                                    ))}
+                                  </TextField>
+                                </TableCell>
+                                <TableCell>
+                                  <Chip
+                                    size="small"
+                                    color={overrideSemantic ? "warning" : "default"}
+                                    label={effectiveSemantic || "text"}
+                                  />
+                                </TableCell>
+                              </TableRow>
+                            );
+                          })}
+                        </TableBody>
+                      </Table>
+                    </TableContainer>
+                  </Stack>
+                </Section>
+              </Stack>
               <Section title="Columns">
-                <DataTable table={schemaTable} tableId="schema" height={520} />
+                <DataTable table={schemaTable} tableId="schema" height={680} />
               </Section>
             </Box>
           )}
