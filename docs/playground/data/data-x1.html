@@ -6480,6 +6480,22 @@ function evaluateGraphDerivedColumnSafe(d, rowMap) {
   }
 }
 
+function normalizeGraphDerivedColumnsForWorker(items=[]) {
+  return (Array.isArray(items) ? items : [])
+    .map((d, i) => {
+      const fallbackName = `new_column_${i + 1}`;
+      const newColumnName = String(d?.newColumnName || fallbackName).trim() || fallbackName;
+      return {
+        id: String(d?.id || `derived_${i + 1}`),
+        newColumnName,
+        valueMode: d?.valueMode === "formula" ? "formula" : "constant",
+        constantValue: d?.constantValue ?? "",
+        formulaExpression: String(d?.formulaExpression || "").trim(),
+      };
+    })
+    .filter((d) => d.newColumnName);
+}
+
 function valueByFlexibleNameForWorker(rowMap, key){
   return valueByFlexibleName(rowMap, key);
 }
@@ -6670,12 +6686,15 @@ function graphResultSurfacePrune(){
     });
 }
 
-function registerGraphResultSurface({mode="data", projection=null, reason="", result=null}={}){
+function registerGraphResultSurface({mode="data", projection=null, reason="", result=null, derivedColumns=[], outputColumnNames=null, readColumns=[]}={}){
   const store = ensureGraphResultSurfaceStore();
   const normalizedMode = String(mode || "data") === "join" ? "join" : "data";
   const id = graphResultSurfaceNextId(normalizedMode);
   const createdAt = new Date().toISOString();
   const createdAtMs = Date.now();
+  const surfaceDerivedColumns = normalizeGraphDerivedColumnsForWorker(derivedColumns);
+  const surfaceOutputColumnNames = Array.isArray(outputColumnNames) && outputColumnNames.length ? outputColumnNames.map(String).filter(Boolean) : null;
+  const surfaceReadColumns = Array.isArray(readColumns) ? readColumns.map(Number).filter(Number.isFinite) : [];
 
   let surface;
   if (normalizedMode === "join"){
@@ -6700,6 +6719,9 @@ function registerGraphResultSurface({mode="data", projection=null, reason="", re
       aggregateCache:Object.create(null),
       visualSurfaceCache:Object.create(null),
       invalidationKey:`join:${createdAtMs}:${rows.length}:${header.length}`,
+      derivedColumns:surfaceDerivedColumns,
+      outputColumnNames:surfaceOutputColumnNames,
+      readColumns:surfaceReadColumns,
       createdAt,
       createdAtMs,
       reason
@@ -6737,7 +6759,10 @@ function registerGraphResultSurface({mode="data", projection=null, reason="", re
       domainCache:Object.create(null),
       aggregateCache:Object.create(null),
       visualSurfaceCache:Object.create(null),
-      invalidationKey:`data:${state.manifest?.id || "dataset"}:${createdAtMs}:${rowCount}:${projectionList.join(".")}`,
+      invalidationKey:`data:${state.manifest?.id || "dataset"}:${createdAtMs}:${rowCount}:${projectionList.join(".")}:${surfaceDerivedColumns.map((d)=>`${d.newColumnName}:${d.valueMode}:${d.constantValue}:${d.formulaExpression}`).join("|")}`,
+      derivedColumns:surfaceDerivedColumns,
+      outputColumnNames:surfaceOutputColumnNames,
+      readColumns:surfaceReadColumns,
       createdAt,
       createdAtMs,
       reason
@@ -6951,6 +6976,33 @@ function graphResultSurfaceHeader(surface, sourceIndices=null){
   return indices.map((idx) => graphResultSurfaceColumn(surface, idx)?.name || `Column ${Number(idx) + 1}`);
 }
 
+function graphResultEffectiveDerivedColumns(surface, derivedColumns=null) {
+  return Array.isArray(derivedColumns) ? normalizeGraphDerivedColumnsForWorker(derivedColumns) : normalizeGraphDerivedColumnsForWorker(surface?.derivedColumns || []);
+}
+
+function graphResultEffectiveColumns(surface, derivedColumns=null) {
+  const base = Array.isArray(surface?.columns) ? surface.columns : [];
+  const derived = graphResultEffectiveDerivedColumns(surface, derivedColumns);
+  const start = base.length;
+  return [
+    ...base,
+    ...derived.map((d, i) => ({
+      index:start + i,
+      sourceIndex:start + i,
+      actualIndex:null,
+      columnIndex:start + i,
+      name:d.newColumnName,
+      type:"string"
+    }))
+  ];
+}
+
+function graphResultEffectiveColumn(surface, index, derivedColumns=null) {
+  const idx = Number(index);
+  if (!Number.isFinite(idx) || idx < 0) return null;
+  return graphResultEffectiveColumns(surface, derivedColumns).find((c) => Number(c.sourceIndex ?? c.index) === idx || Number(c.index) === idx) || null;
+}
+
 /*
  * Last-definition overrides for Graph Query Result utilities.
  * These preserve the existing command/response names while routing work through
@@ -7002,10 +7054,12 @@ function graphResultOutputRowMatches(row, filters){
   return true;
 }
 
-async function readGraphResultWindow({mode="data", surfaceId=null, page=1, pageSize=1000, columns=[], derivedColumns=[], outputColumnNames=null, tableFilters=null}={}){
+async function readGraphResultWindow({mode="data", surfaceId=null, page=1, pageSize=1000, columns=[], derivedColumns=null, outputColumnNames=null, tableFilters=null}={}){
   const surface = getGraphResultSurface({mode, surfaceId});
   if (!surface) throw new Error("Graph Query Result surface is not active");
 
+  const effectiveDerivedColumns = Array.isArray(derivedColumns) ? derivedColumns : (surface.derivedColumns || []);
+  const effectiveOutputColumnNames = Array.isArray(outputColumnNames) && outputColumnNames.length ? outputColumnNames : (surface.outputColumnNames || null);
   const safePage = Math.max(1, Number(page || 1));
   const safePageSize = Math.max(1, Math.min(50000, Number(pageSize || 1000)));
   const start = Math.max(0, (safePage - 1) * safePageSize);
@@ -7033,7 +7087,7 @@ async function readGraphResultWindow({mode="data", surfaceId=null, page=1, pageS
       }
     });
 
-    const applied = graphApplyDerivedRows(header, rows, derivedColumns, outputColumnNames);
+    const applied = graphApplyDerivedRows(header, rows, effectiveDerivedColumns, effectiveOutputColumnNames);
     return {
       ...applied,
       surface:graphResultSurfaceSummary(surface),
@@ -7056,7 +7110,7 @@ async function readGraphResultWindow({mode="data", surfaceId=null, page=1, pageS
     chunkYieldEvery:4,
     visit:(value) => {
       const baseRow = graphResultSurfaceMaterializeValueArray(value, selected);
-      const appliedOne = graphApplyDerivedRows(header, [baseRow], derivedColumns, outputColumnNames);
+      const appliedOne = graphApplyDerivedRows(header, [baseRow], effectiveDerivedColumns, effectiveOutputColumnNames);
       const outRow = appliedOne.rows?.[0] || baseRow;
       if (!graphResultOutputRowMatches(outRow, filters)) return true;
       if (matched >= start && rows.length < limit) rows.push(outRow);
@@ -7065,7 +7119,7 @@ async function readGraphResultWindow({mode="data", surfaceId=null, page=1, pageS
     }
   });
 
-  const appliedHeader = graphApplyDerivedRows(header, [], derivedColumns, outputColumnNames);
+  const appliedHeader = graphApplyDerivedRows(header, [], effectiveDerivedColumns, effectiveOutputColumnNames);
   return {
     header:appliedHeader.header || header,
     rows,
@@ -9055,7 +9109,15 @@ async function legacyWorkerMessageRouter(e){
       const result=await runDataQuery(msg);
       let graphResultSurface=null;
       if (msg.origin === "graph") {
-        graphResultSurface = registerGraphResultSurface({mode:"data", projection:result.projection || msg.projection || [], reason:"RUN_DATA_QUERY:graph", result});
+        graphResultSurface = registerGraphResultSurface({
+          mode:"data",
+          projection:result.projection || msg.projection || [],
+          reason:"RUN_DATA_QUERY:graph",
+          result,
+          derivedColumns:msg.derivedColumns || [],
+          outputColumnNames:msg.graphOutputColumnNames || null,
+          readColumns:msg.graphReadColumns || []
+        });
         post("GRAPH_RESULT_SURFACE_READY", {surface:graphResultSurfaceSummary(graphResultSurface), origin:"graph"});
       }
       post("DATA_QUERY_DONE",{...result,origin:msg.origin || "", graphResultSurface:graphResultSurfaceSummary(graphResultSurface), surfaceId:graphResultSurface?.id || null});
@@ -16696,17 +16758,32 @@ function App() {
           const projection = Array.isArray(msg.projection) && msg.projection.length ? msg.projection.map(Number) : null;
           const derived = graphExecutionRef.current?.derivedColumns || [];
           setGraphResultMode("data");
-          setGraphResultCount(msg.matches || 0);
+          setGraphResultCount(msg.graphResultSurface?.rowCount || msg.matches || 0);
           setGraphResultPage(1);
           setGraphResultSurface(msg.graphResultSurface || null);
           setGraphResultStatus(`Graph Queryを実行しました。結果ページを読み込み中...${projection ? ` / SELECT ${fmt(projection.length)}列` : ""}${derived.length ? ` / 計算列 ${fmt(derived.length)}列` : ""}${msg.graphResultSurface ? ` / Surface ${fmt(msg.graphResultSurface.rowCount || 0)} rows` : ""}`);
           setGraphResultTime(ms(msg.ms));
-          graphExecutionRef.current.readMode = msg.active ? "dataQuery" : "page";
-          if (!msg.active) {
-            const readColumns = graphExecutionRef.current?.readColumns || [];
+          graphExecutionRef.current.readMode = "surface";
+          const ctx = graphExecutionRef.current || {};
+          const surfaceId = msg.surfaceId || msg.graphResultSurface?.id || null;
+          if (surfaceId) {
+            postWorkerCommand({
+              type: "READ_GRAPH_RESULT_WINDOW",
+              origin: "graph",
+              mode: "data",
+              surfaceId,
+              page: 1,
+              pageSize: graphResultPageSizeRef.current,
+              columns: ctx.readColumns || [],
+              outputColumnNames: ctx.outputColumnNames || null,
+              derivedColumns: ctx.derivedColumns || [],
+              tableFilters: normalizeGraphResultUiFilters({}),
+            });
+          } else if (!msg.active) {
+            const readColumns = ctx.readColumns || [];
             postWorkerCommand({ type: "READ_PAGE", origin: "graph", page: 1, pageSize: graphResultPageSizeRef.current, columns: readColumns });
           } else {
-            const readColumns = graphExecutionRef.current?.readColumns || [];
+            const readColumns = ctx.readColumns || [];
             postWorkerCommand({ type: "READ_DATA_QUERY_PAGE", origin: "graph", page: 1, pageSize: graphResultPageSizeRef.current, columns: readColumns });
           }
           return;
@@ -17540,6 +17617,9 @@ function App() {
       sort,
       maxRows,
       projection,
+      derivedColumns,
+      graphOutputColumnNames: outputColumnNames,
+      graphReadColumns: readColumns,
     });
   }
 
@@ -17587,7 +17667,18 @@ function App() {
     }
 
     const readMode = graphExecutionRef.current?.readMode || "dataQuery";
-    if (readMode === "page") {
+    if (readMode === "surface") {
+      setGraphResultStatus("Graph Query Result Surfaceからページを読み込み中...");
+      post({
+        type: "READ_GRAPH_RESULT_WINDOW",
+        origin: "graph",
+        ...graphResultPayload({
+          page: safe,
+          pageSize: requestedPageSize,
+          tableFilters,
+        }),
+      });
+    } else if (readMode === "page") {
       post({ type: "READ_PAGE", origin: "graph", page: safe, pageSize: requestedPageSize, columns: graphExecutionRef.current?.readColumns || [] });
     } else {
       post({ type: "READ_DATA_QUERY_PAGE", origin: "graph", page: safe, pageSize: requestedPageSize, columns: graphExecutionRef.current?.readColumns || [] });
