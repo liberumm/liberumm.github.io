@@ -10670,6 +10670,433 @@ registerRuntimeCommand("RUN_AUTONOMOUS_INSIGHTS", {
 
 
 
+/*
+ * =========================================================
+ * Autonomous Research Kernel v9
+ * =========================================================
+ * v8 discovers interesting surfaces. v9 turns them into research hypotheses
+ * with evidence, counter checks, and executable next actions.
+ */
+const AUTONOMOUS_RESEARCH_KERNEL_VERSION = 9;
+const AUTONOMOUS_RESEARCH_CACHE_LIMIT = 12;
+
+if (!olapKernelRuntime.research) olapKernelRuntime.research = new Map();
+
+function v9ResearchCacheKey(input){
+  const manifestKey = `${state.manifest?.id || ""}:${state.manifest?.totalRows || 0}:${state.manifest?.columns?.length || 0}`;
+  const cfg = [
+    Number(input?.sampleRows || 0),
+    Number(input?.maxColumns || 0),
+    Number(input?.topN || 0),
+    String(input?.mode || "research")
+  ].join("|");
+  return hashText32(`v9|${manifestKey}|${cfg}`);
+}
+
+function v9RememberResearch(key, value){
+  const cache = olapKernelRuntime.research;
+  if (!cache) return;
+  if (cache.has(key)) cache.delete(key);
+  cache.set(key, { at:now(), value });
+  while (cache.size > AUTONOMOUS_RESEARCH_CACHE_LIMIT) {
+    const first = cache.keys().next().value;
+    cache.delete(first);
+  }
+}
+
+function v9SeverityWeight(severity){
+  const s = String(severity || "").toLowerCase();
+  if (s === "high") return 1;
+  if (s === "medium") return 0.72;
+  if (s === "low") return 0.45;
+  return 0.5;
+}
+
+function v9ConfidenceFromInsight(insight, sampledRows){
+  const score = Math.max(0, Math.min(1, Number(insight?.score || 0) / 100));
+  const sample = Math.max(0.15, Math.min(1, Number(sampledRows || 0) / 25000));
+  return Math.round(Math.min(0.98, 0.28 + score * 0.42 + sample * 0.3) * 1000) / 1000;
+}
+
+function v9HypothesisTypeFromInsight(insight){
+  const kind = String(insight?.kind || "");
+  const id = String(insight?.id || "");
+  if (kind === "quality" || id.startsWith("null-")) return "missingness";
+  if (kind === "distribution" || id.startsWith("imbalance-")) return "imbalance";
+  if (kind === "outlier" || id.startsWith("spread-")) return "outlier";
+  if (kind === "semantic" || id.startsWith("id-")) return "semantic_key";
+  return "research_candidate";
+}
+
+function v9CounterChecksForInsight(insight, profile, confidence){
+  const sampleRows = Number(profile?.sampleRows || 0);
+  const nullRate = Number(profile?.nullRate || 0);
+  const topShare = Number(profile?.topShare || 0);
+  const numeric = profile?.numeric || {};
+  const checks = [];
+
+  checks.push({
+    type:"minimum_sample_size",
+    label:"Sample size sufficient",
+    result:sampleRows >= 5000 ? "passed" : sampleRows >= 1000 ? "warning" : "weak",
+    detail:`sample ${fmt(sampleRows)} rows`,
+    confidenceDelta:sampleRows >= 5000 ? 0.03 : sampleRows >= 1000 ? -0.03 : -0.12,
+  });
+
+  checks.push({
+    type:"missingness_bias",
+    label:"Missingness does not dominate",
+    result:nullRate < 0.25 ? "passed" : nullRate < 0.6 ? "warning" : "failed",
+    detail:`null rate ${Math.round(nullRate * 1000) / 10}%`,
+    confidenceDelta:nullRate < 0.25 ? 0.02 : nullRate < 0.6 ? -0.08 : -0.2,
+  });
+
+  if (profile?.semanticType === "measure" || numeric?.count) {
+    const avg = Math.abs(Number(numeric.avg || 0)) || 1;
+    const spread = Number.isFinite(Number(numeric.max)) && Number.isFinite(Number(numeric.min))
+      ? Math.abs(Number(numeric.max) - Number(numeric.min)) / avg
+      : 0;
+    checks.push({
+      type:"outlier_dominance",
+      label:"Outlier dominance check",
+      result:spread > 100 ? "warning" : "passed",
+      detail:spread ? `range/avg ${Math.round(spread * 100) / 100}` : "not numeric",
+      confidenceDelta:spread > 100 ? -0.1 : 0.02,
+    });
+  }
+
+  if (topShare) {
+    checks.push({
+      type:"segment_concentration",
+      label:"Concentration check",
+      result:topShare > 0.8 ? "warning" : "passed",
+      detail:`top share ${Math.round(topShare * 1000) / 10}%`,
+      confidenceDelta:topShare > 0.8 ? -0.06 : 0.02,
+    });
+  }
+
+  checks.push({
+    type:"sample_based",
+    label:"Exact verification",
+    result:confidence >= 0.75 ? "recommended" : "pending",
+    detail:"Use View D3 / Apply Filter to verify with the measured surface.",
+    confidenceDelta:0,
+  });
+
+  return checks;
+}
+
+function v9ResearchActionsForInsight(insight, profile){
+  const actions = [];
+  if (insight?.d3Plan) {
+    actions.push({
+      type:"run_d3",
+      label:"View evidence chart",
+      plan:insight.d3Plan,
+    });
+  }
+
+  const topValue = profile?.top?.[0]?.value;
+  if (profile && topValue != null && topValue !== "") {
+    actions.push({
+      type:"apply_filter",
+      label:`Filter ${profile.name} = ${v8CellString(topValue)}`,
+      columnName:profile.name,
+      columnIndex:profile.index,
+      op:"eq",
+      value:String(topValue),
+    });
+  }
+
+  actions.push({
+    type:"export_evidence",
+    label:"Export hypothesis evidence",
+  });
+
+  return actions;
+}
+
+function v9BuildNarrative(hypothesis){
+  const checks = hypothesis.counterChecks || [];
+  const failed = checks.filter((x)=>["failed","weak"].includes(String(x.result))).length;
+  const warnings = checks.filter((x)=>String(x.result) === "warning").length;
+  const confidence = Math.round(Number(hypothesis.confidence || 0) * 1000) / 10;
+  if (failed) {
+    return `${hypothesis.claim}。ただし反証チェックで弱い根拠が見つかっています。confidence ${confidence}%`;
+  }
+  if (warnings) {
+    return `${hypothesis.claim}。根拠はありますが、${warnings}件の注意点があります。confidence ${confidence}%`;
+  }
+  return `${hypothesis.claim}。主要な反証チェックを通過しています。confidence ${confidence}%`;
+}
+
+function v9MakeHypothesisFromInsight(insight, profile, index, context){
+  const sampledRows = Number(context?.sampledRows || profile?.sampleRows || 0);
+  const confidence = v9ConfidenceFromInsight(insight, sampledRows);
+  const checks = v9CounterChecksForInsight(insight, profile, confidence);
+  const delta = checks.reduce((sum,x)=>sum + Number(x.confidenceDelta || 0), 0);
+  const adjustedConfidence = Math.max(0.05, Math.min(0.99, confidence + delta));
+  const score = Math.round((Number(insight.score || 0) * 0.55 + adjustedConfidence * 100 * 0.35 + v9SeverityWeight(insight.severity) * 10) * 10) / 10;
+  const hypothesis = {
+    id:`hyp-${index}-${String(insight.id || "insight").replace(/[^a-zA-Z0-9_-]/g, "-")}`,
+    version:AUTONOMOUS_RESEARCH_KERNEL_VERSION,
+    type:v9HypothesisTypeFromInsight(insight),
+    severity:insight.severity || "Medium",
+    title:insight.title || "Research hypothesis",
+    claim:insight.detail || insight.title || "This surface may be worth verifying.",
+    sourceInsightId:insight.id || "",
+    columns:insight.columns || [],
+    score,
+    confidence:Math.round(adjustedConfidence * 1000) / 1000,
+    evidence:{
+      summary:insight.detail || "",
+      rows:insight.evidence || [],
+      sampleRows:sampledRows,
+      effectSize:Number(insight.score || 0),
+      chartPlan:insight.d3Plan || null,
+      profile:profile ? {
+        name:profile.name,
+        semanticType:profile.semanticType,
+        nullRate:profile.nullRate,
+        distinct:profile.distinct,
+        top:profile.top,
+        numeric:profile.numeric,
+      } : null,
+    },
+    counterChecks:checks,
+    nextActions:v9ResearchActionsForInsight(insight, profile),
+  };
+  hypothesis.narrative = v9BuildNarrative(hypothesis);
+  return hypothesis;
+}
+
+function v9BuildSegmentDifferenceHypotheses(v8Result, limit){
+  const cols = v8Result?.columns || [];
+  const charts = v8Result?.suggestedCharts || [];
+  const profilesByIndex = new Map(cols.map((c)=>[Number(c.index), c]));
+  const items = [];
+
+  for (const chart of charts) {
+    const plan = chart?.plan || {};
+    if (String(plan.aggregation || "").toLowerCase() !== "avg") continue;
+    const xProfile = profilesByIndex.get(Number(plan.xColumnIndex));
+    const yProfile = profilesByIndex.get(Number(plan.yColumnIndex));
+    if (!xProfile || !yProfile) continue;
+    const confidence = Math.min(0.86, 0.42 + Math.min(0.3, Number(xProfile.sampleRows || 0) / 30000) + Math.min(0.14, Number(yProfile.numeric?.count || 0) / 50000));
+    const topValue = xProfile.top?.[0]?.value;
+    const checks = [
+      {
+        type:"segment_sample_size",
+        label:"Segment sample size",
+        result:Number(xProfile.top?.[0]?.count || 0) >= 200 ? "passed" : "warning",
+        detail:topValue ? `${topValue}: ${fmt(xProfile.top[0].count)} samples` : "top segment unavailable",
+        confidenceDelta:Number(xProfile.top?.[0]?.count || 0) >= 200 ? 0.03 : -0.08,
+      },
+      {
+        type:"measure_quality",
+        label:"Measure quality",
+        result:Number(yProfile.nullRate || 0) < 0.25 ? "passed" : "warning",
+        detail:`${yProfile.name} null rate ${Math.round(Number(yProfile.nullRate || 0) * 1000) / 10}%`,
+        confidenceDelta:Number(yProfile.nullRate || 0) < 0.25 ? 0.02 : -0.06,
+      },
+      {
+        type:"counterfactual_chart",
+        label:"Counterfactual chart",
+        result:"recommended",
+        detail:"Run the chart, then inspect the segment with and without top outliers.",
+        confidenceDelta:0,
+      },
+    ];
+
+    const score = Math.round((Number(chart.score || 0) * 0.65 + confidence * 35) * 10) / 10;
+    const hypothesis = {
+      id:`hyp-segment-${xProfile.index}-${yProfile.index}`,
+      version:AUTONOMOUS_RESEARCH_KERNEL_VERSION,
+      type:"segment_difference",
+      severity:score >= 80 ? "High" : "Medium",
+      title:`${xProfile.name} 別に ${yProfile.name} が変化する可能性`,
+      claim:`${xProfile.name} のセグメントによって ${yProfile.name} の平均・合計が異なる可能性があります。`,
+      sourceInsightId:chart.id || "",
+      columns:[xProfile.name, yProfile.name],
+      score,
+      confidence:Math.round(confidence * 1000) / 1000,
+      evidence:{
+        summary:chart.reason || "カテゴリ別の差分候補です。",
+        rows:[
+          ["dimension", xProfile.name],
+          ["measure", yProfile.name],
+          ["chart", chart.title || ""],
+          ["top segment", topValue || ""],
+        ],
+        sampleRows:Math.max(Number(xProfile.sampleRows || 0), Number(yProfile.sampleRows || 0)),
+        effectSize:Number(chart.score || 0),
+        chartPlan:plan,
+        profile:{ dimension:xProfile, measure:yProfile },
+      },
+      counterChecks:checks,
+      nextActions:[
+        { type:"run_d3", label:"Run segment chart", plan },
+        topValue != null ? { type:"apply_filter", label:`Filter ${xProfile.name} = ${v8CellString(topValue)}`, columnName:xProfile.name, columnIndex:xProfile.index, op:"eq", value:String(topValue) } : null,
+        { type:"export_evidence", label:"Export segment evidence" },
+      ].filter(Boolean),
+    };
+    hypothesis.narrative = v9BuildNarrative(hypothesis);
+    items.push(hypothesis);
+    if (items.length >= limit) break;
+  }
+
+  return items;
+}
+
+function v9BuildResearchBoard(v8Result, input){
+  const insights = v8Result?.insights || [];
+  const profiles = v8Result?.columns || [];
+  const byName = new Map(profiles.map((p)=>[String(p.name), p]));
+  const byIndex = new Map(profiles.map((p)=>[Number(p.index), p]));
+  const sampledRows = Number(v8Result?.summary?.sampledRows || v8Result?.metrics?.sampledRows || 0);
+  const hypotheses = [];
+
+  insights.forEach((insight, index)=>{
+    const profile = (insight.columns || []).map((name)=>byName.get(String(name))).find(Boolean)
+      || byIndex.get(Number(insight?.d3Plan?.xColumnIndex))
+      || null;
+    hypotheses.push(v9MakeHypothesisFromInsight(insight, profile, index, { sampledRows }));
+  });
+
+  hypotheses.push(...v9BuildSegmentDifferenceHypotheses(v8Result, 10));
+
+  const ranked = hypotheses
+    .sort((a,b)=>Number(b.score || 0) - Number(a.score || 0))
+    .slice(0, Math.max(5, Math.min(40, Number(input?.topN || 12) * 3)));
+
+  const actionCount = ranked.reduce((sum,h)=>sum + (h.nextActions?.length || 0), 0);
+  const counterSummary = {
+    passed:0,
+    warning:0,
+    failed:0,
+    pending:0,
+    recommended:0,
+    weak:0,
+  };
+  for (const h of ranked) {
+    for (const c of h.counterChecks || []) {
+      const key = String(c.result || "pending");
+      counterSummary[key] = Number(counterSummary[key] || 0) + 1;
+    }
+  }
+
+  return {
+    hypotheses:ranked,
+    summary:{
+      hypothesisCount:ranked.length,
+      actionCount,
+      counterSummary,
+      highConfidence:ranked.filter((h)=>Number(h.confidence || 0) >= 0.75).length,
+      topType:ranked[0]?.type || "",
+    }
+  };
+}
+
+async function runAutonomousResearchKernelV9(input){
+  const started = now();
+  post("AUTONOMOUS_RESEARCH_PROGRESS", {
+    stage:"v8-scan",
+    progress:8,
+    sampledRows:0,
+    totalRows:Number(state.manifest?.totalRows || 0),
+  });
+
+  const v8Result = await runAutonomousAnalysisKernelV8({
+    sampleRows:Number(input?.sampleRows || 180000),
+    maxColumns:Number(input?.maxColumns || 120),
+    topN:Number(input?.topN || 10),
+    mode:"research",
+  });
+
+  post("AUTONOMOUS_RESEARCH_PROGRESS", {
+    stage:"hypothesis",
+    progress:72,
+    sampledRows:v8Result?.summary?.sampledRows || v8Result?.metrics?.sampledRows || 0,
+    totalRows:Number(state.manifest?.totalRows || 0),
+  });
+
+  const board = v9BuildResearchBoard(v8Result, input);
+
+  post("AUTONOMOUS_RESEARCH_PROGRESS", {
+    stage:"counter-check",
+    progress:90,
+    sampledRows:v8Result?.summary?.sampledRows || v8Result?.metrics?.sampledRows || 0,
+    totalRows:Number(state.manifest?.totalRows || 0),
+  });
+
+  const result = {
+    version:AUTONOMOUS_RESEARCH_KERNEL_VERSION,
+    kernel:"Autonomous Research Kernel v9",
+    dataset:v8Result.dataset,
+    summary:{
+      ...board.summary,
+      insightCount:v8Result?.summary?.insightCount || 0,
+      chartCount:v8Result?.summary?.chartCount || 0,
+      sampledRows:v8Result?.summary?.sampledRows || v8Result?.metrics?.sampledRows || 0,
+      analyzedColumns:v8Result?.summary?.analyzedColumns || v8Result?.metrics?.analyzedColumns || 0,
+    },
+    hypotheses:board.hypotheses,
+    sourceInsights:v8Result.insights || [],
+    suggestedCharts:v8Result.suggestedCharts || [],
+    columns:v8Result.columns || [],
+    metrics:{
+      ...(v8Result.metrics || {}),
+      ms:Math.round(now() - started),
+      cache:"miss",
+      kernel:"Autonomous Research Kernel v9",
+      hypothesisCount:board.hypotheses.length,
+    }
+  };
+  return result;
+}
+
+registerRuntimeCommand("RUN_AUTONOMOUS_RESEARCH", {
+  validate(msg){
+    return {
+      sampleRows:Number(msg.sampleRows || 180000),
+      maxColumns:Number(msg.maxColumns || 120),
+      topN:Number(msg.topN || 12),
+      mode:String(msg.mode || "research"),
+      force:Boolean(msg.force),
+    };
+  },
+  plan(input){
+    return {
+      kind:"autonomous-research",
+      strategy:"hypothesis-graph-v9",
+      estimatedRows:Math.min(Number(state.manifest?.totalRows || 0), Number(input.sampleRows || 0)),
+      input,
+    };
+  },
+  async execute(plan){
+    if (!state.manifest || !Array.isArray(state.manifest.columns) || !state.manifest.columns.length) {
+      throw new Error("Storage Datasetを開いてからResearchを実行してください。");
+    }
+    const key = v9ResearchCacheKey(plan.input);
+    const cached = !plan.input.force && olapKernelRuntime.research?.get(key);
+    if (cached?.value) {
+      return {
+        ...cached.value,
+        metrics:{...(cached.value.metrics || {}), cache:"hit", ms:0}
+      };
+    }
+    const result = await runAutonomousResearchKernelV9(plan.input);
+    v9RememberResearch(key, result);
+    return result;
+  },
+  project(result){
+    return result;
+  },
+  doneType:"AUTONOMOUS_RESEARCH_DONE",
+});
+
+
+
 const runtimeKernel = createRuntimeKernel({
   runtimeState: state,
   post,
@@ -17431,6 +17858,186 @@ function AutonomousInsightsPanel({ manifest, result, status, time, busy, onRun, 
 }
 
 
+function ResearchConfidenceChip({ confidence }) {
+  const value = Number(confidence || 0);
+  const color = value >= 0.75 ? "success" : value >= 0.55 ? "warning" : "default";
+  return <Chip size="small" color={color} label={`confidence ${Math.round(value * 1000) / 10}%`} />;
+}
+
+function ResearchCheckChip({ check }) {
+  const result = String(check?.result || "pending");
+  const color = result === "passed" ? "success" : result === "failed" || result === "weak" ? "error" : result === "warning" ? "warning" : "default";
+  return (
+    <Chip
+      size="small"
+      color={color}
+      variant={result === "recommended" || result === "pending" ? "outlined" : "filled"}
+      label={`${check?.label || check?.type || "check"}: ${result}`}
+    />
+  );
+}
+
+function AutonomousResearchPanel({
+  manifest,
+  result,
+  status,
+  time,
+  busy,
+  onRun,
+  onRunFresh,
+  onApplyChart,
+  onApplyFilter,
+  onExportEvidence,
+}) {
+  const hypotheses = result?.hypotheses || [];
+  const summary = result?.summary || {};
+  const [selectedId, setSelectedId] = useState("");
+
+  useEffect(() => {
+    if (!selectedId && hypotheses[0]?.id) setSelectedId(hypotheses[0].id);
+    if (selectedId && hypotheses.length && !hypotheses.some((h) => h.id === selectedId)) setSelectedId(hypotheses[0]?.id || "");
+  }, [hypotheses, selectedId]);
+
+  const selected = hypotheses.find((h) => h.id === selectedId) || hypotheses[0] || null;
+  const evidenceRows = selected ? [
+    ["type", selected.type || ""],
+    ["score", String(selected.score ?? "")],
+    ["confidence", `${Math.round(Number(selected.confidence || 0) * 1000) / 10}%`],
+    ["columns", (selected.columns || []).join(", ")],
+    ["sample rows", fmt(selected.evidence?.sampleRows || summary.sampledRows || 0)],
+    ...(selected.evidence?.rows || []),
+  ] : [];
+
+  return (
+    <Section
+      title="Autonomous Research"
+      icon={<Analytics />}
+      hint="v9: v8 Insightを仮説・根拠・反証・次アクションへ変換し、判断可能な分析フローにします。"
+    >
+      <Stack direction="row" useFlexGap flexWrap="wrap" spacing={1} alignItems="center" sx={{ mb: 1 }}>
+        <Button variant="contained" disabled={!manifest || busy} onClick={onRun}>
+          Run v9 Research
+        </Button>
+        <Button variant="outlined" disabled={!manifest || busy} onClick={onRunFresh}>
+          Force Research Rescan
+        </Button>
+        <Chip label="Kernel: v9 research / v8 insights / v6 tensor" />
+        <Chip label={`Dataset: ${manifest?.name || "未選択"}`} />
+        <Chip label={`Rows: ${fmt(manifest?.totalRows || 0)}`} />
+        <Chip label={`Columns: ${fmt(manifest?.columns?.length || 0)}`} />
+      </Stack>
+
+      <Alert severity={result ? "success" : manifest ? "info" : "warning"} sx={{ mb: 1 }}>
+        {status}
+      </Alert>
+
+      {result && (
+        <>
+          <Stack direction="row" useFlexGap flexWrap="wrap" spacing={0.75} sx={{ mb: 1 }}>
+            <Chip color="primary" label={`Hypotheses ${fmt(summary.hypothesisCount || hypotheses.length)}`} />
+            <Chip color="secondary" label={`Source insights ${fmt(summary.insightCount || 0)}`} />
+            <Chip label={`High confidence ${fmt(summary.highConfidence || 0)}`} />
+            <Chip label={`Actions ${fmt(summary.actionCount || 0)}`} />
+            <Chip label={`Sample ${fmt(summary.sampledRows || 0)}`} />
+            <Chip label={`Cache ${result.metrics?.cache || "miss"}`} />
+            <Chip label={time || ms(result.metrics?.ms)} />
+          </Stack>
+
+          <Box sx={{ display:"grid", gridTemplateColumns:{ xs:"1fr", xl:"minmax(0, 1.05fr) minmax(420px, 0.95fr)" }, gap:1 }}>
+            <Paper variant="outlined" sx={{ p:1, minWidth:0 }}>
+              <Typography variant="subtitle1" sx={{ fontWeight:900, mb:0.75 }}>Hypothesis Graph</Typography>
+              <Stack spacing={0.75}>
+                {hypotheses.length ? hypotheses.map((h) => (
+                  <Paper
+                    key={h.id}
+                    variant="outlined"
+                    onClick={() => setSelectedId(h.id)}
+                    sx={{
+                      p:0.9,
+                      cursor:"pointer",
+                      bgcolor:h.id === selected?.id ? "action.selected" : "background.default",
+                      borderColor:h.id === selected?.id ? "primary.main" : "divider",
+                    }}
+                  >
+                    <Stack direction="row" spacing={0.75} alignItems="center" justifyContent="space-between">
+                      <Stack direction="row" spacing={0.75} alignItems="center" sx={{ minWidth:0 }}>
+                        <InsightSeverityChip severity={h.severity} />
+                        <Typography variant="subtitle2" sx={{ fontWeight:900, overflow:"hidden", textOverflow:"ellipsis" }}>
+                          {h.title}
+                        </Typography>
+                      </Stack>
+                      <Stack direction="row" spacing={0.5} alignItems="center">
+                        <ResearchConfidenceChip confidence={h.confidence} />
+                        <Chip size="small" label={`score ${h.score}`} />
+                      </Stack>
+                    </Stack>
+                    <Typography variant="body2" color="text.secondary" sx={{ mt:0.5 }}>{h.narrative || h.claim}</Typography>
+                    <Stack direction="row" useFlexGap flexWrap="wrap" spacing={0.5} sx={{ mt:0.6 }}>
+                      {(h.columns || []).map((name) => <Chip size="small" key={name} label={name} />)}
+                      <Chip size="small" variant="outlined" label={h.type} />
+                    </Stack>
+                  </Paper>
+                )) : <Typography color="text.secondary">まだResearch Hypothesisはありません。</Typography>}
+              </Stack>
+            </Paper>
+
+            <Paper variant="outlined" sx={{ p:1, minWidth:0 }}>
+              <Typography variant="subtitle1" sx={{ fontWeight:900, mb:0.75 }}>Evidence / Counter Checks / Actions</Typography>
+              {selected ? (
+                <Stack spacing={1}>
+                  <Paper variant="outlined" sx={{ p:1, bgcolor:"background.default" }}>
+                    <Typography variant="subtitle2" sx={{ fontWeight:900 }}>{selected.title}</Typography>
+                    <Typography variant="body2" color="text.secondary" sx={{ mt:0.5 }}>{selected.claim}</Typography>
+                    <Typography variant="body2" sx={{ mt:0.75 }}>{selected.narrative}</Typography>
+                  </Paper>
+
+                  <Box>
+                    <Typography variant="subtitle2" sx={{ fontWeight:900, mb:0.5 }}>Counter Checks</Typography>
+                    <Stack direction="row" useFlexGap flexWrap="wrap" spacing={0.5}>
+                      {(selected.counterChecks || []).map((check, i) => (
+                        <Tooltip key={`${check.type}-${i}`} title={check.detail || ""}>
+                          <Box component="span"><ResearchCheckChip check={check} /></Box>
+                        </Tooltip>
+                      ))}
+                    </Stack>
+                  </Box>
+
+                  <Box>
+                    <Typography variant="subtitle2" sx={{ fontWeight:900, mb:0.5 }}>Next Actions</Typography>
+                    <Stack direction="row" useFlexGap flexWrap="wrap" spacing={0.75}>
+                      {(selected.nextActions || []).map((action, i) => {
+                        if (action.type === "run_d3") {
+                          return <Button key={i} size="small" variant="contained" onClick={() => onApplyChart(action.plan)}>Create D3</Button>;
+                        }
+                        if (action.type === "apply_filter") {
+                          return <Button key={i} size="small" variant="outlined" onClick={() => onApplyFilter(action)}>Apply Filter</Button>;
+                        }
+                        if (action.type === "export_evidence") {
+                          return <Button key={i} size="small" onClick={() => onExportEvidence(selected)}>Export Evidence</Button>;
+                        }
+                        return <Chip key={i} size="small" label={action.label || action.type} />;
+                      })}
+                    </Stack>
+                  </Box>
+
+                  <Box>
+                    <Typography variant="subtitle2" sx={{ fontWeight:900, mb:0.5 }}>Evidence Surface</Typography>
+                    <KeyValue rows={evidenceRows.slice(0, 18)} />
+                  </Box>
+                </Stack>
+              ) : (
+                <Typography color="text.secondary">左から仮説を選択してください。</Typography>
+              )}
+            </Paper>
+          </Box>
+        </>
+      )}
+    </Section>
+  );
+}
+
+
+
 function App() {
   const workerRef = useRef(null);
   const workerGatewayRef = useRef(null);
@@ -17595,6 +18202,9 @@ function App() {
   const [autonomousInsights, setAutonomousInsights] = useState(null);
   const [autonomousInsightsStatus, setAutonomousInsightsStatus] = useState("Storage Datasetを開くと、v8 Autonomous Insightsを実行できます。");
   const [autonomousInsightsTime, setAutonomousInsightsTime] = useState("");
+  const [autonomousResearch, setAutonomousResearch] = useState(null);
+  const [autonomousResearchStatus, setAutonomousResearchStatus] = useState("Storage Datasetを開くと、v9 Autonomous Researchを実行できます。");
+  const [autonomousResearchTime, setAutonomousResearchTime] = useState("");
 
 
   const [syntheticPreviewTable, setSyntheticPreviewTable] = useState(null);
@@ -17658,6 +18268,11 @@ function App() {
       ? "Storage Datasetを開きました。Run v8 Insightsで自律分析を開始できます。"
       : "Storage Datasetを開くと、v8 Autonomous Insightsを実行できます。");
     setAutonomousInsightsTime("");
+    setAutonomousResearch(null);
+    setAutonomousResearchStatus(manifest
+      ? "Storage Datasetを開きました。Run v9 Researchで仮説検証を開始できます。"
+      : "Storage Datasetを開くと、v9 Autonomous Researchを実行できます。");
+    setAutonomousResearchTime("");
   }, [manifest?.id]);
 
   useEffect(() => { searchPageRef.current = searchPage; }, [searchPage]);
@@ -17828,6 +18443,9 @@ function App() {
     setAutonomousInsights(null);
     setAutonomousInsightsStatus("Storage Datasetを開くと、v8 Autonomous Insightsを実行できます。");
     setAutonomousInsightsTime("");
+    setAutonomousResearch(null);
+    setAutonomousResearchStatus("Storage Datasetを開くと、v9 Autonomous Researchを実行できます。");
+    setAutonomousResearchTime("");
     resetColumnState([]);
     if (list.length) {
       const defaultName = list.length > 1 ? `merged_${list.length}_csv` : list[0].name.replace(/\.[^.]+$/, "");
@@ -18558,6 +19176,40 @@ function App() {
         return;
       },
 
+      "AUTONOMOUS_RESEARCH_PROGRESS"(msg) {
+        const stage = msg.stage || "research";
+        setAutonomousResearchStatus(`v9 Research ${stage}: sample ${fmt(msg.sampledRows || 0)} / ${fmt(msg.totalRows || 0)} rows`);
+        if (Number.isFinite(Number(msg.progress))) {
+          setProgress(Math.max(1, Math.min(99, Number(msg.progress))));
+        }
+        return;
+      },
+
+      "AUTONOMOUS_RESEARCH_DONE"(msg) {
+        setAutonomousResearch(msg);
+        setAutonomousInsights((prev) => prev || {
+          version: 8,
+          dataset: msg.dataset,
+          summary: {
+            insightCount: msg.summary?.insightCount || msg.sourceInsights?.length || 0,
+            chartCount: msg.summary?.chartCount || msg.suggestedCharts?.length || 0,
+            sampledRows: msg.summary?.sampledRows || msg.metrics?.sampledRows || 0,
+            analyzedColumns: msg.summary?.analyzedColumns || 0,
+          },
+          columns: msg.columns || [],
+          insights: msg.sourceInsights || [],
+          suggestedCharts: msg.suggestedCharts || [],
+          metrics: msg.metrics || {},
+        });
+        setAutonomousResearchStatus(`v9 Research ready: ${fmt(msg.summary?.hypothesisCount || msg.hypotheses?.length || 0)} hypotheses / ${fmt(msg.summary?.actionCount || 0)} actions / sample ${fmt(msg.summary?.sampledRows || msg.metrics?.sampledRows || 0)} rows`);
+        setAutonomousResearchTime(ms(msg.metrics?.ms));
+        setBusy(false);
+        setBusyLabel("");
+        setProgress(100);
+        setProgressText("v9 Autonomous Research完了");
+        return;
+      },
+
       "SYNTHETIC_PREVIEW_DONE"(msg) {
         setSyntheticPreviewTable({ header: msg.header || [], rows: msg.rows || [] });
         setSyntheticReport(Object.entries(msg.report || {}).map(([k, v]) => [k, typeof v === "number" ? fmt(v) : String(v)]));
@@ -18752,6 +19404,7 @@ function App() {
       BUILD_TIME: "時間軸集計",
       BUILD_D3_VIZ_SURFACE: "D3全件集約Surface作成",
       RUN_AUTONOMOUS_INSIGHTS: "v8 Autonomous Insights解析",
+      RUN_AUTONOMOUS_RESEARCH: "v9 Autonomous Research解析",
       GENERATE_SYNTHETIC_PREVIEW: "Synthetic Preview生成",
       GENERATE_SYNTHETIC_DATASET: "Synthetic Dataset生成",
       CANCEL_SYNTHETIC_GENERATION: "Synthetic生成キャンセル",
@@ -18898,6 +19551,66 @@ function App() {
       mode:"auto",
       force,
     });
+  }
+
+  function runAutonomousResearch(force = false) {
+    if (!manifestRef.current) {
+      setAutonomousResearchStatus("Storage Datasetを開いてからv9 Researchを実行してください。");
+      return;
+    }
+    setAutonomousResearchStatus(force ? "v9 Researchを再スキャンしています..." : "v9 Researchを生成しています...");
+    setAutonomousResearchTime("");
+    post({
+      type:"RUN_AUTONOMOUS_RESEARCH",
+      sampleRows:220000,
+      maxColumns:128,
+      topN:12,
+      mode:"research",
+      force,
+    });
+  }
+
+  function applyResearchFilterAction(action) {
+    const columns = manifestRef.current?.columns || [];
+    const byIndex = columns.find((c) => Number(c.index) === Number(action?.columnIndex));
+    const byName = columns.find((c) => String(c.name) === String(action?.columnName));
+    const col = byIndex || byName;
+    if (!col) {
+      setAutonomousResearchStatus(`Filter対象列が見つかりません: ${action?.columnName || action?.columnIndex}`);
+      return;
+    }
+    const filter = {
+      id:`research-${Date.now()}-${Math.random().toString(36).slice(2)}`,
+      columnIndex:Number(col.index),
+      op:action?.op || "eq",
+      value:String(action?.value ?? ""),
+    };
+    const nextFilters = [filter];
+    graphExecutionRef.current.active = false;
+    setDataQueryFilters(nextFilters);
+    setDataQueryActive(true);
+    setTab("data");
+    setDataStatus(`v9 Research filter applied: ${col.name} ${filter.op} ${filter.value}`);
+    post({
+      type:"RUN_DATA_QUERY",
+      filters:nextFilters,
+      sort:dataSortColumn === "-1" ? null : { columnIndex:Number(dataSortColumn), direction:dataSortDirection },
+      maxRows:Number(dataQueryMaxRows || 0),
+    });
+  }
+
+  function exportResearchEvidence(hypothesis) {
+    if (!hypothesis) return;
+    const payload = {
+      exportedAt:new Date().toISOString(),
+      dataset:manifestRef.current ? {
+        id:manifestRef.current.id || "",
+        name:manifestRef.current.name || "",
+        rows:manifestRef.current.totalRows || 0,
+      } : null,
+      hypothesis,
+    };
+    downloadText(`research_evidence_${String(hypothesis.id || "hypothesis").replace(/[^a-zA-Z0-9_-]/g, "_")}.json`, JSON.stringify(payload, null, 2));
   }
 
   function normalizeD3VisualizationPlan(plan) {
@@ -20149,6 +20862,7 @@ function App() {
               <Tab value="graph" icon={<Analytics />} iconPosition="start" label="Graph Query" />
               <Tab value="visualize" icon={<Timeline />} iconPosition="start" label="Visualize" />
               <Tab value="insights" icon={<Analytics />} iconPosition="start" label="Insights" />
+              <Tab value="research" icon={<Analytics />} iconPosition="start" label="Research" />
               <Tab value="search" icon={<Search />} iconPosition="start" label="Search" />
               <Tab value="pivot" icon={<TableChart />} iconPosition="start" label="Pivot" />
               <Tab value="time" icon={<Timeline />} iconPosition="start" label="Time" />
@@ -20357,6 +21071,21 @@ function App() {
               onRun={() => runAutonomousInsights(false)}
               onRunFresh={() => runAutonomousInsights(true)}
               onApplyChart={applyAutonomousD3Plan}
+            />
+          )}
+
+          {tab === "research" && (
+            <AutonomousResearchPanel
+              manifest={manifest}
+              result={autonomousResearch}
+              status={autonomousResearchStatus}
+              time={autonomousResearchTime}
+              busy={busy}
+              onRun={() => runAutonomousResearch(false)}
+              onRunFresh={() => runAutonomousResearch(true)}
+              onApplyChart={applyAutonomousD3Plan}
+              onApplyFilter={applyResearchFilterAction}
+              onExportEvidence={exportResearchEvidence}
             />
           )}
 
