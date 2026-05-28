@@ -2,7 +2,7 @@
 <html lang="ja">
 <head>
   <meta charset="UTF-8" />
-  <title>Quantum CSV Grid - D3 Infinite Surface DataSource Build</title>
+  <title>Quantum CSV Grid - Visual All Surfaces Build</title>
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Roboto:wght@300;400;600;700&display=swap" />
   <link rel="stylesheet" href="https://fonts.googleapis.com/icon?family=Material+Icons" />
@@ -7276,6 +7276,452 @@ async function buildD3VisualizationSurface(msg){
 }
 
 
+/*
+ * D3 Visualization Surface v3
+ * Adds bounded Worker-side surfaces for Heatmap, Box Plot, Treemap, Calendar,
+ * Stacked Bar, Area, Bubble, Sankey, and Network. Raw rows still never cross
+ * into the UI projection layer.
+ */
+function d3VizNormalizeChartType(value){
+  const type = String(value || "bar").toLowerCase().replace(/[\s_-]+/g, "");
+  const aliases = {
+    bar:"bar",
+    histogram:"histogram",
+    hist:"histogram",
+    line:"line",
+    scatter:"scatter",
+    heatmap:"heatmap",
+    box:"boxplot",
+    boxplot:"boxplot",
+    treemap:"treemap",
+    calendar:"calendar",
+    calendarheatmap:"calendar",
+    stacked:"stackedbar",
+    stackedbar:"stackedbar",
+    area:"area",
+    areachart:"area",
+    bubble:"bubble",
+    bubblechart:"bubble",
+    sankey:"sankey",
+    flow:"sankey",
+    network:"network",
+    graph:"network"
+  };
+  return aliases[type] || "bar";
+}
+
+function d3VizRequiresSecondaryColumn(chartType){
+  return ["heatmap","stackedbar","sankey","network"].includes(d3VizNormalizeChartType(chartType));
+}
+
+function d3VizSupportsValueAggregation(chartType){
+  return !["scatter","bubble","boxplot","histogram"].includes(d3VizNormalizeChartType(chartType));
+}
+
+function d3VizDateKey(value){
+  if (value == null || value === "") return null;
+  if (value instanceof Date && Number.isFinite(value.getTime())) return value.toISOString().slice(0,10);
+  const raw = String(value).trim();
+  if (!raw) return null;
+  const normalized = raw.replace(/\./g, "/").replace(/年|月/g, "/").replace(/日/g, "");
+  const date = new Date(normalized);
+  if (Number.isFinite(date.getTime())) return date.toISOString().slice(0,10);
+  const n = d3VizParseNumber(value);
+  if (n != null) {
+    const d = new Date(n > 10_000_000_000 ? n : n * 1000);
+    if (Number.isFinite(d.getTime())) return d.toISOString().slice(0,10);
+  }
+  return null;
+}
+
+function d3VizAggLabel(aggregation, valueName, countMode){
+  return countMode ? "Count" : `${aggregation}(${valueName || "Value"})`;
+}
+
+function d3VizQuantile(sorted, q){
+  if (!sorted.length) return 0;
+  const pos = (sorted.length - 1) * q;
+  const base = Math.floor(pos);
+  const rest = pos - base;
+  const next = sorted[base + 1];
+  return next === undefined ? sorted[base] : sorted[base] + rest * (next - sorted[base]);
+}
+
+function d3VizBoxInit(sampleLimit=2048){
+  return { count:0, valid:0, min:Infinity, max:-Infinity, values:[], sampleLimit };
+}
+
+function d3VizBoxAdd(acc, rawValue){
+  acc.count++;
+  const n = d3VizParseNumber(rawValue);
+  if (n == null) return acc;
+  acc.valid++;
+  if (n < acc.min) acc.min = n;
+  if (n > acc.max) acc.max = n;
+  if (acc.values.length < acc.sampleLimit) acc.values.push(n);
+  else acc.values[acc.valid % acc.sampleLimit] = n;
+  return acc;
+}
+
+function d3VizBoxFinalize(key, acc){
+  const values = acc.values.slice().sort((a,b)=>a-b);
+  return {
+    key,
+    count:acc.count,
+    valid:acc.valid,
+    min:acc.valid ? acc.min : 0,
+    q1:d3VizQuantile(values, 0.25),
+    median:d3VizQuantile(values, 0.5),
+    q3:d3VizQuantile(values, 0.75),
+    max:acc.valid ? acc.max : 0,
+    sampleSize:values.length
+  };
+}
+
+function d3VizMakeSurfaceAdapterActive(){
+  return {
+    dataSource:"active",
+    dataSourceLabel:"Active Dataset",
+    sourceMode:"columnar",
+    strategy:"worker-columnar-tile-reduce",
+    totalRows:() => d3VizTotalRows(),
+    hasColumn:(idx) => !!d3VizColumn(idx),
+    name:(idx) => d3VizColumnName(idx),
+    type:(idx) => d3VizColumn(idx)?.type || "string",
+    resolveDomains:(indices, label) => d3VizResolveDomains(indices, label),
+    scan:(indices, label, visit) => d3VizForEachRow(d3VizUniqueColumns(indices), label, (columns, localRow) => {
+      visit((idx) => valueFromColumn(columns.get(idx), localRow));
+    })
+  };
+}
+
+function d3VizMakeSurfaceAdapterGraph(sourceColumns, sourceMode, chunkRows){
+  return {
+    dataSource:"graph",
+    dataSourceLabel:`Graph Query Result / ${sourceMode}`,
+    sourceMode,
+    strategy:"worker-graph-result-window-reduce",
+    totalRows:() => graphResultTotalRows(sourceMode),
+    hasColumn:(idx) => !!d3VizGraphColumn(sourceColumns, idx),
+    name:(idx) => d3VizGraphColumnName(sourceColumns, idx),
+    type:(idx) => d3VizGraphColumn(sourceColumns, idx)?.type || "string",
+    resolveDomains:(indices, label) => d3VizResolveGraphDomains({ columns:sourceColumns, indices, mode:sourceMode, chunkRows, label }),
+    scan:(indices, label, visit) => d3VizForEachGraphResultRow({
+      mode:sourceMode,
+      chunkRows,
+      label,
+      visit:(row) => visit((idx) => d3VizGraphValue(row, idx))
+    })
+  };
+}
+
+function d3VizValidColumnList(indices, adapter){
+  return [...new Set((Array.isArray(indices) ? indices : [])
+    .map(d3VizColumnIndex)
+    .filter((idx) => idx >= 0 && adapter.hasColumn(idx)))];
+}
+
+async function d3VizBuildSurfaceFromAdapter(msg, adapter){
+  const startedAt = now();
+  const chartType = d3VizNormalizeChartType(msg.chartType);
+  const xIdx = d3VizColumnIndex(msg.xColumnIndex);
+  const yIdx = d3VizColumnIndex(msg.yColumnIndex);
+  const zIdx = d3VizColumnIndex(msg.secondaryColumnIndex ?? msg.zColumnIndex ?? msg.groupColumnIndex);
+  const aggregation = d3VizNormalizeAggregation(msg.aggregation);
+  const topN = d3VizSafeInt(msg.topN, 1, D3_VIZ_MAX_TOP_N, 80);
+  const buckets = d3VizSafeInt(msg.buckets, 8, D3_VIZ_MAX_BUCKETS, 240);
+  const categoryLimit = d3VizSafeInt(msg.categoryLimit, topN, D3_VIZ_MAX_CATEGORY_KEYS, 50000);
+  const numericYRequired = ["scatter","bubble","boxplot"].includes(chartType);
+  const countMode = numericYRequired ? false : (aggregation === "Count" || yIdx < 0 || !adapter.hasColumn(yIdx));
+  const totalRows = adapter.totalRows();
+  const xLabel = adapter.name(xIdx);
+  const yLabel = numericYRequired ? adapter.name(yIdx) : d3VizAggLabel(aggregation, adapter.name(yIdx), countMode);
+  const secondaryLabel = adapter.hasColumn(zIdx) ? adapter.name(zIdx) : "Group";
+
+  if (!adapter.hasColumn(xIdx)) throw new Error("Select a valid X column.");
+  if (d3VizRequiresSecondaryColumn(chartType) && !adapter.hasColumn(zIdx)) throw new Error(`${chartType} requires a Group/Target column.`);
+  if (numericYRequired && !adapter.hasColumn(yIdx)) throw new Error(`${chartType} requires a numeric Y column.`);
+  if (!countMode && !adapter.hasColumn(yIdx)) throw new Error("Select a valid numeric Value column.");
+  if (!totalRows) throw new Error("Source surface is empty.");
+
+  const metadata = {
+    version:3,
+    strategy:adapter.strategy,
+    dataSource:adapter.dataSource,
+    dataSourceLabel:adapter.dataSourceLabel,
+    sourceMode:adapter.sourceMode,
+    chartType,
+    aggregation,
+    xColumnIndex:xIdx,
+    xColumnName:xLabel,
+    yColumnIndex:countMode ? -1 : yIdx,
+    yColumnName:countMode ? "Rows" : adapter.name(yIdx),
+    secondaryColumnIndex:adapter.hasColumn(zIdx) ? zIdx : -1,
+    secondaryColumnName:adapter.hasColumn(zIdx) ? secondaryLabel : "",
+    xLabel,
+    yLabel,
+    secondaryLabel,
+    totalRows,
+    bucketCount:buckets,
+    topN,
+    categoryLimit,
+    builtAt:new Date().toISOString()
+  };
+
+  postProgress(1, `D3 Surface Plan: ${adapter.dataSourceLabel} / ${chartType} / ${fmt(totalRows)} rows`);
+
+  if (chartType === "bar"){
+    const groups = new Map();
+    const overflow = d3VizAggInit();
+    let overflowed = false;
+    const exec = await adapter.scan(d3VizValidColumnList([xIdx, ...(countMode ? [] : [yIdx])], adapter), "D3 bar surface", (value) => {
+      const key = d3VizCategory(value(xIdx));
+      let acc = groups.get(key);
+      if (!acc) {
+        if (groups.size >= categoryLimit) {
+          overflowed = true;
+          d3VizAggAdd(overflow, countMode ? null : value(yIdx), countMode);
+          return;
+        }
+        acc = d3VizAggInit();
+        groups.set(key, acc);
+      }
+      d3VizAggAdd(acc, countMode ? null : value(yIdx), countMode);
+    });
+    let rows = [...groups.entries()].map(([key, acc]) => ({ key, value:d3VizAggValue(acc, aggregation), count:acc.count, valid:acc.valid }));
+    if (overflowed) rows.push({ key:"(other categories)", value:d3VizAggValue(overflow, aggregation), count:overflow.count, valid:overflow.valid, overflow:true });
+    rows.sort((a,b) => Math.abs(Number(b.value || 0)) - Math.abs(Number(a.value || 0)));
+    rows = rows.slice(0, topN);
+    return { surface:{ ...metadata, kind:"bar", rows, reducedRows:rows.length, categoriesTracked:groups.size, overflowed, scanned:exec.scanned, chunks:exec.chunks }, ms:now() - startedAt };
+  }
+
+  if (chartType === "histogram"){
+    const domains = await adapter.resolveDomains([xIdx], "D3 histogram surface");
+    const domain = domains.get(xIdx);
+    if (!domain) throw new Error("Histogram requires a numeric X column.");
+    const bins = Array.from({ length:buckets }, (_, i) => ({ x0:domain.min + (domain.max - domain.min) * (i / buckets), x1:domain.min + (domain.max - domain.min) * ((i + 1) / buckets), count:0 }));
+    const exec = await adapter.scan(d3VizValidColumnList([xIdx], adapter), "D3 histogram surface", (value) => {
+      const n = d3VizParseNumber(value(xIdx));
+      if (n == null) return;
+      bins[d3VizBucketIndex(n, domain.min, domain.max, buckets)].count++;
+    });
+    return { surface:{ ...metadata, kind:"histogram", bins, domain, reducedRows:bins.length, scanned:exec.scanned, chunks:exec.chunks }, ms:now() - startedAt };
+  }
+
+  if (chartType === "line" || chartType === "area"){
+    const domains = await adapter.resolveDomains([xIdx], `D3 ${chartType} surface`);
+    const domain = domains.get(xIdx);
+    if (!domain) throw new Error(`${chartType} requires a numeric X column.`);
+    const bins = Array.from({ length:buckets }, (_, i) => ({ x0:domain.min + (domain.max - domain.min) * (i / buckets), x1:domain.min + (domain.max - domain.min) * ((i + 1) / buckets), agg:d3VizAggInit() }));
+    const exec = await adapter.scan(d3VizValidColumnList([xIdx, ...(countMode ? [] : [yIdx])], adapter), `D3 ${chartType} surface`, (value) => {
+      const x = d3VizParseNumber(value(xIdx));
+      if (x == null) return;
+      d3VizAggAdd(bins[d3VizBucketIndex(x, domain.min, domain.max, buckets)].agg, countMode ? null : value(yIdx), countMode);
+    });
+    const points = bins.map((bin) => ({ x:(bin.x0 + bin.x1) / 2, y:d3VizAggValue(bin.agg, aggregation), count:bin.agg.count, x0:bin.x0, x1:bin.x1 })).filter((point) => point.count > 0);
+    return { surface:{ ...metadata, kind:chartType, points, domain, reducedRows:points.length, scanned:exec.scanned, chunks:exec.chunks }, ms:now() - startedAt };
+  }
+
+  if (chartType === "scatter" || chartType === "bubble"){
+    const domains = await adapter.resolveDomains([xIdx, yIdx], `D3 ${chartType} density surface`);
+    const xDomain = domains.get(xIdx);
+    const yDomain = domains.get(yIdx);
+    if (!xDomain || !yDomain) throw new Error(`${chartType} requires numeric X and numeric Y columns.`);
+    const grid = Math.max(4, Math.min(160, Math.ceil(Math.sqrt(buckets))));
+    const cells = new Map();
+    const exec = await adapter.scan(d3VizValidColumnList([xIdx, yIdx], adapter), `D3 ${chartType} density surface`, (value) => {
+      const x = d3VizParseNumber(value(xIdx));
+      const y = d3VizParseNumber(value(yIdx));
+      if (x == null || y == null) return;
+      const xi = d3VizBucketIndex(x, xDomain.min, xDomain.max, grid);
+      const yi = d3VizBucketIndex(y, yDomain.min, yDomain.max, grid);
+      const key = `${xi}\u001f${yi}`;
+      let cell = cells.get(key);
+      if (!cell) {
+        cell = { count:0, xSum:0, ySum:0, xi, yi };
+        cells.set(key, cell);
+      }
+      cell.count++;
+      cell.xSum += x;
+      cell.ySum += y;
+    });
+    const points = [...cells.values()].map((cell) => ({ x:cell.xSum / cell.count, y:cell.ySum / cell.count, count:cell.count, xi:cell.xi, yi:cell.yi })).sort((a,b) => b.count - a.count).slice(0, buckets);
+    return { surface:{ ...metadata, kind:chartType, points, xDomain, yDomain, grid, reducedRows:points.length, scanned:exec.scanned, chunks:exec.chunks }, ms:now() - startedAt };
+  }
+
+  if (chartType === "heatmap"){
+    const cells = new Map();
+    const xTotals = new Map();
+    const yTotals = new Map();
+    const exec = await adapter.scan(d3VizValidColumnList([xIdx, zIdx, ...(countMode ? [] : [yIdx])], adapter), "D3 heatmap surface", (value) => {
+      const xKey = d3VizCategory(value(xIdx));
+      const yKey = d3VizCategory(value(zIdx));
+      const key = `${xKey}\u001f${yKey}`;
+      let acc = cells.get(key);
+      if (!acc) {
+        if (cells.size >= categoryLimit) return;
+        acc = d3VizAggInit();
+        cells.set(key, acc);
+      }
+      d3VizAggAdd(acc, countMode ? null : value(yIdx), countMode);
+      xTotals.set(xKey, (xTotals.get(xKey) || 0) + 1);
+      yTotals.set(yKey, (yTotals.get(yKey) || 0) + 1);
+    });
+    const xKeys = [...xTotals.entries()].sort((a,b)=>b[1]-a[1]).slice(0, Math.min(topN, 80)).map(([key])=>key);
+    const yKeys = [...yTotals.entries()].sort((a,b)=>b[1]-a[1]).slice(0, Math.min(topN, 80)).map(([key])=>key);
+    const xSet = new Set(xKeys);
+    const ySet = new Set(yKeys);
+    const out = [...cells.entries()].map(([key, acc]) => {
+      const [xKey, yKey] = key.split("\u001f");
+      return { xKey, yKey, value:d3VizAggValue(acc, aggregation), count:acc.count, valid:acc.valid };
+    }).filter((cell) => xSet.has(cell.xKey) && ySet.has(cell.yKey));
+    return { surface:{ ...metadata, kind:"heatmap", cells:out, xKeys, yKeys, reducedRows:out.length, scanned:exec.scanned, chunks:exec.chunks }, ms:now() - startedAt };
+  }
+
+  if (chartType === "stackedbar"){
+    const groups = new Map();
+    const stackTotals = new Map();
+    const exec = await adapter.scan(d3VizValidColumnList([xIdx, zIdx, ...(countMode ? [] : [yIdx])], adapter), "D3 stacked bar surface", (value) => {
+      const xKey = d3VizCategory(value(xIdx));
+      const stackKey = d3VizCategory(value(zIdx));
+      let row = groups.get(xKey);
+      if (!row) {
+        if (groups.size >= categoryLimit) return;
+        row = new Map();
+        groups.set(xKey, row);
+      }
+      let acc = row.get(stackKey);
+      if (!acc) {
+        acc = d3VizAggInit();
+        row.set(stackKey, acc);
+      }
+      d3VizAggAdd(acc, countMode ? null : value(yIdx), countMode);
+      stackTotals.set(stackKey, (stackTotals.get(stackKey) || 0) + 1);
+    });
+    const rows = [...groups.entries()].map(([key, stackMap]) => {
+      const stacks = {};
+      let total = 0;
+      for (const [stack, acc] of stackMap.entries()){
+        const v = d3VizAggValue(acc, aggregation);
+        stacks[stack] = v;
+        total += Math.abs(Number(v || 0));
+      }
+      return { key, total, stacks };
+    }).sort((a,b)=>b.total-a.total).slice(0, topN);
+    const stackKeys = [...stackTotals.entries()].sort((a,b)=>b[1]-a[1]).slice(0, 24).map(([key])=>key);
+    return { surface:{ ...metadata, kind:"stackedbar", rows, stackKeys, reducedRows:rows.length, scanned:exec.scanned, chunks:exec.chunks }, ms:now() - startedAt };
+  }
+
+  if (chartType === "boxplot"){
+    const groups = new Map();
+    const exec = await adapter.scan(d3VizValidColumnList([xIdx, yIdx], adapter), "D3 box plot surface", (value) => {
+      const key = d3VizCategory(value(xIdx));
+      let acc = groups.get(key);
+      if (!acc) {
+        if (groups.size >= categoryLimit) return;
+        acc = d3VizBoxInit();
+        groups.set(key, acc);
+      }
+      d3VizBoxAdd(acc, value(yIdx));
+    });
+    const boxes = [...groups.entries()].map(([key, acc]) => d3VizBoxFinalize(key, acc)).filter((box) => box.valid > 0).sort((a,b)=>b.valid-a.valid).slice(0, topN);
+    return { surface:{ ...metadata, kind:"boxplot", boxes, reducedRows:boxes.length, scanned:exec.scanned, chunks:exec.chunks }, ms:now() - startedAt };
+  }
+
+  if (chartType === "treemap"){
+    const parents = new Map();
+    const hasChild = adapter.hasColumn(zIdx);
+    const exec = await adapter.scan(d3VizValidColumnList([xIdx, ...(hasChild ? [zIdx] : []), ...(countMode ? [] : [yIdx])], adapter), "D3 treemap surface", (value) => {
+      const parentKey = d3VizCategory(value(xIdx));
+      const childKey = hasChild ? d3VizCategory(value(zIdx)) : "__value__";
+      let parent = parents.get(parentKey);
+      if (!parent) {
+        if (parents.size >= categoryLimit) return;
+        parent = new Map();
+        parents.set(parentKey, parent);
+      }
+      let acc = parent.get(childKey);
+      if (!acc) {
+        acc = d3VizAggInit();
+        parent.set(childKey, acc);
+      }
+      d3VizAggAdd(acc, countMode ? null : value(yIdx), countMode);
+    });
+    const children = [...parents.entries()].map(([name, childMap]) => {
+      const childNodes = [...childMap.entries()].map(([childName, acc]) => ({ name:childName === "__value__" ? name : childName, value:Math.max(0, d3VizAggValue(acc, aggregation)), count:acc.count }));
+      const value = childNodes.reduce((a, x) => a + Number(x.value || 0), 0);
+      return hasChild ? { name, value, children:childNodes.sort((a,b)=>b.value-a.value).slice(0, 80) } : { name, value, count:childNodes[0]?.count || 0 };
+    }).filter((node)=>Number(node.value || 0) > 0).sort((a,b)=>b.value-a.value).slice(0, topN);
+    return { surface:{ ...metadata, kind:"treemap", root:{ name:"root", children }, reducedRows:children.length, scanned:exec.scanned, chunks:exec.chunks }, ms:now() - startedAt };
+  }
+
+  if (chartType === "calendar"){
+    const days = new Map();
+    const exec = await adapter.scan(d3VizValidColumnList([xIdx, ...(countMode ? [] : [yIdx])], adapter), "D3 calendar heatmap surface", (value) => {
+      const day = d3VizDateKey(value(xIdx));
+      if (!day) return;
+      let acc = days.get(day);
+      if (!acc) {
+        acc = d3VizAggInit();
+        days.set(day, acc);
+      }
+      d3VizAggAdd(acc, countMode ? null : value(yIdx), countMode);
+    });
+    const rows = [...days.entries()].map(([date, acc]) => ({ date, value:d3VizAggValue(acc, aggregation), count:acc.count, valid:acc.valid })).sort((a,b)=>a.date.localeCompare(b.date));
+    return { surface:{ ...metadata, kind:"calendar", days:rows, reducedRows:rows.length, scanned:exec.scanned, chunks:exec.chunks }, ms:now() - startedAt };
+  }
+
+  if (chartType === "sankey" || chartType === "network"){
+    const edges = new Map();
+    const sourceTotals = new Map();
+    const targetTotals = new Map();
+    const exec = await adapter.scan(d3VizValidColumnList([xIdx, zIdx, ...(countMode ? [] : [yIdx])], adapter), `D3 ${chartType} surface`, (value) => {
+      const source = d3VizCategory(value(xIdx));
+      const target = d3VizCategory(value(zIdx));
+      if (!source || !target || source === target) return;
+      const key = `${source}\u001f${target}`;
+      let acc = edges.get(key);
+      if (!acc) {
+        if (edges.size >= categoryLimit) return;
+        acc = d3VizAggInit();
+        edges.set(key, acc);
+      }
+      d3VizAggAdd(acc, countMode ? null : value(yIdx), countMode);
+      sourceTotals.set(source, (sourceTotals.get(source) || 0) + 1);
+      targetTotals.set(target, (targetTotals.get(target) || 0) + 1);
+    });
+    const links = [...edges.entries()].map(([key, acc]) => {
+      const [source, target] = key.split("\u001f");
+      return { source, target, value:Math.max(0, d3VizAggValue(acc, aggregation)), count:acc.count };
+    }).filter((link)=>Number(link.value || 0) > 0).sort((a,b)=>b.value-a.value).slice(0, topN);
+    const nodeMap = new Map();
+    for (const link of links){
+      nodeMap.set(link.source, { id:link.source, side:"source", value:(nodeMap.get(link.source)?.value || 0) + link.value });
+      nodeMap.set(link.target, { id:link.target, side:"target", value:(nodeMap.get(link.target)?.value || 0) + link.value });
+    }
+    const nodes = [...nodeMap.values()].sort((a,b)=>b.value-a.value);
+    return { surface:{ ...metadata, kind:chartType, nodes, links, reducedRows:links.length, scanned:exec.scanned, chunks:exec.chunks }, ms:now() - startedAt };
+  }
+
+  throw new Error(`Unsupported D3 surface: ${chartType}`);
+}
+
+async function buildD3GraphResultVisualizationSurface(msg){
+  const sourceMode = d3VizNormalizeGraphMode(msg.sourceMode || msg.graphMode);
+  const sourceColumns = d3VizSourceColumnList(msg.sourceColumns);
+  const chunkRows = d3VizSafeInt(msg.chunkRows, 500, 50000, 10000);
+  const adapter = d3VizMakeSurfaceAdapterGraph(sourceColumns, sourceMode, chunkRows);
+  return await d3VizBuildSurfaceFromAdapter(msg, adapter);
+}
+
+async function buildD3VisualizationSurface(msg){
+  const dataSource = d3VizNormalizeDataSource(msg.dataSource);
+  if (dataSource === "graph") return await buildD3GraphResultVisualizationSurface(msg);
+  if (!state.manifest || !d3VizActiveChunkCount()) throw new Error("Open a Storage dataset before building D3 visualization.");
+  return await d3VizBuildSurfaceFromAdapter(msg, d3VizMakeSurfaceAdapterActive());
+}
+
+
 async function legacyWorkerMessageRouter(e){
   const msg=e.data||{};
   state.__lastRouterError = null;
@@ -9540,12 +9986,278 @@ function renderD3WorkerSurface(svgNode, surface) {
   return clearD3Svg(svg, width, height, "Unsupported D3 surface");
 }
 
+
+
+/* D3 Visual Projection v3 renderers. These render only bounded surfaces returned by Worker. */
+function renderD3WorkerArea(svg, surface, options) {
+  const { width, height } = options;
+  const points = Array.isArray(surface.points) ? surface.points : [];
+  if (points.length < 2) return clearD3Svg(svg, width, height, "描画できる点が足りません");
+  const margin = { top: 24, right: 24, bottom: 58, left: 78 };
+  const chartWidth = Math.max(1, width - margin.left - margin.right);
+  const chartHeight = Math.max(1, height - margin.top - margin.bottom);
+  svg.attr("viewBox", `0 0 ${width} ${height}`).attr("role", "img");
+  const x = d3.scaleLinear().domain(d3VizExtent(points, (d) => Number(d.x))).nice().range([0, chartWidth]);
+  const y = d3.scaleLinear().domain([0, Math.max(1, d3.max(points, (d) => Number(d.y)) || 1)]).nice().range([chartHeight, 0]);
+  const area = d3.area().defined((d) => Number.isFinite(Number(d.x)) && Number.isFinite(Number(d.y))).x((d) => x(Number(d.x))).y0(chartHeight).y1((d) => y(Number(d.y)));
+  const line = d3.line().defined((d) => Number.isFinite(Number(d.x)) && Number.isFinite(Number(d.y))).x((d) => x(Number(d.x))).y((d) => y(Number(d.y)));
+  const g = svg.append("g").attr("transform", `translate(${margin.left},${margin.top})`);
+  g.append("g").attr("opacity", 0.22).call(d3.axisLeft(y).ticks(6).tickSize(-chartWidth).tickFormat(""));
+  g.append("g").attr("transform", `translate(0,${chartHeight})`).call(d3.axisBottom(x).ticks(8));
+  g.append("g").call(d3.axisLeft(y).ticks(6));
+  g.append("path").datum(points).attr("fill", "currentColor").attr("opacity", 0.22).attr("d", area);
+  g.append("path").datum(points).attr("fill", "none").attr("stroke", "currentColor").attr("stroke-width", 2).attr("opacity", 0.9).attr("d", line);
+  svg.append("text").attr("x", margin.left).attr("y", height - 18).attr("font-size", 12).attr("fill", "currentColor").text(surface.xLabel || "X");
+  svg.append("text").attr("x", 16).attr("y", 18).attr("font-size", 12).attr("fill", "currentColor").text(surface.yLabel || "Y");
+}
+
+function renderD3WorkerHeatmap(svg, surface, options) {
+  const { width, height } = options;
+  const cells = Array.isArray(surface.cells) ? surface.cells : [];
+  const xKeys = Array.isArray(surface.xKeys) ? surface.xKeys : [];
+  const yKeys = Array.isArray(surface.yKeys) ? surface.yKeys : [];
+  if (!cells.length || !xKeys.length || !yKeys.length) return clearD3Svg(svg, width, height, "集約結果がありません");
+  const margin = { top: 28, right: 32, bottom: 110, left: 132 };
+  const chartWidth = Math.max(1, width - margin.left - margin.right);
+  const chartHeight = Math.max(1, height - margin.top - margin.bottom);
+  svg.attr("viewBox", `0 0 ${width} ${height}`).attr("role", "img");
+  const x = d3.scaleBand().domain(xKeys).range([0, chartWidth]).padding(0.04);
+  const y = d3.scaleBand().domain(yKeys).range([0, chartHeight]).padding(0.04);
+  const maxValue = d3.max(cells, (d) => Math.abs(Number(d.value || 0))) || 1;
+  const opacity = d3.scaleSqrt().domain([0, maxValue]).range([0.08, 0.92]);
+  const g = svg.append("g").attr("transform", `translate(${margin.left},${margin.top})`);
+  g.append("g").attr("transform", `translate(0,${chartHeight})`)
+    .call(d3.axisBottom(x).tickFormat((d) => String(d).slice(0, 16)))
+    .selectAll("text").attr("transform", "rotate(-38)").attr("text-anchor", "end");
+  g.append("g").call(d3.axisLeft(y).tickFormat((d) => String(d).slice(0, 24)));
+  g.selectAll("rect").data(cells).join("rect")
+    .attr("x", (d) => x(d.xKey))
+    .attr("y", (d) => y(d.yKey))
+    .attr("width", x.bandwidth())
+    .attr("height", y.bandwidth())
+    .attr("rx", 2)
+    .attr("fill", "currentColor")
+    .attr("opacity", (d) => opacity(Math.abs(Number(d.value || 0))))
+    .append("title")
+    .text((d) => `${d.xKey} × ${d.yKey}\nvalue ${formatD3VizNumber(d.value)}\ncount ${formatD3VizNumber(d.count)}`);
+  svg.append("text").attr("x", margin.left).attr("y", height - 18).attr("font-size", 12).attr("fill", "currentColor").text(surface.xLabel || "X");
+  svg.append("text").attr("x", 16).attr("y", 18).attr("font-size", 12).attr("fill", "currentColor").text(surface.secondaryLabel || "Y");
+}
+
+function renderD3WorkerStackedBar(svg, surface, options) {
+  const { width, height } = options;
+  const rows = Array.isArray(surface.rows) ? surface.rows : [];
+  const stackKeys = Array.isArray(surface.stackKeys) ? surface.stackKeys : [];
+  if (!rows.length || !stackKeys.length) return clearD3Svg(svg, width, height, "集約結果がありません");
+  const margin = { top: 24, right: 140, bottom: 96, left: 78 };
+  const chartWidth = Math.max(1, width - margin.left - margin.right);
+  const chartHeight = Math.max(1, height - margin.top - margin.bottom);
+  const normalized = rows.map((row) => ({ key: row.key, ...row.stacks }));
+  const series = d3.stack().keys(stackKeys)(normalized);
+  const yMax = d3.max(series, (s) => d3.max(s, (d) => d[1])) || 1;
+  const x = d3.scaleBand().domain(rows.map((d) => d.key)).range([0, chartWidth]).padding(0.18);
+  const y = d3.scaleLinear().domain([0, yMax]).nice().range([chartHeight, 0]);
+  svg.attr("viewBox", `0 0 ${width} ${height}`).attr("role", "img");
+  const g = svg.append("g").attr("transform", `translate(${margin.left},${margin.top})`);
+  g.append("g").attr("opacity", 0.22).call(d3.axisLeft(y).ticks(6).tickSize(-chartWidth).tickFormat(""));
+  g.append("g").attr("transform", `translate(0,${chartHeight})`)
+    .call(d3.axisBottom(x).tickFormat((d) => String(d).slice(0, 18)))
+    .selectAll("text").attr("transform", "rotate(-38)").attr("text-anchor", "end");
+  g.append("g").call(d3.axisLeft(y).ticks(6));
+  g.selectAll("g.stack").data(series).join("g")
+    .attr("class", "stack")
+    .attr("fill", "currentColor")
+    .attr("opacity", (_, i) => 0.25 + 0.65 * ((i + 1) / Math.max(1, series.length)))
+    .selectAll("rect")
+    .data((d) => d.map((v) => ({ ...v, stackKey: d.key })))
+    .join("rect")
+    .attr("x", (d) => x(d.data.key))
+    .attr("y", (d) => y(d[1]))
+    .attr("height", (d) => Math.max(0, y(d[0]) - y(d[1])))
+    .attr("width", x.bandwidth())
+    .append("title")
+    .text((d) => `${d.data.key} / ${d.stackKey}\n${formatD3VizNumber(d[1] - d[0])}`);
+  svg.append("text").attr("x", width - margin.right + 8).attr("y", 24).attr("font-size", 12).attr("fill", "currentColor").text("Stack");
+  stackKeys.slice(0, 16).forEach((key, i) => {
+    svg.append("text").attr("x", width - margin.right + 8).attr("y", 46 + i * 18).attr("font-size", 11).attr("fill", "currentColor").attr("opacity", 0.9).text(String(key).slice(0, 18));
+  });
+}
+
+function renderD3WorkerBoxPlot(svg, surface, options) {
+  const { width, height } = options;
+  const boxes = Array.isArray(surface.boxes) ? surface.boxes : [];
+  if (!boxes.length) return clearD3Svg(svg, width, height, "集約結果がありません");
+  const margin = { top: 24, right: 24, bottom: 96, left: 78 };
+  const chartWidth = Math.max(1, width - margin.left - margin.right);
+  const chartHeight = Math.max(1, height - margin.top - margin.bottom);
+  const x = d3.scaleBand().domain(boxes.map((d) => d.key)).range([0, chartWidth]).padding(0.22);
+  const y = d3.scaleLinear().domain(d3VizExtent(boxes.flatMap((d) => [{v:d.min},{v:d.max}]), (d) => Number(d.v))).nice().range([chartHeight, 0]);
+  svg.attr("viewBox", `0 0 ${width} ${height}`).attr("role", "img");
+  const g = svg.append("g").attr("transform", `translate(${margin.left},${margin.top})`);
+  g.append("g").attr("opacity", 0.22).call(d3.axisLeft(y).ticks(6).tickSize(-chartWidth).tickFormat(""));
+  g.append("g").attr("transform", `translate(0,${chartHeight})`)
+    .call(d3.axisBottom(x).tickFormat((d) => String(d).slice(0, 18)))
+    .selectAll("text").attr("transform", "rotate(-38)").attr("text-anchor", "end");
+  g.append("g").call(d3.axisLeft(y).ticks(6));
+  const box = g.selectAll("g.box").data(boxes).join("g").attr("transform", (d) => `translate(${x(d.key) + x.bandwidth() / 2},0)`);
+  box.append("line").attr("y1", (d) => y(d.min)).attr("y2", (d) => y(d.max)).attr("stroke", "currentColor").attr("opacity", 0.72);
+  box.append("rect").attr("x", -Math.max(8, x.bandwidth() * 0.34)).attr("width", Math.max(16, x.bandwidth() * 0.68)).attr("y", (d) => y(d.q3)).attr("height", (d) => Math.max(1, y(d.q1) - y(d.q3))).attr("rx", 4).attr("fill", "currentColor").attr("opacity", 0.28);
+  box.append("line").attr("x1", -Math.max(8, x.bandwidth() * 0.38)).attr("x2", Math.max(8, x.bandwidth() * 0.38)).attr("y1", (d) => y(d.median)).attr("y2", (d) => y(d.median)).attr("stroke", "currentColor").attr("stroke-width", 2);
+  box.append("title").text((d) => `${d.key}\nmin ${formatD3VizNumber(d.min)}\nq1 ${formatD3VizNumber(d.q1)}\nmedian ${formatD3VizNumber(d.median)}\nq3 ${formatD3VizNumber(d.q3)}\nmax ${formatD3VizNumber(d.max)}\nrows ${formatD3VizNumber(d.count)}`);
+}
+
+function renderD3WorkerTreemap(svg, surface, options) {
+  const { width, height } = options;
+  const rootData = surface.root || { name: "root", children: [] };
+  if (!Array.isArray(rootData.children) || !rootData.children.length) return clearD3Svg(svg, width, height, "集約結果がありません");
+  svg.attr("viewBox", `0 0 ${width} ${height}`).attr("role", "img");
+  const root = d3.hierarchy(rootData).sum((d) => Math.max(0, Number(d.value || 0))).sort((a, b) => b.value - a.value);
+  d3.treemap().size([width - 24, height - 24]).paddingOuter(6).paddingInner(3).round(true)(root);
+  const g = svg.append("g").attr("transform", "translate(12,12)");
+  const leaves = root.leaves();
+  const maxDepth = d3.max(leaves, (d) => d.depth) || 1;
+  const cell = g.selectAll("g").data(leaves).join("g").attr("transform", (d) => `translate(${d.x0},${d.y0})`);
+  cell.append("rect")
+    .attr("width", (d) => Math.max(0, d.x1 - d.x0))
+    .attr("height", (d) => Math.max(0, d.y1 - d.y0))
+    .attr("rx", 5)
+    .attr("fill", "currentColor")
+    .attr("opacity", (d) => 0.18 + 0.62 * (d.depth / maxDepth));
+  cell.append("text")
+    .attr("x", 6)
+    .attr("y", 16)
+    .attr("font-size", 11)
+    .attr("fill", "currentColor")
+    .attr("pointer-events", "none")
+    .text((d) => String(d.data.name || "").slice(0, Math.max(8, Math.floor((d.x1 - d.x0) / 7))));
+  cell.append("title").text((d) => `${d.ancestors().map((x) => x.data.name).reverse().slice(1).join(" / ")}\nvalue ${formatD3VizNumber(d.value)}`);
+}
+
+function renderD3WorkerCalendar(svg, surface, options) {
+  const { width, height } = options;
+  const days = Array.isArray(surface.days) ? surface.days : [];
+  if (!days.length) return clearD3Svg(svg, width, height, "日付として読める値がありません");
+  svg.attr("viewBox", `0 0 ${width} ${height}`).attr("role", "img");
+  const byDate = new Map(days.map((d) => [d.date, d]));
+  const dates = days.map((d) => new Date(`${d.date}T00:00:00`)).filter((d) => Number.isFinite(d.getTime()));
+  if (!dates.length) return clearD3Svg(svg, width, height, "日付として読める値がありません");
+  const years = [...new Set(dates.map((d) => d.getUTCFullYear()))].sort((a, b) => a - b);
+  const cell = 13;
+  const rowHeight = 132;
+  const maxValue = d3.max(days, (d) => Math.abs(Number(d.value || 0))) || 1;
+  const opacity = d3.scaleSqrt().domain([0, maxValue]).range([0.08, 0.9]);
+  years.slice(0, 4).forEach((year, yi) => {
+    const yOffset = 24 + yi * rowHeight;
+    svg.append("text").attr("x", 18).attr("y", yOffset + 20).attr("font-size", 13).attr("font-weight", 700).attr("fill", "currentColor").text(String(year));
+    const start = new Date(Date.UTC(year, 0, 1));
+    const end = new Date(Date.UTC(year + 1, 0, 1));
+    const yearDays = d3.timeDays(start, end);
+    const g = svg.append("g").attr("transform", `translate(80,${yOffset})`);
+    g.selectAll("rect").data(yearDays).join("rect")
+      .attr("x", (d) => d3.utcWeek.count(d3.utcYear(d), d) * cell)
+      .attr("y", (d) => d.getUTCDay() * cell)
+      .attr("width", cell - 2)
+      .attr("height", cell - 2)
+      .attr("rx", 2)
+      .attr("fill", "currentColor")
+      .attr("opacity", (d) => {
+        const key = d.toISOString().slice(0,10);
+        return byDate.has(key) ? opacity(Math.abs(Number(byDate.get(key).value || 0))) : 0.05;
+      })
+      .append("title")
+      .text((d) => {
+        const key = d.toISOString().slice(0,10);
+        const row = byDate.get(key);
+        return row ? `${key}\nvalue ${formatD3VizNumber(row.value)}\ncount ${formatD3VizNumber(row.count)}` : key;
+      });
+  });
+}
+
+function renderD3WorkerFlow(svg, surface, options, asNetwork = false) {
+  const { width, height } = options;
+  const links = Array.isArray(surface.links) ? surface.links : [];
+  if (!links.length) return clearD3Svg(svg, width, height, "集約結果がありません");
+  const margin = { top: 32, right: 160, bottom: 32, left: 160 };
+  const chartWidth = Math.max(1, width - margin.left - margin.right);
+  const chartHeight = Math.max(1, height - margin.top - margin.bottom);
+  const sourceKeys = [...new Set(links.map((d) => d.source))].slice(0, 40);
+  const targetKeys = [...new Set(links.map((d) => d.target))].slice(0, 40);
+  const sourceY = d3.scalePoint().domain(sourceKeys).range([20, chartHeight - 20]).padding(0.5);
+  const targetY = d3.scalePoint().domain(targetKeys).range([20, chartHeight - 20]).padding(0.5);
+  const widthScale = d3.scaleSqrt().domain([0, d3.max(links, (d) => Number(d.value || 0)) || 1]).range([1.5, asNetwork ? 7 : 18]);
+  svg.attr("viewBox", `0 0 ${width} ${height}`).attr("role", "img");
+  const g = svg.append("g").attr("transform", `translate(${margin.left},${margin.top})`);
+  g.selectAll("path.link").data(links).join("path")
+    .attr("d", (d) => {
+      const y1 = sourceY(d.source) ?? chartHeight / 2;
+      const y2 = targetY(d.target) ?? chartHeight / 2;
+      return `M0,${y1} C${chartWidth * 0.45},${y1} ${chartWidth * 0.55},${y2} ${chartWidth},${y2}`;
+    })
+    .attr("fill", "none")
+    .attr("stroke", "currentColor")
+    .attr("stroke-width", (d) => widthScale(Number(d.value || 0)))
+    .attr("opacity", asNetwork ? 0.34 : 0.22)
+    .append("title")
+    .text((d) => `${d.source} → ${d.target}\nvalue ${formatD3VizNumber(d.value)}\ncount ${formatD3VizNumber(d.count)}`);
+  const sourceNode = g.selectAll("g.source-node").data(sourceKeys).join("g").attr("transform", (d) => `translate(0,${sourceY(d) ?? 0})`);
+  const targetNode = g.selectAll("g.target-node").data(targetKeys).join("g").attr("transform", (d) => `translate(${chartWidth},${targetY(d) ?? 0})`);
+  if (asNetwork) {
+    sourceNode.append("circle").attr("r", 8).attr("fill", "currentColor").attr("opacity", 0.8);
+    targetNode.append("circle").attr("r", 8).attr("fill", "currentColor").attr("opacity", 0.8);
+  } else {
+    sourceNode.append("rect").attr("x", -10).attr("y", -11).attr("width", 20).attr("height", 22).attr("rx", 4).attr("fill", "currentColor").attr("opacity", 0.8);
+    targetNode.append("rect").attr("x", -10).attr("y", -11).attr("width", 20).attr("height", 22).attr("rx", 4).attr("fill", "currentColor").attr("opacity", 0.8);
+  }
+  sourceNode.append("text").attr("x", -16).attr("y", 4).attr("text-anchor", "end").attr("font-size", 11).attr("fill", "currentColor").text((d) => String(d).slice(0, 22));
+  targetNode.append("text").attr("x", 16).attr("y", 4).attr("font-size", 11).attr("fill", "currentColor").text((d) => String(d).slice(0, 22));
+}
+
+function renderD3WorkerSurface(svgNode, surface) {
+  const svg = d3.select(svgNode);
+  svg.selectAll("*").remove();
+  const width = 1080;
+  const height = 560;
+  const s = surface || D3_VIZ_EMPTY_SURFACE;
+  if (!s.kind || s.kind === "empty") return clearD3Svg(svg, width, height, "Build a visualization surface first");
+  if (s.kind === "bar") return renderD3WorkerBar(svg, s, { width, height });
+  if (s.kind === "histogram") return renderD3WorkerHistogram(svg, s, { width, height });
+  if (s.kind === "line") return renderD3WorkerLine(svg, s, { width, height });
+  if (s.kind === "area") return renderD3WorkerArea(svg, s, { width, height });
+  if (s.kind === "scatter") return renderD3WorkerScatter(svg, s, { width, height });
+  if (s.kind === "bubble") return renderD3WorkerScatter(svg, s, { width, height });
+  if (s.kind === "heatmap") return renderD3WorkerHeatmap(svg, s, { width, height });
+  if (s.kind === "stackedbar") return renderD3WorkerStackedBar(svg, s, { width, height });
+  if (s.kind === "boxplot") return renderD3WorkerBoxPlot(svg, s, { width, height });
+  if (s.kind === "treemap") return renderD3WorkerTreemap(svg, s, { width, height });
+  if (s.kind === "calendar") return renderD3WorkerCalendar(svg, s, { width, height });
+  if (s.kind === "sankey") return renderD3WorkerFlow(svg, s, { width, height }, false);
+  if (s.kind === "network") return renderD3WorkerFlow(svg, s, { width, height }, true);
+  return clearD3Svg(svg, width, height, "Unsupported D3 surface");
+}
+
 function D3VisualizationPanel({ manifest, columns, graphColumns = [], graphResultCount = 0, graphResultMode = "data", result, status, time, onRun, onClear }) {
   const svgRef = useRef(null);
   const activeColumnOptions = useMemo(() => d3VizColumnOptions(columns), [columns]);
   const graphColumnOptions = useMemo(() => d3VizColumnOptions(graphColumns), [graphColumns]);
   const canUseActiveSource = Boolean(manifest && activeColumnOptions.length);
   const canUseGraphSource = Boolean(graphResultCount > 0 && graphColumnOptions.length);
+
+  const chartGuides = {
+    bar:{ label:"Bar", title:"カテゴリ比較", types:"X=カテゴリ/ID/日付文字列、Y=数値またはCount", how:"地域別売上、ステータス件数などカテゴリごとの大きさを見る。", example:"Sales: X=region, Y=amount, Aggregation=Sum" },
+    stackedbar:{ label:"Stacked Bar", title:"カテゴリ内訳", types:"X=カテゴリ、Group=積み上げカテゴリ、Y=数値またはCount", how:"1つのカテゴリをさらに別カテゴリで内訳表示する。", example:"Sales: X=region, Group=channel, Y=amount" },
+    heatmap:{ label:"Heatmap", title:"2軸の濃淡", types:"X=カテゴリ/日付、Group=カテゴリ、Y=数値またはCount", how:"組み合わせごとの偏りや集中を色の濃さで見る。", example:"Access: X=path, Group=status_code, Aggregation=Count" },
+    histogram:{ label:"Histogram", title:"数値分布", types:"X=数値、Yは自動Count", how:"金額・温度・遅延などのばらつきを見る。", example:"Finance: X=amount, Buckets=240" },
+    boxplot:{ label:"Box Plot", title:"カテゴリ別分布", types:"X=カテゴリ、Y=数値", how:"カテゴリごとの中央値・四分位・外れ値傾向を見る。", example:"IoT: X=device_id, Y=temperature" },
+    line:{ label:"Line", title:"連続値の推移", types:"X=数値、Y=数値またはCount", how:"数値軸でbucket化し、合計・平均・件数の推移を見る。", example:"Sales: X=ordered_atが数値化済みならY=amount" },
+    area:{ label:"Area", title:"量の推移", types:"X=数値、Y=数値またはCount", how:"Lineと同じだが、量感や累積感を面で見る。", example:"Access: X=timestamp_numeric, Y=latency_ms Avg" },
+    calendar:{ label:"Calendar", title:"日別ヒートマップ", types:"X=日付文字列/タイムスタンプ、Y=数値またはCount", how:"日別の売上・アクセス・エラー数の偏りを見る。", example:"Sales: X=ordered_at, Y=amount Sum" },
+    scatter:{ label:"Scatter", title:"2数値の関係", types:"X=数値、Y=数値", how:"2つの数値の相関や密度を見る。", example:"IoT: X=temperature, Y=humidity" },
+    bubble:{ label:"Bubble", title:"2数値＋密度", types:"X=数値、Y=数値、Size=密度Count", how:"Scatterを密度バブルとして表示し、大量点の重なりを見る。", example:"Finance: X=amount, Y=risk_score" },
+    treemap:{ label:"Treemap", title:"構成比", types:"X=親カテゴリ、Group=子カテゴリ任意、Y=数値またはCount", how:"売上・件数などの構成比を面積で見る。", example:"Sales: X=region, Group=channel, Y=amount" },
+    sankey:{ label:"Sankey", title:"流れ", types:"X=Sourceカテゴリ、Group=Targetカテゴリ、Y=数値またはCount", how:"流入元→ページ、地域→チャネルなどの流れを見る。", example:"Access: X=referrer, Group=path, Count" },
+    network:{ label:"Network", title:"関係", types:"X=Sourceカテゴリ、Group=Targetカテゴリ、Y=数値またはCount", how:"カテゴリ間の接続関係をネットワーク風に見る。", example:"Graph: X=user_id, Group=product_id, Count" },
+  };
+  const chartOrder = ["bar","stackedbar","heatmap","histogram","boxplot","line","area","calendar","scatter","bubble","treemap","sankey","network"];
 
   const [dataSource, setDataSource] = useState("active");
   const sourceColumns = dataSource === "graph" ? graphColumnOptions : activeColumnOptions;
@@ -9562,11 +10274,23 @@ function D3VisualizationPanel({ manifest, columns, graphColumns = [], graphResul
   const [chartType, setChartType] = useState("bar");
   const [xColumn, setXColumn] = useState("");
   const [yColumn, setYColumn] = useState("-1");
+  const [secondaryColumn, setSecondaryColumn] = useState("");
   const [aggregation, setAggregation] = useState("Count");
   const [topN, setTopN] = useState("80");
   const [buckets, setBuckets] = useState("240");
   const [categoryLimit, setCategoryLimit] = useState("50000");
   const [chunkRows, setChunkRows] = useState("10000");
+
+  const guide = chartGuides[chartType] || chartGuides.bar;
+  const needsNumericX = ["histogram","line","area","scatter","bubble"].includes(chartType);
+  const needsNumericY = ["scatter","bubble","boxplot"].includes(chartType);
+  const needsSecondary = ["heatmap","stackedbar","sankey","network"].includes(chartType);
+  const optionalSecondary = chartType === "treemap";
+  const hidesY = chartType === "histogram";
+  const showsAggregation = !["histogram","scatter","bubble","boxplot"].includes(chartType);
+  const showsBuckets = ["histogram","line","area","scatter","bubble"].includes(chartType);
+  const showsTopN = !showsBuckets || ["heatmap","stackedbar","boxplot","treemap","sankey","network"].includes(chartType);
+  const xOptions = needsNumericX ? numericOptions : columnOptions;
 
   useEffect(() => {
     if (dataSource === "graph" && !canUseGraphSource) setDataSource("active");
@@ -9576,17 +10300,20 @@ function D3VisualizationPanel({ manifest, columns, graphColumns = [], graphResul
     if (!columnOptions.length) {
       setXColumn("");
       setYColumn("-1");
+      setSecondaryColumn("");
       return;
     }
-    setXColumn((current) => current && columnOptions.some((column) => String(column.index) === String(current)) ? current : String(columnOptions[0].index));
+    setXColumn((current) => current && columnOptions.some((column) => String(column.index) === String(current)) ? current : String((needsNumericX ? numericOptions[0] : columnOptions[0])?.index ?? ""));
     setYColumn((current) => current === "-1" || columnOptions.some((column) => String(column.index) === String(current)) ? current : "-1");
-  }, [dataSource, columnOptions.map((column) => `${column.index}:${column.name}:${column.type}`).join("|")]);
+    setSecondaryColumn((current) => current && columnOptions.some((column) => String(column.index) === String(current)) ? current : String(columnOptions[Math.min(1, columnOptions.length - 1)]?.index ?? ""));
+  }, [dataSource, chartType, columnOptions.map((column) => `${column.index}:${column.name}:${column.type}`).join("|"), numericOptions.map((column) => `${column.index}:${column.name}`).join("|")]);
 
   useEffect(() => {
-    if (chartType === "scatter" && yColumn === "-1" && numericOptions.length) {
-      setYColumn(String(numericOptions[0].index));
+    if (needsNumericY && yColumn === "-1" && numericOptions.length) {
+      const fallback = numericOptions.find((column) => String(column.index) !== String(xColumn)) || numericOptions[0];
+      setYColumn(String(fallback.index));
     }
-  }, [chartType, yColumn, numericOptions.map((column) => `${column.index}:${column.name}`).join("|")]);
+  }, [chartType, yColumn, xColumn, numericOptions.map((column) => `${column.index}:${column.name}`).join("|")]);
 
   useEffect(() => {
     if (!svgRef.current) return;
@@ -9603,6 +10330,7 @@ function D3VisualizationPanel({ manifest, columns, graphColumns = [], graphResul
       chartType,
       xColumnIndex:Number(xColumn),
       yColumnIndex:yColumn === "-1" ? -1 : Number(yColumn),
+      secondaryColumnIndex:secondaryColumn === "" ? -1 : Number(secondaryColumn),
       aggregation,
       topN:clampD3VizNumber(topN, 1, 1000, 80),
       buckets:clampD3VizNumber(buckets, 8, 2400, 240),
@@ -9611,16 +10339,17 @@ function D3VisualizationPanel({ manifest, columns, graphColumns = [], graphResul
     });
   }
 
-  const canRun = Boolean((dataSource === "graph" ? canUseGraphSource : canUseActiveSource) && columnOptions.length && xColumn !== "");
-  const markCount = result?.reducedRows || result?.rows?.length || result?.points?.length || result?.bins?.length || 0;
+  const canRun = Boolean((dataSource === "graph" ? canUseGraphSource : canUseActiveSource) && columnOptions.length && xColumn !== "" && (!needsSecondary || secondaryColumn !== "") && (!needsNumericY || yColumn !== "-1"));
+  const markCount = result?.reducedRows || result?.rows?.length || result?.points?.length || result?.bins?.length || result?.cells?.length || result?.boxes?.length || result?.days?.length || result?.links?.length || result?.root?.children?.length || 0;
   const scanned = result?.scanned || 0;
+  const secondaryLabel = chartType === "heatmap" ? "Y / Group column" : chartType === "stackedbar" ? "Stack column" : chartType === "sankey" || chartType === "network" ? "Target column" : "Child category";
 
   return (
-    <Box sx={{ display: "grid", gridTemplateColumns: { xs: "1fr", lg: "380px minmax(0, 1fr)" }, gap: 1 }}>
+    <Box sx={{ display: "grid", gridTemplateColumns: { xs: "1fr", lg: "410px minmax(0, 1fr)" }, gap: 1 }}>
       <Section title="D3 Infinite Surface Plan" icon={<Analytics />} hint="DataSourceを選び、対象面だけをWorkerで集約します。D3は集約済みSurfaceだけを描画します。">
         <Stack spacing={1}>
           <Alert severity="info">
-            DataSourceは観測面です。Active DatasetはColumnar Tileを直接走査し、Graph Query Resultは結果Windowをチャンク走査します。
+            Visualはraw rowsを描きません。Workerが全件をTile/Window単位で集約し、D3には数百〜数千markのSurfaceだけを渡します。
           </Alert>
 
           <TextField select label="DataSource" size="small" fullWidth value={dataSource} onChange={(e) => { setDataSource(e.target.value); onClear?.(); }} disabled={!canUseActiveSource && !canUseGraphSource}>
@@ -9628,30 +10357,45 @@ function D3VisualizationPanel({ manifest, columns, graphColumns = [], graphResul
             <MenuItem value="graph" disabled={!canUseGraphSource}>Graph Query Result / Current Result Surface</MenuItem>
           </TextField>
 
-          <TextField select label="Chart type" size="small" fullWidth value={chartType} onChange={(e) => setChartType(e.target.value)} disabled={!canRun}>
-            <MenuItem value="bar">Bar / category aggregate</MenuItem>
-            <MenuItem value="line">Line / numeric binned series</MenuItem>
-            <MenuItem value="scatter">Scatter / density surface</MenuItem>
-            <MenuItem value="histogram">Histogram / numeric distribution</MenuItem>
+          <TextField select label="Chart type" size="small" fullWidth value={chartType} onChange={(e) => { setChartType(e.target.value); onClear?.(); }} disabled={!canRun && !columnOptions.length}>
+            {chartOrder.map((key) => (
+              <MenuItem key={key} value={key}>{chartGuides[key].label} / {chartGuides[key].title}</MenuItem>
+            ))}
           </TextField>
 
-          <TextField select label={chartType === "histogram" ? "Value column" : "X / Category column"} size="small" fullWidth value={xColumn} onChange={(e) => setXColumn(e.target.value)} disabled={!canRun}>
-            {(chartType === "histogram" || chartType === "line" || chartType === "scatter" ? numericOptions : columnOptions).map((column) => (
+          <Alert severity="success" icon={false}>
+            <Typography variant="body2" sx={{ fontWeight: 800 }}>{guide.label}: {guide.title}</Typography>
+            <Typography variant="caption" display="block">{guide.how}</Typography>
+            <Typography variant="caption" display="block">型: {guide.types}</Typography>
+            <Typography variant="caption" display="block">例: {guide.example}</Typography>
+          </Alert>
+
+          <TextField select label={chartType === "histogram" ? "Value column" : chartType === "calendar" ? "Date column" : chartType === "sankey" || chartType === "network" ? "Source column" : "X / Category column"} size="small" fullWidth value={xColumn} onChange={(e) => setXColumn(e.target.value)} disabled={!columnOptions.length}>
+            {xOptions.map((column) => (
               <MenuItem key={column.index} value={String(column.index)}>{column.name} / {column.type}</MenuItem>
             ))}
           </TextField>
 
-          {chartType !== "histogram" && (
-            <TextField select label="Y / Value column" size="small" fullWidth value={yColumn} onChange={(e) => setYColumn(e.target.value)} disabled={!canRun || (aggregation === "Count" && chartType !== "scatter")}>
-              <MenuItem value="-1" disabled={chartType === "scatter"}>Rows / Count</MenuItem>
+          {(needsSecondary || optionalSecondary) && (
+            <TextField select label={secondaryLabel} size="small" fullWidth value={secondaryColumn} onChange={(e) => setSecondaryColumn(e.target.value)} disabled={!columnOptions.length}>
+              {optionalSecondary && <MenuItem value="-1">なし / single level</MenuItem>}
+              {columnOptions.map((column) => (
+                <MenuItem key={column.index} value={String(column.index)}>{column.name} / {column.type}</MenuItem>
+              ))}
+            </TextField>
+          )}
+
+          {!hidesY && (
+            <TextField select label={needsNumericY ? "Y numeric column" : "Value column"} size="small" fullWidth value={yColumn} onChange={(e) => setYColumn(e.target.value)} disabled={!columnOptions.length || (aggregation === "Count" && !needsNumericY)}>
+              <MenuItem value="-1" disabled={needsNumericY}>Rows / Count</MenuItem>
               {numericOptions.map((column) => (
                 <MenuItem key={column.index} value={String(column.index)}>{column.name} / {column.type}</MenuItem>
               ))}
             </TextField>
           )}
 
-          {chartType !== "scatter" && (
-            <TextField select label="Aggregation" size="small" fullWidth value={aggregation} onChange={(e) => setAggregation(e.target.value)} disabled={!canRun}>
+          {showsAggregation && (
+            <TextField select label="Aggregation" size="small" fullWidth value={aggregation} onChange={(e) => setAggregation(e.target.value)} disabled={!columnOptions.length}>
               <MenuItem value="Count">Count</MenuItem>
               <MenuItem value="Sum">Sum</MenuItem>
               <MenuItem value="Avg">Avg</MenuItem>
@@ -9660,17 +10404,19 @@ function D3VisualizationPanel({ manifest, columns, graphColumns = [], graphResul
             </TextField>
           )}
 
-          {chartType === "bar" ? (
+          {showsBuckets && (
+            <TextField label="Buckets / max marks" size="small" value={buckets} onChange={(e) => setBuckets(e.target.value)} disabled={!columnOptions.length} />
+          )}
+
+          {showsTopN && (
             <>
-              <TextField label="Top N marks" size="small" value={topN} onChange={(e) => setTopN(e.target.value)} disabled={!canRun} />
-              <TextField label="Category tracking limit" size="small" value={categoryLimit} onChange={(e) => setCategoryLimit(e.target.value)} disabled={!canRun} />
+              <TextField label="Top N marks" size="small" value={topN} onChange={(e) => setTopN(e.target.value)} disabled={!columnOptions.length} />
+              <TextField label="Category tracking limit" size="small" value={categoryLimit} onChange={(e) => setCategoryLimit(e.target.value)} disabled={!columnOptions.length} />
             </>
-          ) : (
-            <TextField label="Buckets / max marks" size="small" value={buckets} onChange={(e) => setBuckets(e.target.value)} disabled={!canRun} />
           )}
 
           {dataSource === "graph" && (
-            <TextField label="Graph chunk rows" size="small" value={chunkRows} onChange={(e) => setChunkRows(e.target.value)} disabled={!canRun} />
+            <TextField label="Graph chunk rows" size="small" value={chunkRows} onChange={(e) => setChunkRows(e.target.value)} disabled={!canUseGraphSource} />
           )}
 
           <Stack direction="row" spacing={1}>
@@ -9680,6 +10426,8 @@ function D3VisualizationPanel({ manifest, columns, graphColumns = [], graphResul
 
           <KeyValue rows={[
             ["DataSource", sourceLabel],
+            ["必要な型", guide.types],
+            ["使い方", guide.how],
             ["Source rows", fmt(sourceRows)],
             ["D3 marks", fmt(markCount)],
             ["Scanned rows", fmt(scanned)],
@@ -9706,7 +10454,6 @@ function D3VisualizationPanel({ manifest, columns, graphColumns = [], graphResul
     </Box>
   );
 }
-
 
 function columnsFromTableHeader(header) {
   return (Array.isArray(header) ? header : []).map((name, index) => ({
