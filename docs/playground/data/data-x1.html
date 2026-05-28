@@ -7054,6 +7054,168 @@ function graphResultOutputRowMatches(row, filters){
   return true;
 }
 
+
+function graphResultWindowCacheDigest(value){
+  try {
+    return JSON.stringify(value ?? null);
+  } catch {
+    return String(value ?? "");
+  }
+}
+
+function graphResultWindowCacheKey({selected, start, limit, derivedColumns, outputColumnNames}={}){
+  return [
+    "v2",
+    Array.isArray(selected) ? selected.join(".") : "",
+    Number(start || 0),
+    Number(limit || 0),
+    graphResultWindowCacheDigest(derivedColumns || []),
+    graphResultWindowCacheDigest(outputColumnNames || [])
+  ].join("|");
+}
+
+function graphResultWindowCacheGet(surface, key){
+  if (!surface || !key || !surface.windowCache || typeof surface.windowCache !== "object") return null;
+  const entry = surface.windowCache.map?.[key];
+  if (!entry) return null;
+  entry.lastUsedMs = Date.now();
+  return entry.value || null;
+}
+
+function graphResultWindowCacheSet(surface, key, value){
+  if (!surface || !key || !value) return;
+  if (!surface.windowCache || typeof surface.windowCache !== "object") {
+    surface.windowCache = { map:Object.create(null), order:[], max:24 };
+  }
+  const cache = surface.windowCache;
+  if (!cache.map) cache.map = Object.create(null);
+  if (!Array.isArray(cache.order)) cache.order = [];
+  const nowMs = Date.now();
+  if (!cache.map[key]) cache.order.push(key);
+  cache.map[key] = { value, createdAtMs:nowMs, lastUsedMs:nowMs };
+  const max = Math.max(4, Math.min(64, Number(cache.max || 24)));
+  while (cache.order.length > max) {
+    const oldest = cache.order.shift();
+    if (oldest && oldest !== key) delete cache.map[oldest];
+  }
+}
+
+function graphResultSurfaceRowWindowBuckets(surface, start, limit){
+  if (!surface || surface.mode !== "data") return { buckets:new Map(), rowCount:0, strategy:"none" };
+  const safeStart = Math.max(0, Number(start || 0));
+  const safeLimit = Math.max(0, Math.min(50000, Number(limit || 0)));
+  if (!safeLimit) return { buckets:new Map(), rowCount:0, strategy:"empty" };
+
+  if (Array.isArray(surface.rowIds)) {
+    const rowIds = surface.rowIds.slice(safeStart, safeStart + safeLimit);
+    const bucketed = d3VizBucketRowIdsByChunkFast(rowIds);
+    return { ...bucketed, rowCount:rowIds.length, strategy:"rowid-window" };
+  }
+
+  const totalRows = Number(surface.rowCount || surface.totalRows || state.manifest?.totalRows || 0);
+  const end = Math.min(totalRows, safeStart + safeLimit);
+  const ranges = d3VizChunkRangesForActiveDataset();
+  const buckets = new Map();
+  let order = 0;
+
+  for (const range of ranges){
+    if (range.end <= safeStart) continue;
+    if (range.start >= end) break;
+    const localStart = Math.max(0, safeStart - range.start);
+    const localEnd = Math.min(range.rowCount, end - range.start);
+    if (localEnd <= localStart) continue;
+
+    const refs = [];
+    for (let localRow = localStart; localRow < localEnd; localRow++){
+      refs.push({
+        order,
+        global:range.start + localRow,
+        localRow
+      });
+      order++;
+    }
+    if (refs.length) buckets.set(range.chunkIndex, refs);
+  }
+
+  return { buckets, ranges, rowCount:order, strategy:"contiguous-window" };
+}
+
+async function readGraphResultSurfaceRowsWindow(surface, sourceIndices, {start=0, limit=1000, label="GraphResultSurface page"}={}){
+  if (!surface) throw new Error("GraphResultSurface is not active");
+  const safeStart = Math.max(0, Number(start || 0));
+  const safeLimit = Math.max(1, Math.min(50000, Number(limit || 1000)));
+
+  const requiredSource = graphResultSurfaceRequiredSourceIndices(surface, sourceIndices);
+  if (!requiredSource.length) return { rows:[], scanned:0, chunks:0, strategy:"empty" };
+
+  if (surface.mode === "join"){
+    const sourceRows = Array.isArray(surface.rows) ? surface.rows.slice(safeStart, safeStart + safeLimit) : [];
+    return {
+      rows:sourceRows.map((row) => graphResultSurfaceMaterializeValueArray((sourceIdx) => graphResultSurfaceValueFromJoin(surface, row, sourceIdx), requiredSource)),
+      scanned:sourceRows.length,
+      chunks:Math.ceil(sourceRows.length / 5000),
+      strategy:"join-window"
+    };
+  }
+
+  const requiredActual = graphResultSurfaceRequiredActualColumns(surface, requiredSource);
+  if (!requiredActual.length) return { rows:[], scanned:0, chunks:0, strategy:"empty" };
+
+  const { buckets, rowCount, strategy } = graphResultSurfaceRowWindowBuckets(surface, safeStart, safeLimit);
+  const rows = new Array(rowCount);
+  let scanned = 0;
+  let chunkCount = 0;
+  const total = Number(surface.rowCount || surface.totalRows || 0);
+
+  for (const [chunkIndex, refsRaw] of buckets.entries()){
+    if (state.cancelled) throw new Error("Cancelled");
+    const refs = Array.isArray(refsRaw) ? refsRaw.slice().sort((a,b) => a.localRow - b.localRow) : [];
+    if (!refs.length) continue;
+
+    const chunk = await readChunkColumns(chunkIndex, requiredActual, {
+      surfacePlan:{
+        version:GRAPH_RESULT_SURFACE_VERSION,
+        surface:"graph-result-window",
+        surfaceId:surface.id,
+        startRow:safeStart,
+        rowLimit:safeLimit,
+        strategy,
+        requiredColumns:requiredActual,
+        warmColumns:requiredActual,
+        hotColumns:requiredActual
+      }
+    });
+
+    for (const ref of refs){
+      const localRow = Number(ref.localRow);
+      const order = Number(ref.order);
+      if (!Number.isFinite(localRow) || localRow < 0 || localRow >= chunk.rowCount) continue;
+      if (!Number.isFinite(order) || order < 0 || order >= rows.length) continue;
+
+      rows[order] = graphResultSurfaceMaterializeValueArray(
+        (sourceIdx) => graphResultSurfaceValueFromDataChunk(surface, chunk, sourceIdx, localRow),
+        requiredSource
+      );
+      scanned++;
+    }
+
+    chunkCount++;
+    if (chunkCount % 4 === 0) await workerYield();
+  }
+
+  postProgress(
+    1,
+    `${label}: ${strategy} ${fmt(scanned)}/${fmt(total)}`
+  );
+
+  return {
+    rows:rows.filter((row) => Array.isArray(row)),
+    scanned,
+    chunks:chunkCount,
+    strategy
+  };
+}
+
 async function readGraphResultWindow({mode="data", surfaceId=null, page=1, pageSize=1000, columns=[], derivedColumns=null, outputColumnNames=null, tableFilters=null}={}){
   const surface = getGraphResultSurface({mode, surfaceId});
   if (!surface) throw new Error("Graph Query Result surface is not active");
@@ -7073,22 +7235,36 @@ async function readGraphResultWindow({mode="data", surfaceId=null, page=1, pageS
   const filtered = hasGraphResultTableFilters(filters);
 
   if (!filtered) {
-    const rows = [];
-    let skipped = 0;
-    await forEachGraphResultSurfaceRow(surface, selected, {
-      label:"GraphResultSurface page",
-      progressBase:0,
-      progressSpan:1,
-      rowLimit:start + limit,
-      chunkYieldEvery:8,
-      visit:(value) => {
-        if (skipped < start) { skipped++; return; }
-        if (rows.length < limit) rows.push(graphResultSurfaceMaterializeValueArray(value, selected));
-      }
+    const cacheKey = graphResultWindowCacheKey({
+      selected,
+      start,
+      limit,
+      derivedColumns:effectiveDerivedColumns,
+      outputColumnNames:effectiveOutputColumnNames
+    });
+    const cached = graphResultWindowCacheGet(surface, cacheKey);
+    if (cached) {
+      return {
+        ...cached,
+        surface:graphResultSurfaceSummary(surface),
+        surfaceId:surface.id,
+        startRow:start,
+        totalMatches:Number(surface.rowCount || surface.totalRows || 0),
+        filtered:false,
+        page:safePage,
+        pageSize:safePageSize,
+        cacheHit:true
+      };
+    }
+
+    const windowResult = await readGraphResultSurfaceRowsWindow(surface, selected, {
+      start,
+      limit,
+      label:"GraphResultSurface page"
     });
 
-    const applied = graphApplyDerivedRows(header, rows, effectiveDerivedColumns, effectiveOutputColumnNames);
-    return {
+    const applied = graphApplyDerivedRows(header, windowResult.rows, effectiveDerivedColumns, effectiveOutputColumnNames);
+    const response = {
       ...applied,
       surface:graphResultSurfaceSummary(surface),
       surfaceId:surface.id,
@@ -7096,8 +7272,20 @@ async function readGraphResultWindow({mode="data", surfaceId=null, page=1, pageS
       totalMatches:Number(surface.rowCount || surface.totalRows || 0),
       filtered:false,
       page:safePage,
-      pageSize:safePageSize
+      pageSize:safePageSize,
+      cacheHit:false,
+      windowStrategy:windowResult.strategy,
+      windowScanned:windowResult.scanned,
+      windowChunks:windowResult.chunks
     };
+    graphResultWindowCacheSet(surface, cacheKey, {
+      header:response.header,
+      rows:response.rows,
+      windowStrategy:response.windowStrategy,
+      windowScanned:response.windowScanned,
+      windowChunks:response.windowChunks
+    });
+    return response;
   }
 
   const rows = [];
