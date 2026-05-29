@@ -7518,6 +7518,181 @@ function graphResultEffectiveColumn(surface, index, derivedColumns=null) {
   return graphResultEffectiveColumns(surface, derivedColumns).find((c) => Number(c.sourceIndex ?? c.index) === idx || Number(c.index) === idx) || null;
 }
 
+
+/*
+ * Graph Result Analysis Surface
+ * ---------------------------------------------------------
+ * Search / Pivot / Time / CSV export must read the same output surface
+ * that the Graph Result table displays.  The old path validated columns
+ * against surface.columns only, so derived/calculated columns appeared in
+ * the UI but were invisible to the analysis engine.  This adapter raises
+ * the processing unit from "base column" to "effective output column".
+ */
+function createGraphResultAnalysisSurface(surface, msg={}) {
+  if (!surface) throw new Error("Graph Query Result surface is not active");
+
+  const baseIndices = Array.isArray(msg.columns) && msg.columns.length
+    ? graphResultSurfaceRequiredSourceIndices(surface, msg.columns)
+    : graphResultSurfaceAllSourceIndices(surface);
+
+  const baseHeader = graphResultSurfaceHeader(surface, baseIndices);
+  const derivedColumns = graphResultEffectiveDerivedColumns(surface, msg.derivedColumns);
+  const compiledDerived = compileGraphDerivedColumnsForWorker(derivedColumns, baseHeader);
+  const outputColumnNames = Array.isArray(msg.outputColumnNames) && msg.outputColumnNames.length
+    ? msg.outputColumnNames.map(String).filter(Boolean)
+    : null;
+
+  const fullHeader = graphExportHeader(baseHeader, derivedColumns, null);
+  let outputHeader = graphExportHeader(baseHeader, derivedColumns, outputColumnNames);
+  let outputIndexes = graphExportIndexesForHeader(baseHeader, derivedColumns, outputColumnNames);
+
+  if (!outputHeader.length || outputIndexes.length !== outputHeader.length) {
+    outputHeader = fullHeader;
+    outputIndexes = fullHeader.map((_, i) => i);
+  }
+
+  const baseColumnCount = baseHeader.length;
+  const columns = outputHeader.map((name, outputIndex) => {
+    const fullIndex = Number(outputIndexes[outputIndex]);
+    if (Number.isFinite(fullIndex) && fullIndex >= 0 && fullIndex < baseColumnCount) {
+      const sourceIndex = Number(baseIndices[fullIndex]);
+      const baseColumn = graphResultSurfaceColumn(surface, sourceIndex) || {};
+      return {
+        index:outputIndex,
+        sourceIndex:outputIndex,
+        outputIndex,
+        fullIndex,
+        kind:"base",
+        baseHeaderIndex:fullIndex,
+        baseSourceIndex:sourceIndex,
+        actualIndex:baseColumn.actualIndex ?? baseColumn.columnIndex ?? null,
+        columnIndex:baseColumn.columnIndex ?? baseColumn.actualIndex ?? sourceIndex,
+        name:String(name || baseColumn.name || `Column ${outputIndex + 1}`),
+        type:baseColumn.type || "string"
+      };
+    }
+
+    const derivedIndex = fullIndex - baseColumnCount;
+    const derived = compiledDerived[derivedIndex] || derivedColumns[derivedIndex] || {};
+    return {
+      index:outputIndex,
+      sourceIndex:outputIndex,
+      outputIndex,
+      fullIndex,
+      kind:"derived",
+      baseHeaderIndex:null,
+      baseSourceIndex:null,
+      actualIndex:null,
+      columnIndex:outputIndex,
+      derivedIndex,
+      name:String(name || derived.newColumnName || `Derived ${derivedIndex + 1}`),
+      type:"string"
+    };
+  });
+
+  return {
+    surface,
+    baseIndices,
+    baseHeader,
+    derivedColumns,
+    compiledDerived,
+    outputHeader,
+    outputIndexes,
+    columns,
+    rowCount:Number(surface.rowCount || surface.totalRows || 0)
+  };
+}
+
+function graphResultAnalysisColumn(analysis, index) {
+  const idx = Number(index);
+  if (!analysis || !Number.isFinite(idx) || idx < 0) return null;
+  return analysis.columns?.[idx] || null;
+}
+
+function graphResultAnalysisAllIndices(analysis) {
+  return (analysis?.columns || []).map((_, i) => i);
+}
+
+function graphResultAnalysisRequiredBaseIndices(analysis, outputIndices=[]) {
+  const seen = new Set();
+  const out = [];
+  const addBase = (idx) => {
+    const n = Number(idx);
+    if (Number.isFinite(n) && n >= 0 && !seen.has(n)) {
+      seen.add(n);
+      out.push(n);
+    }
+  };
+
+  for (const raw of Array.isArray(outputIndices) ? outputIndices : []) {
+    const column = graphResultAnalysisColumn(analysis, raw);
+    if (!column) continue;
+
+    if (column.kind === "base") {
+      addBase(column.baseSourceIndex);
+      continue;
+    }
+
+    const derived = analysis.compiledDerived?.[column.derivedIndex];
+    const requiredPositions = Array.isArray(derived?.requiredColumnIndices) ? derived.requiredColumnIndices : [];
+
+    if ((derived?.compiledMode || derived?.valueMode) === "formula" && Array.isArray(derived?.requiredColumns) && derived.requiredColumns.length > requiredPositions.length) {
+      for (const idx of analysis.baseIndices || []) addBase(idx);
+      continue;
+    }
+
+    for (const pos of requiredPositions) {
+      const sourceIndex = analysis.baseIndices?.[Number(pos)];
+      addBase(sourceIndex);
+    }
+  }
+
+  return out;
+}
+
+function graphResultAnalysisScanBaseIndices(analysis, outputIndices=[]) {
+  const required = graphResultAnalysisRequiredBaseIndices(analysis, outputIndices);
+  if (required.length) return required;
+
+  const anchor = Number(analysis?.baseIndices?.[0]);
+  return Number.isFinite(anchor) && anchor >= 0 ? [anchor] : [];
+}
+
+function graphResultAnalysisMakeGetter(analysis, baseValueGetter) {
+  let rowMap = null;
+  const derivedCache = new Map();
+
+  const ensureRowMap = () => {
+    if (rowMap) return rowMap;
+    rowMap = {};
+    for (let i = 0; i < (analysis.baseHeader || []).length; i++) {
+      rowMap[analysis.baseHeader[i]] = baseValueGetter(analysis.baseIndices[i]);
+    }
+    return rowMap;
+  };
+
+  return (outputIndex) => {
+    const column = graphResultAnalysisColumn(analysis, outputIndex);
+    if (!column) return "";
+
+    if (column.kind === "base") {
+      return baseValueGetter(column.baseSourceIndex);
+    }
+
+    if (derivedCache.has(column.derivedIndex)) return derivedCache.get(column.derivedIndex);
+
+    const compiled = analysis.compiledDerived?.[column.derivedIndex];
+    const value = evaluateCompiledGraphDerivedColumnForWorker(compiled, ensureRowMap());
+    derivedCache.set(column.derivedIndex, value);
+    return value;
+  };
+}
+
+function graphResultAnalysisMaterializeValueArray(analysis, getOutputValue, outputIndices=null) {
+  const indices = Array.isArray(outputIndices) && outputIndices.length ? outputIndices : graphResultAnalysisAllIndices(analysis);
+  return indices.map((idx) => getOutputValue(idx));
+}
+
 /*
  * Last-definition overrides for Graph Query Result utilities.
  * These preserve the existing command/response names while routing work through
@@ -7963,25 +8138,31 @@ async function readGraphResultWindow({mode="data", surfaceId=null, page=1, pageS
 async function runGraphResultSearch(msg={}){
   const surface = getGraphResultSurface(msg);
   if (!surface) throw new Error("Graph Query Result surface is not active");
+
+  const analysis = createGraphResultAnalysisSurface(surface, msg);
   const colIndex = Number(msg.columnIndex || 0);
+  const targetColumn = graphResultAnalysisColumn(analysis, colIndex);
+  if (!targetColumn) throw new Error("Search column is not available on Graph Result Analysis surface");
+
   const op = msg.op || "contains";
   const value = msg.value ?? "";
   const cap = normalizePlanLimit(msg.maxMatches || 100000);
-  const allIndices = graphResultSurfaceAllSourceIndices(surface);
-  const required = [...new Set([colIndex, ...allIndices])];
+  const allOutputIndices = graphResultAnalysisAllIndices(analysis);
+  const requiredOutputs = [...new Set([colIndex, ...allOutputIndices])];
+  const requiredBase = graphResultAnalysisScanBaseIndices(analysis, requiredOutputs);
   const matched = [];
   const t0 = now();
 
-  const scan = await forEachGraphResultSurfaceRow(surface, required, {
+  const scan = await forEachGraphResultSurfaceRow(surface, requiredBase, {
     label:"GraphResultSurface search",
     progressBase:0,
     progressSpan:99,
     rowLimit:Number.POSITIVE_INFINITY,
-    visit:(getValue, rowOrder) => {
-      const col = graphResultSurfaceColumn(surface, colIndex);
-      const type = col?.type || "string";
+    visit:(getBaseValue, rowOrder) => {
+      const getValue = graphResultAnalysisMakeGetter(analysis, getBaseValue);
+      const type = targetColumn?.type || "string";
       if (compareValue(getValue(colIndex), op, value, type)){
-        matched.push({ rowNumber:rowOrder + 1, row:graphResultSurfaceMaterializeValueArray(getValue, allIndices) });
+        matched.push({ rowNumber:rowOrder + 1, row:graphResultAnalysisMaterializeValueArray(analysis, getValue, allOutputIndices) });
       }
       return matched.length < cap;
     }
@@ -7990,12 +8171,13 @@ async function runGraphResultSearch(msg={}){
   const capped = matched.length >= cap;
   const finalRows = capped ? matched.slice(0, cap) : matched;
   state.graphResultSearch = {
-    header:["Result Row", ...graphResultSurfaceHeader(surface, allIndices)],
+    header:["Result Row", ...analysis.outputHeader],
     rows:finalRows.map((x) => [x.rowNumber, ...x.row]),
     totalSourceRows:Number(surface.rowCount || 0),
     capped,
     surfaceId:surface.id,
-    ms:now() - t0
+    ms:now() - t0,
+    analysisSurface:{ columns:analysis.columns, outputHeader:analysis.outputHeader }
   };
   return {
     matches:finalRows.length,
@@ -8030,26 +8212,30 @@ function readGraphResultSearchPage(page=1,pageSize=500){
 async function buildGraphResultPivot(msg={}){
   const surface = getGraphResultSurface(msg);
   if (!surface) throw new Error("Graph Query Result surface is not active");
-  const rowFields=(msg.rowFields||[]).map(Number).filter((i) => Number.isFinite(i) && graphResultSurfaceColumn(surface, i));
-  const columnFields=(msg.columnFields||[]).map(Number).filter((i) => Number.isFinite(i) && graphResultSurfaceColumn(surface, i));
+
+  const analysis = createGraphResultAnalysisSurface(surface, msg);
+  const rowFields=(msg.rowFields||[]).map(Number).filter((i) => Number.isFinite(i) && graphResultAnalysisColumn(analysis, i));
+  const columnFields=(msg.columnFields||[]).map(Number).filter((i) => Number.isFinite(i) && graphResultAnalysisColumn(analysis, i));
   const valIdx=Number(msg.valueField);
-  const hasValue=Number.isFinite(valIdx) && valIdx >= 0 && graphResultSurfaceColumn(surface, valIdx);
+  const hasValue=Number.isFinite(valIdx) && valIdx >= 0 && !!graphResultAnalysisColumn(analysis, valIdx);
   const countMode=!hasValue;
   const aggMode=countMode ? "Count" : (msg.aggregation || "Count");
   const rowLimit=Math.max(1,Number(msg.maxRows||10000));
   const colLimit=Math.max(1,Number(msg.maxCols||1000));
-  const required=[...new Set([...rowFields, ...columnFields, ...(hasValue ? [valIdx] : [])])];
+  const requiredOutputs=[...new Set([...rowFields, ...columnFields, ...(hasValue ? [valIdx] : [])])];
+  const requiredBase=graphResultAnalysisScanBaseIndices(analysis, requiredOutputs);
 
   const rowKeys=[], colKeys=[], rowSet=new Set(), colSet=new Set(), cells=new Map(), rowTotals=new Map(), colTotals=new Map();
   const grand=makeAgg();
   let limitHit=false;
   const t0=now();
 
-  const scan = await forEachGraphResultSurfaceRow(surface, required, {
+  const scan = await forEachGraphResultSurfaceRow(surface, requiredBase, {
     label:"GraphResultSurface pivot",
     progressBase:0,
     progressSpan:99,
-    visit:(getValue) => {
+    visit:(getBaseValue) => {
+      const getValue = graphResultAnalysisMakeGetter(analysis, getBaseValue);
       const rParts=rowFields.length ? rowFields.map((i) => getValue(i)) : ["(All)"];
       const cParts=columnFields.length ? columnFields.map((i) => getValue(i)) : ["Value"];
       const rk=keyOf(rParts), ck=keyOf(cParts);
@@ -8074,7 +8260,7 @@ async function buildGraphResultPivot(msg={}){
     }
   });
 
-  const rowHeaderNames=rowFields.length ? rowFields.map((i)=>graphResultSurfaceColumn(surface, i)?.name || `Field ${i+1}`) : ["Rows"];
+  const rowHeaderNames=rowFields.length ? rowFields.map((i)=>graphResultAnalysisColumn(analysis, i)?.name || `Field ${i+1}`) : ["Rows"];
   const colLabels=colKeys.map(k=>pivotColumnLabel(k, columnFields));
   const outHeader=[...rowHeaderNames, ...colLabels, "Grand Total"];
   const outRows=[];
@@ -8093,34 +8279,38 @@ async function buildGraphResultPivot(msg={}){
   totalRow.push(aggValue(grand, aggMode));
   outRows.push(totalRow);
 
-  state.graphResultPivot={header:outHeader, rows:outRows, scanned:scan.scanned, limitHit, surfaceId:surface.id, strategy:scan.strategy, ms:now()-t0};
+  state.graphResultPivot={header:outHeader, rows:outRows, scanned:scan.scanned, limitHit, surfaceId:surface.id, strategy:scan.strategy, ms:now()-t0, analysisSurface:{ columns:analysis.columns, outputHeader:analysis.outputHeader }};
   return {...state.graphResultPivot, surface:graphResultSurfaceSummary(surface)};
 }
 
 async function buildGraphResultTime(msg={}){
   const surface = getGraphResultSurface(msg);
   if (!surface) throw new Error("Graph Query Result surface is not active");
+
+  const analysis = createGraphResultAnalysisSurface(surface, msg);
   const timeIdx=Number(msg.timeField);
   const groupIdx=Number(msg.groupField);
   const valIdx=Number(msg.valueField);
-  const hasTime=Number.isFinite(timeIdx) && timeIdx >= 0 && graphResultSurfaceColumn(surface, timeIdx);
+  const hasTime=Number.isFinite(timeIdx) && timeIdx >= 0 && !!graphResultAnalysisColumn(analysis, timeIdx);
   if (!hasTime) throw new Error("Time column is required for Graph Result Time");
-  const hasGroup=Number.isFinite(groupIdx) && groupIdx >= 0 && graphResultSurfaceColumn(surface, groupIdx);
-  const hasValue=Number.isFinite(valIdx) && valIdx >= 0 && graphResultSurfaceColumn(surface, valIdx);
+  const hasGroup=Number.isFinite(groupIdx) && groupIdx >= 0 && !!graphResultAnalysisColumn(analysis, groupIdx);
+  const hasValue=Number.isFinite(valIdx) && valIdx >= 0 && !!graphResultAnalysisColumn(analysis, valIdx);
   const countMode=!hasValue;
   const aggMode=countMode ? "Count" : (msg.aggregation || "Count");
   const bucket=msg.bucket || "month";
   const bucketLimit=Math.max(1,Number(msg.maxBuckets||10000));
-  const required=[...new Set([timeIdx, ...(hasGroup ? [groupIdx] : []), ...(hasValue ? [valIdx] : [])])];
+  const requiredOutputs=[...new Set([timeIdx, ...(hasGroup ? [groupIdx] : []), ...(hasValue ? [valIdx] : [])])];
+  const requiredBase=graphResultAnalysisScanBaseIndices(analysis, requiredOutputs);
   const states=new Map();
   let invalidTime=0, limitHit=false;
   const t0=now();
 
-  const scan = await forEachGraphResultSurfaceRow(surface, required, {
+  const scan = await forEachGraphResultSurfaceRow(surface, requiredBase, {
     label:"GraphResultSurface time",
     progressBase:0,
     progressSpan:99,
-    visit:(getValue) => {
+    visit:(getBaseValue) => {
+      const getValue = graphResultAnalysisMakeGetter(analysis, getBaseValue);
       const b=parseTimeBucket(getValue(timeIdx), bucket);
       if (!b){ invalidTime++; return; }
       const g=hasGroup ? keyCellValue(getValue(groupIdx)) : "";
@@ -8138,15 +8328,15 @@ async function buildGraphResultTime(msg={}){
     let b="", g=""; try{ [b,g]=JSON.parse(key); }catch{ [b,g]=String(key).split("\u001f"); }
     return hasGroup ? [b,g,aggValue(agg,aggMode)] : [b,aggValue(agg,aggMode)];
   });
-  state.graphResultTime={header:outHeader, rows:outRows, scanned:scan.scanned, invalidTime, limitHit, surfaceId:surface.id, strategy:scan.strategy, ms:now()-t0};
+  state.graphResultTime={header:outHeader, rows:outRows, scanned:scan.scanned, invalidTime, limitHit, surfaceId:surface.id, strategy:scan.strategy, ms:now()-t0, analysisSurface:{ columns:analysis.columns, outputHeader:analysis.outputHeader }};
   return {...state.graphResultTime, surface:graphResultSurfaceSummary(surface)};
 }
 
 async function exportGraphQueryCsv(msg={}){
   const surface = getGraphResultSurface(msg);
   if (!surface) throw new Error("Graph Query Result surface is not active");
-  const derivedColumns = normalizeGraphDerivedColumnsForWorker(msg.derivedColumns || []);
-  const outputColumnNames = Array.isArray(msg.outputColumnNames) ? msg.outputColumnNames.map(String).filter(Boolean) : null;
+  const derivedColumns = graphResultEffectiveDerivedColumns(surface, msg.derivedColumns);
+  const outputColumnNames = Array.isArray(msg.outputColumnNames) ? msg.outputColumnNames.map(String).filter(Boolean) : (surface.outputColumnNames || null);
   const maxRows = normalizeExportLimit(msg.maxRows);
   const allIndices = graphResultSurfaceAllSourceIndices(surface);
   const selected = Array.isArray(msg.columns) && msg.columns.length
@@ -10141,6 +10331,14 @@ async function legacyWorkerMessageRouter(e){
       const lines=[state.timeTable.header.map(csvEscape).join(",")];
       for (const r of state.timeTable.rows) lines.push(r.map(csvEscape).join(","));
       post("TIME_CSV",{csv:lines.join("\n")});
+      return;
+    }
+
+    if (msg.type==="EXPORT_GRAPH_RESULT_SEARCH"){
+      if (!state.graphResultSearch) throw new Error("Graph Result Search table is empty");
+      const lines=[state.graphResultSearch.header.map(csvEscape).join(",")];
+      for (const r of state.graphResultSearch.rows || []) lines.push((r || []).map(csvEscape).join(","));
+      post("GRAPH_RESULT_SEARCH_CSV",{csv:lines.join("\n"), rows:state.graphResultSearch.rows?.length || 0, source:"graph"});
       return;
     }
 
@@ -18927,7 +19125,7 @@ function GraphQueryVirtualTable({ table, totalRows=0, page=1, pageSize=GRAPH_RES
   );
 }
 
-function GraphQueryEditor({ columns, datasets=[], manifest=null, nodes, setNodes, edges, setEdges, onApply, onReadPage=()=>{}, onClearResult=()=>{}, onExportCsv=()=>{}, onResultSearch=()=>{}, onResultSearchPage=()=>{}, onResultPivot=()=>{}, onResultTime=()=>{}, resultSearchTable=null, resultSearchCount=0, resultSearchPage=1, resultSearchStatus="", resultSearchTime="", resultPivotTable=null, resultPivotStatus="", resultPivotTime="", resultTimeTable=null, resultTimeStatus="", resultTimeTime="", disabled, dataQueryActive, dataQueryCount, resultTable, resultStatus, resultTime, resultPage, resultPageMax, resultViewMode="tile", setResultViewMode=()=>{}, resultRowsPerTile="1000", setResultRowsPerTile=()=>{}, sqlText="", setSqlText=()=>{}, sqlMode=false, setSqlMode=()=>{}, graphSessions=[], activeSessionId="", sessionName="", setSessionName=()=>{}, onSessionNew=()=>{}, onSessionSave=()=>{}, onSessionSaveAs=()=>{}, onSessionLoad=()=>{}, onSessionDelete=()=>{}, onSessionDuplicate=()=>{}, autoStandby=true, setAutoStandby=()=>{}, onDatasetStandby=()=>{} }) {
+function GraphQueryEditor({ columns, datasets=[], manifest=null, nodes, setNodes, edges, setEdges, onApply, onReadPage=()=>{}, onClearResult=()=>{}, onExportCsv=()=>{}, onResultSearch=()=>{}, onResultSearchPage=()=>{}, onResultPivot=()=>{}, onResultTime=()=>{}, onResultSearchCsv=()=>{}, onResultPivotCsv=()=>{}, onResultTimeCsv=()=>{}, resultSearchTable=null, resultSearchCount=0, resultSearchPage=1, resultSearchStatus="", resultSearchTime="", resultPivotTable=null, resultPivotStatus="", resultPivotTime="", resultTimeTable=null, resultTimeStatus="", resultTimeTime="", disabled, dataQueryActive, dataQueryCount, resultTable, resultStatus, resultTime, resultPage, resultPageMax, resultViewMode="tile", setResultViewMode=()=>{}, resultRowsPerTile="1000", setResultRowsPerTile=()=>{}, sqlText="", setSqlText=()=>{}, sqlMode=false, setSqlMode=()=>{}, graphSessions=[], activeSessionId="", sessionName="", setSessionName=()=>{}, onSessionNew=()=>{}, onSessionSave=()=>{}, onSessionSaveAs=()=>{}, onSessionLoad=()=>{}, onSessionDelete=()=>{}, onSessionDuplicate=()=>{}, autoStandby=true, setAutoStandby=()=>{}, onDatasetStandby=()=>{} }) {
   const [selectedId, setSelectedId] = useState(nodes?.[0]?.id || "source");
   const [sqlErrors, setSqlErrors] = useState([]);
   const [showMiniMap, setShowMiniMap] = useState(false);
@@ -18944,11 +19142,14 @@ function GraphQueryEditor({ columns, datasets=[], manifest=null, nodes, setNodes
   const [resultPivotCols, setResultPivotCols] = useState([]);
   const [resultPivotValue, setResultPivotValue] = useState("-1");
   const [resultPivotAgg, setResultPivotAgg] = useState("Count");
+  const [resultPivotMaxRows, setResultPivotMaxRows] = useState("10000");
+  const [resultPivotMaxCols, setResultPivotMaxCols] = useState("1000");
   const [resultTimeField, setResultTimeField] = useState("0");
   const [resultTimeBucket, setResultTimeBucket] = useState("month");
   const [resultTimeGroup, setResultTimeGroup] = useState("-1");
   const [resultTimeValue, setResultTimeValue] = useState("-1");
   const [resultTimeAgg, setResultTimeAgg] = useState("Count");
+  const [resultTimeMaxBuckets, setResultTimeMaxBuckets] = useState("10000");
   const flowPanelRef = useRef(null);
   const selectedNode = useMemo(() => nodes.find((n) => n.id === selectedId) || null, [nodes, selectedId]);
   const plan = useMemo(() => compileGraphQuery(nodes, edges, columns, datasets), [nodes, edges, columns, datasets]);
@@ -19559,6 +19760,7 @@ function GraphQueryEditor({ columns, datasets=[], manifest=null, nodes, setNodes
                   <TextField size="small" label="値" value={resultSearchValue} onChange={(e)=>setResultSearchValue(e.target.value)} sx={{ minWidth: 220 }} />
                   <SmallNumberField label="最大一致" value={resultSearchMax} onChange={setResultSearchMax} min="1" step="10000" sx={{ width: 130 }} />
                   <Button size="small" variant="contained" onClick={()=>onResultSearch({ columnIndex:Number(resultSearchColumn), op:resultSearchOp, value:resultSearchValue, maxMatches:Number(resultSearchMax || 100000) })}>結果内検索</Button>
+                  <Button size="small" variant="outlined" startIcon={<Download />} onClick={onResultSearchCsv} disabled={!Number(resultSearchCount || 0)}>CSV出力</Button>
                   <Button size="small" onClick={()=>onResultSearchPage(Math.max(1, Number(resultSearchPage || 1)-1))}>Prev</Button>
                   <Typography variant="caption">Page {Number(resultSearchPage || 1).toLocaleString()} / {Math.max(1, Math.ceil(Number(resultSearchCount || 0) / 500)).toLocaleString()}</Typography>
                   <Button size="small" onClick={()=>onResultSearchPage(Math.min(Math.max(1, Math.ceil(Number(resultSearchCount || 0) / 500)), Number(resultSearchPage || 1)+1))}>Next</Button>
@@ -19582,7 +19784,10 @@ function GraphQueryEditor({ columns, datasets=[], manifest=null, nodes, setNodes
                   <TextField select size="small" label="集計" value={resultPivotAgg} onChange={(e)=>setResultPivotAgg(e.target.value)} sx={{ width: 150 }}>
                     {["Count","Sum","Average","Min","Max"].map(x=><MenuItem key={x} value={x}>{x}</MenuItem>)}
                   </TextField>
-                  <Button size="small" variant="contained" onClick={()=>onResultPivot({ rowFields:resultPivotRows.map(Number), columnFields:resultPivotCols.map(Number), valueField:Number(resultPivotValue), aggregation:resultPivotAgg, maxRows:10000, maxCols:1000 })}>Pivot作成</Button>
+                  <SmallNumberField label="最大行" value={resultPivotMaxRows} onChange={setResultPivotMaxRows} min="1" step="1000" sx={{ width: 120 }} />
+                  <SmallNumberField label="最大列" value={resultPivotMaxCols} onChange={setResultPivotMaxCols} min="1" step="100" sx={{ width: 120 }} />
+                  <Button size="small" variant="contained" onClick={()=>onResultPivot({ rowFields:resultPivotRows.map(Number), columnFields:resultPivotCols.map(Number), valueField:Number(resultPivotValue), aggregation:resultPivotAgg, maxRows:Number(resultPivotMaxRows || 10000), maxCols:Number(resultPivotMaxCols || 1000) })}>Pivot作成</Button>
+                  <Button size="small" variant="outlined" startIcon={<Download />} onClick={onResultPivotCsv} disabled={!resultPivotTable?.rows?.length}>CSV出力</Button>
                 </Stack>
                 <DataTable table={resultPivotTable} tableId="graphResultPivot" height={300} />
                 <Stack direction="row" justifyContent="space-between"><Typography variant="caption" color="text.secondary">{resultPivotStatus}</Typography><Typography variant="caption" color="text.secondary">{resultPivotTime}</Typography></Stack>
@@ -19606,7 +19811,9 @@ function GraphQueryEditor({ columns, datasets=[], manifest=null, nodes, setNodes
                   <TextField select size="small" label="集計" value={resultTimeAgg} onChange={(e)=>setResultTimeAgg(e.target.value)} sx={{ width: 150 }}>
                     {["Count","Sum","Average","Min","Max"].map(x=><MenuItem key={x} value={x}>{x}</MenuItem>)}
                   </TextField>
-                  <Button size="small" variant="contained" onClick={()=>onResultTime({ timeField:Number(resultTimeField), bucket:resultTimeBucket, groupField:Number(resultTimeGroup), valueField:Number(resultTimeValue), aggregation:resultTimeAgg, maxBuckets:10000 })}>Time作成</Button>
+                  <SmallNumberField label="最大bucket" value={resultTimeMaxBuckets} onChange={setResultTimeMaxBuckets} min="1" step="1000" sx={{ width: 130 }} />
+                  <Button size="small" variant="contained" onClick={()=>onResultTime({ timeField:Number(resultTimeField), bucket:resultTimeBucket, groupField:Number(resultTimeGroup), valueField:Number(resultTimeValue), aggregation:resultTimeAgg, maxBuckets:Number(resultTimeMaxBuckets || 10000) })}>Time作成</Button>
+                  <Button size="small" variant="outlined" startIcon={<Download />} onClick={onResultTimeCsv} disabled={!resultTimeTable?.rows?.length}>CSV出力</Button>
                 </Stack>
                 <DataTable table={resultTimeTable} tableId="graphResultTime" height={300} />
                 <Stack direction="row" justifyContent="space-between"><Typography variant="caption" color="text.secondary">{resultTimeStatus}</Typography><Typography variant="caption" color="text.secondary">{resultTimeTime}</Typography></Stack>
@@ -22419,7 +22626,7 @@ function App() {
           setGraphResultTableWithDerived(table, derived);
           setGraphResultMode("data");
           setGraphResultPage(msg.page || 1);
-          setGraphResultCount(manifestRef.current?.totalRows || msg.totalMatches || 0);
+          setGraphResultCount(msg.totalMatches || msg.graphResultSurface?.rowCount || 0);
           setGraphResultStatus(`Graph rows ${fmt(msg.startRow + 1)} - ${fmt(msg.startRow + msg.rows.length)} / page ${fmt(msg.page)}${derived.length ? ` / 計算列 ${fmt(derived.length)}列` : ""}`);
           setGraphResultTime(ms(msg.ms));
           return;
@@ -22880,7 +23087,7 @@ function App() {
       },
 
       "PIVOT_CSV"(msg) {
-        downloadText("pivot.csv", msg.csv || "");
+        downloadText(msg.source === "graph" ? "graph_result_pivot.csv" : "pivot.csv", msg.csv || "");
         return;
       },
 
@@ -22892,7 +23099,13 @@ function App() {
       },
 
       "TIME_CSV"(msg) {
-        downloadText("time_view.csv", msg.csv || "");
+        downloadText(msg.source === "graph" ? "graph_result_time.csv" : "time_view.csv", msg.csv || "");
+        return;
+      },
+
+      "GRAPH_RESULT_SEARCH_CSV"(msg) {
+        downloadText("graph_result_search.csv", msg.csv || "");
+        setGraphResultSearchStatus(`Search CSVを出力しました: ${fmt(msg.rows || 0)} rows`);
         return;
       },
 
@@ -23998,6 +24211,21 @@ function App() {
     post({ type:"BUILD_GRAPH_RESULT_TIME", ...graphResultPayload(params) });
   }
 
+  function exportGraphResultSearchCsv() {
+    if (!graphResultSearchCount) { setGraphResultSearchStatus("CSV出力対象のSearch結果がありません。先に結果内検索を実行してください。"); return; }
+    post({ type:"EXPORT_GRAPH_RESULT_SEARCH" });
+  }
+
+  function exportGraphResultPivotCsv() {
+    if (!graphResultPivotTable?.rows?.length) { setGraphResultPivotStatus("CSV出力対象のPivot結果がありません。先にPivotを作成してください。"); return; }
+    post({ type:"EXPORT_GRAPH_RESULT_PIVOT" });
+  }
+
+  function exportGraphResultTimeCsv() {
+    if (!graphResultTimeTable?.rows?.length) { setGraphResultTimeStatus("CSV出力対象のTime結果がありません。先にTime viewを作成してください。"); return; }
+    post({ type:"EXPORT_GRAPH_RESULT_TIME" });
+  }
+
   function runDataQuery() {
     if (!manifest) return;
     graphExecutionRef.current.active = false;
@@ -24871,6 +25099,9 @@ function App() {
                   onResultSearchPage={readGraphResultSearchPage}
                   onResultPivot={runGraphResultPivot}
                   onResultTime={runGraphResultTime}
+                  onResultSearchCsv={exportGraphResultSearchCsv}
+                  onResultPivotCsv={exportGraphResultPivotCsv}
+                  onResultTimeCsv={exportGraphResultTimeCsv}
                   resultSearchTable={graphResultSearchTable}
                   resultSearchCount={graphResultSearchCount}
                   resultSearchPage={graphResultSearchPage}
