@@ -6213,20 +6213,117 @@ async function buildPivot({rowFields,columnFields,valueField,aggregation,maxRows
       taskId:exec.taskId,
       chunks:exec.chunks.length
     },
-    builtAt:new Date().toISOString()
+    builtAt:new Date().toISOString(),
+    source:"active"
   };
 
   return pivotTileMeta();
 }
 
-function pivotTileMeta(){
+function normalizePivotResultFilters(input={}){
+  const globalFilter=String(input.globalFilter || "").trim().toLowerCase().slice(0,500);
+  const rowFilter=String(input.rowFilter || input.rowLabelFilter || "").trim().toLowerCase().slice(0,500);
+  const columnFilter=String(input.columnFilter || input.colFilter || input.columnLabelFilter || "").trim().toLowerCase().slice(0,500);
+  return {globalFilter,rowFilter,columnFilter};
+}
+
+function hasPivotResultFilters(filters){
+  const f=normalizePivotResultFilters(filters);
+  return !!(f.globalFilter || f.rowFilter || f.columnFilter);
+}
+
+function pivotResultFilterText(value){
+  if (value == null) return "";
+  if (typeof value === "number") return Number.isFinite(value) ? String(value) : "";
+  if (typeof value === "boolean") return value ? "true" : "false";
+  return String(value);
+}
+
+function pivotResultRowLabelText(key){
+  return pivotRowLabelParts(key).map(pivotResultFilterText).join(" / ").toLowerCase();
+}
+
+function pivotResultColumnLabelText(key, colIdx){
+  return pivotColumnLabel(key, colIdx).toLowerCase();
+}
+
+function pivotResultVisibleKeys(p, filters={}){
+  const f=normalizePivotResultFilters(filters);
+  const rowTexts=p.rowKeys.map((key) => pivotResultRowLabelText(key));
+  const colTexts=p.colKeys.map((key) => pivotResultColumnLabelText(key, p.colIdx));
+  const anyRowGlobal=f.globalFilter ? rowTexts.some((text) => text.includes(f.globalFilter)) : false;
+  const anyColGlobal=f.globalFilter ? colTexts.some((text) => text.includes(f.globalFilter)) : false;
+
+  let rowKeys=p.rowKeys;
+  if (f.rowFilter || (f.globalFilter && anyRowGlobal)) {
+    rowKeys=p.rowKeys.filter((key, i) => {
+      const text=rowTexts[i] || "";
+      return (!f.rowFilter || text.includes(f.rowFilter)) && (!f.globalFilter || !anyRowGlobal || text.includes(f.globalFilter));
+    });
+  }
+
+  let colKeys=p.colKeys;
+  if (f.columnFilter || (f.globalFilter && anyColGlobal)) {
+    colKeys=p.colKeys.filter((key, i) => {
+      const text=colTexts[i] || "";
+      return (!f.columnFilter || text.includes(f.columnFilter)) && (!f.globalFilter || !anyColGlobal || text.includes(f.globalFilter));
+    });
+  }
+
+  if (f.globalFilter && !anyRowGlobal && !anyColGlobal) {
+    rowKeys=[];
+    colKeys=[];
+  }
+
+  return {rowKeys,colKeys,filters:f,active:hasPivotResultFilters(f)};
+}
+
+function mergeAggInto(target, source){
+  if (!source) return target;
+  target.count += Number(source.count || 0);
+  target.n += Number(source.n || 0);
+  target.sum += Number(source.sum || 0);
+  if (source.min != null) target.min = target.min == null ? source.min : Math.min(target.min, source.min);
+  if (source.max != null) target.max = target.max == null ? source.max : Math.max(target.max, source.max);
+  return target;
+}
+
+function pivotVisibleAgg(p, visibleRows, visibleCols, rowKey=null, colKey=null){
+  if (rowKey != null && colKey != null) return (p.cells.get(rowKey) || new Map()).get(colKey) || makeAgg();
+
+  const out=makeAgg();
+  if (rowKey != null) {
+    const rowMap=p.cells.get(rowKey) || new Map();
+    for (const ck of visibleCols) mergeAggInto(out, rowMap.get(ck));
+    return out;
+  }
+
+  if (colKey != null) {
+    for (const rk of visibleRows) mergeAggInto(out, (p.cells.get(rk) || new Map()).get(colKey));
+    return out;
+  }
+
+  for (const rk of visibleRows) {
+    const rowMap=p.cells.get(rk) || new Map();
+    for (const ck of visibleCols) mergeAggInto(out, rowMap.get(ck));
+  }
+  return out;
+}
+
+function pivotTileMeta(filters={}){
   const p=state.pivotTileIndex;
   if (!p) throw new Error("Pivot tile index is empty");
+  const visible=pivotResultVisibleKeys(p, filters);
   return {
-    totalRows:p.rowKeys.length + 1,
-    totalDataRows:p.rowKeys.length,
-    totalCols:p.colKeys.length + 1,
-    totalDataCols:p.colKeys.length,
+    totalRows:visible.rowKeys.length + 1,
+    totalDataRows:visible.rowKeys.length,
+    totalCols:visible.colKeys.length + 1,
+    totalDataCols:visible.colKeys.length,
+    source:p.source || "active",
+    filtered:visible.active,
+    originalDataRows:p.rowKeys.length,
+    originalDataCols:p.colKeys.length,
+    filters:visible.filters,
     tileRows:p.tileRows,
     tileCols:p.tileCols,
     rowHeaderNames:p.rowHeaderNames,
@@ -6241,43 +6338,38 @@ function pivotTileMeta(){
   };
 }
 
-function pivotCellValue(rowIndex, colIndex){
-  const p=state.pivotTileIndex;
-  if (!p) return "";
-  const isGrandRow = rowIndex >= p.rowKeys.length;
-  const isGrandCol = colIndex >= p.colKeys.length;
-  if (isGrandRow && isGrandCol) return aggValue(p.grand, p.mode);
+function pivotCellValueForVisible(p, visible, rowIndex, colIndex){
+  const isGrandRow = rowIndex >= visible.rowKeys.length;
+  const isGrandCol = colIndex >= visible.colKeys.length;
+  if (isGrandRow && isGrandCol) return aggValue(pivotVisibleAgg(p, visible.rowKeys, visible.colKeys, null, null), p.mode);
   if (isGrandRow){
-    const ck=p.colKeys[colIndex];
-    return aggValue(p.colTotals.get(ck), p.mode);
+    const ck=visible.colKeys[colIndex];
+    return aggValue(pivotVisibleAgg(p, visible.rowKeys, visible.colKeys, null, ck), p.mode);
   }
   if (isGrandCol){
-    const rk=p.rowKeys[rowIndex];
-    return aggValue(p.rowTotals.get(rk), p.mode);
+    const rk=visible.rowKeys[rowIndex];
+    return aggValue(pivotVisibleAgg(p, visible.rowKeys, visible.colKeys, rk, null), p.mode);
   }
-  const rk=p.rowKeys[rowIndex];
-  const ck=p.colKeys[colIndex];
+  const rk=visible.rowKeys[rowIndex];
+  const ck=visible.colKeys[colIndex];
   return aggValue((p.cells.get(rk)||new Map()).get(ck), p.mode);
 }
 
-function pivotRowLabel(rowIndex){
-  const p=state.pivotTileIndex;
-  if (!p) return [""];
-  if (rowIndex >= p.rowKeys.length) return ["Grand Total"];
-  return pivotRowLabelParts(p.rowKeys[rowIndex]);
+function pivotRowLabelForVisible(visible, rowIndex){
+  if (rowIndex >= visible.rowKeys.length) return ["Grand Total"];
+  return pivotRowLabelParts(visible.rowKeys[rowIndex]);
 }
 
-function pivotColLabel(colIndex){
-  const p=state.pivotTileIndex;
-  if (!p) return [""];
-  if (colIndex >= p.colKeys.length) return ["Grand Total"];
-  return [pivotColumnLabel(p.colKeys[colIndex], p.colIdx)];
+function pivotColLabelForVisible(p, visible, colIndex){
+  if (colIndex >= visible.colKeys.length) return ["Grand Total"];
+  return [pivotColumnLabel(visible.colKeys[colIndex], p.colIdx)];
 }
 
-function readPivotViewport({rowStart=0,colStart=0,viewportRows=90,viewportCols=40,overscan=1}={}){
+function readPivotViewport({rowStart=0,colStart=0,viewportRows=90,viewportCols=40,overscan=1,filters={}}={}){
   const p=state.pivotTileIndex;
   if (!p) throw new Error("Pivot tile index is empty");
-  const meta=pivotTileMeta();
+  const visible=pivotResultVisibleKeys(p, filters);
+  const meta=pivotTileMeta(filters);
   const totalRows=meta.totalRows, totalCols=meta.totalCols;
   const safeRows=Math.max(1, Math.min(240, Number(viewportRows || 90)));
   const safeCols=Math.max(1, Math.min(120, Number(viewportCols || 40)));
@@ -6296,16 +6388,16 @@ function readPivotViewport({rowStart=0,colStart=0,viewportRows=90,viewportCols=4
     const row0=ty*p.tileRows;
     const row1=Math.min(totalRows,row0+p.tileRows);
     const rowLabels=[];
-    for (let r=row0; r<row1; r++) rowLabels.push(pivotRowLabel(r));
+    for (let r=row0; r<row1; r++) rowLabels.push(pivotRowLabelForVisible(visible, r));
     for (let tx=tileX0; tx<=tileX1; tx++){
       const col0=tx*p.tileCols;
       const col1=Math.min(totalCols,col0+p.tileCols);
       const colLabels=[];
-      for (let c=col0; c<col1; c++) colLabels.push(pivotColLabel(c));
+      for (let c=col0; c<col1; c++) colLabels.push(pivotColLabelForVisible(p, visible, c));
       const values=[];
       for (let r=row0; r<row1; r++){
         const row=[];
-        for (let c=col0; c<col1; c++) row.push(pivotCellValue(r,c));
+        for (let c=col0; c<col1; c++) row.push(pivotCellValueForVisible(p, visible, r, c));
         values.push(row);
       }
       tiles.push({tileY:ty,tileX:tx,rowStart:row0,rowEnd:row1,colStart:col0,colEnd:col1,rowLabels,colLabels,values});
@@ -6315,22 +6407,23 @@ function readPivotViewport({rowStart=0,colStart=0,viewportRows=90,viewportCols=4
   return {...meta,rowStart:rs,rowEnd:re,colStart:cs,colEnd:ce,tileY0,tileY1,tileX0,tileX1,tiles,generatedAt:now()};
 }
 
-function exportPivotCsvFromTileIndex(){
+function exportPivotCsvFromTileIndex(filters={}){
   const p=state.pivotTileIndex;
   if (!p) throw new Error("Pivot tile index is empty");
-  const header=[...p.rowHeaderNames, ...p.colKeys.map(k=>pivotColumnLabel(k,p.colIdx)), "Grand Total"];
+  const visible=pivotResultVisibleKeys(p, filters);
+  const header=[...p.rowHeaderNames, ...visible.colKeys.map(k=>pivotColumnLabel(k,p.colIdx)), "Grand Total"];
   const lines=[header.map(csvEscape).join(",")];
-  for (let r=0; r<p.rowKeys.length; r++){
-    const row=[...pivotRowLabel(r)];
+  for (let r=0; r<visible.rowKeys.length; r++){
+    const row=[...pivotRowLabelForVisible(visible, r)];
     while(row.length < p.rowHeaderNames.length) row.push("");
-    for (let c=0; c<p.colKeys.length; c++) row.push(pivotCellValue(r,c));
-    row.push(pivotCellValue(r,p.colKeys.length));
+    for (let c=0; c<visible.colKeys.length; c++) row.push(pivotCellValueForVisible(p, visible, r, c));
+    row.push(pivotCellValueForVisible(p, visible, r, visible.colKeys.length));
     lines.push(row.map(csvEscape).join(","));
   }
   const grand=["Grand Total"];
   while(grand.length < p.rowHeaderNames.length) grand.push("");
-  for (let c=0; c<p.colKeys.length; c++) grand.push(pivotCellValue(p.rowKeys.length,c));
-  grand.push(pivotCellValue(p.rowKeys.length,p.colKeys.length));
+  for (let c=0; c<visible.colKeys.length; c++) grand.push(pivotCellValueForVisible(p, visible, visible.rowKeys.length, c));
+  grand.push(pivotCellValueForVisible(p, visible, visible.rowKeys.length, visible.colKeys.length));
   lines.push(grand.map(csvEscape).join(","));
   return lines.join("\n");
 }
@@ -8279,7 +8372,43 @@ async function buildGraphResultPivot(msg={}){
   totalRow.push(aggValue(grand, aggMode));
   outRows.push(totalRow);
 
-  state.graphResultPivot={header:outHeader, rows:outRows, scanned:scan.scanned, limitHit, surfaceId:surface.id, strategy:scan.strategy, ms:now()-t0, analysisSurface:{ columns:analysis.columns, outputHeader:analysis.outputHeader }};
+  const elapsed=now()-t0;
+  state.graphResultPivot={header:outHeader, rows:outRows, scanned:scan.scanned, limitHit, surfaceId:surface.id, strategy:scan.strategy, ms:elapsed, analysisSurface:{ columns:analysis.columns, outputHeader:analysis.outputHeader }};
+
+  const target = String(msg.target || "graph");
+  if (target === "mainPivot") {
+    state.pivotTileIndex={
+      rowKeys,
+      colKeys,
+      cells,
+      rowTotals,
+      colTotals,
+      grand,
+      mode:aggMode,
+      countMode,
+      rowIdx:rowFields,
+      colIdx:columnFields,
+      valueField:countMode ? -1 : valIdx,
+      rowHeaderNames,
+      colHeaderNames:columnFields.length ? columnFields.map((i)=>graphResultAnalysisColumn(analysis, i)?.name || `Field ${i+1}`) : ["Columns"],
+      tileRows:PIVOT_TILE_ROWS,
+      tileCols:PIVOT_TILE_COLS,
+      source:"graph",
+      scanned:scan.scanned,
+      limitHit,
+      queryPlan:null,
+      executionEngine:{ mode:"graph-result-surface", strategy:scan.strategy, chunks:scan.chunks || null },
+      ms:elapsed,
+      builtAt:new Date().toISOString()
+    };
+    return {
+      ...state.graphResultPivot,
+      surface:graphResultSurfaceSummary(surface),
+      tileMeta:pivotTileMeta(msg.filters || {}),
+      tileView:readPivotViewport({rowStart:0,colStart:0,viewportRows:90,viewportCols:40,overscan:1,filters:msg.filters || {}})
+    };
+  }
+
   return {...state.graphResultPivot, surface:graphResultSurfaceSummary(surface)};
 }
 
@@ -10351,12 +10480,17 @@ async function legacyWorkerMessageRouter(e){
     }
 
     if (msg.type==="EXPORT_PIVOT"){
-      const csv=exportPivotCsvFromTileIndex();
-      post("PIVOT_CSV",{csv});
+      const csv=exportPivotCsvFromTileIndex(msg.filters || {});
+      post("PIVOT_CSV",{csv, filters:normalizePivotResultFilters(msg.filters || {})});
       return;
     }
 
     if (msg.type==="EXPORT_GRAPH_RESULT_PIVOT"){
+      if (state.pivotTileIndex?.source === "graph" && hasPivotResultFilters(msg.filters || {})) {
+        const csv=exportPivotCsvFromTileIndex(msg.filters || {});
+        post("PIVOT_CSV",{csv, source:"graph", filters:normalizePivotResultFilters(msg.filters || {})});
+        return;
+      }
       if (!state.graphResultPivot) throw new Error("Graph Result Pivot table is empty");
       const lines=[state.graphResultPivot.header.map(csvEscape).join(",")];
       for (const r of state.graphResultPivot.rows || []) lines.push((r || []).map(csvEscape).join(","));
@@ -17640,17 +17774,35 @@ function Section({ title, children, hint, icon, defaultCollapsed = false, action
 }
 
 
-function PivotTileGrid({ meta, view, onRequest, height = 640 }) {
+function normalizePivotUiFilters(filters = {}) {
+  return {
+    globalFilter: String(filters.globalFilter || ""),
+    rowFilter: String(filters.rowFilter || ""),
+    columnFilter: String(filters.columnFilter || ""),
+  };
+}
+
+function PivotTileGrid({ meta, view, onRequest, height = 640, filters = {}, onFiltersChange = () => {} }) {
   const scrollerRef = useRef(null);
   const timerRef = useRef(null);
   const lastKeyRef = useRef("");
   const [scrollInfo, setScrollInfo] = useState({ top: 0, left: 0 });
+  const normalizedFilters = normalizePivotUiFilters(filters);
+  const filterKey = JSON.stringify(normalizedFilters);
 
   const rowHeight = 28;
   const colWidth = 132;
   const rowHeaderWidth = 260;
   const colHeaderHeight = 34;
   const maxScrollPx = 24000000;
+
+  function updateFilter(key, value) {
+    onFiltersChange({ ...normalizedFilters, [key]: value });
+  }
+
+  function clearFilters() {
+    onFiltersChange({ globalFilter: "", rowFilter: "", columnFilter: "" });
+  }
 
   function requestVisible() {
     if (!meta || !onRequest || !scrollerRef.current) return;
@@ -17661,10 +17813,10 @@ function PivotTileGrid({ meta, view, onRequest, height = 640 }) {
     const colStart = Math.max(0, Math.floor(bodyLeft / colWidth) - 4);
     const viewportRows = Math.ceil(el.clientHeight / rowHeight) + 18;
     const viewportCols = Math.ceil(el.clientWidth / colWidth) + 10;
-    const key = `${rowStart}:${colStart}:${viewportRows}:${viewportCols}:${meta.totalRows}:${meta.totalCols}`;
+    const key = `${rowStart}:${colStart}:${viewportRows}:${viewportCols}:${meta.totalRows}:${meta.totalCols}:${filterKey}`;
     if (lastKeyRef.current === key) return;
     lastKeyRef.current = key;
-    onRequest({ rowStart, colStart, viewportRows, viewportCols, overscan: 1 });
+    onRequest({ rowStart, colStart, viewportRows, viewportCols, overscan: 1, filters: normalizedFilters });
   }
 
   function handleScroll() {
@@ -17676,12 +17828,18 @@ function PivotTileGrid({ meta, view, onRequest, height = 640 }) {
 
   useEffect(() => {
     lastKeyRef.current = "";
+    const el = scrollerRef.current;
+    if (el) {
+      el.scrollTop = 0;
+      el.scrollLeft = 0;
+    }
+    setScrollInfo({ top: 0, left: 0 });
     const id = setTimeout(requestVisible, 0);
     return () => {
       clearTimeout(id);
       if (timerRef.current) clearTimeout(timerRef.current);
     };
-  }, [meta?.totalRows, meta?.totalCols]);
+  }, [meta?.totalRows, meta?.totalCols, filterKey]);
 
   if (!meta) {
     return <Alert severity="info">PivotをBuildすると、ページ移動なしのlazy tile gridで表示します。</Alert>;
@@ -17740,9 +17898,17 @@ function PivotTileGrid({ meta, view, onRequest, height = 640 }) {
 
   return (
     <Box>
+      <Stack direction="row" spacing={1} useFlexGap flexWrap="wrap" alignItems="center" sx={{ mb: 0.75 }}>
+        <TextField size="small" label="Pivot結果 全体" value={normalizedFilters.globalFilter} onChange={(e)=>updateFilter("globalFilter", e.target.value)} sx={{ minWidth: 180 }} />
+        <TextField size="small" label="行ラベル" value={normalizedFilters.rowFilter} onChange={(e)=>updateFilter("rowFilter", e.target.value)} sx={{ minWidth: 160 }} />
+        <TextField size="small" label="列ラベル" value={normalizedFilters.columnFilter} onChange={(e)=>updateFilter("columnFilter", e.target.value)} sx={{ minWidth: 160 }} />
+        {(normalizedFilters.globalFilter || normalizedFilters.rowFilter || normalizedFilters.columnFilter) && <Button size="small" onClick={clearFilters}>Clear filters</Button>}
+      </Stack>
       <Stack direction="row" spacing={1} useFlexGap flexWrap="wrap" sx={{ mb: 0.75 }}>
         <Chip size="small" label={`Rows ${fmt(meta.totalRows)}`} />
         <Chip size="small" label={`Columns ${fmt(meta.totalCols)}`} />
+        {meta.filtered && <Chip size="small" color="warning" variant="outlined" label={`Filtered from ${fmt(meta.originalDataRows)}×${fmt(meta.originalDataCols)}`} />}
+        <Chip size="small" label={`Source ${meta.source || "active"}`} />
         <Chip size="small" label={`Tile ${meta.tileRows}×${meta.tileCols}`} />
         <Chip size="small" label={`Viewport r${fmt(view?.rowStart || 0)}-r${fmt(view?.rowEnd || 0)} / c${fmt(view?.colStart || 0)}-c${fmt(view?.colEnd || 0)}`} />
       </Stack>
@@ -21676,6 +21842,7 @@ function App() {
   const [pivotTable, setPivotTable] = useState(null);
   const [pivotTileMeta, setPivotTileMeta] = useState(null);
   const [pivotTileView, setPivotTileView] = useState(null);
+  const [pivotResultFilters, setPivotResultFilters] = useState({ globalFilter: "", rowFilter: "", columnFilter: "" });
   const [pivotStatus, setPivotStatus] = useState("Columnar cacheを開いてください。");
   const [pivotTime, setPivotTime] = useState("");
 
@@ -22796,8 +22963,8 @@ function App() {
         const table = { header: msg.header || [], rows: msg.rows || [] };
         if ((msg.target || "graph") === "mainPivot") {
           setPivotTable(table);
-          setPivotTileMeta(null);
-          setPivotTileView(null);
+          setPivotTileMeta(msg.tileMeta || null);
+          setPivotTileView(msg.tileView || null);
           setPivotStatus(`Graph Query Result Pivot: scanned ${fmt(msg.scanned || 0)} rows / ${fmt(table.rows.length)} output rows${msg.limitHit ? " / limit hit" : ""}`);
           setPivotTime(ms(msg.ms));
         } else {
@@ -23083,6 +23250,10 @@ function App() {
 
       "PIVOT_VIEWPORT_DONE"(msg) {
         setPivotTileView(msg);
+        if (msg && typeof msg === "object") {
+          const { tiles, ...meta } = msg;
+          setPivotTileMeta((prev) => prev ? { ...prev, ...meta } : meta);
+        }
         return;
       },
 
@@ -24276,6 +24447,7 @@ function App() {
     setPivotTable(null);
     setPivotTileMeta(null);
     setPivotTileView(null);
+    setPivotResultFilters({ globalFilter: "", rowFilter: "", columnFilter: "" });
     if (pivotSource === "graph") {
       if (!graphResultCount) { setPivotStatus("Graph Query Resultがありません。先にGraph Queryを実行してください。"); return; }
       setPivotStatus("Graph Query ResultからPivotを作成中...");
@@ -24306,7 +24478,7 @@ function App() {
   }
 
   function requestPivotViewport(payload) {
-    postWorkerCommand({ type: "READ_PIVOT_VIEWPORT", ...(payload || {}) });
+    postWorkerCommand({ type: "READ_PIVOT_VIEWPORT", filters: pivotResultFilters, ...(payload || {}) });
   }
 
   function buildTimeSeries() {
@@ -25278,7 +25450,7 @@ function App() {
           {tab === "pivot" && (
             <Box sx={{ display: "grid", gridTemplateColumns: { xs: "1fr", md: "360px 1fr" }, gap: 2 }}>
               <Section title="Pivot Builder" icon={<TableChart />} hint="Row / Column / Valueを選び、必要な列ファイルだけを読みます。">
-                <TextField select label="データソース" size="small" fullWidth value={pivotSource} onChange={(e) => { setPivotSource(e.target.value); setRowFields([]); setColumnFields([]); setValueField("-1"); setPivotTable(null); setPivotTileMeta(null); setPivotTileView(null); }} sx={{ mb: 0.9 }}>
+                <TextField select label="データソース" size="small" fullWidth value={pivotSource} onChange={(e) => { setPivotSource(e.target.value); setRowFields([]); setColumnFields([]); setValueField("-1"); setPivotTable(null); setPivotTileMeta(null); setPivotTileView(null); setPivotResultFilters({ globalFilter: "", rowFilter: "", columnFilter: "" }); }} sx={{ mb: 0.9 }}>
                   <MenuItem value="active">Active Dataset</MenuItem>
                   <MenuItem value="graph" disabled={!canUseGraphResultSource}>Graph Query Result</MenuItem>
                 </TextField>
@@ -25299,15 +25471,21 @@ function App() {
                 </Stack>
                 <Stack direction="row" spacing={1} sx={{ mt: 0.9 }}>
                   <Button variant="contained" onClick={buildPivot}>Build Pivot</Button>
-                  <Button startIcon={<Download />} onClick={() => post({ type: pivotSource === "graph" ? "EXPORT_GRAPH_RESULT_PIVOT" : "EXPORT_PIVOT" })}>Export CSV</Button>
+                  <Button startIcon={<Download />} onClick={() => post({ type: pivotSource === "graph" ? "EXPORT_GRAPH_RESULT_PIVOT" : "EXPORT_PIVOT", filters: pivotResultFilters })}>Export CSV</Button>
                 </Stack>
                 <Alert severity="info" sx={{ mt: 0.9 }}>{pivotStatus}</Alert>
               </Section>
               <Section title="Pivot Result">
-                {pivotSource === "graph" ? (
-                  <DataTable table={pivotTable} tableId="pivot-graph-result" height={520} />
+                {pivotTileMeta ? (
+                  <PivotTileGrid
+                    meta={pivotTileMeta}
+                    view={pivotTileView}
+                    onRequest={requestPivotViewport}
+                    filters={pivotResultFilters}
+                    onFiltersChange={setPivotResultFilters}
+                  />
                 ) : (
-                  <PivotTileGrid meta={pivotTileMeta} view={pivotTileView} onRequest={requestPivotViewport} />
+                  <DataTable table={pivotTable} tableId={pivotSource === "graph" ? "pivot-graph-result" : "pivot-active-result"} height={520} />
                 )}
                 <Typography variant="caption" color="text.secondary">{pivotTime}</Typography>
               </Section>
