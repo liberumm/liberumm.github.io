@@ -119,7 +119,7 @@ let state = {
   hyperTensor:{enabled:true,version:2,lastPlan:null},
   externalDataset:null,
   runtime:{
-    kernelVersion:4,
+    kernelVersion:5,
     bootedAt:new Date().toISOString(),
     commandCount:0,
     failureCount:0,
@@ -8505,51 +8505,131 @@ async function exportGraphQueryCsv(msg={}){
 
 
 
+
 /*
  * =========================================================
- * Runtime Kernel v2
+ * Runtime Kernel v5 - Structural Runtime Boundary
  * =========================================================
  * Purpose:
- * - Worker入口を巨大if routerから切り離し、Command / Plan / Execution /
- *   Measurement / Fallback の実行面へ寄せる。
- * - 既存の巨大routerは legacyWorkerMessageRouter として温存し、
- *   互換性を崩さず段階的にCommand化できる。
- * - 新機能は registerRuntimeCommand(type, command) で追加し、
+ * - Worker入口を巨大if routerから切り離し、Command / Plan / Strategy /
+ *   Execution / Measurement / Fallback の実行面へ固定する。
+ * - 既存の巨大routerは Data Plane Fast Path として保持し、既存機能と速度を落とさない。
+ * - 新規・構造化済みCommandは registerRuntimeCommand(type, command) で登録し、
  *   self.onmessageへ直接ifを足さない。
+ * - UIへ返す結果は、原則として bounded surface / viewport / metadata に限定する。
  */
+
+function runtimeSafeNumber(value, fallback = null){
+  const n = Number(value);
+  return Number.isFinite(n) ? n : fallback;
+}
+
+function runtimeSafeInt(value, min, max, fallback){
+  const n = Math.floor(Number(value));
+  if (!Number.isFinite(n)) return fallback;
+  return Math.max(min, Math.min(max, n));
+}
+
+function runtimeByteLabel(bytes){
+  const n = Number(bytes || 0);
+  if (!Number.isFinite(n) || n <= 0) return "0 B";
+  const units = ["B","KB","MB","GB","TB"];
+  let v = n;
+  let i = 0;
+  while (v >= 1024 && i < units.length - 1) {
+    v /= 1024;
+    i++;
+  }
+  return `${Math.round(v * 10) / 10} ${units[i]}`;
+}
 
 function createRuntimeMeasurement(){
   const entries = [];
-  const maxEntries = 300;
+  const byType = new Map();
+  const maxEntries = 800;
 
-  function record(entry){
-    const normalized = {
+  function normalizeEntry(entry){
+    const durationMs = Math.max(0, Math.round(runtimeSafeNumber(entry?.durationMs, 0)));
+    const type = String(entry?.type || entry?.command || "UNKNOWN");
+    return {
       at: new Date().toISOString(),
-      type: String(entry?.type || "UNKNOWN"),
+      type,
+      route: entry?.route || "unknown",
+      planKind: entry?.planKind || entry?.kind || null,
       ok: entry?.ok !== false,
-      durationMs: Math.round(Number(entry?.durationMs || 0)),
-      strategy: entry?.strategy || "legacy",
-      rows: Number.isFinite(Number(entry?.rows)) ? Number(entry.rows) : null,
-      bytes: Number.isFinite(Number(entry?.bytes)) ? Number(entry.bytes) : null,
+      durationMs,
+      strategy: entry?.strategy || entry?.strategyMode || "legacy",
+      strategyReason: entry?.strategyReason || "",
+      rows: runtimeSafeNumber(entry?.rows, null),
+      bytes: runtimeSafeNumber(entry?.bytes, null),
+      chunks: runtimeSafeNumber(entry?.chunks, null),
+      cacheHit: entry?.cacheHit == null ? null : Boolean(entry.cacheHit),
       fallback: Boolean(entry?.fallback),
+      memoryRisk: entry?.memoryRisk || null,
       errorCode: entry?.errorCode || null,
     };
+  }
+
+  function record(entry){
+    const normalized = normalizeEntry(entry);
     entries.push(normalized);
     if (entries.length > maxEntries) entries.shift();
+
+    const current = byType.get(normalized.type) || {
+      type: normalized.type,
+      count: 0,
+      failures: 0,
+      fallback: 0,
+      totalDurationMs: 0,
+      maxDurationMs: 0,
+      lastDurationMs: 0,
+      lastRoute: "",
+      lastStrategy: "",
+      lastAt: "",
+    };
+    current.count += 1;
+    if (!normalized.ok) current.failures += 1;
+    if (normalized.fallback) current.fallback += 1;
+    current.totalDurationMs += normalized.durationMs;
+    current.maxDurationMs = Math.max(current.maxDurationMs, normalized.durationMs);
+    current.lastDurationMs = normalized.durationMs;
+    current.lastRoute = normalized.route;
+    current.lastStrategy = normalized.strategy;
+    current.lastAt = normalized.at;
+    byType.set(normalized.type, current);
     return normalized;
   }
 
+  function percentile(values, p){
+    if (!values.length) return 0;
+    const sorted = [...values].sort((a,b)=>a-b);
+    const idx = Math.max(0, Math.min(sorted.length - 1, Math.ceil((p / 100) * sorted.length) - 1));
+    return sorted[idx];
+  }
+
   function snapshot(){
-    const recent = entries.slice(-50);
+    const recent = entries.slice(-80);
+    const durations = entries.map((x)=>Number(x.durationMs || 0));
     const failures = entries.filter((x)=>!x.ok).length;
     const fallback = entries.filter((x)=>x.fallback).length;
-    const totalDuration = entries.reduce((sum,x)=>sum + Number(x.durationMs || 0), 0);
+    const totalDuration = durations.reduce((sum,x)=>sum + x, 0);
+    const byCommand = [...byType.values()]
+      .map((x)=>({
+        ...x,
+        averageDurationMs: x.count ? Math.round(x.totalDurationMs / x.count) : 0,
+      }))
+      .sort((a,b)=>Number(b.totalDurationMs || 0) - Number(a.totalDurationMs || 0))
+      .slice(0, 40);
+
     return {
       count: entries.length,
       failures,
       fallback,
       averageDurationMs: entries.length ? Math.round(totalDuration / entries.length) : 0,
+      p95DurationMs: percentile(durations, 95),
+      maxDurationMs: durations.length ? Math.max(...durations) : 0,
       recent,
+      byCommand,
     };
   }
 
@@ -8577,10 +8657,13 @@ function defineRuntimeCommand(command){
   }
   return {
     validate: command.validate || ((msg)=>msg),
-    plan: command.plan || ((input)=>({kind:"direct", strategy:"classic", input})),
+    plan: command.plan || ((input)=>({ kind:"direct", cost:"low", input })),
+    strategy: command.strategy || null,
     execute: command.execute,
+    fallback: command.fallback || null,
     project: command.project || ((result)=>result || {}),
     doneType: command.doneType || null,
+    outputMode: command.outputMode || "surface",
   };
 }
 
@@ -8594,59 +8677,210 @@ function createRuntimeCommandRegistry(initialDefinitions = {}){
     set(type, command){ table.set(String(type), defineRuntimeCommand(command)); return this; },
     has(type){ return table.has(String(type || "")); },
     keys(){ return [...table.keys()]; },
+    size(){ return table.size; },
   };
 }
 
-function createRuntimeStateSnapshot(runtimeState){
+function createRuntimeStrategySelector(){
+  function normalizeCost(plan){
+    const cost = plan?.cost && typeof plan.cost === "object" ? plan.cost : {};
+    const label = typeof plan?.cost === "string" ? plan.cost : "";
+    const estimatedRows = runtimeSafeNumber(cost.estimatedRows ?? plan?.estimatedRows, null);
+    const estimatedBytes = runtimeSafeNumber(cost.estimatedBytes ?? plan?.estimatedBytes, null);
+    const estimatedChunks = runtimeSafeNumber(cost.estimatedChunks ?? plan?.estimatedChunks, null);
+    const memoryRisk = cost.memoryRisk || plan?.memoryRisk || (
+      label === "high" ? "high" :
+      label === "medium" ? "medium" :
+      "low"
+    );
+    return { label, estimatedRows, estimatedBytes, estimatedChunks, memoryRisk };
+  }
+
+  function select(plan, runtimeState){
+    const explicit = plan?.strategy;
+    if (explicit && typeof explicit === "object") return explicit;
+    if (explicit && typeof explicit === "string") {
+      return { mode: explicit, reason:"plan-explicit" };
+    }
+
+    const cost = normalizeCost(plan);
+    const rows = Number(cost.estimatedRows || 0);
+    const bytes = Number(cost.estimatedBytes || 0);
+    const chunks = Number(cost.estimatedChunks || 0);
+
+    if (cost.memoryRisk === "high") {
+      return { mode:"classic", reason:"high-memory-risk", cost };
+    }
+    if (bytes >= 256 * 1024 * 1024 || chunks >= 32) {
+      return { mode:"adaptive", reason:"large-surface", cost };
+    }
+    if (rows >= 500000) {
+      return { mode:"optimized", reason:"large-row-count", cost };
+    }
+    if (runtimeState?.runtime?.failureCount >= 3) {
+      return { mode:"safe", reason:"recent-failures", cost };
+    }
+    return { mode:"optimized", reason:"bounded-cost", cost };
+  }
+
+  return { select };
+}
+
+function createRuntimeExecutionPolicy({
+  controlCommands = [],
+  hotPathCommands = [],
+  alwaysKernelCommands = [],
+} = {}){
+  const control = new Set(controlCommands.map(String));
+  const hotPath = new Set(hotPathCommands.map(String));
+  const alwaysKernel = new Set(alwaysKernelCommands.map(String));
+
+  function classify(type, commands){
+    const t = String(type || "");
+    if (!t) return "invalid";
+    if (alwaysKernel.has(t)) return "kernel-locked";
+    if (control.has(t)) return "control-plane";
+    if (commands?.has?.(t)) return "registered-command";
+    if (hotPath.has(t)) return "data-plane-fast-path";
+    return "legacy-compatible";
+  }
+
+  function shouldUseKernel(rawMessage, commands){
+    const type = String(rawMessage?.type || "");
+    const route = classify(type, commands);
+    return route === "kernel-locked" ||
+      route === "control-plane" ||
+      route === "registered-command" ||
+      route === "invalid";
+  }
+
+  function snapshot(commands){
+    return {
+      controlCommands: [...control],
+      hotPathCommands: [...hotPath],
+      alwaysKernelCommands: [...alwaysKernel],
+      registeredCommands: commands?.keys?.() || [],
+      invariant: "UI -> Command -> Plan -> Strategy -> Execution -> Measurement; hot data-plane keeps legacy direct route for speed.",
+    };
+  }
+
+  return { classify, shouldUseKernel, snapshot };
+}
+
+function runtimeCacheSnapshot(){
+  const cache = typeof chunkColumnCache === "object" ? chunkColumnCache : null;
   return {
-    kernelVersion: runtimeState.runtime?.kernelVersion || 2,
+    entries: cache?.map?.size || 0,
+    bytes: cache?.bytes || 0,
+    bytesLabel: runtimeByteLabel(cache?.bytes || 0),
+    hits: cache?.hits || 0,
+    misses: cache?.misses || 0,
+    evictions: cache?.evictions || 0,
+    hitRate: (Number(cache?.hits || 0) + Number(cache?.misses || 0))
+      ? Number(cache?.hits || 0) / (Number(cache?.hits || 0) + Number(cache?.misses || 0))
+      : 0,
+  };
+}
+
+function createRuntimeStateSnapshot(runtimeState, executionPolicy, commands){
+  const manifest = runtimeState.manifest || null;
+  return {
+    kernelVersion: runtimeState.runtime?.kernelVersion || 5,
+    bootedAt: runtimeState.runtime?.bootedAt || null,
     commandCount: runtimeState.runtime?.commandCount || 0,
     failureCount: runtimeState.runtime?.failureCount || 0,
     fallbackCount: runtimeState.runtime?.fallbackCount || 0,
     lastCommandType: runtimeState.runtime?.lastCommandType || "",
     lastStrategy: runtimeState.runtime?.lastStrategy || "",
+    lastRoute: runtimeState.runtime?.lastRoute || "",
     lastError: runtimeState.runtime?.lastError || null,
-    hasFile: Boolean(runtimeState.file),
-    hasManifest: Boolean(runtimeState.manifest),
-    hasDataset: Boolean(runtimeState.dataset),
-    hasVirtualDataset: Boolean(runtimeState.virtual),
-    cache: {
-      entries: chunkColumnCache.map.size,
-      bytes: chunkColumnCache.bytes,
-      hits: chunkColumnCache.hits,
-      misses: chunkColumnCache.misses,
-      evictions: chunkColumnCache.evictions,
+    dataset: {
+      hasFile: Boolean(runtimeState.file),
+      hasManifest: Boolean(manifest),
+      hasDataset: Boolean(runtimeState.dataset),
+      hasVirtualDataset: Boolean(runtimeState.virtual),
+      totalRows: Number(manifest?.totalRows || runtimeState.dataset?.totalRows || 0),
+      columns: Array.isArray(manifest?.columns) ? manifest.columns.length : 0,
+      chunks: Array.isArray(runtimeState.dataset?.chunks) ? runtimeState.dataset.chunks.length : 0,
     },
+    cache: runtimeCacheSnapshot(),
+    boundary: executionPolicy?.snapshot?.(commands) || null,
   };
 }
 
-function createRuntimeKernel({ runtimeState, post, commands, measurement, legacyHandler }){
-  async function executeRegisteredCommand(command, msg, startedAt){
-    const input = command.validate(msg, runtimeState);
-    const plan = await command.plan(input, runtimeState);
-    const result = await command.execute(plan, runtimeState, {
-      post,
-      progress: postProgress,
-      isCancelled: ()=>Boolean(runtimeState.cancelled),
-      now,
-    });
-    const output = command.project(result, runtimeState) || {};
-    const doneType = command.doneType || `${msg.type}_DONE`;
-    post(doneType, { requestId: msg.requestId, ...output });
+function createRuntimeKernel({ runtimeState, post, commands, measurement, legacyHandler, executionPolicy }){
+  const strategySelector = createRuntimeStrategySelector();
 
+  function recordRuntimeSuccess({ msg, startedAt, route, plan, strategy, result, fallback = false }){
     runtimeState.runtime.commandCount += 1;
     runtimeState.runtime.lastCommandType = msg.type;
-    runtimeState.runtime.lastStrategy = plan?.strategy || "classic";
+    runtimeState.runtime.lastStrategy = strategy?.mode || plan?.strategy || "classic";
+    runtimeState.runtime.lastRoute = route;
 
     measurement.record({
       type: msg.type,
       ok: true,
+      route,
+      planKind: plan?.kind || null,
       durationMs: now() - startedAt,
-      strategy: plan?.strategy || "classic",
-      rows: plan?.estimatedRows || result?.rows || null,
-      bytes: plan?.estimatedBytes || null,
-      fallback: false,
+      strategy: strategy?.mode || plan?.strategy || "classic",
+      strategyReason: strategy?.reason || "",
+      rows: plan?.estimatedRows || result?.rows || result?.metrics?.rows || null,
+      bytes: plan?.estimatedBytes || result?.bytes || result?.metrics?.bytes || null,
+      chunks: plan?.estimatedChunks || result?.chunks || result?.metrics?.chunks || null,
+      cacheHit: result?.metrics?.cache === "hit" ? true : result?.cacheHit,
+      fallback,
+      memoryRisk: strategy?.cost?.memoryRisk || plan?.memoryRisk || null,
     });
+  }
+
+  async function executeRegisteredCommand(command, msg, startedAt){
+    const input = command.validate(msg, runtimeState);
+    const basePlan = await command.plan(input, runtimeState);
+    const strategy = command.strategy
+      ? await command.strategy(basePlan, runtimeState)
+      : strategySelector.select(basePlan, runtimeState);
+    const plan = {
+      ...(basePlan || {}),
+      strategy: strategy?.mode || basePlan?.strategy || "optimized",
+      strategyPlan: strategy,
+      outputMode: command.outputMode,
+    };
+
+    try {
+      const result = await command.execute(plan, runtimeState, {
+        post,
+        progress: postProgress,
+        isCancelled: ()=>Boolean(runtimeState.cancelled),
+        now,
+        measurement,
+        strategy,
+      });
+      const output = command.project(result, runtimeState, plan) || {};
+      const doneType = command.doneType || `${msg.type}_DONE`;
+      post(doneType, { requestId: msg.requestId, runtime:{ route:"kernel", strategy }, ...output });
+      recordRuntimeSuccess({ msg, startedAt, route:"kernel", plan, strategy, result, fallback:false });
+    } catch (error) {
+      if (typeof command.fallback !== "function") throw error;
+      const safeError = normalizeCommandError(error);
+      const fallbackResult = await command.fallback(safeError, plan, runtimeState, {
+        post,
+        progress: postProgress,
+        isCancelled: ()=>Boolean(runtimeState.cancelled),
+        now,
+        measurement,
+        strategy,
+      });
+      const output = command.project(fallbackResult, runtimeState, plan) || {};
+      const doneType = command.doneType || `${msg.type}_DONE`;
+      post(doneType, {
+        requestId: msg.requestId,
+        runtime:{ route:"kernel-fallback", strategy, error:safeError },
+        ...output
+      });
+      runtimeState.runtime.fallbackCount += 1;
+      recordRuntimeSuccess({ msg, startedAt, route:"kernel-fallback", plan, strategy, result:fallbackResult, fallback:true });
+    }
   }
 
   async function executeLegacyFallback(msg, startedAt){
@@ -8659,6 +8893,7 @@ function createRuntimeKernel({ runtimeState, post, commands, measurement, legacy
     runtimeState.runtime.fallbackCount += 1;
     runtimeState.runtime.lastCommandType = msg.type;
     runtimeState.runtime.lastStrategy = "legacy";
+    runtimeState.runtime.lastRoute = "legacy-fallback";
 
     if (routedError) {
       runtimeState.runtime.failureCount += 1;
@@ -8668,6 +8903,7 @@ function createRuntimeKernel({ runtimeState, post, commands, measurement, legacy
     measurement.record({
       type: msg.type,
       ok: !routedError,
+      route: "legacy-fallback",
       durationMs: now() - startedAt,
       strategy: "legacy",
       fallback: true,
@@ -8688,19 +8924,20 @@ function createRuntimeKernel({ runtimeState, post, commands, measurement, legacy
         if (msg.type === "CANCEL") {
           runtimeState.cancelled = true;
           runtimeState.runtime.lastCommandType = "CANCEL";
+          runtimeState.runtime.lastRoute = "control-plane";
           post("CANCELLED", { requestId: msg.requestId });
-          measurement.record({ type:"CANCEL", ok:true, durationMs:now() - startedAt, strategy:"kernel" });
+          measurement.record({ type:"CANCEL", ok:true, route:"control-plane", durationMs:now() - startedAt, strategy:"kernel" });
           return;
         }
 
         if (msg.type === "RUNTIME_HEALTH") {
           post("RUNTIME_HEALTH_DONE", {
             requestId: msg.requestId,
-            state: createRuntimeStateSnapshot(runtimeState),
+            state: createRuntimeStateSnapshot(runtimeState, executionPolicy, commands),
             measurement: measurement.snapshot(),
             commands: commands.keys(),
           });
-          measurement.record({ type:"RUNTIME_HEALTH", ok:true, durationMs:now() - startedAt, strategy:"kernel" });
+          measurement.record({ type:"RUNTIME_HEALTH", ok:true, route:"control-plane", durationMs:now() - startedAt, strategy:"kernel" });
           return;
         }
 
@@ -8709,7 +8946,7 @@ function createRuntimeKernel({ runtimeState, post, commands, measurement, legacy
             requestId: msg.requestId,
             measurement: measurement.snapshot(),
           });
-          measurement.record({ type:"RUNTIME_MEASUREMENTS", ok:true, durationMs:now() - startedAt, strategy:"kernel" });
+          measurement.record({ type:"RUNTIME_MEASUREMENTS", ok:true, route:"control-plane", durationMs:now() - startedAt, strategy:"kernel" });
           return;
         }
 
@@ -8725,6 +8962,7 @@ function createRuntimeKernel({ runtimeState, post, commands, measurement, legacy
         runtimeState.runtime.commandCount += 1;
         runtimeState.runtime.failureCount += 1;
         runtimeState.runtime.lastCommandType = msg.type || "";
+        runtimeState.runtime.lastRoute = "kernel-error";
         runtimeState.runtime.lastError = safeError;
 
         post("ERROR", {
@@ -8738,6 +8976,7 @@ function createRuntimeKernel({ runtimeState, post, commands, measurement, legacy
         measurement.record({
           type: msg.type || "UNKNOWN",
           ok: false,
+          route: "kernel-error",
           durationMs: now() - startedAt,
           strategy: "kernel",
           errorCode: safeError.code,
@@ -13269,41 +13508,117 @@ registerRuntimeCommand("RUN_SIMULATION_WHATIF", {
 });
 
 
+
+/*
+ * Runtime Boundary Router v5
+ * ---------------------------------------------------------
+ * Data processing commands are the hot path. They must not pay the
+ * control-plane cost of normalize / plan wrapper / measurement / fallback
+ * accounting on every message.
+ *
+ * Boundary:
+ * - Registered commands and control-plane commands go through Runtime Kernel.
+ * - Existing data-plane commands go directly to legacyWorkerMessageRouter.
+ * - Unknown legacy-compatible messages also keep the legacy route to preserve
+ *   current behavior.
+ *
+ * This completes the structural reform without slowing ANALYZE /
+ * BUILD_COLUMNAR / RUN_DATA_QUERY / READ_PAGE / graph / pivot / chunk paths.
+ */
+const runtimeExecutionPolicy = createRuntimeExecutionPolicy({
+  controlCommands:[
+    "CANCEL",
+    "RUNTIME_HEALTH",
+    "RUNTIME_MEASUREMENTS"
+  ],
+  alwaysKernelCommands:[
+    "RUN_AUTONOMOUS_INSIGHTS",
+    "RUN_AUTONOMOUS_RESEARCH",
+    "RUN_COLLABORATIVE_AGENT",
+    "RUN_KNOWLEDGE_GRAPH",
+    "RUN_SIMULATION_WHATIF"
+  ],
+  hotPathCommands:[
+    "GENERATE_SYNTHETIC_PREVIEW",
+    "GENERATE_SYNTHETIC_DATASET",
+    "CANCEL_SYNTHETIC_GENERATION",
+    "BUILD_D3_VIZ_SURFACE",
+    "GRAPH_RESULT_SURFACE_STATUS",
+    "EXECUTE_CHUNK_BATCH",
+    "REMOTE_EXECUTION_CONFIG",
+    "REMOTE_EXECUTION_STATUS",
+    "REMOTE_EXECUTION_PING",
+    "EXTERNAL_STORAGE_CONFIG",
+    "EXTERNAL_STORAGE_TEST",
+    "EXTERNAL_STORAGE_LIST",
+    "EXTERNAL_STORAGE_SYNC",
+    "EXTERNAL_STORAGE_OPEN",
+    "OBSERVATION_ENGINE_CONFIG",
+    "OBSERVATION_ENGINE_STATUS",
+    "HYBRID_SURFACE_CONFIG",
+    "HYBRID_SURFACE_STATUS",
+    "HYBRID_SURFACE_CLEAR",
+    "ROW_SURFACE_STATUS",
+    "ROW_SURFACE_CLEAR",
+    "ROW_SURFACE_PREFETCH",
+    "EXECUTION_PLANE_CONFIG",
+    "EXECUTION_PLANE_STATUS",
+    "ADAPTIVE_KERNEL_CONFIG",
+    "ADAPTIVE_KERNEL_STATUS",
+    "ADAPTIVE_CACHE_CLEAR",
+    "HYPERTENSOR_PLAN_PREVIEW",
+    "ADAPTIVE_PERF_BENCH",
+    "PERF_BENCH",
+    "ANALYZE",
+    "VALIDATE_MERGE",
+    "PREVIEW_CLEAN",
+    "BUILD_COLUMNAR",
+    "OPFS_LIST",
+    "OPFS_ESTIMATE",
+    "OPFS_LOAD",
+    "OPFS_OPEN_VIRTUAL",
+    "OPFS_OPEN_MEMORY",
+    "OPFS_DELETE",
+    "MERGE_OPFS_DATASETS",
+    "PURGE_SELECTED",
+    "PURGE_ALL",
+    "FORGET_SESSION",
+    "READ_PAGE",
+    "RUN_DATA_QUERY",
+    "READ_DATA_QUERY_PAGE",
+    "RUN_GRAPH_JOIN_QUERY",
+    "READ_GRAPH_JOIN_PAGE",
+    "READ_GRAPH_RESULT_WINDOW",
+    "RUN_GRAPH_RESULT_SEARCH",
+    "READ_GRAPH_RESULT_SEARCH_PAGE",
+    "BUILD_GRAPH_RESULT_PIVOT",
+    "BUILD_GRAPH_RESULT_TIME",
+    "EXPORT_GRAPH_QUERY_CSV",
+    "CLEAR_DATA_QUERY",
+    "RUN_SEARCH",
+    "READ_SEARCH_PAGE",
+    "BUILD_PIVOT",
+    "READ_PIVOT_VIEWPORT",
+    "BUILD_TIME",
+    "EXPORT_TIME",
+    "EXPORT_GRAPH_RESULT_SEARCH",
+    "EXPORT_GRAPH_RESULT_TIME",
+    "EXPORT_PIVOT",
+    "EXPORT_GRAPH_RESULT_PIVOT"
+  ]
+});
+
 const runtimeKernel = createRuntimeKernel({
   runtimeState: state,
   post,
   commands: runtimeCommands,
   measurement: runtimeMeasurements,
   legacyHandler: legacyWorkerMessageRouter,
+  executionPolicy: runtimeExecutionPolicy,
 });
 
-/*
- * Runtime Fast Path
- * ---------------------------------------------------------
- * Data processing commands are the hot path. They must not pay the
- * control-plane cost of normalize / plan wrapper / measurement / fallback
- * accounting on every message.
- *
- * Rule:
- * - Control-plane commands and newly registered runtime commands go through
- *   Runtime Kernel.
- * - Existing data-plane commands go directly to legacyWorkerMessageRouter.
- *
- * This keeps the structural boundary while restoring the original execution
- * speed for ANALYZE / BUILD_COLUMNAR / RUN_DATA_QUERY / READ_PAGE /
- * graph / pivot / chunk operations.
- */
-const RUNTIME_CONTROL_COMMANDS = new Set([
-  "CANCEL",
-  "RUNTIME_HEALTH",
-  "RUNTIME_MEASUREMENTS",
-]);
-
 function shouldUseRuntimeKernel(rawMessage){
-  if (!rawMessage || typeof rawMessage !== "object") return true;
-  const type = String(rawMessage.type || "");
-  if (!type) return true;
-  return RUNTIME_CONTROL_COMMANDS.has(type) || runtimeCommands.has(type);
+  return runtimeExecutionPolicy.shouldUseKernel(rawMessage, runtimeCommands);
 }
 
 self.onmessage = (event) => {
@@ -13313,8 +13628,42 @@ self.onmessage = (event) => {
     return;
   }
 
-  legacyWorkerMessageRouter(event);
+  const startedAt = now();
+  const type = String(rawMessage.type || "UNKNOWN");
+  state.runtime.lastCommandType = type;
+  state.runtime.lastRoute = runtimeExecutionPolicy.classify(type, runtimeCommands);
+  try {
+    legacyWorkerMessageRouter(event);
+    runtimeMeasurements.record({
+      type,
+      ok:true,
+      route:state.runtime.lastRoute,
+      durationMs:now() - startedAt,
+      strategy:"legacy-fast-path",
+      fallback:false
+    });
+  } catch (error) {
+    const safeError = normalizeCommandError(error);
+    state.runtime.failureCount += 1;
+    state.runtime.lastError = safeError;
+    runtimeMeasurements.record({
+      type,
+      ok:false,
+      route:"legacy-fast-path-error",
+      durationMs:now() - startedAt,
+      strategy:"legacy-fast-path",
+      errorCode:safeError.code
+    });
+    post("ERROR", {
+      requestId: rawMessage.requestId,
+      requestType: type,
+      code: safeError.code,
+      message: safeError.message,
+      stack: safeError.stack,
+    });
+  }
 };
+
 
   
 
