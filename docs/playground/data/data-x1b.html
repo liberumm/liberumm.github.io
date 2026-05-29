@@ -18132,18 +18132,21 @@ function normalizePivotUiFilters(filters = {}) {
 }
 
 function PivotTileGrid({ meta, view, onRequest, height = 640, filters = {}, onFiltersChange = () => {} }) {
-  const scrollerRef = useRef(null);
-  const timerRef = useRef(null);
-  const lastKeyRef = useRef("");
-  const [scrollInfo, setScrollInfo] = useState({ top: 0, left: 0 });
   const normalizedFilters = normalizePivotUiFilters(filters);
   const filterKey = JSON.stringify(normalizedFilters);
+  const lastRequestKeyRef = useRef("");
+  const rowHeaderNames = Array.isArray(meta?.rowHeaderNames) && meta.rowHeaderNames.length ? meta.rowHeaderNames : ["Rows"];
+  const rowHeaderCount = Math.max(1, rowHeaderNames.length);
+  const [rowPageSizeDraft, setRowPageSizeDraft] = useState(String(Math.max(64, Number(meta?.tileRows || 128))));
+  const [colWindowSizeDraft, setColWindowSizeDraft] = useState(String(Math.max(32, Number(meta?.tileCols || 64))));
+  const [columnWindowStart, setColumnWindowStart] = useState(0);
 
-  const rowHeight = 28;
-  const colWidth = 132;
-  const rowHeaderWidth = 260;
-  const colHeaderHeight = 34;
-  const maxScrollPx = 24000000;
+  const totalRows = Math.max(0, Number(meta?.totalRows || 0));
+  const totalCols = Math.max(0, Number(meta?.totalCols || 0));
+  const rowPageSize = Math.max(20, Math.min(240, Number(rowPageSizeDraft || meta?.tileRows || 128) || 128));
+  const colWindowSize = Math.max(8, Math.min(120, Number(colWindowSizeDraft || meta?.tileCols || 64) || 64));
+  const maxColumnWindowStart = Math.max(0, totalCols - colWindowSize);
+  const safeColumnWindowStart = Math.max(0, Math.min(maxColumnWindowStart, Number(columnWindowStart || 0)));
 
   function updateFilter(key, value) {
     onFiltersChange({ ...normalizedFilters, [key]: value });
@@ -18153,96 +18156,118 @@ function PivotTileGrid({ meta, view, onRequest, height = 640, filters = {}, onFi
     onFiltersChange({ globalFilter: "", rowFilter: "", columnFilter: "" });
   }
 
-  function requestVisible() {
-    if (!meta || !onRequest || !scrollerRef.current) return;
-    const el = scrollerRef.current;
-    const bodyTop = Math.max(0, el.scrollTop - colHeaderHeight);
-    const bodyLeft = Math.max(0, el.scrollLeft - rowHeaderWidth);
-    const rowStart = Math.max(0, Math.floor(bodyTop / rowHeight) - 8);
-    const colStart = Math.max(0, Math.floor(bodyLeft / colWidth) - 4);
-    const viewportRows = Math.ceil(el.clientHeight / rowHeight) + 18;
-    const viewportCols = Math.ceil(el.clientWidth / colWidth) + 10;
-    const key = `${rowStart}:${colStart}:${viewportRows}:${viewportCols}:${meta.totalRows}:${meta.totalCols}:${filterKey}`;
-    if (lastKeyRef.current === key) return;
-    lastKeyRef.current = key;
-    onRequest({ rowStart, colStart, viewportRows, viewportCols, overscan: 1, filters: normalizedFilters });
-  }
-
-  function handleScroll() {
-    const el = scrollerRef.current;
-    if (el) setScrollInfo({ top: el.scrollTop, left: el.scrollLeft });
-    if (timerRef.current) clearTimeout(timerRef.current);
-    timerRef.current = setTimeout(requestVisible, 40);
-  }
+  const requestWindow = useCallback((page = 1, pageSize = rowPageSize, requestedColumnStart = safeColumnWindowStart, options = {}) => {
+    if (!meta || !onRequest || !totalRows || !totalCols) return;
+    const safePageSize = Math.max(20, Math.min(240, Number(pageSize || rowPageSize) || rowPageSize));
+    const safePage = Math.max(1, Math.floor(Number(page || 1) || 1));
+    const rowStart = Math.max(0, Math.min(Math.max(0, totalRows - 1), (safePage - 1) * safePageSize));
+    const colStart = Math.max(0, Math.min(Math.max(0, totalCols - 1), Number(requestedColumnStart || 0) || 0));
+    const key = `${rowStart}:${safePageSize}:${colStart}:${colWindowSize}:${totalRows}:${totalCols}:${filterKey}`;
+    if (!options.force && lastRequestKeyRef.current === key) return;
+    lastRequestKeyRef.current = key;
+    onRequest({
+      rowStart,
+      colStart,
+      viewportRows: safePageSize,
+      viewportCols: colWindowSize,
+      overscan: 1,
+      filters: normalizedFilters,
+    });
+  }, [meta, onRequest, totalRows, totalCols, rowPageSize, colWindowSize, safeColumnWindowStart, filterKey]);
 
   useEffect(() => {
-    lastKeyRef.current = "";
-    const el = scrollerRef.current;
-    if (el) {
-      el.scrollTop = 0;
-      el.scrollLeft = 0;
-    }
-    setScrollInfo({ top: 0, left: 0 });
-    const id = setTimeout(requestVisible, 0);
-    return () => {
-      clearTimeout(id);
-      if (timerRef.current) clearTimeout(timerRef.current);
-    };
+    lastRequestKeyRef.current = "";
+    setColumnWindowStart(0);
   }, [meta?.totalRows, meta?.totalCols, filterKey]);
 
-  if (!meta) {
-    return <Alert severity="info">PivotをBuildすると、ページ移動なしのlazy tile gridで表示します。</Alert>;
-  }
+  useEffect(() => {
+    if (!meta) return;
+    const id = setTimeout(() => requestWindow(1, rowPageSize, safeColumnWindowStart, { force: true }), 0);
+    return () => clearTimeout(id);
+  }, [meta?.totalRows, meta?.totalCols, rowPageSize, colWindowSize, safeColumnWindowStart, filterKey]);
 
-  const totalRows = Math.max(1, Number(meta.totalRows || 1));
-  const totalCols = Math.max(1, Number(meta.totalCols || 1));
-  const logicalHeight = colHeaderHeight + totalRows * rowHeight;
-  const logicalWidth = rowHeaderWidth + totalCols * colWidth;
-  const innerHeight = Math.min(logicalHeight, maxScrollPx);
-  const innerWidth = Math.min(logicalWidth, maxScrollPx);
-  const yScale = logicalHeight > maxScrollPx ? logicalHeight / maxScrollPx : 1;
-  const xScale = logicalWidth > maxScrollPx ? logicalWidth / maxScrollPx : 1;
+  const pivotTable = useMemo(() => {
+    const tiles = Array.isArray(view?.tiles) ? view.tiles : [];
+    const rowStart = Math.max(0, Number(view?.rowStart || 0) || 0);
+    const rowEnd = Math.max(rowStart, Number(view?.rowEnd || rowStart) || rowStart);
+    const colStart = Math.max(0, Number(view?.colStart ?? safeColumnWindowStart) || 0);
+    const colEnd = Math.max(colStart, Number(view?.colEnd || Math.min(totalCols, colStart + colWindowSize)) || colStart);
 
-  const rowLabels = new Map();
-  const colLabels = new Map();
-  const body = [];
-  for (const tile of view?.tiles || []) {
-    for (let r = tile.rowStart; r < tile.rowEnd; r++) {
-      if (!rowLabels.has(r)) rowLabels.set(r, (tile.rowLabels?.[r - tile.rowStart] || []).join(" / "));
-    }
-    for (let c = tile.colStart; c < tile.colEnd; c++) {
-      if (!colLabels.has(c)) colLabels.set(c, (tile.colLabels?.[c - tile.colStart] || []).join(" / "));
-    }
-    for (let rr = 0; rr < (tile.values || []).length; rr++) {
-      const r = tile.rowStart + rr;
-      for (let cc = 0; cc < (tile.values[rr] || []).length; cc++) {
-        const c = tile.colStart + cc;
-        body.push({ r, c, value: tile.values[rr][cc] });
+    const rowLabels = new Map();
+    const colLabels = new Map();
+    const values = new Map();
+
+    for (const tile of tiles) {
+      for (let r = Number(tile.rowStart || 0); r < Number(tile.rowEnd || 0); r++) {
+        if (!rowLabels.has(r)) rowLabels.set(r, tile.rowLabels?.[r - Number(tile.rowStart || 0)] || []);
+      }
+      for (let c = Number(tile.colStart || 0); c < Number(tile.colEnd || 0); c++) {
+        if (!colLabels.has(c)) colLabels.set(c, (tile.colLabels?.[c - Number(tile.colStart || 0)] || []).join(" / "));
+      }
+      for (let rr = 0; rr < (tile.values || []).length; rr++) {
+        const r = Number(tile.rowStart || 0) + rr;
+        const row = tile.values[rr] || [];
+        for (let cc = 0; cc < row.length; cc++) {
+          const c = Number(tile.colStart || 0) + cc;
+          values.set(`${r}:${c}`, row[cc]);
+        }
       }
     }
+
+    const header = [...rowHeaderNames];
+    for (let c = colStart; c < colEnd; c++) {
+      header.push(colLabels.get(c) || (c === totalCols - 1 ? "Grand Total" : `Column ${fmt(c + 1)}`));
+    }
+
+    const rows = [];
+    for (let r = rowStart; r < rowEnd; r++) {
+      const labelParts = Array.isArray(rowLabels.get(r)) && rowLabels.get(r).length
+        ? rowLabels.get(r)
+        : (r === totalRows - 1 ? ["Grand Total"] : [`Row ${fmt(r + 1)}`]);
+      const row = labelParts.slice(0, rowHeaderCount);
+      while (row.length < rowHeaderCount) row.push("");
+      for (let c = colStart; c < colEnd; c++) row.push(values.has(`${r}:${c}`) ? values.get(`${r}:${c}`) : "");
+      rows.push(row);
+    }
+
+    return {
+      header,
+      rows,
+      page: Math.floor(rowStart / Math.max(1, rowPageSize)) + 1,
+      pageSize: rowPageSize,
+      startRow: rowStart,
+      colStart,
+      colEnd,
+    };
+  }, [view, rowHeaderNames.join("\u001f"), rowHeaderCount, rowPageSize, safeColumnWindowStart, colWindowSize, totalRows, totalCols]);
+
+  if (!meta) {
+    return <Alert severity="info">PivotをBuildすると、Graph Query Resultと同じCanvas table rendererで表示します。</Alert>;
   }
 
-  function cellBaseSx(r, c, extra = {}) {
-    return {
-      position: "absolute",
-      top: Math.round((colHeaderHeight + r * rowHeight) / yScale),
-      left: Math.round((rowHeaderWidth + c * colWidth) / xScale),
-      width: Math.max(48, Math.round(colWidth / xScale)),
-      height: Math.max(18, Math.round(rowHeight / yScale)),
-      boxSizing: "border-box",
-      borderRight: "1px solid",
-      borderBottom: "1px solid",
-      borderColor: "divider",
-      overflow: "hidden",
-      whiteSpace: "nowrap",
-      textOverflow: "ellipsis",
-      px: 0.75,
-      py: 0.25,
-      fontSize: 12,
-      lineHeight: "20px",
-      bgcolor: "background.paper",
-      ...extra,
-    };
+  const externalColumnFilters = {};
+  if (normalizedFilters.rowFilter) externalColumnFilters[0] = normalizedFilters.rowFilter;
+  if (normalizedFilters.columnFilter) externalColumnFilters[rowHeaderCount] = normalizedFilters.columnFilter;
+
+  function updateTableColumnFilters(next = {}) {
+    const rowFilter = String(next[0] || "").trim();
+    const columnFilter = Object.entries(next)
+      .filter(([key]) => Number(key) >= rowHeaderCount)
+      .map(([, value]) => String(value || "").trim())
+      .filter(Boolean)
+      .join(" ");
+    onFiltersChange({ ...normalizedFilters, rowFilter, columnFilter });
+  }
+
+  function moveColumnWindow(delta) {
+    const next = Math.max(0, Math.min(maxColumnWindowStart, safeColumnWindowStart + delta));
+    setColumnWindowStart(next);
+    requestWindow(1, rowPageSize, next, { force: true });
+  }
+
+  function applyWindowSize() {
+    lastRequestKeyRef.current = "";
+    requestWindow(1, rowPageSize, safeColumnWindowStart, { force: true });
   }
 
   return (
@@ -18253,51 +18278,46 @@ function PivotTileGrid({ meta, view, onRequest, height = 640, filters = {}, onFi
         <TextField size="small" label="列ラベル" value={normalizedFilters.columnFilter} onChange={(e)=>updateFilter("columnFilter", e.target.value)} sx={{ minWidth: 160 }} />
         {(normalizedFilters.globalFilter || normalizedFilters.rowFilter || normalizedFilters.columnFilter) && <Button size="small" onClick={clearFilters}>Clear filters</Button>}
       </Stack>
-      <Stack direction="row" spacing={1} useFlexGap flexWrap="wrap" sx={{ mb: 0.75 }}>
+      <Stack direction="row" spacing={1} useFlexGap flexWrap="wrap" alignItems="center" sx={{ mb: 0.75 }}>
         <Chip size="small" label={`Rows ${fmt(meta.totalRows)}`} />
         <Chip size="small" label={`Columns ${fmt(meta.totalCols)}`} />
         {meta.filtered && <Chip size="small" color="warning" variant="outlined" label={`Filtered from ${fmt(meta.originalDataRows)}×${fmt(meta.originalDataCols)}`} />}
         <Chip size="small" label={`Source ${meta.source || "active"}`} />
-        <Chip size="small" label={`Tile ${meta.tileRows}×${meta.tileCols}`} />
-        <Chip size="small" label={`Viewport r${fmt(view?.rowStart || 0)}-r${fmt(view?.rowEnd || 0)} / c${fmt(view?.colStart || 0)}-c${fmt(view?.colEnd || 0)}`} />
+        <Chip size="small" label={`Renderer GraphQuery/VisualHyperTensor`} />
+        <Chip size="small" label={`Window c${fmt(pivotTable.colStart + 1)}-c${fmt(pivotTable.colEnd)} / ${fmt(totalCols)}`} />
+        <SmallNumberField label="行/tile" value={rowPageSizeDraft} onChange={setRowPageSizeDraft} min="20" step="20" sx={{ width: 115 }} />
+        <SmallNumberField label="列/window" value={colWindowSizeDraft} onChange={setColWindowSizeDraft} min="8" step="8" sx={{ width: 125 }} />
+        <Button size="small" variant="outlined" onClick={() => moveColumnWindow(-colWindowSize)} disabled={safeColumnWindowStart <= 0}>← Cols</Button>
+        <Button size="small" variant="outlined" onClick={() => moveColumnWindow(colWindowSize)} disabled={safeColumnWindowStart >= maxColumnWindowStart}>Cols →</Button>
+        <Button size="small" onClick={applyWindowSize}>Apply</Button>
       </Stack>
-      <Box
-        ref={scrollerRef}
-        onScroll={handleScroll}
-        sx={{
-          height,
-          overflow: "auto",
-          border: "1px solid",
-          borderColor: "divider",
-          borderRadius: 1.5,
-          bgcolor: "background.default",
-          position: "relative",
-          overscrollBehavior: "contain",
-        }}
-      >
-        <Box sx={{ position: "relative", width: innerWidth, height: innerHeight, minWidth: "100%" }}>
-          <Box sx={{ position: "absolute", top: 0, left: 0, width: rowHeaderWidth, height: colHeaderHeight, bgcolor: "background.paper", borderRight: "1px solid", borderBottom: "1px solid", borderColor: "divider", px: 1, lineHeight: `${colHeaderHeight}px`, fontWeight: 900, fontSize: 12 }}>
-            {(meta.rowHeaderNames || []).join(" / ")}
-          </Box>
-          {[...colLabels.entries()].map(([c, label]) => (
-            <Box key={`ch:${c}`} sx={cellBaseSx(0, c, { top: 0, height: colHeaderHeight, fontWeight: 900, bgcolor: "background.paper" })} title={label}>
-              {label}
-            </Box>
-          ))}
-          {[...rowLabels.entries()].map(([r, label]) => (
-            <Box key={`rh:${r}`} sx={{ position: "absolute", top: Math.round((colHeaderHeight + r * rowHeight) / yScale), left: 0, width: rowHeaderWidth, height: Math.max(18, Math.round(rowHeight / yScale)), boxSizing: "border-box", borderRight: "1px solid", borderBottom: "1px solid", borderColor: "divider", overflow: "hidden", whiteSpace: "nowrap", textOverflow: "ellipsis", px: 1, py: 0.25, fontSize: 12, lineHeight: "20px", bgcolor: "background.paper", fontWeight: label === "Grand Total" ? 900 : 500 }} title={label}>
-              {label}
-            </Box>
-          ))}
-          {body.map((cell) => (
-            <Box key={`b:${cell.r}:${cell.c}`} sx={cellBaseSx(cell.r, cell.c, { fontWeight: cell.r === meta.totalRows - 1 || cell.c === meta.totalCols - 1 ? 900 : 400 })} title={String(cell.value ?? "")}>
-              {cell.value}
-            </Box>
-          ))}
-        </Box>
-      </Box>
+      <VisualHyperTensorTableView
+        tableId="pivotResultGraphRenderer"
+        header={pivotTable.header}
+        rows={pivotTable.rows}
+        height={height}
+        dense={false}
+        filterable
+        sortable={false}
+        minColumnWidth={150}
+        externalLazy
+        totalRows={totalRows}
+        loadedStart={Number(pivotTable.startRow || 0)}
+        page={Number(pivotTable.page || 1)}
+        pageSize={rowPageSize}
+        onReadPage={(page, pageSize) => requestWindow(page, pageSize, safeColumnWindowStart)}
+        externalGlobalFilter={normalizedFilters.globalFilter}
+        externalColumnFilters={externalColumnFilters}
+        onExternalGlobalFilterChange={(value) => updateFilter("globalFilter", value)}
+        onExternalColumnFiltersChange={updateTableColumnFilters}
+        onExternalClearFilters={clearFilters}
+        emptyMessage="PivotをBuildすると、ここに結果が表示されます。"
+        sourceLabel="Pivot Result"
+        statusLabel={`全${fmt(totalRows)}行 / 表示列 ${fmt(pivotTable.header.length)} / page ${fmt(pivotTable.page)} / row tile ${fmt(rowPageSize)}`}
+        resetKey={`pivot-result:${totalRows}:${totalCols}:${rowPageSize}:${colWindowSize}:${safeColumnWindowStart}:${filterKey}`}
+      />
       <Typography variant="caption" color="text.secondary">
-        Lazy tile grid: 表示範囲と周辺タイルだけWorkerから取得します。スクロール位置: top {fmt(scrollInfo.top)} / left {fmt(scrollInfo.left)}。
+        Pivot ResultはGraph Query Resultと同じCanvas body + DOM header rendererで表示します。列方向は巨大Pivotに対応するためwindow単位でWorkerから取得します。
       </Typography>
     </Box>
   );
