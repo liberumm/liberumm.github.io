@@ -6102,19 +6102,40 @@ async function readGraphJoinPage(page,pageSize,origin=""){
 }
 
 function makeAgg(){ return {count:0,n:0,sum:0,min:null,max:null}; }
+function normalizeAggMode(mode){
+  const raw=String(mode || "Count").trim().toLowerCase();
+  if (raw === "sum") return "Sum";
+  if (raw === "avg" || raw === "average" || raw === "mean") return "Average";
+  if (raw === "min") return "Min";
+  if (raw === "max") return "Max";
+  return "Count";
+}
+function parseAggNumber(value){
+  if (typeof value === "number") return Number.isFinite(value) ? value : null;
+  if (value == null || value === "") return null;
+  const normalized=String(value).normalize("NFKC").trim()
+    .replace(/[,\s￥¥$€£]/g,"")
+    .replace(/％/g,"%");
+  if (!normalized) return null;
+  const percent=normalized.endsWith("%");
+  const n=Number(percent ? normalized.slice(0,-1) : normalized);
+  if (!Number.isFinite(n)) return null;
+  return percent ? n / 100 : n;
+}
 function addAgg(a, v, countMode){
   a.count++;
   if (countMode) return;
-  const n=Number(v);
+  const n=parseAggNumber(v);
   if (Number.isFinite(n)){ a.n++; a.sum+=n; a.min=a.min==null?n:Math.min(a.min,n); a.max=a.max==null?n:Math.max(a.max,n); }
 }
 function aggValue(a,mode){
   if (!a) return "";
-  if (mode==="Count") return a.count;
-  if (mode==="Sum") return a.n ? Math.round(a.sum*1e6)/1e6 : "";
-  if (mode==="Average") return a.n ? Math.round((a.sum/a.n)*1e6)/1e6 : "";
-  if (mode==="Min") return a.n ? a.min : "";
-  if (mode==="Max") return a.n ? a.max : "";
+  const normalizedMode=normalizeAggMode(mode);
+  if (normalizedMode==="Count") return a.count;
+  if (normalizedMode==="Sum") return a.n ? Math.round(a.sum*1e6)/1e6 : "";
+  if (normalizedMode==="Average") return a.n ? Math.round((a.sum/a.n)*1e6)/1e6 : "";
+  if (normalizedMode==="Min") return a.n ? a.min : "";
+  if (normalizedMode==="Max") return a.n ? a.max : "";
   return a.count;
 }
 function keyCellValue(v){
@@ -6150,7 +6171,7 @@ async function buildPivot({rowFields,columnFields,valueField,aggregation,maxRows
   const colIdx=(columnFields||[]).map(Number).filter(i => state.manifest?.columns?.[i]);
   const valIdx=Number(valueField);
   const countMode = !Number.isFinite(valIdx) || valIdx < 0 || !state.manifest?.columns?.[valIdx];
-  const mode=countMode?"Count":aggregation;
+  const mode=countMode ? "Count" : normalizeAggMode(aggregation);
   const rowLimit=Math.max(1, Number(maxRows || 1000000));
   const colLimit=Math.max(1, Number(maxCols || 10000));
   const required=[...new Set([...rowIdx,...colIdx,...(countMode?[]:[valIdx])])];
@@ -6220,16 +6241,46 @@ async function buildPivot({rowFields,columnFields,valueField,aggregation,maxRows
   return pivotTileMeta();
 }
 
+
+function normalizePivotFilterMap(input={}){
+  const out={};
+  if (!input || typeof input !== "object") return out;
+  for (const [rawKey, rawValue] of Object.entries(input)){
+    const key=String(rawKey);
+    const value=String(rawValue || "").trim().toLowerCase().slice(0,500);
+    if (value) out[key]=value;
+  }
+  return out;
+}
+
 function normalizePivotResultFilters(input={}){
   const globalFilter=String(input.globalFilter || "").trim().toLowerCase().slice(0,500);
   const rowFilter=String(input.rowFilter || input.rowLabelFilter || "").trim().toLowerCase().slice(0,500);
   const columnFilter=String(input.columnFilter || input.colFilter || input.columnLabelFilter || "").trim().toLowerCase().slice(0,500);
-  return {globalFilter,rowFilter,columnFilter};
+  return {
+    globalFilter,
+    rowFilter,
+    columnFilter,
+    rowHeaderColumnFilters:normalizePivotFilterMap(input.rowHeaderColumnFilters || input.rowLabelColumnFilters || {}),
+    valueColumnFilters:normalizePivotFilterMap(input.valueColumnFilters || input.measureColumnFilters || {}),
+    columnFilters:normalizePivotFilterMap(input.columnFilters || {})
+  };
+}
+
+function pivotFilterKey(filters={}){
+  return JSON.stringify(normalizePivotResultFilters(filters));
 }
 
 function hasPivotResultFilters(filters){
   const f=normalizePivotResultFilters(filters);
-  return !!(f.globalFilter || f.rowFilter || f.columnFilter);
+  return !!(
+    f.globalFilter ||
+    f.rowFilter ||
+    f.columnFilter ||
+    Object.keys(f.rowHeaderColumnFilters).length ||
+    Object.keys(f.valueColumnFilters).length ||
+    Object.keys(f.columnFilters).length
+  );
 }
 
 function pivotResultFilterText(value){
@@ -6239,12 +6290,125 @@ function pivotResultFilterText(value){
   return String(value);
 }
 
+function pivotResultRowLabelPartsFromKey(key){
+  return pivotRowLabelParts(key).map(pivotResultFilterText);
+}
+
 function pivotResultRowLabelText(key){
-  return pivotRowLabelParts(key).map(pivotResultFilterText).join(" / ").toLowerCase();
+  return pivotResultRowLabelPartsFromKey(key).join(" / ").toLowerCase();
 }
 
 function pivotResultColumnLabelText(key, colIdx){
   return pivotColumnLabel(key, colIdx).toLowerCase();
+}
+
+function mergePivotVisibleAggInto(target, source){
+  if (!source) return target;
+  target.count += Number(source.count || 0);
+  target.n += Number(source.n || 0);
+  target.sum += Number(source.sum || 0);
+  if (source.min != null) target.min = target.min == null ? source.min : Math.min(target.min, source.min);
+  if (source.max != null) target.max = target.max == null ? source.max : Math.max(target.max, source.max);
+  return target;
+}
+
+function pivotDirectAgg(p, rowKey=null, colKey=null){
+  if (!p) return makeAgg();
+  if (rowKey != null && colKey != null) return (p.cells.get(rowKey) || new Map()).get(colKey) || makeAgg();
+  if (rowKey != null && colKey == null) return p.rowTotals?.get(rowKey) || makeAgg();
+  if (rowKey == null && colKey != null) return p.colTotals?.get(colKey) || makeAgg();
+  return p.grand || makeAgg();
+}
+
+function pivotComputeVisibleAgg(p, visible, rowKey=null, colKey=null){
+  const out=makeAgg();
+  if (rowKey != null && colKey != null) return mergePivotVisibleAggInto(out, (p.cells.get(rowKey) || new Map()).get(colKey));
+
+  if (rowKey != null) {
+    const rowMap=p.cells.get(rowKey) || new Map();
+    for (const ck of visible.colKeys) mergePivotVisibleAggInto(out, rowMap.get(ck));
+    return out;
+  }
+
+  if (colKey != null) {
+    for (const rk of visible.rowKeys) mergePivotVisibleAggInto(out, (p.cells.get(rk) || new Map()).get(colKey));
+    return out;
+  }
+
+  for (const rk of visible.rowKeys) {
+    const rowMap=p.cells.get(rk) || new Map();
+    for (const ck of visible.colKeys) mergePivotVisibleAggInto(out, rowMap.get(ck));
+  }
+  return out;
+}
+
+function pivotVisibleAgg(p, visible, rowKey=null, colKey=null){
+  if (!visible?.active) return pivotDirectAgg(p, rowKey, colKey);
+
+  if (!visible._aggCache) {
+    visible._aggCache={
+      rowTotals:new Map(),
+      colTotals:new Map(),
+      grand:null
+    };
+  }
+
+  if (rowKey != null && colKey != null) return pivotDirectAgg(p, rowKey, colKey);
+
+  if (rowKey != null) {
+    if (!visible._aggCache.rowTotals.has(rowKey)) {
+      visible._aggCache.rowTotals.set(rowKey, pivotComputeVisibleAgg(p, visible, rowKey, null));
+    }
+    return visible._aggCache.rowTotals.get(rowKey);
+  }
+
+  if (colKey != null) {
+    if (!visible._aggCache.colTotals.has(colKey)) {
+      visible._aggCache.colTotals.set(colKey, pivotComputeVisibleAgg(p, visible, null, colKey));
+    }
+    return visible._aggCache.colTotals.get(colKey);
+  }
+
+  if (!visible._aggCache.grand) visible._aggCache.grand=pivotComputeVisibleAgg(p, visible, null, null);
+  return visible._aggCache.grand;
+}
+
+function pivotCellValueForVisible(p, visible, rowIndex, colIndex){
+  const isGrandRow = rowIndex >= visible.rowKeys.length;
+  const isGrandCol = colIndex >= visible.colKeys.length;
+  if (isGrandRow && isGrandCol) return aggValue(pivotVisibleAgg(p, visible, null, null), p.mode);
+  if (isGrandRow){
+    const ck=visible.colKeys[colIndex];
+    return aggValue(pivotVisibleAgg(p, visible, null, ck), p.mode);
+  }
+  if (isGrandCol){
+    const rk=visible.rowKeys[rowIndex];
+    return aggValue(pivotVisibleAgg(p, visible, rk, null), p.mode);
+  }
+  const rk=visible.rowKeys[rowIndex];
+  const ck=visible.colKeys[colIndex];
+  return aggValue(pivotDirectAgg(p, rk, ck), p.mode);
+}
+
+function pivotRowPassesValueColumnFilters(p, rowKey, colKeys, filters){
+  const entries=Object.entries(filters.valueColumnFilters || {});
+  if (!entries.length) return true;
+  for (const [rawIndex, q] of entries){
+    if (!q) continue;
+    const absoluteColIndex=Number(rawIndex);
+    let agg;
+    if (!Number.isFinite(absoluteColIndex) || absoluteColIndex < 0) continue;
+    if (absoluteColIndex >= colKeys.length) {
+      const pseudoVisible={rowKeys:[rowKey], colKeys, active:true};
+      agg=pivotVisibleAgg(p, pseudoVisible, rowKey, null);
+    } else {
+      const ck=colKeys[Math.floor(absoluteColIndex)];
+      agg=pivotDirectAgg(p, rowKey, ck);
+    }
+    const text=pivotResultFilterText(aggValue(agg, p.mode)).toLowerCase();
+    if (!text.includes(q)) return false;
+  }
+  return true;
 }
 
 function pivotResultVisibleKeys(p, filters={}){
@@ -6264,18 +6428,33 @@ function pivotResultVisibleKeys(p, filters={}){
     colKeys=p.colKeys.filter((key, i) => (colTexts[i] || "").includes(f.columnFilter));
   }
 
+  const rowHeaderFilterEntries=Object.entries(f.rowHeaderColumnFilters || {});
+  if (rowHeaderFilterEntries.length) {
+    rowKeys=rowKeys.filter((key) => {
+      const parts=pivotResultRowLabelPartsFromKey(key).map((v) => String(v || "").toLowerCase());
+      return rowHeaderFilterEntries.every(([rawIndex, query]) => {
+        const idx=Number(rawIndex);
+        if (!Number.isFinite(idx) || idx < 0) return true;
+        return String(parts[Math.floor(idx)] || "").includes(query);
+      });
+    });
+  }
+
   if (f.globalFilter) {
     const rowMatches=p.rowKeys.filter((key, i) => (rowTexts[i] || "").includes(f.globalFilter));
     const colMatches=p.colKeys.filter((key, i) => (colTexts[i] || "").includes(f.globalFilter));
 
-    if (rowMatches.length) {
-      const rowMatchSet=new Set(rowMatches);
-      rowKeys=rowKeys.filter((key) => rowMatchSet.has(key));
-      globalScope="row";
-    } else if (colMatches.length) {
-      const colMatchSet=new Set(colMatches);
-      colKeys=colKeys.filter((key) => colMatchSet.has(key));
-      globalScope="column";
+    if (rowMatches.length || colMatches.length) {
+      if (rowMatches.length) {
+        const rowMatchSet=new Set(rowMatches);
+        rowKeys=rowKeys.filter((key) => rowMatchSet.has(key));
+        globalScope=rowMatches.length && colMatches.length ? "row+column" : "row";
+      }
+      if (colMatches.length) {
+        const colMatchSet=new Set(colMatches);
+        colKeys=colKeys.filter((key) => colMatchSet.has(key));
+        globalScope=rowMatches.length && colMatches.length ? "row+column" : "column";
+      }
     } else {
       rowKeys=[];
       colKeys=[];
@@ -6283,46 +6462,20 @@ function pivotResultVisibleKeys(p, filters={}){
     }
   }
 
+  if (Object.keys(f.valueColumnFilters || {}).length) {
+    rowKeys=rowKeys.filter((rowKey) => pivotRowPassesValueColumnFilters(p, rowKey, colKeys, f));
+  }
+
+  const active=hasPivotResultFilters(f);
   return {
     rowKeys,
     colKeys,
     filters:f,
-    active:hasPivotResultFilters(f),
+    active,
     globalScope,
-    aggregateScope:hasPivotResultFilters(f) ? "filtered-visible-cross-product" : "full-pivot"
+    aggregateScope:active ? "filtered-visible-cross-product" : "full-pivot",
+    filterKey:pivotFilterKey(f)
   };
-}
-
-function mergeAggInto(target, source){
-  if (!source) return target;
-  target.count += Number(source.count || 0);
-  target.n += Number(source.n || 0);
-  target.sum += Number(source.sum || 0);
-  if (source.min != null) target.min = target.min == null ? source.min : Math.min(target.min, source.min);
-  if (source.max != null) target.max = target.max == null ? source.max : Math.max(target.max, source.max);
-  return target;
-}
-
-function pivotVisibleAgg(p, visibleRows, visibleCols, rowKey=null, colKey=null){
-  if (rowKey != null && colKey != null) return (p.cells.get(rowKey) || new Map()).get(colKey) || makeAgg();
-
-  const out=makeAgg();
-  if (rowKey != null) {
-    const rowMap=p.cells.get(rowKey) || new Map();
-    for (const ck of visibleCols) mergeAggInto(out, rowMap.get(ck));
-    return out;
-  }
-
-  if (colKey != null) {
-    for (const rk of visibleRows) mergeAggInto(out, (p.cells.get(rk) || new Map()).get(colKey));
-    return out;
-  }
-
-  for (const rk of visibleRows) {
-    const rowMap=p.cells.get(rk) || new Map();
-    for (const ck of visibleCols) mergeAggInto(out, rowMap.get(ck));
-  }
-  return out;
 }
 
 function pivotTileMeta(filters={}){
@@ -6341,6 +6494,7 @@ function pivotTileMeta(filters={}){
     filters:visible.filters,
     filterGlobalScope:visible.globalScope || "none",
     aggregateScope:visible.aggregateScope || "full-pivot",
+    filterKey:visible.filterKey,
     tileRows:p.tileRows,
     tileCols:p.tileCols,
     rowHeaderNames:p.rowHeaderNames,
@@ -6353,23 +6507,6 @@ function pivotTileMeta(filters={}){
     ms:p.ms,
     builtAt:p.builtAt
   };
-}
-
-function pivotCellValueForVisible(p, visible, rowIndex, colIndex){
-  const isGrandRow = rowIndex >= visible.rowKeys.length;
-  const isGrandCol = colIndex >= visible.colKeys.length;
-  if (isGrandRow && isGrandCol) return aggValue(pivotVisibleAgg(p, visible.rowKeys, visible.colKeys, null, null), p.mode);
-  if (isGrandRow){
-    const ck=visible.colKeys[colIndex];
-    return aggValue(pivotVisibleAgg(p, visible.rowKeys, visible.colKeys, null, ck), p.mode);
-  }
-  if (isGrandCol){
-    const rk=visible.rowKeys[rowIndex];
-    return aggValue(pivotVisibleAgg(p, visible.rowKeys, visible.colKeys, rk, null), p.mode);
-  }
-  const rk=visible.rowKeys[rowIndex];
-  const ck=visible.colKeys[colIndex];
-  return aggValue((p.cells.get(rk)||new Map()).get(ck), p.mode);
 }
 
 function pivotRowLabelForVisible(visible, rowIndex){
@@ -8329,7 +8466,7 @@ async function buildGraphResultPivot(msg={}){
   const valIdx=Number(msg.valueField);
   const hasValue=Number.isFinite(valIdx) && valIdx >= 0 && !!graphResultAnalysisColumn(analysis, valIdx);
   const countMode=!hasValue;
-  const aggMode=countMode ? "Count" : (msg.aggregation || "Count");
+  const aggMode=countMode ? "Count" : normalizeAggMode(msg.aggregation || "Count");
   const rowLimit=Math.max(1,Number(msg.maxRows||10000));
   const colLimit=Math.max(1,Number(msg.maxCols||1000));
   const requiredOutputs=[...new Set([...rowFields, ...columnFields, ...(hasValue ? [valIdx] : [])])];
@@ -8442,7 +8579,7 @@ async function buildGraphResultTime(msg={}){
   const hasGroup=Number.isFinite(groupIdx) && groupIdx >= 0 && !!graphResultAnalysisColumn(analysis, groupIdx);
   const hasValue=Number.isFinite(valIdx) && valIdx >= 0 && !!graphResultAnalysisColumn(analysis, valIdx);
   const countMode=!hasValue;
-  const aggMode=countMode ? "Count" : (msg.aggregation || "Count");
+  const aggMode=countMode ? "Count" : normalizeAggMode(msg.aggregation || "Count");
   const bucket=msg.bucket || "month";
   const bucketLimit=Math.max(1,Number(msg.maxBuckets||10000));
   const requiredOutputs=[...new Set([timeIdx, ...(hasGroup ? [groupIdx] : []), ...(hasValue ? [valIdx] : [])])];
@@ -17399,11 +17536,23 @@ function Section({ title, children, hint, icon, defaultCollapsed = false, action
 }
 
 
+function normalizePivotUiFilterMap(input = {}) {
+  const out = {};
+  if (!input || typeof input !== "object") return out;
+  for (const [key, value] of Object.entries(input)) {
+    const text = String(value || "");
+    if (text.trim()) out[String(key)] = text;
+  }
+  return out;
+}
+
 function normalizePivotUiFilters(filters = {}) {
   return {
     globalFilter: String(filters.globalFilter || ""),
     rowFilter: String(filters.rowFilter || ""),
     columnFilter: String(filters.columnFilter || ""),
+    rowHeaderColumnFilters: normalizePivotUiFilterMap(filters.rowHeaderColumnFilters || {}),
+    valueColumnFilters: normalizePivotUiFilterMap(filters.valueColumnFilters || {}),
   };
 }
 
@@ -17429,7 +17578,49 @@ function PivotTileGrid({ meta, view, onRequest, height = 640, filters = {}, onFi
   }
 
   function clearFilters() {
-    onFiltersChange({ globalFilter: "", rowFilter: "", columnFilter: "" });
+    onFiltersChange({ globalFilter: "", rowFilter: "", columnFilter: "", rowHeaderColumnFilters: {}, valueColumnFilters: {} });
+  }
+
+  const tableColumnFilters = useMemo(() => {
+    const out = {};
+    for (const [key, value] of Object.entries(normalizedFilters.rowHeaderColumnFilters || {})) {
+      const index = Number(key);
+      if (Number.isFinite(index) && index >= 0 && index < rowHeaderCount && String(value || "").trim()) out[Math.floor(index)] = value;
+    }
+    for (const [key, value] of Object.entries(normalizedFilters.valueColumnFilters || {})) {
+      const absoluteIndex = Number(key);
+      const localIndex = rowHeaderCount + Math.floor(absoluteIndex) - safeColumnWindowStart;
+      if (Number.isFinite(absoluteIndex) && localIndex >= rowHeaderCount && localIndex < rowHeaderCount + colWindowSize && String(value || "").trim()) {
+        out[localIndex] = value;
+      }
+    }
+    return out;
+  }, [normalizedFilters.rowHeaderColumnFilters, normalizedFilters.valueColumnFilters, rowHeaderCount, safeColumnWindowStart, colWindowSize]);
+
+  function handleTableColumnFiltersChange(nextLocalFilters = {}) {
+    const nextRowHeaderFilters = { ...(normalizedFilters.rowHeaderColumnFilters || {}) };
+    const nextValueFilters = { ...(normalizedFilters.valueColumnFilters || {}) };
+
+    for (let i = 0; i < rowHeaderCount; i++) delete nextRowHeaderFilters[String(i)];
+    for (let c = safeColumnWindowStart; c < Math.min(totalCols, safeColumnWindowStart + colWindowSize); c++) delete nextValueFilters[String(c)];
+
+    for (const [rawLocalIndex, rawValue] of Object.entries(nextLocalFilters || {})) {
+      const localIndex = Number(rawLocalIndex);
+      const value = String(rawValue || "");
+      if (!Number.isFinite(localIndex) || !value.trim()) continue;
+      if (localIndex < rowHeaderCount) {
+        nextRowHeaderFilters[String(Math.floor(localIndex))] = value;
+      } else {
+        const absoluteIndex = safeColumnWindowStart + Math.floor(localIndex - rowHeaderCount);
+        nextValueFilters[String(absoluteIndex)] = value;
+      }
+    }
+
+    onFiltersChange({
+      ...normalizedFilters,
+      rowHeaderColumnFilters: nextRowHeaderFilters,
+      valueColumnFilters: nextValueFilters,
+    });
   }
 
   const requestWindow = useCallback((page = 1, pageSize = rowPageSize, requestedColumnStart = safeColumnWindowStart, options = {}) => {
@@ -17564,7 +17755,7 @@ function PivotTileGrid({ meta, view, onRequest, height = 640, filters = {}, onFi
         rows={pivotTable.rows}
         height={height}
         dense={false}
-        filterable={false}
+        filterable={true}
         sortable={false}
         minColumnWidth={150}
         externalLazy
@@ -17573,10 +17764,10 @@ function PivotTileGrid({ meta, view, onRequest, height = 640, filters = {}, onFi
         page={Number(pivotTable.page || 1)}
         pageSize={rowPageSize}
         onReadPage={(page, pageSize) => requestWindow(page, pageSize, safeColumnWindowStart)}
-        externalGlobalFilter=""
-        externalColumnFilters={{}}
-        onExternalGlobalFilterChange={null}
-        onExternalColumnFiltersChange={null}
+        externalGlobalFilter={normalizedFilters.globalFilter}
+        externalColumnFilters={tableColumnFilters}
+        onExternalGlobalFilterChange={(value) => updateFilter("globalFilter", value)}
+        onExternalColumnFiltersChange={handleTableColumnFiltersChange}
         onExternalClearFilters={clearFilters}
         emptyMessage="PivotをBuildすると、ここに結果が表示されます。"
         sourceLabel="Pivot Result"
@@ -24086,7 +24277,7 @@ function App() {
     setPivotTable(null);
     setPivotTileMeta(null);
     setPivotTileView(null);
-    setPivotResultFilters({ globalFilter: "", rowFilter: "", columnFilter: "" });
+    setPivotResultFilters({ globalFilter: "", rowFilter: "", columnFilter: "", rowHeaderColumnFilters: {}, valueColumnFilters: {} });
     if (pivotSource === "graph") {
       if (!graphResultCount) { setPivotStatus("Graph Query Resultがありません。先にGraph Queryを実行してください。"); return; }
       setPivotStatus("Graph Query ResultからPivotを作成中...");
@@ -25103,7 +25294,7 @@ function App() {
                     setPivotTable(null);
                     setPivotTileMeta(null);
                     setPivotTileView(null);
-                    setPivotResultFilters({ globalFilter: "", rowFilter: "", columnFilter: "" });
+                    setPivotResultFilters({ globalFilter: "", rowFilter: "", columnFilter: "", rowHeaderColumnFilters: {}, valueColumnFilters: {} });
                   }}
                   sx={{ mb: 0.9 }}
                 >
