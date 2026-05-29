@@ -6271,6 +6271,47 @@ function pivotFilterKey(filters={}){
   return JSON.stringify(normalizePivotResultFilters(filters));
 }
 
+const PIVOT_VISIBLE_CACHE_LIMIT = 32;
+const PIVOT_VIEWPORT_CACHE_LIMIT = 96;
+
+function pivotCachePutLimited(map, key, value, limit){
+  if (!map || !key) return value;
+  if (map.has(key)) map.delete(key);
+  map.set(key, value);
+  while (map.size > limit) {
+    const oldestKey = map.keys().next().value;
+    map.delete(oldestKey);
+  }
+  return value;
+}
+
+function ensurePivotSurfaceCache(p){
+  if (!p) return { visible:new Map(), viewport:new Map(), version:"empty" };
+  const version = `${p.source || "active"}|${p.builtAt || ""}|${p.rowKeys?.length || 0}|${p.colKeys?.length || 0}|${p.mode || ""}`;
+  if (!p._surfaceCache || p._surfaceCache.version !== version) {
+    p._surfaceCache = {
+      version,
+      visible:new Map(),
+      viewport:new Map(),
+      meta:new Map()
+    };
+  }
+  return p._surfaceCache;
+}
+
+function pivotViewportCacheKey({p, filters, rowStart, colStart, viewportRows, viewportCols, overscan}){
+  const cache = ensurePivotSurfaceCache(p);
+  return [
+    cache.version,
+    pivotFilterKey(filters || {}),
+    Math.floor(Number(rowStart || 0)),
+    Math.floor(Number(colStart || 0)),
+    Math.floor(Number(viewportRows || 0)),
+    Math.floor(Number(viewportCols || 0)),
+    Math.floor(Number(overscan || 0))
+  ].join("|");
+}
+
 function hasPivotResultFilters(filters){
   const f=normalizePivotResultFilters(filters);
   return !!(
@@ -6345,6 +6386,17 @@ function pivotComputeVisibleAgg(p, visible, rowKey=null, colKey=null){
 function pivotVisibleAgg(p, visible, rowKey=null, colKey=null){
   if (!visible?.active) return pivotDirectAgg(p, rowKey, colKey);
 
+  if (rowKey != null && colKey != null) return pivotDirectAgg(p, rowKey, colKey);
+
+  const allRowsVisible = visible.rowKeys === p.rowKeys || visible.rowKeys.length === p.rowKeys.length;
+  const allColsVisible = visible.colKeys === p.colKeys || visible.colKeys.length === p.colKeys.length;
+
+  // フィルターが片軸だけの場合は、既存のprecomputed totalsを使う。
+  // ここを毎回cross-product再集計にすると、巨大Pivotの縦スクロールで極端に遅くなる。
+  if (rowKey != null && allColsVisible) return pivotDirectAgg(p, rowKey, null);
+  if (colKey != null && allRowsVisible) return pivotDirectAgg(p, null, colKey);
+  if (rowKey == null && colKey == null && allRowsVisible && allColsVisible) return pivotDirectAgg(p, null, null);
+
   if (!visible._aggCache) {
     visible._aggCache={
       rowTotals:new Map(),
@@ -6352,8 +6404,6 @@ function pivotVisibleAgg(p, visible, rowKey=null, colKey=null){
       grand:null
     };
   }
-
-  if (rowKey != null && colKey != null) return pivotDirectAgg(p, rowKey, colKey);
 
   if (rowKey != null) {
     if (!visible._aggCache.rowTotals.has(rowKey)) {
@@ -6412,7 +6462,17 @@ function pivotRowPassesValueColumnFilters(p, rowKey, colKeys, filters){
 }
 
 function pivotResultVisibleKeys(p, filters={}){
+  if (!p) return { rowKeys:[], colKeys:[], filters:normalizePivotResultFilters(filters), active:false, globalScope:"none", aggregateScope:"full-pivot", filterKey:pivotFilterKey(filters) };
   const f=normalizePivotResultFilters(filters);
+  const filterKey=pivotFilterKey(f);
+  const cache=ensurePivotSurfaceCache(p);
+  const cached=cache.visible.get(filterKey);
+  if (cached) {
+    cached.cacheHit = true;
+    cached.lastUsedAt = now();
+    return cached;
+  }
+
   const rowTexts=p.rowKeys.map((key) => pivotResultRowLabelText(key));
   const colTexts=p.colKeys.map((key) => pivotResultColumnLabelText(key, p.colIdx));
 
@@ -6444,17 +6504,17 @@ function pivotResultVisibleKeys(p, filters={}){
     const rowMatches=p.rowKeys.filter((key, i) => (rowTexts[i] || "").includes(f.globalFilter));
     const colMatches=p.colKeys.filter((key, i) => (colTexts[i] || "").includes(f.globalFilter));
 
-    if (rowMatches.length || colMatches.length) {
-      if (rowMatches.length) {
-        const rowMatchSet=new Set(rowMatches);
-        rowKeys=rowKeys.filter((key) => rowMatchSet.has(key));
-        globalScope=rowMatches.length && colMatches.length ? "row+column" : "row";
-      }
-      if (colMatches.length) {
-        const colMatchSet=new Set(colMatches);
-        colKeys=colKeys.filter((key) => colMatchSet.has(key));
-        globalScope=rowMatches.length && colMatches.length ? "row+column" : "column";
-      }
+    // Pivotのglobal searchは、Graph Resultの単純行検索とは違う。
+    // 行と列の両方を同時に絞ると、ユーザーが期待しない交差集計になるため、
+    // 行ラベルを優先し、行に無ければ列ラベルを絞る。
+    if (rowMatches.length) {
+      const rowMatchSet=new Set(rowMatches);
+      rowKeys=rowKeys.filter((key) => rowMatchSet.has(key));
+      globalScope="row";
+    } else if (colMatches.length) {
+      const colMatchSet=new Set(colMatches);
+      colKeys=colKeys.filter((key) => colMatchSet.has(key));
+      globalScope="column";
     } else {
       rowKeys=[];
       colKeys=[];
@@ -6467,21 +6527,25 @@ function pivotResultVisibleKeys(p, filters={}){
   }
 
   const active=hasPivotResultFilters(f);
-  return {
+  const visible={
     rowKeys,
     colKeys,
     filters:f,
     active,
     globalScope,
     aggregateScope:active ? "filtered-visible-cross-product" : "full-pivot",
-    filterKey:pivotFilterKey(f)
+    filterKey,
+    cacheHit:false,
+    builtAt:now(),
+    lastUsedAt:now()
   };
+  return pivotCachePutLimited(cache.visible, filterKey, visible, PIVOT_VISIBLE_CACHE_LIMIT);
 }
 
-function pivotTileMeta(filters={}){
+function pivotTileMeta(filters={}, visibleOverride=null){
   const p=state.pivotTileIndex;
   if (!p) throw new Error("Pivot tile index is empty");
-  const visible=pivotResultVisibleKeys(p, filters);
+  const visible=visibleOverride || pivotResultVisibleKeys(p, filters);
   return {
     totalRows:visible.rowKeys.length + 1,
     totalDataRows:visible.rowKeys.length,
@@ -6495,6 +6559,7 @@ function pivotTileMeta(filters={}){
     filterGlobalScope:visible.globalScope || "none",
     aggregateScope:visible.aggregateScope || "full-pivot",
     filterKey:visible.filterKey,
+    visibleCacheHit:!!visible.cacheHit,
     tileRows:p.tileRows,
     tileCols:p.tileCols,
     rowHeaderNames:p.rowHeaderNames,
@@ -6519,19 +6584,47 @@ function pivotColLabelForVisible(p, visible, colIndex){
   return [pivotColumnLabel(visible.colKeys[colIndex], p.colIdx)];
 }
 
-function readPivotViewport({rowStart=0,colStart=0,viewportRows=90,viewportCols=40,overscan=1,filters={}}={}){
+function readPivotViewport({
+  rowStart=0,
+  colStart=0,
+  viewportRows=90,
+  viewportCols=40,
+  overscan=1,
+  filters={},
+  viewportRequestId=null,
+  viewportRequestKey="",
+  viewportWindowKey=""
+}={}){
   const p=state.pivotTileIndex;
   if (!p) throw new Error("Pivot tile index is empty");
-  const visible=pivotResultVisibleKeys(p, filters);
-  const meta=pivotTileMeta(filters);
+  const t0=now();
+  const normalizedFilters=normalizePivotResultFilters(filters || {});
+  const visible=pivotResultVisibleKeys(p, normalizedFilters);
+  const meta=pivotTileMeta(normalizedFilters, visible);
   const totalRows=meta.totalRows, totalCols=meta.totalCols;
   const safeRows=Math.max(1, Math.min(240, Number(viewportRows || 90)));
   const safeCols=Math.max(1, Math.min(120, Number(viewportCols || 40)));
   const extra=Math.max(0, Math.min(3, Number(overscan || 0)));
-  const rs=Math.max(0, Math.min(totalRows-1, Math.floor(Number(rowStart || 0))));
-  const cs=Math.max(0, Math.min(totalCols-1, Math.floor(Number(colStart || 0))));
+  const rs=Math.max(0, Math.min(Math.max(0,totalRows-1), Math.floor(Number(rowStart || 0))));
+  const cs=Math.max(0, Math.min(Math.max(0,totalCols-1), Math.floor(Number(colStart || 0))));
   const re=Math.min(totalRows, rs + safeRows);
   const ce=Math.min(totalCols, cs + safeCols);
+  const cache=ensurePivotSurfaceCache(p);
+  const requestEcho={viewportRequestId, viewportRequestKey, viewportWindowKey};
+  const cacheKey=pivotViewportCacheKey({p, filters:normalizedFilters, rowStart:rs, colStart:cs, viewportRows:safeRows, viewportCols:safeCols, overscan:extra});
+  const cached=cache.viewport.get(cacheKey);
+  if (cached) {
+    cached.lastUsedAt=now();
+    return {
+      ...cached.result,
+      ...requestEcho,
+      cacheHit:true,
+      visibleCacheHit:!!visible.cacheHit,
+      generatedAt:now(),
+      ms:now()-t0
+    };
+  }
+
   const tileY0=Math.max(0, Math.floor(rs/p.tileRows)-extra);
   const tileY1=Math.min(Math.floor((totalRows-1)/p.tileRows), Math.floor(Math.max(rs,re-1)/p.tileRows)+extra);
   const tileX0=Math.max(0, Math.floor(cs/p.tileCols)-extra);
@@ -6558,7 +6651,24 @@ function readPivotViewport({rowStart=0,colStart=0,viewportRows=90,viewportCols=4
     }
   }
 
-  return {...meta,rowStart:rs,rowEnd:re,colStart:cs,colEnd:ce,tileY0,tileY1,tileX0,tileX1,tiles,generatedAt:now()};
+  const result={
+    ...meta,
+    rowStart:rs,
+    rowEnd:re,
+    colStart:cs,
+    colEnd:ce,
+    tileY0,
+    tileY1,
+    tileX0,
+    tileX1,
+    tiles,
+    cacheHit:false,
+    visibleCacheHit:!!visible.cacheHit,
+    generatedAt:now(),
+    ms:now()-t0
+  };
+  pivotCachePutLimited(cache.viewport, cacheKey, {result, lastUsedAt:now()}, PIVOT_VIEWPORT_CACHE_LIMIT);
+  return {...result, ...requestEcho};
 }
 
 function exportPivotCsvFromTileIndex(filters={}){
@@ -14444,6 +14554,7 @@ function VisualHyperTensorTableView({
   onExternalGlobalFilterChange = null,
   onExternalColumnFiltersChange = null,
   onExternalClearFilters = null,
+  retainStaleLazyRows = false,
 }) {
   const baseHeader = Array.isArray(header) ? header : [];
   const baseRows = Array.isArray(rows) ? rows : [];
@@ -14647,15 +14758,19 @@ function VisualHyperTensorTableView({
         lastGoodWindowRef.current = {rows:renderRows, absStart:renderAbsStart, start, end, at:visualNow()};
       } else {
         loading = safeTotal > 0;
-        const last = lastGoodWindowRef.current;
-        if (last?.rows?.length) {
-          renderRows = last.rows;
-          renderAbsStart = start;
-          stale = true;
-        } else if (decoratedRows.length) {
-          renderRows = decoratedRows.slice(0, Math.min(decoratedRows.length, viewportRows + VISUAL_RENDER_OVERSCAN_ROWS));
-          renderAbsStart = start;
-          stale = true;
+        // 正確性優先: 未読込windowに直前のrowsを新しい座標で描かない。
+        // retainStaleLazyRows=trueの場合だけ従来の保持表示を許可する。
+        if (retainStaleLazyRows) {
+          const last = lastGoodWindowRef.current;
+          if (last?.rows?.length) {
+            renderRows = last.rows;
+            renderAbsStart = last.absStart ?? start;
+            stale = true;
+          } else if (decoratedRows.length) {
+            renderRows = decoratedRows.slice(0, Math.min(decoratedRows.length, viewportRows + VISUAL_RENDER_OVERSCAN_ROWS));
+            renderAbsStart = safeLoadedStart;
+            stale = true;
+          }
         }
       }
       const activeRows = decoratedRows.length;
@@ -14668,7 +14783,7 @@ function VisualHyperTensorTableView({
       if (renderRows.length) lastGoodWindowRef.current = {rows:renderRows, absStart:renderAbsStart, start, end, at:visualNow()};
     }
     return {scrollTop, scrollLeft, viewport, start, end, columns, renderRows, renderAbsStart, loading, stale, loadedRangeText};
-  }, [canvasHeight, decoratedRows, externalLazy, findCachedLazyRows, prefix, processedRows, safeLoadedStart, safeTotal, virtualRowFromBodyTop, viewportRows, widths]);
+  }, [canvasHeight, decoratedRows, externalLazy, findCachedLazyRows, prefix, processedRows, retainStaleLazyRows, safeLoadedStart, safeTotal, virtualRowFromBodyTop, viewportRows, widths]);
 
   const paintVisualFrame = useCallback((reason = "paint") => {
     const canvas = canvasRef.current;
@@ -17560,6 +17675,7 @@ function PivotTileGrid({ meta, view, onRequest, height = 640, filters = {}, onFi
   const normalizedFilters = normalizePivotUiFilters(filters);
   const filterKey = JSON.stringify(normalizedFilters);
   const lastRequestKeyRef = useRef("");
+  const [pendingViewport, setPendingViewport] = useState(null);
   const rowHeaderNames = Array.isArray(meta?.rowHeaderNames) && meta.rowHeaderNames.length ? meta.rowHeaderNames : ["Rows"];
   const rowHeaderCount = Math.max(1, rowHeaderNames.length);
   const [rowPageSizeDraft, setRowPageSizeDraft] = useState(String(Math.max(64, Number(meta?.tileRows || 128))));
@@ -17632,6 +17748,7 @@ function PivotTileGrid({ meta, view, onRequest, height = 640, filters = {}, onFi
     const key = `${rowStart}:${safePageSize}:${colStart}:${colWindowSize}:${totalRows}:${totalCols}:${filterKey}`;
     if (!options.force && lastRequestKeyRef.current === key) return;
     lastRequestKeyRef.current = key;
+    setPendingViewport({ key, rowStart, rowEnd:Math.min(totalRows, rowStart + safePageSize), colStart, colEnd:Math.min(totalCols, colStart + colWindowSize), at:Date.now() });
     onRequest({
       rowStart,
       colStart,
@@ -17639,6 +17756,7 @@ function PivotTileGrid({ meta, view, onRequest, height = 640, filters = {}, onFi
       viewportCols: colWindowSize,
       overscan: 1,
       filters: normalizedFilters,
+      viewportWindowKey: key,
     });
   }, [meta, onRequest, totalRows, totalCols, rowPageSize, colWindowSize, safeColumnWindowStart, filterKey]);
 
@@ -17648,17 +17766,48 @@ function PivotTileGrid({ meta, view, onRequest, height = 640, filters = {}, onFi
   }, [meta?.totalRows, meta?.totalCols, filterKey]);
 
   useEffect(() => {
-    if (!meta) return;
-    const id = setTimeout(() => requestWindow(1, rowPageSize, safeColumnWindowStart, { force: true }), 0);
-    return () => clearTimeout(id);
-  }, [meta?.totalRows, meta?.totalCols, rowPageSize, colWindowSize, safeColumnWindowStart, filterKey]);
+    if (!pendingViewport || !view) return;
+    const viewKey = String(view.viewportWindowKey || "");
+    const numericMatch =
+      Number(view.rowStart || 0) === Number(pendingViewport.rowStart || 0) &&
+      Number(view.colStart || 0) === Number(pendingViewport.colStart || 0);
+    if ((viewKey && viewKey === pendingViewport.key) || numericMatch) {
+      setPendingViewport(null);
+    }
+  }, [view?.viewportWindowKey, view?.rowStart, view?.colStart, pendingViewport?.key]);
+
+  const effectiveView = useMemo(() => {
+    if (!pendingViewport) return view;
+    if (!view) return null;
+    const viewKey = String(view.viewportWindowKey || "");
+    const numericMatch =
+      Number(view.rowStart || 0) === Number(pendingViewport.rowStart || 0) &&
+      Number(view.colStart || 0) === Number(pendingViewport.colStart || 0);
+    return ((viewKey && viewKey === pendingViewport.key) || numericMatch) ? view : null;
+  }, [view, pendingViewport]);
 
   const pivotTable = useMemo(() => {
-    const tiles = Array.isArray(view?.tiles) ? view.tiles : [];
-    const rowStart = Math.max(0, Number(view?.rowStart || 0) || 0);
-    const rowEnd = Math.max(rowStart, Number(view?.rowEnd || rowStart) || rowStart);
-    const colStart = Math.max(0, Number(view?.colStart ?? safeColumnWindowStart) || 0);
-    const colEnd = Math.max(colStart, Number(view?.colEnd || Math.min(totalCols, colStart + colWindowSize)) || colStart);
+    const activeView = effectiveView;
+    const tiles = Array.isArray(activeView?.tiles) ? activeView.tiles : [];
+    const rowStart = Math.max(0, Number(activeView?.rowStart ?? pendingViewport?.rowStart ?? 0) || 0);
+    const rowEnd = Math.max(rowStart, Number(activeView?.rowEnd ?? pendingViewport?.rowEnd ?? rowStart) || rowStart);
+    const colStart = Math.max(0, Number(activeView?.colStart ?? pendingViewport?.colStart ?? safeColumnWindowStart) || 0);
+    const colEnd = Math.max(colStart, Number(activeView?.colEnd ?? pendingViewport?.colEnd ?? Math.min(totalCols, colStart + colWindowSize)) || colStart);
+
+    if (!activeView && pendingViewport) {
+      const header = [...rowHeaderNames];
+      for (let c = colStart; c < colEnd; c++) header.push(c === totalCols - 1 ? "Grand Total" : `Column ${fmt(c + 1)}`);
+      return {
+        header,
+        rows: [],
+        page: Math.floor(rowStart / Math.max(1, rowPageSize)) + 1,
+        pageSize: rowPageSize,
+        startRow: rowStart,
+        colStart,
+        colEnd,
+        loading:true,
+      };
+    }
 
     const rowLabels = new Map();
     const colLabels = new Map();
@@ -17706,7 +17855,7 @@ function PivotTileGrid({ meta, view, onRequest, height = 640, filters = {}, onFi
       colStart,
       colEnd,
     };
-  }, [view, rowHeaderNames.join("\u001f"), rowHeaderCount, rowPageSize, safeColumnWindowStart, colWindowSize, totalRows, totalCols]);
+  }, [effectiveView, pendingViewport, rowHeaderNames.join("\u001f"), rowHeaderCount, rowPageSize, safeColumnWindowStart, colWindowSize, totalRows, totalCols]);
 
   if (!meta) {
     return <Alert severity="info">PivotをBuildすると、Graph Query Resultと同じCanvas table rendererで表示します。</Alert>;
@@ -21672,7 +21821,9 @@ function App() {
   const [pivotTable, setPivotTable] = useState(null);
   const [pivotTileMeta, setPivotTileMeta] = useState(null);
   const [pivotTileView, setPivotTileView] = useState(null);
-  const [pivotResultFilters, setPivotResultFilters] = useState({ globalFilter: "", rowFilter: "", columnFilter: "" });
+  const [pivotResultFilters, setPivotResultFilters] = useState({ globalFilter: "", rowFilter: "", columnFilter: "", rowHeaderColumnFilters: {}, valueColumnFilters: {} });
+  const pivotViewportSeqRef = useRef(0);
+  const pivotViewportLatestKeyRef = useRef("");
   const [pivotStatus, setPivotStatus] = useState("Columnar cacheを開いてください。");
   const [pivotTime, setPivotTime] = useState("");
 
@@ -23079,6 +23230,10 @@ function App() {
       },
 
       "PIVOT_VIEWPORT_DONE"(msg) {
+        const incomingId = Number(msg?.viewportRequestId || 0);
+        const incomingKey = String(msg?.viewportRequestKey || "");
+        if (incomingId && incomingId < Number(pivotViewportSeqRef.current || 0)) return;
+        if (incomingKey && pivotViewportLatestKeyRef.current && incomingKey !== pivotViewportLatestKeyRef.current) return;
         setPivotTileView(msg);
         if (msg && typeof msg === "object") {
           const { tiles, ...meta } = msg;
@@ -24277,6 +24432,8 @@ function App() {
     setPivotTable(null);
     setPivotTileMeta(null);
     setPivotTileView(null);
+    pivotViewportSeqRef.current = 0;
+    pivotViewportLatestKeyRef.current = "";
     setPivotResultFilters({ globalFilter: "", rowFilter: "", columnFilter: "", rowHeaderColumnFilters: {}, valueColumnFilters: {} });
     if (pivotSource === "graph") {
       if (!graphResultCount) { setPivotStatus("Graph Query Resultがありません。先にGraph Queryを実行してください。"); return; }
@@ -24308,7 +24465,25 @@ function App() {
   }
 
   function requestPivotViewport(payload) {
-    postWorkerCommand({ type: "READ_PIVOT_VIEWPORT", filters: pivotResultFilters, ...(payload || {}) });
+    const viewportRequestId = (Number(pivotViewportSeqRef.current || 0) || 0) + 1;
+    pivotViewportSeqRef.current = viewportRequestId;
+    const effectiveFilters = payload?.filters || pivotResultFilters;
+    const viewportRequestKey = [
+      Number(payload?.rowStart || 0),
+      Number(payload?.colStart || 0),
+      Number(payload?.viewportRows || 0),
+      Number(payload?.viewportCols || 0),
+      payload?.viewportWindowKey || "",
+      JSON.stringify(effectiveFilters || {})
+    ].join("|");
+    pivotViewportLatestKeyRef.current = viewportRequestKey;
+    postWorkerCommand({
+      ...(payload || {}),
+      type: "READ_PIVOT_VIEWPORT",
+      filters: effectiveFilters,
+      viewportRequestId,
+      viewportRequestKey,
+    });
   }
 
   function buildTimeSeries() {
