@@ -6251,31 +6251,46 @@ function pivotResultVisibleKeys(p, filters={}){
   const f=normalizePivotResultFilters(filters);
   const rowTexts=p.rowKeys.map((key) => pivotResultRowLabelText(key));
   const colTexts=p.colKeys.map((key) => pivotResultColumnLabelText(key, p.colIdx));
-  const anyRowGlobal=f.globalFilter ? rowTexts.some((text) => text.includes(f.globalFilter)) : false;
-  const anyColGlobal=f.globalFilter ? colTexts.some((text) => text.includes(f.globalFilter)) : false;
 
   let rowKeys=p.rowKeys;
-  if (f.rowFilter || (f.globalFilter && anyRowGlobal)) {
-    rowKeys=p.rowKeys.filter((key, i) => {
-      const text=rowTexts[i] || "";
-      return (!f.rowFilter || text.includes(f.rowFilter)) && (!f.globalFilter || !anyRowGlobal || text.includes(f.globalFilter));
-    });
-  }
-
   let colKeys=p.colKeys;
-  if (f.columnFilter || (f.globalFilter && anyColGlobal)) {
-    colKeys=p.colKeys.filter((key, i) => {
-      const text=colTexts[i] || "";
-      return (!f.columnFilter || text.includes(f.columnFilter)) && (!f.globalFilter || !anyColGlobal || text.includes(f.globalFilter));
-    });
+  let globalScope="none";
+
+  if (f.rowFilter) {
+    rowKeys=p.rowKeys.filter((key, i) => (rowTexts[i] || "").includes(f.rowFilter));
   }
 
-  if (f.globalFilter && !anyRowGlobal && !anyColGlobal) {
-    rowKeys=[];
-    colKeys=[];
+  if (f.columnFilter) {
+    colKeys=p.colKeys.filter((key, i) => (colTexts[i] || "").includes(f.columnFilter));
   }
 
-  return {rowKeys,colKeys,filters:f,active:hasPivotResultFilters(f)};
+  if (f.globalFilter) {
+    const rowMatches=p.rowKeys.filter((key, i) => (rowTexts[i] || "").includes(f.globalFilter));
+    const colMatches=p.colKeys.filter((key, i) => (colTexts[i] || "").includes(f.globalFilter));
+
+    if (rowMatches.length) {
+      const rowMatchSet=new Set(rowMatches);
+      rowKeys=rowKeys.filter((key) => rowMatchSet.has(key));
+      globalScope="row";
+    } else if (colMatches.length) {
+      const colMatchSet=new Set(colMatches);
+      colKeys=colKeys.filter((key) => colMatchSet.has(key));
+      globalScope="column";
+    } else {
+      rowKeys=[];
+      colKeys=[];
+      globalScope="none-match";
+    }
+  }
+
+  return {
+    rowKeys,
+    colKeys,
+    filters:f,
+    active:hasPivotResultFilters(f),
+    globalScope,
+    aggregateScope:hasPivotResultFilters(f) ? "filtered-visible-cross-product" : "full-pivot"
+  };
 }
 
 function mergeAggInto(target, source){
@@ -6324,6 +6339,8 @@ function pivotTileMeta(filters={}){
     originalDataRows:p.rowKeys.length,
     originalDataCols:p.colKeys.length,
     filters:visible.filters,
+    filterGlobalScope:visible.globalScope || "none",
+    aggregateScope:visible.aggregateScope || "full-pivot",
     tileRows:p.tileRows,
     tileCols:p.tileCols,
     rowHeaderNames:p.rowHeaderNames,
@@ -17504,19 +17521,9 @@ function PivotTileGrid({ meta, view, onRequest, height = 640, filters = {}, onFi
     return <Alert severity="info">PivotをBuildすると、Graph Query Resultと同じCanvas table rendererで表示します。</Alert>;
   }
 
-  const externalColumnFilters = {};
-  if (normalizedFilters.rowFilter) externalColumnFilters[0] = normalizedFilters.rowFilter;
-  if (normalizedFilters.columnFilter) externalColumnFilters[rowHeaderCount] = normalizedFilters.columnFilter;
-
-  function updateTableColumnFilters(next = {}) {
-    const rowFilter = String(next[0] || "").trim();
-    const columnFilter = Object.entries(next)
-      .filter(([key]) => Number(key) >= rowHeaderCount)
-      .map(([, value]) => String(value || "").trim())
-      .filter(Boolean)
-      .join(" ");
-    onFiltersChange({ ...normalizedFilters, rowFilter, columnFilter });
-  }
+  // Pivot Resultのフィルターは通常の表セルフィルターではなく、行/列ラベルをWorker側で絞り、
+  // 表示中の行×列の交差範囲でGrand Totalを再集計する。Canvas table側の列フィルターへ
+  // 混ぜると「値セルのフィルター」に見えて集計範囲が曖昧になるため、ここでは明示UIだけに限定する。
 
   function moveColumnWindow(delta) {
     const next = Math.max(0, Math.min(maxColumnWindowStart, safeColumnWindowStart + delta));
@@ -17532,7 +17539,7 @@ function PivotTileGrid({ meta, view, onRequest, height = 640, filters = {}, onFi
   return (
     <Box>
       <Stack direction="row" spacing={1} useFlexGap flexWrap="wrap" alignItems="center" sx={{ mb: 0.75 }}>
-        <TextField size="small" label="Pivot結果 全体" value={normalizedFilters.globalFilter} onChange={(e)=>updateFilter("globalFilter", e.target.value)} sx={{ minWidth: 180 }} />
+        <TextField size="small" label="Pivotラベル検索" value={normalizedFilters.globalFilter} onChange={(e)=>updateFilter("globalFilter", e.target.value)} helperText="行ラベル優先。行に無ければ列ラベルを検索。" sx={{ minWidth: 220 }} />
         <TextField size="small" label="行ラベル" value={normalizedFilters.rowFilter} onChange={(e)=>updateFilter("rowFilter", e.target.value)} sx={{ minWidth: 160 }} />
         <TextField size="small" label="列ラベル" value={normalizedFilters.columnFilter} onChange={(e)=>updateFilter("columnFilter", e.target.value)} sx={{ minWidth: 160 }} />
         {(normalizedFilters.globalFilter || normalizedFilters.rowFilter || normalizedFilters.columnFilter) && <Button size="small" onClick={clearFilters}>Clear filters</Button>}
@@ -17541,6 +17548,7 @@ function PivotTileGrid({ meta, view, onRequest, height = 640, filters = {}, onFi
         <Chip size="small" label={`Rows ${fmt(meta.totalRows)}`} />
         <Chip size="small" label={`Columns ${fmt(meta.totalCols)}`} />
         {meta.filtered && <Chip size="small" color="warning" variant="outlined" label={`Filtered from ${fmt(meta.originalDataRows)}×${fmt(meta.originalDataCols)}`} />}
+        {meta.filtered && <Chip size="small" color="info" variant="outlined" label={`Totals: visible ${fmt(meta.totalDataRows)}×${fmt(meta.totalDataCols)}`} />}
         <Chip size="small" label={`Source ${meta.source || "active"}`} />
         <Chip size="small" label={`Renderer GraphQuery/VisualHyperTensor`} />
         <Chip size="small" label={`Window c${fmt(pivotTable.colStart + 1)}-c${fmt(pivotTable.colEnd)} / ${fmt(totalCols)}`} />
@@ -17556,7 +17564,7 @@ function PivotTileGrid({ meta, view, onRequest, height = 640, filters = {}, onFi
         rows={pivotTable.rows}
         height={height}
         dense={false}
-        filterable
+        filterable={false}
         sortable={false}
         minColumnWidth={150}
         externalLazy
@@ -17565,18 +17573,18 @@ function PivotTileGrid({ meta, view, onRequest, height = 640, filters = {}, onFi
         page={Number(pivotTable.page || 1)}
         pageSize={rowPageSize}
         onReadPage={(page, pageSize) => requestWindow(page, pageSize, safeColumnWindowStart)}
-        externalGlobalFilter={normalizedFilters.globalFilter}
-        externalColumnFilters={externalColumnFilters}
-        onExternalGlobalFilterChange={(value) => updateFilter("globalFilter", value)}
-        onExternalColumnFiltersChange={updateTableColumnFilters}
+        externalGlobalFilter=""
+        externalColumnFilters={{}}
+        onExternalGlobalFilterChange={null}
+        onExternalColumnFiltersChange={null}
         onExternalClearFilters={clearFilters}
         emptyMessage="PivotをBuildすると、ここに結果が表示されます。"
         sourceLabel="Pivot Result"
-        statusLabel={`全${fmt(totalRows)}行 / 表示列 ${fmt(pivotTable.header.length)} / page ${fmt(pivotTable.page)} / row tile ${fmt(rowPageSize)}`}
+        statusLabel={`全${fmt(totalRows)}行 / 表示列 ${fmt(pivotTable.header.length)} / page ${fmt(pivotTable.page)} / row tile ${fmt(rowPageSize)}${meta.filtered ? " / filtered totals recalculated" : ""}`}
         resetKey={`pivot-result:${totalRows}:${totalCols}:${rowPageSize}:${colWindowSize}:${safeColumnWindowStart}:${filterKey}`}
       />
       <Typography variant="caption" color="text.secondary">
-        Pivot ResultはGraph Query Resultと同じCanvas body + DOM header rendererで表示します。列方向は巨大Pivotに対応するためwindow単位でWorkerから取得します。
+        Pivot ResultはGraph Query Resultと同じCanvas body + DOM header rendererで表示します。フィルターは行/列ラベルに限定し、Grand Totalは表示中の行×列範囲でWorker側再集計します。列方向は巨大Pivotに対応するためwindow単位で取得します。
       </Typography>
     </Box>
   );
