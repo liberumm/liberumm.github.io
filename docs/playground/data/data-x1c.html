@@ -615,11 +615,7 @@ async function openVirtualDatasetForWorkerReadOnly(ids, name){
   chunks:globalChunks.length,
   fileSize:sources.reduce((a,x)=>a+$N(x.manifest.fileSize || 0),0)
  };
- state.virtual={sources:virtualSources, globalChunks};
- state.memory=null;
- state.dir=null;
- state.manifest=manifest;
- state.dataset={id:manifest.id,manifest,chunks:globalChunks};
+ activateWorkerDataset({id:manifest.id,manifest,chunks:globalChunks,virtual:{sources:virtualSources, globalChunks},clearCache:false});
 }
 function colFileName(index, type){ return `col_${$S(index).padStart(4,"0")}.${type === "number" ? "f64" : "i32"}.bin`; }
 function dictFileName(index){ return `col_${$S(index).padStart(4,"0")}.dict.json`; }
@@ -2924,11 +2920,7 @@ async function openExternalDataset(id){
  if (!manifest || !$A(manifest.columns)) throw new Error("External manifest is invalid");
  if (!$A(chunks)) throw new Error("External chunks.json is invalid");
  const openedManifest={...manifest,id:manifest.id || datasetId,openedFromExternalStorage:true,externalStoragePath:base};
- state.virtual=null; state.memory=null; state.dir=null;
- state.externalDataset={id:datasetId,base,manifest:openedManifest,chunks};
- state.manifest=openedManifest;
- state.dataset={id:datasetId,manifest:openedManifest,chunks};
- state.searchMatches=[]; state.dataQueryMatches=null; state.dataQueryMeta=null; state.pivotTable=null; state.pivotTileIndex=null; state.timeTable=null;
+ activateWorkerDataset({id:datasetId,manifest:openedManifest,chunks,externalDataset:{id:datasetId,base,manifest:openedManifest,chunks},clearCache:false});
  return {manifest:openedManifest,chunks};
 }
 function activeIsExternalStorage(){ return !!state.externalDataset && !!state.manifest?.openedFromExternalStorage; }
@@ -2951,11 +2943,7 @@ async function hydrateChunkExecutionContext(context){
  if (context.mode === "memory") throw new Error(context.reason || "Memory dataset is not supported by worker pool");
  if (context.mode === "storage"){
   const loaded=await loadDatasetForWorkerReadOnly(context.datasetId);
-  state.virtual=null;
-  state.memory=null;
-  state.dir=loaded.dir;
-  state.manifest=loaded.manifest;
-  state.dataset={id:loaded.id,manifest:loaded.manifest,chunks:loaded.chunks};
+  activateWorkerDataset({id:loaded.id,manifest:loaded.manifest,chunks:loaded.chunks,dir:loaded.dir,clearCache:false});
   return;
  }
  if (context.mode === "virtual"){
@@ -3594,19 +3582,16 @@ async function syntheticGenerateColumnarDataset(rawPlan){
     }
     const flushedChunkMetas=await writeQueue.drain();
     chunkMetas.push(...flushedChunkMetas);
-    const cleanReport = {
+    const cleanReport = buildChunkCleanReport(chunkMetas, {
       sourceRows:plan.rows,
       totalRows,
       skippedRows:0,
       malformedRows:0,
-      changedCells:chunkMetas.flatMap(c=>c.stats).reduce((a,s)=>a+(s.changedCells||0),0),
-      nullCells:chunkMetas.flatMap(c=>c.stats).reduce((a,s)=>a+(s.nulls||0),0),
-      invalidNumbers:chunkMetas.flatMap(c=>c.stats).reduce((a,s)=>a+(s.invalidNumbers||0),0),
       synthetic:true,
       preset:plan.preset,
       seed:plan.seed,
       estimatedBytes:plan.estimatedBytes
-    };
+    });
     const tableName = cleanMetaValue(plan.output.datasetName, `synthetic_${plan.preset}`);
     const manifest = {
       id,
@@ -3623,7 +3608,7 @@ async function syntheticGenerateColumnarDataset(rawPlan){
       storageLayout:"chunk-pack-v4",
       writeKernelVersion:WRITE_KERNEL_VERSION,
       olapKernelVersion:OLAP_KERNEL_VERSION,
-      features:integrityFeatureFlags({syntheticData:true,chunkPack:true,stagingCommit:true,writeQueue:true,browserOlapKernel:true}),
+      features:columnarFeatureFlags({syntheticData:true}),
       encoding:"utf-8",
       delimiter:",",
       fileSize:plan.estimatedBytes,
@@ -3637,9 +3622,7 @@ async function syntheticGenerateColumnarDataset(rawPlan){
       cleanReport
     };
     const committedManifest=await commitDatasetManifest(dir,manifest,chunkMetas,{writeMetrics:{queue:writeQueue.stats(), storageLayout:"chunk-pack-v4", synthetic:true}});
-    state.dataset={id,manifest:committedManifest,chunks:chunkMetas};
-    state.virtual=null; state.memory=null; state.externalDataset=null; state.manifest=committedManifest; state.dir=dir;
-    state.searchMatches=[]; state.dataQueryMatches=null; state.dataQueryMeta=null; state.pivotTable=null; state.pivotTileIndex=null; state.timeTable=null;
+    activateWorkerDataset({id,manifest:committedManifest,chunks:chunkMetas,dir,clearCache:false});
     return {
       outputMode:plan.output.mode,
       manifest:committedManifest,
@@ -3858,6 +3841,54 @@ async function analyzeFilesForMerge({files, encoding, delimiter, sampleRows, rul
   state.schema=base;
   return {schema:base,fileSchemas,typeWarnings};
 }
+function resetWorkerResultSurfaces(){
+  state.searchMatches=[];
+  state.dataQueryMatches=null;
+  state.dataQueryMeta=null;
+  state.graphJoinResult=null;
+  state.graphResultSearch=null;
+  state.graphResultPivot=null;
+  state.graphResultTime=null;
+  state.pivotTable=null;
+  state.pivotTileIndex=null;
+  state.timeTable=null;
+}
+function activateWorkerDataset({id, manifest, chunks, dir=null, virtual=null, memory=null, externalDataset=null, clearCache=true}){
+  if (clearCache) clearChunkCache();
+  state.dataset={id:id || manifest?.id,manifest,chunks};
+  state.manifest=manifest;
+  state.dir=dir;
+  state.virtual=virtual;
+  state.memory=memory;
+  state.externalDataset=externalDataset;
+  resetWorkerResultSurfaces();
+}
+function buildChunkCleanReport(chunkMetas, extra={}){
+  const stats=($A(chunkMetas) ? chunkMetas : []).flatMap((chunk)=>chunk?.stats || []);
+  return {
+    changedCells:stats.reduce((sum,stat)=>sum+$N(stat?.changedCells || 0),0),
+    nullCells:stats.reduce((sum,stat)=>sum+$N(stat?.nulls ?? stat?.nullCells ?? 0),0),
+    invalidNumbers:stats.reduce((sum,stat)=>sum+$N(stat?.invalidNumbers || 0),0),
+    ...extra
+  };
+}
+function normalizeCsvCellsForColumns(cells, columns){
+  const expected=$N(columns?.length || 0);
+  let row=$A(cells) ? cells : [];
+  const malformed=row.length !== expected;
+  while(row.length < expected) row.push("");
+  if (row.length > expected) row=row.slice(0, expected);
+  return {cells:row, malformed};
+}
+function columnarFeatureFlags(extra={}){
+  return integrityFeatureFlags({chunkPack:true,stagingCommit:true,writeQueue:true,browserOlapKernel:true,...extra});
+}
+function buildStoragePathMeta(input, fallbackName, defaults={}){
+  const workspace=cleanMetaValue(input?.storageWorkspace, defaults.workspace || "Default");
+  const collection=cleanMetaValue(input?.storageCollection, defaults.collection || "General");
+  const tableName=cleanMetaValue(input?.tableName || input?.datasetName || fallbackName, fallbackName);
+  return {storageWorkspace:workspace,storageCollection:collection,tableName,storagePath:`${workspace} / ${collection} / ${tableName}`};
+}
 async function buildSingleColumnarCache(msg){
   clearChunkCache();
   const rules=makeRules(msg);
@@ -3883,12 +3914,10 @@ async function buildSingleColumnarCache(msg){
     for await (const line of iter){
       if (state.cancelled) throw new Error("Cancelled");
       sourceRows++;
-      let cells=parseCSVLine(line, msg.delimiter);
-      if (cells.length !== columns.length) malformedRows++;
-      if (rules.skipBadRows && cells.length !== columns.length){ skippedRows++; continue; }
-      while(cells.length < columns.length) cells.push("");
-      if (cells.length > columns.length) cells=cells.slice(0, columns.length);
-      addRowToChunk(chunk,cells,columns,rules);
+      const normalized=normalizeCsvCellsForColumns(parseCSVLine(line, msg.delimiter), columns);
+      if (normalized.malformed) malformedRows++;
+      if (rules.skipBadRows && normalized.malformed){ skippedRows++; continue; }
+      addRowToChunk(chunk,normalized.cells,columns,rules);
       totalRows++;
       if (chunk.rows >= chunkSize){
         await writeQueue.enqueue(chunkIndex,chunk);
@@ -3907,32 +3936,23 @@ async function buildSingleColumnarCache(msg){
     const flushedChunkMetas=await writeQueue.drain();
     chunkMetas.push(...flushedChunkMetas);
     postProgress(88, `Finalizing columnar cache... ${fmt(totalRows)} rows / ${fmt(chunkIndex)} chunks`);
-    const cleanReport={
-      sourceRows,totalRows,skippedRows,malformedRows,
-      changedCells:chunkMetas.flatMap(c=>c.stats).reduce((a,s)=>a+(s.changedCells||0),0),
-      nullCells:chunkMetas.flatMap(c=>c.stats).reduce((a,s)=>a+(s.nulls||0),0),
-      invalidNumbers:chunkMetas.flatMap(c=>c.stats).reduce((a,s)=>a+(s.invalidNumbers||0),0)
-    };
-    const tableName=cleanMetaValue(msg.tableName || msg.datasetName || msg.file.name, msg.file.name);
+    const cleanReport=buildChunkCleanReport(chunkMetas,{sourceRows,totalRows,skippedRows,malformedRows});
+    const storagePathMeta=buildStoragePathMeta(msg, msg.file.name);
     const manifest={
       id,
-      name:msg.datasetName || tableName,
-      storageWorkspace:cleanMetaValue(msg.storageWorkspace, "Default"),
-      storageCollection:cleanMetaValue(msg.storageCollection, "General"),
-      tableName,
-      storagePath:`${cleanMetaValue(msg.storageWorkspace, "Default")} / ${cleanMetaValue(msg.storageCollection, "General")} / ${tableName}`,
+      name:msg.datasetName || storagePathMeta.tableName,
+      ...storagePathMeta,
       originalFileName:msg.file.name,
       sourceFiles:[{name:msg.file.name,size:msg.file.size,sourceRows,totalRows,skippedRows,malformedRows}],
       createdAt:new Date().toISOString(), mode:"columnar-clean",
-      formatVersion:6, storageLayout:"chunk-pack-v4", writeKernelVersion:WRITE_KERNEL_VERSION, olapKernelVersion:OLAP_KERNEL_VERSION, features:integrityFeatureFlags({chunkPack:true,stagingCommit:true,writeQueue:true,browserOlapKernel:true}),
+      formatVersion:6, storageLayout:"chunk-pack-v4", writeKernelVersion:WRITE_KERNEL_VERSION, olapKernelVersion:OLAP_KERNEL_VERSION, features:columnarFeatureFlags(),
       encoding:msg.encoding, delimiter:msg.delimiter, fileSize:msg.file.size,
       chunkSize,totalRows,sourceRows,chunks:chunkIndex,
       columns, rules, cleanReport
     };
     postProgress(94, "Committing packed OLAP dataset...");
     const committedManifest=await commitDatasetManifest(dir,manifest,chunkMetas,{writeMetrics:{queue:writeQueue.stats(), storageLayout:"chunk-pack-v4"}});
-    state.dataset={id,manifest:committedManifest,chunks:chunkMetas};
-    state.virtual=null; state.memory=null; state.manifest=committedManifest; state.dir=dir; state.searchMatches=[]; state.dataQueryMatches=null; state.dataQueryMeta=null; state.pivotTable=null; state.pivotTileIndex=null; state.timeTable=null;
+    activateWorkerDataset({id,manifest:committedManifest,chunks:chunkMetas,dir,clearCache:false});
     return {manifest:committedManifest,chunks:chunkMetas,ms:now()-t0,olapKernel:olapKernelStatus()};
   }catch(err){
     await cleanupDatasetDir(root,id);
@@ -3968,12 +3988,10 @@ async function buildMergedColumnarCache(msg){
       for await (const line of iter){
         if (state.cancelled) throw new Error("Cancelled");
         fileSourceRows++; sourceRows++;
-        let cells=parseCSVLine(line, msg.delimiter);
-        if (cells.length !== columns.length){ malformedRows++; fileMalformedRows++; }
-        if (rules.skipBadRows && cells.length !== columns.length){ skippedRows++; fileSkippedRows++; continue; }
-        while(cells.length < columns.length) cells.push("");
-        if (cells.length > columns.length) cells=cells.slice(0, columns.length);
-        addRowToChunk(chunk,cells,columns,rules);
+        const normalized=normalizeCsvCellsForColumns(parseCSVLine(line, msg.delimiter), columns);
+        if (normalized.malformed){ malformedRows++; fileMalformedRows++; }
+        if (rules.skipBadRows && normalized.malformed){ skippedRows++; fileSkippedRows++; continue; }
+        addRowToChunk(chunk,normalized.cells,columns,rules);
         totalRows++; fileTotalRows++;
         if (chunk.rows >= chunkSize){
           await writeQueue.enqueue(chunkIndex,chunk);
@@ -3993,32 +4011,22 @@ async function buildMergedColumnarCache(msg){
     const flushedChunkMetas=await writeQueue.drain();
     chunkMetas.push(...flushedChunkMetas);
     postProgress(88, `Finalizing merged cache... ${fmt(totalRows)} rows / ${fmt(chunkIndex)} chunks`);
-    const cleanReport={
-      sourceRows,totalRows,skippedRows,malformedRows,
-      changedCells:chunkMetas.flatMap(c=>c.stats).reduce((a,s)=>a+(s.changedCells||0),0),
-      nullCells:chunkMetas.flatMap(c=>c.stats).reduce((a,s)=>a+(s.nulls||0),0),
-      invalidNumbers:chunkMetas.flatMap(c=>c.stats).reduce((a,s)=>a+(s.invalidNumbers||0),0),
-      typeWarnings:analyzed.typeWarnings
-    };
-    const tableName=cleanMetaValue(msg.tableName || msg.datasetName || `merged_${files.length}_csv`, `merged_${files.length}_csv`);
+    const cleanReport=buildChunkCleanReport(chunkMetas,{sourceRows,totalRows,skippedRows,malformedRows,typeWarnings:analyzed.typeWarnings});
+    const storagePathMeta=buildStoragePathMeta(msg, `merged_${files.length}_csv`);
     const manifest={
       id,
-      name:msg.datasetName || tableName,
-      storageWorkspace:cleanMetaValue(msg.storageWorkspace, "Default"),
-      storageCollection:cleanMetaValue(msg.storageCollection, "General"),
-      tableName,
-      storagePath:`${cleanMetaValue(msg.storageWorkspace, "Default")} / ${cleanMetaValue(msg.storageCollection, "General")} / ${tableName}`,
+      name:msg.datasetName || storagePathMeta.tableName,
+      ...storagePathMeta,
       originalFileName:files.map(f=>f.name).join(" + "),
       sourceFiles,
       createdAt:new Date().toISOString(), mode:"columnar-clean-merged-csv",
-      formatVersion:6, storageLayout:"chunk-pack-v4", writeKernelVersion:WRITE_KERNEL_VERSION, olapKernelVersion:OLAP_KERNEL_VERSION, features:integrityFeatureFlags({chunkPack:true,stagingCommit:true,writeQueue:true,browserOlapKernel:true}),
+      formatVersion:6, storageLayout:"chunk-pack-v4", writeKernelVersion:WRITE_KERNEL_VERSION, olapKernelVersion:OLAP_KERNEL_VERSION, features:columnarFeatureFlags(),
       encoding:msg.encoding, delimiter:msg.delimiter, fileSize:files.reduce((a,f)=>a+(f.size||0),0),
       chunkSize,totalRows,sourceRows,chunks:chunkIndex,
       columns, rules, cleanReport
     };
     const committedManifest=await commitDatasetManifest(dir,manifest,chunkMetas,{writeMetrics:{queue:writeQueue.stats(), storageLayout:"chunk-pack-v4", mergedFiles:files.length}});
-    state.dataset={id,manifest:committedManifest,chunks:chunkMetas};
-    state.virtual=null; state.memory=null; state.manifest=committedManifest; state.dir=dir; state.searchMatches=[]; state.dataQueryMatches=null; state.dataQueryMeta=null; state.pivotTable=null; state.pivotTileIndex=null; state.timeTable=null;
+    activateWorkerDataset({id,manifest:committedManifest,chunks:chunkMetas,dir,clearCache:false});
     return {manifest:committedManifest,chunks:chunkMetas,ms:now()-t0,typeWarnings:analyzed.typeWarnings,olapKernel:olapKernelStatus()};
   }catch(err){
     await cleanupDatasetDir(root,id);
@@ -4066,8 +4074,7 @@ async function openDataset(id){
   clearChunkCache();
   const loaded=await loadValidatedDataset(id,{rebuildStats:true});
   const {dir,manifest,chunks}=loaded;
-  state.virtual=null; state.memory=null; state.externalDataset=null; state.dir=dir; state.manifest=manifest; state.dataset={id,manifest,chunks};
-  state.searchMatches=[]; state.dataQueryMatches=null; state.dataQueryMeta=null; state.pivotTable=null; state.pivotTileIndex=null; state.timeTable=null;
+  activateWorkerDataset({id,manifest,chunks,dir,clearCache:false});
   return {manifest,chunks,integrity:loaded.integrity};
 }
 async function openVirtualDataset(ids, name){
@@ -4138,10 +4145,7 @@ async function openVirtualDataset(ids, name){
       invalidNumbers:sources.reduce((a,x)=>a+$N(x.manifest.cleanReport?.invalidNumbers || 0),0)
     }
   };
-  state.virtual={sources:virtualSources, globalChunks};
-  state.externalDataset=null;
-  state.dir=null; state.manifest=manifest; state.dataset={id:manifest.id,manifest,chunks:globalChunks};
-  state.searchMatches=[]; state.dataQueryMatches=null; state.dataQueryMeta=null; state.pivotTable=null; state.pivotTileIndex=null; state.timeTable=null;
+  activateWorkerDataset({id:manifest.id,manifest,chunks:globalChunks,virtual:{sources:virtualSources, globalChunks},clearCache:false});
   return {manifest,chunks:globalChunks};
 }
 async function openMemoryDataset(ids, name, options={}){
@@ -4248,9 +4252,7 @@ async function openMemoryDataset(ids, name, options={}){
     const fullChunk = $N(srcMeta?.rowCount || 0) === $N(ch.rowCount || 0);
     return {chunkIndex:i,rowCount:ch.rowCount,sourceIndex:ch.sourceIndex,sourceChunkIndex:ch.sourceChunkIndex,rowStart:ch.rowStart,rowEnd:ch.rowEnd,...(fullChunk && srcMeta ? {stats:srcMeta.stats,columnStats:srcMeta.columnStats,indexVersion:srcMeta.indexVersion} : {})};
   });
-  state.memory={sources:memorySources,chunks:memoryChunks,estimatedBytes,maxBytes};
-  state.virtual=null; state.externalDataset=null; state.dir=null; state.manifest=manifest; state.dataset={id:manifest.id,manifest,chunks:chunkMetas};
-  state.searchMatches=[]; state.dataQueryMatches=null; state.dataQueryMeta=null; state.pivotTable=null; state.pivotTileIndex=null; state.timeTable=null;
+  activateWorkerDataset({id:manifest.id,manifest,chunks:chunkMetas,memory:{sources:memorySources,chunks:memoryChunks,estimatedBytes,maxBytes},clearCache:false});
   return {manifest,chunks:chunkMetas};
 }
 function activeIsVirtual(){ return !!state.virtual && state.manifest?.mode === "virtual-dataset"; }
@@ -4319,14 +4321,11 @@ async function mergeSavedDatasets(ids, datasetName, storageMeta={}){
       nullCells:sumReport("nullCells"),
       invalidNumbers:sumReport("invalidNumbers")
     };
-    const tableName=cleanMetaValue(storageMeta.tableName || datasetName || `merged_${list.length}_saved`, `merged_${list.length}_saved`);
+    const storagePathMeta=buildStoragePathMeta({...storageMeta,datasetName}, `merged_${list.length}_saved`, {workspace:manifestWorkspace(base),collection:manifestCollection(base)});
     const manifest={
       id,
-      name:datasetName || tableName,
-      storageWorkspace:cleanMetaValue(storageMeta.storageWorkspace, manifestWorkspace(base)),
-      storageCollection:cleanMetaValue(storageMeta.storageCollection, manifestCollection(base)),
-      tableName,
-      storagePath:`${cleanMetaValue(storageMeta.storageWorkspace, manifestWorkspace(base))} / ${cleanMetaValue(storageMeta.storageCollection, manifestCollection(base))} / ${tableName}`,
+      name:datasetName || storagePathMeta.tableName,
+      ...storagePathMeta,
       originalFileName:opened.map(x=>x.manifest.name || x.id).join(" + "),
       sourceDatasets:opened.map(x=>({id:x.id,name:x.manifest.name,rows:x.manifest.totalRows,chunks:x.manifest.chunks,createdAt:x.manifest.createdAt})),
       createdAt:new Date().toISOString(),
@@ -4345,8 +4344,7 @@ async function mergeSavedDatasets(ids, datasetName, storageMeta={}){
     };
     await writeJson(targetDir,"manifest.json",manifest);
     await writeJson(targetDir,"chunks.json",chunkMetas);
-    state.dataset={id,manifest,chunks:chunkMetas};
-    state.virtual=null; state.memory=null; state.manifest=manifest; state.dir=targetDir; state.searchMatches=[]; state.dataQueryMatches=null; state.dataQueryMeta=null; state.pivotTable=null; state.pivotTileIndex=null; state.timeTable=null;
+    activateWorkerDataset({id,manifest,chunks:chunkMetas,dir:targetDir,clearCache:false});
     return {manifest,chunks:chunkMetas};
   }catch(err){
     await cleanupDatasetDir(root,id);
