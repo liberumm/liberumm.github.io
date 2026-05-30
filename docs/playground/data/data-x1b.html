@@ -1,13 +1,13 @@
 <!DOCTYPE html>
 
 <!--
-  Quantum CSV Grid - Step1 Base Integrated Build
+  Quantum CSV Grid - Step2 Functional Surface Build
   1HTML前提 / 疑似モジュール化 / 後日JS分割可能 / Compat fallback付き
 -->
 <html lang="ja">
 <head>
   <meta charset="UTF-8" />
-  <title>Quantum CSV Grid - Dev Structural Reform Build</title>
+  <title>Quantum CSV Grid - Step2 Functional Surface Build</title>
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <meta name="referrer" content="no-referrer" />
   <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'unsafe-inline' https://unpkg.com https://cdn.jsdelivr.net https://esm.sh; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com https://cdn.jsdelivr.net; font-src 'self' https://fonts.gstatic.com https://fonts.googleapis.com; connect-src 'self' http://localhost:* https://localhost:*; worker-src 'self' blob:; img-src 'self' data: blob:; object-src 'none'; base-uri 'none'; form-action 'none'; upgrade-insecure-requests" />
@@ -13907,6 +13907,506 @@ const runtimeExecutionPolicy = createRuntimeExecutionPolicy({
   ]
 });
 
+
+/*
+ * =========================================================
+ * STEP2 FUNCTIONAL SURFACE WORKER v1
+ * =========================================================
+ * Purpose:
+ * - Add a single Plan / Operator execution face above the existing CSV,
+ *   Query, Formula, Graph, and Projection engines.
+ * - Preserve legacy commands and data-plane fast paths.
+ * - Let UI or future split JS call one command without touching the old router.
+ */
+
+const STEP2_FUNCTIONAL_SURFACE_WORKER_VERSION = 1;
+
+function step2Text(value, fallback = ""){
+  return value == null ? fallback : String(value);
+}
+
+function step2Array(value){
+  return Array.isArray(value) ? value : [];
+}
+
+function step2SafeInt(value, min, max, fallback){
+  const n = Math.floor(Number(value));
+  if (!Number.isFinite(n)) return fallback;
+  return Math.max(min, Math.min(max, n));
+}
+
+function step2ColumnIndex(value){
+  if (!state.manifest?.columns?.length) return -1;
+  const numeric = Number(value);
+  if (Number.isFinite(numeric) && numeric >= 0 && state.manifest.columns[Math.floor(numeric)]) return Math.floor(numeric);
+  const name = step2Text(value).trim();
+  if (!name) return -1;
+  const exact = state.manifest.columns.find((col) => col.name === name);
+  if (exact) return Number(exact.index);
+  const lower = name.toLowerCase();
+  const folded = state.manifest.columns.find((col) => String(col.name || "").toLowerCase() === lower);
+  return folded ? Number(folded.index) : -1;
+}
+
+function step2NormalizeColumns(columns){
+  const list = step2Array(columns);
+  if (!list.length) return [];
+  const out = [];
+  const seen = new Set();
+  for (const item of list){
+    const idx = step2ColumnIndex(item);
+    if (idx >= 0 && !seen.has(idx)){
+      seen.add(idx);
+      out.push(idx);
+    }
+  }
+  return out;
+}
+
+function step2NormalizeKind(kind){
+  const raw = step2Text(kind).trim();
+  const lower = raw.toLowerCase().replace(/\s+/g, "_");
+  const aliases = {
+    filter:"query.filter",
+    where:"query.filter",
+    "query.filter":"query.filter",
+    filter_group:"query.filterGroup",
+    filtergroup:"query.filterGroup",
+    "query.filtergroup":"query.filterGroup",
+    "query.filterGroup":"query.filterGroup",
+    sort:"query.sort",
+    order:"query.sort",
+    "query.sort":"query.sort",
+    limit:"query.limit",
+    "query.limit":"query.limit",
+    select:"query.project",
+    project:"query.project",
+    projection:"query.project",
+    "query.project":"query.project",
+    formula:"formula.derive",
+    derive:"formula.derive",
+    "formula.derive":"formula.derive",
+    graph_join:"graph.join",
+    join:"graph.join",
+    "graph.join":"graph.join",
+    pivot:"graph.resultPivot",
+    "graph.resultpivot":"graph.resultPivot",
+    "graph.resultPivot":"graph.resultPivot",
+    time:"graph.resultTime",
+    timeseries:"graph.resultTime",
+    "graph.resulttime":"graph.resultTime",
+    "graph.resultTime":"graph.resultTime",
+    viewport:"projection.viewport",
+    "projection.viewport":"projection.viewport"
+  };
+  return aliases[lower] || raw.replace(/[^A-Za-z0-9_.:-]/g, "_").slice(0, 80);
+}
+
+function step2NormalizeOperator(op){
+  const raw = op || {};
+  return {
+    id: raw.id || `op_${Math.random().toString(36).slice(2)}`,
+    kind: step2NormalizeKind(raw.kind || raw.type || raw.action || "unknown"),
+    params: raw.params && typeof raw.params === "object" ? raw.params : {},
+    meta: raw.meta && typeof raw.meta === "object" ? raw.meta : {}
+  };
+}
+
+function step2Viewport(input = {}){
+  const raw = input.viewport || input.params || input || {};
+  const pageSize = step2SafeInt(raw.pageSize, 1, 5000, 500);
+  const page = step2SafeInt(raw.page, 1, 100000000, 1);
+  const startRow = step2SafeInt(raw.startRow, 0, Number.MAX_SAFE_INTEGER, (page - 1) * pageSize);
+  return { page, pageSize, startRow };
+}
+
+function step2NormalizeStructuredPlan(input = {}){
+  const raw = input.plan && typeof input.plan === "object" ? input.plan : input;
+  const operators = step2Array(raw.operators || input.operators).map(step2NormalizeOperator);
+  const viewport = step2Viewport(raw.viewport || input.viewport || {});
+  const projectionFromPlan = step2NormalizeColumns(raw.projection || input.projection || []);
+  return {
+    id: raw.id || input.requestId || `plan_${Date.now().toString(36)}_${Math.random().toString(36).slice(2)}`,
+    version: 2,
+    name: step2Text(raw.name || input.name || "structured-plan").slice(0, 120),
+    kind: step2Text(raw.kind || input.kind || "structured").slice(0, 80),
+    source: step2Text(raw.source || input.source || "active-dataset").slice(0, 120),
+    operators,
+    projection: projectionFromPlan,
+    viewport,
+    options: raw.options && typeof raw.options === "object" ? raw.options : {},
+    estimatedRows: Number(state.manifest?.totalRows || 0),
+    estimatedBytes: Number(state.manifest?.fileSize || 0),
+    estimatedChunks: Number(state.manifest?.chunks || state.dataset?.chunks?.length || 0),
+    memoryRisk: Number(state.manifest?.totalRows || 0) > 1000000 ? "medium" : "low",
+    cost: {
+      estimatedRows: Number(state.manifest?.totalRows || 0),
+      estimatedBytes: Number(state.manifest?.fileSize || 0),
+      estimatedChunks: Number(state.manifest?.chunks || state.dataset?.chunks?.length || 0),
+      operatorCount: operators.length,
+      memoryRisk: Number(state.manifest?.totalRows || 0) > 1000000 ? "medium" : "low"
+    }
+  };
+}
+
+function step2DatasetSummary(){
+  const columns = step2Array(state.manifest?.columns).map((col) => ({
+    index: Number(col.index),
+    name: col.name,
+    type: col.type,
+    nulls: col.nulls,
+    distinct: col.distinct,
+    min: col.min,
+    max: col.max
+  }));
+  return {
+    active: Boolean(state.manifest && state.dataset),
+    id: state.manifest?.id || state.dataset?.id || null,
+    name: state.manifest?.name || state.manifest?.id || null,
+    mode: state.manifest?.mode || "",
+    totalRows: Number(state.manifest?.totalRows || 0),
+    chunks: Number(state.manifest?.chunks || state.dataset?.chunks?.length || 0),
+    fileSize: Number(state.manifest?.fileSize || 0),
+    columns
+  };
+}
+
+function step2PlanSummary(plan){
+  return {
+    id: plan.id,
+    name: plan.name,
+    kind: plan.kind,
+    source: plan.source,
+    operatorCount: plan.operators.length,
+    operators: plan.operators.map((op) => ({ id: op.id, kind: op.kind })),
+    projection: plan.projection,
+    viewport: plan.viewport,
+    cost: plan.cost,
+    dataset: step2DatasetSummary()
+  };
+}
+
+function step2BuildQueryArgs(plan){
+  const filters = [];
+  const filterGroups = [];
+  let sort = null;
+  let maxRows = Number(plan.options?.maxRows || 0);
+  let projection = plan.projection.slice();
+  const formulaOperators = [];
+  let special = null;
+
+  for (const operator of plan.operators){
+    const kind = step2NormalizeKind(operator.kind);
+    const params = operator.params || {};
+
+    if (kind === "query.filter"){
+      const columnIndex = step2ColumnIndex(params.columnIndex ?? params.column ?? params.field ?? params.name);
+      if (columnIndex >= 0) filters.push({
+        id: params.id || operator.id,
+        columnIndex,
+        op: params.op || params.operator || "contains",
+        value: params.value ?? "",
+        source: "step2-plan"
+      });
+    } else if (kind === "query.filterGroup"){
+      const conditions = step2Array(params.conditions || params.filters)
+        .map((condition) => {
+          const columnIndex = step2ColumnIndex(condition.columnIndex ?? condition.column ?? condition.field ?? condition.name);
+          return columnIndex >= 0 ? {
+            id: condition.id || `${operator.id}_${columnIndex}`,
+            columnIndex,
+            op: condition.op || condition.operator || "contains",
+            value: condition.value ?? "",
+            source: "step2-plan-group"
+          } : null;
+        })
+        .filter(Boolean);
+      if (conditions.length) filterGroups.push({
+        id: params.id || operator.id,
+        mode: step2Text(params.mode || params.matchMode || "all").toLowerCase() === "any" ? "any" : "all",
+        conditions
+      });
+    } else if (kind === "query.sort"){
+      const columnIndex = step2ColumnIndex(params.columnIndex ?? params.column ?? params.field ?? params.name);
+      if (columnIndex >= 0) sort = {
+        columnIndex,
+        direction: step2Text(params.direction || params.dir || "asc").toLowerCase() === "desc" ? "desc" : "asc"
+      };
+    } else if (kind === "query.limit"){
+      maxRows = step2SafeInt(params.maxRows ?? params.limit ?? params.value, 0, Number.MAX_SAFE_INTEGER, maxRows || 0);
+    } else if (kind === "query.project"){
+      const cols = step2NormalizeColumns(params.columns || params.projection || params.values);
+      if (cols.length) projection = cols;
+    } else if (kind === "formula.derive"){
+      formulaOperators.push(operator);
+    } else if (kind === "graph.join" || kind === "graph.resultPivot" || kind === "graph.resultTime"){
+      special = operator;
+    }
+  }
+
+  return {
+    filters,
+    filterGroups,
+    sort,
+    maxRows,
+    projection,
+    formulaOperators,
+    special,
+    hasQuery: filters.length > 0 || filterGroups.length > 0 || Boolean(sort) || maxRows > 0
+  };
+}
+
+function step2CellNumber(value){
+  if (typeof value === "number") return Number.isFinite(value) ? value : 0;
+  const n = Number(String(value ?? "").replace(/,/g, ""));
+  return Number.isFinite(n) ? n : 0;
+}
+
+function step2ApplyFormula(surface, formulaOperators){
+  if (!formulaOperators.length) return surface;
+  let header = step2Array(surface.header).slice();
+  let rows = step2Array(surface.rows).map((row) => step2Array(row).slice());
+
+  for (const operator of formulaOperators){
+    const params = operator.params || {};
+    const name = step2Text(params.name || params.output || "derived").slice(0, 120) || "derived";
+    const operation = step2Text(params.operation || params.op || "concat").toLowerCase();
+    const indexes = step2Array(params.columns || params.args || params.fields).map((item) => {
+      const n = Number(item);
+      if (Number.isFinite(n) && n >= 0 && n < header.length) return Math.floor(n);
+      const lower = step2Text(item).toLowerCase();
+      return header.findIndex((h) => step2Text(h).toLowerCase() === lower);
+    }).filter((idx) => idx >= 0);
+    const separator = params.separator == null ? "" : String(params.separator);
+    const fallback = params.fallback == null ? "" : params.fallback;
+
+    rows = rows.map((row) => {
+      const values = indexes.map((idx) => row[idx]);
+      let value = fallback;
+      try {
+        if (operation === "concat") value = values.map((v) => v == null ? "" : String(v)).join(separator);
+        else if (operation === "add" || operation === "sum") value = values.reduce((a, v) => a + step2CellNumber(v), 0);
+        else if (operation === "subtract") value = values.length ? values.slice(1).reduce((a, v) => a - step2CellNumber(v), step2CellNumber(values[0])) : fallback;
+        else if (operation === "multiply") value = values.reduce((a, v) => a * step2CellNumber(v), values.length ? 1 : 0);
+        else if (operation === "divide") {
+          const left = step2CellNumber(values[0]);
+          const right = step2CellNumber(values[1]);
+          value = right === 0 ? fallback : left / right;
+        } else if (operation === "upper") value = step2Text(values[0]).toUpperCase();
+        else if (operation === "lower") value = step2Text(values[0]).toLowerCase();
+        else if (operation === "trim") value = step2Text(values[0]).trim();
+        else if (operation === "length") value = step2Text(values[0]).length;
+        else if (operation === "coalesce") {
+          const found = values.find((v) => v != null && String(v) !== "");
+          value = found == null ? fallback : found;
+        } else if (operation === "year" || operation === "month" || operation === "day") {
+          const d = new Date(values[0]);
+          if (!Number.isNaN(d.getTime())) {
+            value = operation === "year" ? d.getFullYear() : operation === "month" ? d.getMonth() + 1 : d.getDate();
+          }
+        }
+      } catch {}
+      return [...row, value];
+    });
+
+    header = [...header, name];
+  }
+
+  return { ...surface, header, rows, formulaApplied: formulaOperators.map((op) => ({ id: op.id, name: op.params?.name || "derived", operation: op.params?.operation || op.params?.op || "concat" })) };
+}
+
+async function step2BuildProjection(plan){
+  if (!state.manifest || !state.dataset) throw new Error("Active dataset is required for projection");
+  const queryArgs = step2BuildQueryArgs(plan);
+  const columns = queryArgs.projection.length ? queryArgs.projection : plan.projection;
+  const viewport = plan.viewport;
+
+  let pageResult;
+  let queryResult = null;
+  if (queryArgs.hasQuery) {
+    queryResult = await runDataQuery({
+      filters: queryArgs.filters,
+      filterGroups: queryArgs.filterGroups,
+      sort: queryArgs.sort,
+      maxRows: queryArgs.maxRows,
+      projection: columns
+    });
+    if (queryResult.active) {
+      pageResult = await readDataQueryPage(viewport.page, viewport.pageSize, columns);
+    } else {
+      pageResult = await readPage(viewport.page, viewport.pageSize, columns);
+    }
+  } else if (state.dataQueryMatches && plan.source === "active-query") {
+    pageResult = await readDataQueryPage(viewport.page, viewport.pageSize, columns);
+  } else {
+    pageResult = await readPage(viewport.page, viewport.pageSize, columns);
+  }
+
+  const surface = step2ApplyFormula({
+    mode: queryResult?.active ? "query-projection" : "dataset-projection",
+    header: pageResult.header || [],
+    rows: pageResult.rows || [],
+    startRow: pageResult.startRow || 0,
+    page: viewport.page,
+    pageSize: viewport.pageSize,
+    totalRows: Number(state.manifest?.totalRows || 0),
+    totalMatches: Number(pageResult.totalMatches || queryResult?.matches || 0),
+    rowSurface: pageResult.rowSurface || null
+  }, queryArgs.formulaOperators);
+
+  return {
+    type: "projection",
+    surface,
+    query: queryResult ? {
+      active: Boolean(queryResult.active),
+      matches: queryResult.matches,
+      capped: queryResult.capped,
+      queryPlan: queryResult.queryPlan,
+      ms: queryResult.ms
+    } : null,
+    metrics: {
+      rows: surface.rows.length,
+      columns: surface.header.length,
+      sourceRows: Number(state.manifest?.totalRows || 0)
+    }
+  };
+}
+
+async function step2ExecuteSpecial(plan, special){
+  const kind = step2NormalizeKind(special.kind);
+  const params = special.params || {};
+  if (kind === "graph.join"){
+    const result = await runGraphJoinQuery({ plan: params.plan || params.graphPlan || params, pageSize: Number(params.pageSize || plan.viewport.pageSize || 500) });
+    const graphResultSurface = registerGraphResultSurface({ mode:"join", reason:"STEP2_EXECUTE_STRUCTURED_PLAN", result });
+    const page = await readGraphJoinPage(plan.viewport.page, plan.viewport.pageSize, "step2");
+    return {
+      type: "graph-join",
+      graphResult: result,
+      graphResultSurface: graphResultSurfaceSummary(graphResultSurface),
+      surface: page,
+      metrics: { rows: result.rows || page.rows?.length || 0 }
+    };
+  }
+  if (kind === "graph.resultPivot"){
+    const result = await buildGraphResultPivot(params);
+    const viewport = readPivotViewport({ rowStart:0, colStart:0, viewportRows:Number(params.viewportRows || 90), viewportCols:Number(params.viewportCols || 40), overscan:1, filters:params.filters || {} });
+    return {
+      type: "graph-result-pivot",
+      pivot: result,
+      surface: viewport,
+      metrics: { rows: result.rows || result.rowKeys || 0 }
+    };
+  }
+  if (kind === "graph.resultTime"){
+    const result = await buildGraphResultTime(params);
+    return {
+      type: "graph-result-time",
+      time: result,
+      surface: { header: result.header || [], rows: result.rows || [] },
+      metrics: { rows: result.rows?.length || 0 }
+    };
+  }
+  return null;
+}
+
+async function step2ExecuteStructuredPlan(plan, tools = {}){
+  if (!state.manifest || !state.dataset) throw new Error("Active dataset is required for structured plan");
+  const queryArgs = step2BuildQueryArgs(plan);
+  if (queryArgs.special) return await step2ExecuteSpecial(plan, queryArgs.special);
+
+  const pivotOp = plan.operators.find((op) => step2NormalizeKind(op.kind) === "graph.resultPivot" || step2NormalizeKind(op.kind) === "pivot");
+  if (pivotOp) return await step2ExecuteSpecial(plan, { ...pivotOp, kind:"graph.resultPivot" });
+
+  const timeOp = plan.operators.find((op) => step2NormalizeKind(op.kind) === "graph.resultTime" || step2NormalizeKind(op.kind) === "time");
+  if (timeOp) return await step2ExecuteSpecial(plan, { ...timeOp, kind:"graph.resultTime" });
+
+  return await step2BuildProjection(plan);
+}
+
+registerRuntimeCommand("STRUCTURED_PLAN_PREVIEW", {
+  doneType: "STRUCTURED_PLAN_PREVIEW_DONE",
+  outputMode: "metadata",
+  validate(msg){ return msg || {}; },
+  plan(input){ return step2NormalizeStructuredPlan(input); },
+  strategy(plan){ return { mode:"metadata", reason:"preview-only", cost:plan.cost }; },
+  async execute(plan){
+    return {
+      ok:true,
+      version:STEP2_FUNCTIONAL_SURFACE_WORKER_VERSION,
+      plan:step2PlanSummary(plan),
+      dataset:step2DatasetSummary()
+    };
+  },
+  project(result){ return result; }
+});
+
+registerRuntimeCommand("BUILD_PROJECTION", {
+  doneType: "PROJECTION_RESULT",
+  outputMode: "surface",
+  validate(msg){ return msg || {}; },
+  plan(input){ return step2NormalizeStructuredPlan(input); },
+  strategy(plan){
+    const rows = Number(plan.estimatedRows || 0);
+    return { mode: rows > 100000 ? "optimized" : "classic", reason: rows > 100000 ? "large-projection" : "bounded-projection", cost:plan.cost };
+  },
+  async execute(plan, runtimeState, tools){
+    tools.progress?.(1, "Building Step2 projection surface...");
+    const result = await step2BuildProjection(plan);
+    tools.progress?.(100, `Step2 projection ready: ${fmt(result.surface?.rows?.length || 0)} rows`);
+    return { ...result, plan:step2PlanSummary(plan), dataset:step2DatasetSummary() };
+  },
+  project(result){ return result; }
+});
+
+registerRuntimeCommand("EXECUTE_STRUCTURED_PLAN", {
+  doneType: "STRUCTURED_PLAN_DONE",
+  outputMode: "surface",
+  validate(msg){ return msg || {}; },
+  plan(input){ return step2NormalizeStructuredPlan(input); },
+  strategy(plan){
+    const rows = Number(plan.estimatedRows || 0);
+    const opCount = Number(plan.operators?.length || 0);
+    if (rows > 1000000 || opCount >= 5) return { mode:"adaptive", reason:"large-functional-surface", cost:plan.cost };
+    if (rows > 100000) return { mode:"optimized", reason:"medium-functional-surface", cost:plan.cost };
+    return { mode:"classic", reason:"small-functional-surface", cost:plan.cost };
+  },
+  async execute(plan, runtimeState, tools){
+    tools.progress?.(1, "Executing Step2 structured plan...");
+    const result = await step2ExecuteStructuredPlan(plan, tools);
+    tools.progress?.(100, `Step2 plan complete: ${fmt(result.surface?.rows?.length || result.metrics?.rows || 0)} rows`);
+    return {
+      ...result,
+      version:STEP2_FUNCTIONAL_SURFACE_WORKER_VERSION,
+      plan:step2PlanSummary(plan),
+      dataset:step2DatasetSummary()
+    };
+  },
+  project(result){ return result; }
+});
+
+registerRuntimeCommand("RUN_QUERY_PLAN", {
+  doneType: "QUERY_PLAN_RESULT",
+  outputMode: "surface",
+  validate(msg){ return msg || {}; },
+  plan(input){
+    const plan = step2NormalizeStructuredPlan(input);
+    plan.kind = "query";
+    return plan;
+  },
+  strategy(plan){
+    const rows = Number(plan.estimatedRows || 0);
+    return { mode: rows > 100000 ? "optimized" : "classic", reason:"query-plan", cost:plan.cost };
+  },
+  async execute(plan, runtimeState, tools){
+    tools.progress?.(1, "Executing Step2 query plan...");
+    const result = await step2BuildProjection(plan);
+    tools.progress?.(100, `Step2 query complete: ${fmt(result.surface?.rows?.length || 0)} rows`);
+    return { ...result, plan:step2PlanSummary(plan), dataset:step2DatasetSummary() };
+  },
+  project(result){ return result; }
+});
+
+
 const runtimeKernel = createRuntimeKernel({
   runtimeState: state,
   post,
@@ -14902,6 +15402,377 @@ self.onmessage = (event) => {
   } catch {}
 })(window);
   </script>
+
+
+  <script id="step2-domain-surface-kernel" type="text/javascript">
+/*
+ * =========================================================
+ * STEP2 FUNCTIONAL SURFACE KERNEL v1
+ * =========================================================
+ * Purpose:
+ * - Keep 1HTML.
+ * - Preserve all existing UI / Worker / Storage behavior.
+ * - Add one functional execution surface for CSV / Query / Formula /
+ *   Graph / Projection.
+ * - Make each block removable into .js later.
+ *
+ * Extraction map:
+ * - QCSVStep2.DomainCore       -> domain/core.js
+ * - QCSVStep2.CsvDomain        -> domain/csv/csv-plan.js
+ * - QCSVStep2.QueryDomain      -> domain/query/query-plan.js
+ * - QCSVStep2.FormulaDomain    -> domain/formula/formula-operators.js
+ * - QCSVStep2.GraphDomain      -> domain/graph/graph-plan.js
+ * - QCSVStep2.ProjectionDomain -> domain/projection/projection-plan.js
+ * - QCSVStep2.ExecutionPlane   -> runtime/functional-execution-plane.js
+ */
+(function bootstrapStep2FunctionalSurfaceKernel(global) {
+  "use strict";
+
+  const STEP2_VERSION = "step2-functional-surface-kernel-v1";
+  const Kernel = global.QCSVDevKernel || {};
+  const Modules = global.Modules || (global.Modules = {});
+
+  function now() { return Date.now(); }
+
+  function safeString(value, fallback = "") {
+    const text = value == null ? fallback : String(value);
+    return text.slice(0, 1000);
+  }
+
+  function safeArray(value) {
+    return Array.isArray(value) ? value : [];
+  }
+
+  function createId(prefix) {
+    if (Kernel.WorkerProtocol?.createId) return Kernel.WorkerProtocol.createId(prefix || "step2");
+    if (global.crypto?.randomUUID) return `${prefix || "step2"}_${global.crypto.randomUUID()}`;
+    return `${prefix || "step2"}_${Date.now().toString(36)}_${Math.random().toString(36).slice(2)}`;
+  }
+
+  function redact(value) {
+    return Kernel.Security?.redact ? Kernel.Security.redact(value) : value;
+  }
+
+  const DomainCore = (() => {
+    const OPERATOR_KINDS = Object.freeze({
+      CSV_INSPECT: "csv.inspect",
+      CSV_LOAD: "csv.load",
+      QUERY_FILTER: "query.filter",
+      QUERY_FILTER_GROUP: "query.filterGroup",
+      QUERY_SORT: "query.sort",
+      QUERY_LIMIT: "query.limit",
+      QUERY_PROJECT: "query.project",
+      FORMULA_DERIVE: "formula.derive",
+      GRAPH_JOIN: "graph.join",
+      GRAPH_RESULT_PIVOT: "graph.resultPivot",
+      GRAPH_RESULT_TIME: "graph.resultTime",
+      PROJECTION_VIEWPORT: "projection.viewport"
+    });
+
+    function normalizeKind(kind) {
+      const raw = safeString(kind, "").trim();
+      const lower = raw.toLowerCase().replace(/\s+/g, "_");
+      const aliases = {
+        inspect: OPERATOR_KINDS.CSV_INSPECT,
+        load: OPERATOR_KINDS.CSV_LOAD,
+        filter: OPERATOR_KINDS.QUERY_FILTER,
+        where: OPERATOR_KINDS.QUERY_FILTER,
+        filter_group: OPERATOR_KINDS.QUERY_FILTER_GROUP,
+        filtergroup: OPERATOR_KINDS.QUERY_FILTER_GROUP,
+        sort: OPERATOR_KINDS.QUERY_SORT,
+        order: OPERATOR_KINDS.QUERY_SORT,
+        limit: OPERATOR_KINDS.QUERY_LIMIT,
+        select: OPERATOR_KINDS.QUERY_PROJECT,
+        project: OPERATOR_KINDS.QUERY_PROJECT,
+        projection: OPERATOR_KINDS.QUERY_PROJECT,
+        formula: OPERATOR_KINDS.FORMULA_DERIVE,
+        derive: OPERATOR_KINDS.FORMULA_DERIVE,
+        graph_join: OPERATOR_KINDS.GRAPH_JOIN,
+        join: OPERATOR_KINDS.GRAPH_JOIN,
+        pivot: OPERATOR_KINDS.GRAPH_RESULT_PIVOT,
+        result_pivot: OPERATOR_KINDS.GRAPH_RESULT_PIVOT,
+        time: OPERATOR_KINDS.GRAPH_RESULT_TIME,
+        timeseries: OPERATOR_KINDS.GRAPH_RESULT_TIME,
+        viewport: OPERATOR_KINDS.PROJECTION_VIEWPORT
+      };
+      return aliases[lower] || raw.replace(/[^A-Za-z0-9_.:-]/g, "_").slice(0, 80);
+    }
+
+    function operator(kind, params = {}, meta = {}) {
+      const normalized = normalizeKind(kind);
+      if (!normalized) throw new Error("Operator kind is required");
+      return {
+        id: createId("op"),
+        kind: normalized,
+        params: redact(params || {}),
+        meta: { createdAt: now(), ...redact(meta || {}) }
+      };
+    }
+
+    function normalizeViewport(viewport = {}) {
+      const page = Math.max(1, Math.floor(Number(viewport.page || 1)));
+      const pageSize = Math.max(1, Math.min(5000, Math.floor(Number(viewport.pageSize || 500))));
+      const startRow = Math.max(0, Math.floor(Number(viewport.startRow || (page - 1) * pageSize || 0)));
+      return { page, pageSize, startRow };
+    }
+
+    function normalizePlan(input = {}) {
+      const raw = input.plan && typeof input.plan === "object" ? input.plan : input;
+      const operators = safeArray(raw.operators || input.operators).map((op) => {
+        if (!op) return null;
+        if (op.kind) return {
+          id: op.id || createId("op"),
+          kind: normalizeKind(op.kind),
+          params: redact(op.params || {}),
+          meta: { createdAt: now(), ...(op.meta || {}) }
+        };
+        return operator(op.type || op.action || "unknown", op.params || op);
+      }).filter(Boolean);
+
+      return {
+        id: raw.id || createId("plan"),
+        version: 2,
+        name: safeString(raw.name || input.name || "structured-plan", "structured-plan").slice(0, 120),
+        kind: safeString(raw.kind || input.kind || "structured", "structured"),
+        source: safeString(raw.source || input.source || "active-dataset", "active-dataset"),
+        projection: safeArray(raw.projection || input.projection),
+        viewport: normalizeViewport(raw.viewport || input.viewport || {}),
+        operators,
+        options: redact(raw.options || input.options || {}),
+        meta: {
+          createdAt: now(),
+          ...(raw.meta || {}),
+          step2Version: STEP2_VERSION
+        }
+      };
+    }
+
+    function estimateCost(plan = {}) {
+      const rows = Number(plan.meta?.estimatedRows || plan.estimatedRows || 0);
+      const bytes = Number(plan.meta?.estimatedBytes || plan.estimatedBytes || 0);
+      const operatorCount = safeArray(plan.operators).length;
+      const score = operatorCount * 12 + Math.log10(Math.max(1, rows)) * 8 + Math.log10(Math.max(1, bytes)) * 2;
+      return {
+        score: Math.round(score * 10) / 10,
+        operatorCount,
+        estimatedRows: Number.isFinite(rows) ? rows : 0,
+        estimatedBytes: Number.isFinite(bytes) ? bytes : 0,
+        memoryRisk: rows > 1000000 || bytes > 512 * 1024 * 1024 ? "high" : rows > 100000 ? "medium" : "low"
+      };
+    }
+
+    function summarize(plan = {}) {
+      return {
+        id: plan.id,
+        name: plan.name,
+        kind: plan.kind,
+        source: plan.source,
+        operators: safeArray(plan.operators).map((op) => ({ id: op.id, kind: op.kind })),
+        viewport: plan.viewport,
+        projectionSize: safeArray(plan.projection).length,
+        cost: estimateCost(plan)
+      };
+    }
+
+    return { OPERATOR_KINDS, normalizeKind, operator, normalizePlan, normalizeViewport, estimateCost, summarize };
+  })();
+
+  const CsvDomain = (() => {
+    function inspect({ fileName = "", encoding = "utf-8", delimiter = ",", sampleRows = 20000 } = {}) {
+      return DomainCore.normalizePlan({
+        name: "csv-inspect",
+        kind: "csv",
+        operators: [
+          DomainCore.operator("csv.inspect", { fileName, encoding, delimiter, sampleRows })
+        ],
+        options: { legacyCommand: "ANALYZE" }
+      });
+    }
+
+    function load({ fileName = "", encoding = "utf-8", delimiter = ",", chunkSize = 200000 } = {}) {
+      return DomainCore.normalizePlan({
+        name: "csv-load",
+        kind: "csv",
+        operators: [
+          DomainCore.operator("csv.load", { fileName, encoding, delimiter, chunkSize })
+        ],
+        options: { legacyCommand: "BUILD_COLUMNAR" }
+      });
+    }
+
+    return { inspect, load };
+  })();
+
+  const QueryDomain = (() => {
+    function filter(column, op, value, extra = {}) {
+      return DomainCore.operator("filter", { column, columnIndex: column, op, value, ...extra });
+    }
+
+    function filterGroup(conditions = [], mode = "all", extra = {}) {
+      return DomainCore.operator("filterGroup", { conditions, mode, ...extra });
+    }
+
+    function sort(column, direction = "asc") {
+      return DomainCore.operator("sort", { column, columnIndex: column, direction });
+    }
+
+    function project(columns = []) {
+      return DomainCore.operator("project", { columns });
+    }
+
+    function limit(maxRows) {
+      return DomainCore.operator("limit", { maxRows });
+    }
+
+    function plan({ filters = [], filterGroups = [], sort: sortSpec = null, projection = [], limit: maxRows = 0, viewport = {} } = {}) {
+      const operators = [
+        ...filters,
+        ...filterGroups,
+        ...(sortSpec ? [sortSpec] : []),
+        ...(projection.length ? [project(projection)] : []),
+        ...(maxRows ? [limit(maxRows)] : [])
+      ];
+      return DomainCore.normalizePlan({
+        name: "query-plan",
+        kind: "query",
+        projection,
+        viewport,
+        operators
+      });
+    }
+
+    return { filter, filterGroup, sort, project, limit, plan };
+  })();
+
+  const FormulaDomain = (() => {
+    const SAFE_FORMULA_OPS = Object.freeze(["concat", "add", "subtract", "multiply", "divide", "upper", "lower", "trim", "length", "coalesce", "year", "month", "day"]);
+
+    function derive(name, operation, columns = [], options = {}) {
+      const op = safeString(operation || "concat").toLowerCase();
+      if (!SAFE_FORMULA_OPS.includes(op)) {
+        throw new Error(`Unsupported safe formula operation: ${operation}`);
+      }
+      return DomainCore.operator("formula", {
+        name: safeString(name || op || "derived"),
+        operation: op,
+        columns,
+        separator: options.separator ?? "",
+        fallback: options.fallback ?? ""
+      });
+    }
+
+    return { SAFE_FORMULA_OPS, derive };
+  })();
+
+  const GraphDomain = (() => {
+    function join(plan, options = {}) {
+      return DomainCore.normalizePlan({
+        name: "graph-join-plan",
+        kind: "graph",
+        operators: [
+          DomainCore.operator("graph.join", { plan, pageSize: options.pageSize || 500 })
+        ],
+        viewport: { page: 1, pageSize: options.pageSize || 500 }
+      });
+    }
+
+    function resultPivot(params = {}) {
+      return DomainCore.operator("graph.resultPivot", params);
+    }
+
+    function resultTime(params = {}) {
+      return DomainCore.operator("graph.resultTime", params);
+    }
+
+    return { join, resultPivot, resultTime };
+  })();
+
+  const ProjectionDomain = (() => {
+    function viewport({ page = 1, pageSize = 500, columns = [], source = "active-dataset" } = {}) {
+      return DomainCore.normalizePlan({
+        name: "projection-viewport",
+        kind: "projection",
+        source,
+        projection: columns,
+        viewport: { page, pageSize },
+        operators: [
+          DomainCore.operator("viewport", { page, pageSize, columns, source })
+        ]
+      });
+    }
+
+    return { viewport };
+  })();
+
+  const ExecutionPlane = (() => {
+    function commandForPlan(plan, extra = {}) {
+      const normalized = DomainCore.normalizePlan(plan);
+      return {
+        type: "EXECUTE_STRUCTURED_PLAN",
+        requestId: createId("step2_req"),
+        plan: normalized,
+        ...redact(extra || {})
+      };
+    }
+
+    function previewCommand(plan, extra = {}) {
+      const normalized = DomainCore.normalizePlan(plan);
+      return {
+        type: "STRUCTURED_PLAN_PREVIEW",
+        requestId: createId("step2_preview"),
+        plan: normalized,
+        ...redact(extra || {})
+      };
+    }
+
+    function projectionCommand(planOrViewport, extra = {}) {
+      const normalized = DomainCore.normalizePlan(
+        planOrViewport?.operators ? planOrViewport : ProjectionDomain.viewport(planOrViewport || {})
+      );
+      return {
+        type: "BUILD_PROJECTION",
+        requestId: createId("step2_projection"),
+        plan: normalized,
+        ...redact(extra || {})
+      };
+    }
+
+    function send(gateway, plan, extra = {}) {
+      if (!gateway || typeof gateway.post !== "function") throw new Error("Worker gateway is required");
+      return gateway.post(commandForPlan(plan, extra));
+    }
+
+    return { commandForPlan, previewCommand, projectionCommand, send };
+  })();
+
+  const QCSVStep2 = Object.freeze({
+    version: STEP2_VERSION,
+    createdAt: now(),
+    DomainCore,
+    CsvDomain,
+    QueryDomain,
+    FormulaDomain,
+    GraphDomain,
+    ProjectionDomain,
+    ExecutionPlane
+  });
+
+  global.QCSVStep2 = QCSVStep2;
+  Object.assign(Modules, {
+    Step2DomainCore: DomainCore,
+    CsvDomain,
+    QueryDomain,
+    FormulaDomain,
+    GraphDomain,
+    ProjectionDomain,
+    FunctionalExecutionPlane: ExecutionPlane
+  });
+
+  Kernel.Measurement?.mark?.("step2.functional-surface.ready", { version: STEP2_VERSION });
+  try { console.info("[Quantum CSV Grid] Step2 functional surface kernel ready", STEP2_VERSION); } catch {}
+})(window);
+  </script>
+
 
   <script id="app-chunk-00" type="text/plain" data-app-chunk="plain" data-app-chunk-index="0" data-statement-count="21">
 
@@ -23535,6 +24406,52 @@ function App() {
         return;
       },
 
+
+      "STRUCTURED_PLAN_PREVIEW_DONE"(msg) {
+        const summary = msg.plan || {};
+        appendLog(`Step2 plan preview: ${summary.name || "structured-plan"} / ops=${fmt(summary.operatorCount || summary.operators?.length || 0)}`);
+        setStatus(`Step2 Plan確認: ${summary.name || "structured-plan"} / ${fmt(summary.operatorCount || summary.operators?.length || 0)} operators`);
+        return;
+      },
+
+      "STRUCTURED_PLAN_DONE"(msg) {
+        setBusy(false); setBusyLabel("");
+        const surface = msg.surface || {};
+        appendLog(`Step2 structured plan done: ${msg.plan?.name || "structured-plan"} / rows=${fmt(surface.rows?.length || msg.metrics?.rows || 0)}`);
+        setStatus(`Step2 Plan完了: ${fmt(surface.rows?.length || msg.metrics?.rows || 0)} rows / ${fmt(surface.header?.length || msg.metrics?.columns || 0)} cols`);
+        if (surface.header && surface.rows) {
+          setCleanTable({ header: surface.header, rows: surface.rows });
+          setCleanReport([
+            ["Step2 source", msg.type || "structured-plan"],
+            ["Rows", fmt(surface.rows.length)],
+            ["Columns", fmt(surface.header.length)],
+            ["Strategy", msg.runtime?.strategy?.mode || ""],
+          ]);
+        }
+        return;
+      },
+
+      "PROJECTION_RESULT"(msg) {
+        setBusy(false); setBusyLabel("");
+        const surface = msg.surface || {};
+        appendLog(`Step2 projection ready: rows=${fmt(surface.rows?.length || 0)} / cols=${fmt(surface.header?.length || 0)}`);
+        setStatus(`Step2 Projection完了: ${fmt(surface.rows?.length || 0)} rows`);
+        if (surface.header && surface.rows) {
+          setCleanTable({ header: surface.header, rows: surface.rows });
+        }
+        return;
+      },
+
+      "QUERY_PLAN_RESULT"(msg) {
+        setBusy(false); setBusyLabel("");
+        const surface = msg.surface || {};
+        appendLog(`Step2 query plan done: rows=${fmt(surface.rows?.length || msg.query?.matches || 0)}`);
+        setStatus(`Step2 Query完了: ${fmt(surface.rows?.length || msg.query?.matches || 0)} rows`);
+        if (surface.header && surface.rows) {
+          setCleanTable({ header: surface.header, rows: surface.rows });
+        }
+        return;
+      },
       "SCHEMA_DONE"(msg) {
         setSchema(msg.schema);
         setManifest(null);
