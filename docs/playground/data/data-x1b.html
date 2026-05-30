@@ -14718,7 +14718,7 @@ function VisualHyperTensorTableView({
     };
     const sameRequest = !pageSizeChanged && safeNext === requestRef.current.page;
     const duplicateWindowMs = Math.max(TILE_TABLE_READ_THROTTLE_MS, 220);
-    if (sameRequest && now - requestRef.current.at < duplicateWindowMs) return;
+    if (!force && sameRequest && now - requestRef.current.at < duplicateWindowMs) return;
     if (!force && sameRequest) return;
     const wait = Math.max(0, TILE_TABLE_READ_THROTTLE_MS - (now - requestRef.current.at));
     if (force || pageSizeChanged || wait <= 0) send();
@@ -14728,23 +14728,47 @@ function VisualHyperTensorTableView({
     }
   }, [externalLazy, onReadPage, safePageSize, safeTotal, totalPages]);
 
-  const findCachedLazyRows = useCallback((start, end) => {
-    const pages = [...lazyPageCacheRef.current.values()].sort((a,b) => Number(a.start || 0) - Number(b.start || 0));
-    let best = null;
-    let bestOverlap = -1;
+  const readCachedLazyCoverage = useCallback((start, end) => {
+    const safeStart = Math.max(0, Math.floor(Number(start || 0) || 0));
+    const safeEnd = Math.max(safeStart, Math.floor(Number(end || safeStart) || safeStart));
+    const pages = [...lazyPageCacheRef.current.values()]
+      .filter((item) => Array.isArray(item.rows) && item.rows.length)
+      .sort((a,b) => Number(a.start || 0) - Number(b.start || 0));
+
+    const parts = [];
+    let cursor = safeStart;
     for (const item of pages) {
       const rows = Array.isArray(item.rows) ? item.rows : [];
-      const itemStart = Number(item.start || 0);
+      const itemStart = Math.max(0, Math.floor(Number(item.start || 0) || 0));
       const itemEnd = itemStart + rows.length;
-      const overlapStart = Math.max(start, itemStart);
-      const overlapEnd = Math.min(end, itemEnd);
-      const overlap = Math.max(0, overlapEnd - overlapStart);
-      if (overlap > bestOverlap) {
-        bestOverlap = overlap;
-        best = {...item, overlapStart, overlapEnd, overlap};
+      if (itemEnd <= cursor) continue;
+      if (itemStart > cursor) break;
+      const localStart = Math.max(0, cursor - itemStart);
+      const localEnd = Math.min(rows.length, safeEnd - itemStart);
+      if (localEnd > localStart) {
+        parts.push({ rows: rows.slice(localStart, localEnd), absStart: itemStart + localStart });
+        cursor = itemStart + localEnd;
       }
+      if (cursor >= safeEnd) break;
     }
-    return best;
+
+    const mergedRows = [];
+    const firstAbsStart = parts.length ? Number(parts[0].absStart || safeStart) : safeStart;
+    for (const part of parts) {
+      if (mergedRows.length) {
+        const expected = firstAbsStart + mergedRows.length;
+        if (Number(part.absStart || 0) > expected) break;
+      }
+      mergedRows.push(...part.rows);
+    }
+
+    return {
+      rows: mergedRows,
+      absStart: firstAbsStart,
+      covered: firstAbsStart <= safeStart && cursor >= safeEnd,
+      coveredRows: Math.max(0, cursor - Math.max(safeStart, firstAbsStart)),
+      requestedRows: Math.max(0, safeEnd - safeStart),
+    };
   }, []);
 
   const readRenderWindow = useCallback(() => {
@@ -14769,12 +14793,11 @@ function VisualHyperTensorTableView({
           if (oldest) lazyPageCacheRef.current.delete(oldest[0]);
         }
       }
-      const best = findCachedLazyRows(start, end);
-      if (best && best.overlap > 0) {
-        const localStart = Math.max(0, best.overlapStart - Number(best.start || 0));
-        const localEnd = Math.min(best.rows.length, Math.max(localStart, best.overlapEnd - Number(best.start || 0)));
-        renderRows = best.rows.slice(localStart, localEnd);
-        renderAbsStart = best.overlapStart;
+      const coverage = readCachedLazyCoverage(start, end);
+      if (coverage.rows.length) {
+        renderRows = coverage.rows;
+        renderAbsStart = coverage.absStart;
+        loading = !coverage.covered;
         lastGoodWindowRef.current = {rows:renderRows, absStart:renderAbsStart, start, end, at:visualNow()};
       } else {
         loading = safeTotal > 0;
@@ -14803,7 +14826,7 @@ function VisualHyperTensorTableView({
       if (renderRows.length) lastGoodWindowRef.current = {rows:renderRows, absStart:renderAbsStart, start, end, at:visualNow()};
     }
     return {scrollTop, scrollLeft, viewport, start, end, columns, renderRows, renderAbsStart, loading, stale, loadedRangeText};
-  }, [canvasHeight, decoratedRows, externalLazy, findCachedLazyRows, prefix, processedRows, retainStaleLazyRows, safeLoadedStart, safeTotal, virtualRowFromBodyTop, viewportRows, widths]);
+  }, [canvasHeight, decoratedRows, externalLazy, readCachedLazyCoverage, prefix, processedRows, retainStaleLazyRows, safeLoadedStart, safeTotal, virtualRowFromBodyTop, viewportRows, widths]);
 
   const paintVisualFrame = useCallback((reason = "paint") => {
     const canvas = canvasRef.current;
@@ -14884,7 +14907,7 @@ function VisualHyperTensorTableView({
       ctx.fillRect(12, headerHeight + 8, Math.min(360, viewportWidth - 24), 24);
       ctx.fillStyle = "#111827";
       ctx.font = `${dense ? 10 : 11}px Roboto, Meiryo, Arial, sans-serif`;
-      ctx.fillText("読み込み中: 直前のRow Surfaceを保持表示しています", 20, headerHeight + 20);
+      ctx.fillText(win.stale ? "読み込み中: 直前のRow Surfaceを保持表示しています" : "読み込み中: 不足Row Surfaceを追加取得しています", 20, headerHeight + 20);
     }
     if (selected.row >= 0 && selected.col >= 0 && selected.row >= win.start && selected.row < win.end) {
       const x = Number(prefix[selected.col] || 0) - win.scrollLeft;
@@ -14991,12 +15014,14 @@ function VisualHyperTensorTableView({
       const nextPage = Math.min(Math.max(1, Math.floor(virtualStart / safePageSize) + 1), totalPages);
       const loadedAbsStart = safeLoadedStart;
       const loadedAbsEnd = loadedAbsStart + baseRows.length;
-      const cached = findCachedLazyRows(virtualStart, Math.min(safeTotal, virtualStart + viewportRows));
-      const needsRead = baseRows.length === 0 || virtualStart < loadedAbsStart || virtualStart >= loadedAbsEnd;
-      if (needsRead && !(cached && cached.overlap > 0)) scheduleLazyReadPage(nextPage, {force:true});
+      const desiredEnd = Math.min(safeTotal, virtualStart + Math.max(viewportRows, VISUAL_RENDER_OVERSCAN_ROWS * 2));
+      const coverage = readCachedLazyCoverage(virtualStart, desiredEnd);
+      const currentPageCoversStart = baseRows.length > 0 && virtualStart >= loadedAbsStart && virtualStart < loadedAbsEnd;
+      const needsRead = baseRows.length === 0 || !currentPageCoversStart || !coverage.covered;
+      if (needsRead) scheduleLazyReadPage(nextPage, {force:true});
       else if (nextPage !== requestRef.current.page) scheduleLazyReadPage(nextPage, {force:false});
     }
-  }, [baseRows.length, externalLazy, findCachedLazyRows, safeLoadedStart, safePageSize, safeTotal, scheduleLazyReadPage, schedulePaint, totalPages, virtualRowFromBodyTop, viewportRows]);
+  }, [baseRows.length, externalLazy, readCachedLazyCoverage, safeLoadedStart, safePageSize, safeTotal, scheduleLazyReadPage, schedulePaint, totalPages, virtualRowFromBodyTop, viewportRows]);
 
   const toggleSort = useCallback((index) => {
     if (!sortable || externalLazy || index < 0) return;
@@ -17706,7 +17731,7 @@ function PivotTileGrid({ meta, view, onRequest, height = 640, filters = {}, onFi
 
   const totalRows = Math.max(0, Number(meta?.totalRows || 0));
   const totalCols = Math.max(0, Number(meta?.totalCols || 0));
-  const rowPageSize = Math.max(20, Math.min(240, Number(rowPageSizeDraft || meta?.tileRows || 128) || 128));
+  const rowPageSize = Math.max(64, Math.min(240, Number(rowPageSizeDraft || meta?.tileRows || 128) || 128));
   const colWindowSize = Math.max(8, Math.min(120, Number(colWindowSizeDraft || meta?.tileCols || 64) || 64));
   const maxColumnWindowStart = Math.max(0, totalCols - colWindowSize);
   const safeColumnWindowStart = Math.max(0, Math.min(maxColumnWindowStart, Number(columnWindowStart || 0)));
@@ -17763,7 +17788,7 @@ function PivotTileGrid({ meta, view, onRequest, height = 640, filters = {}, onFi
 
   const requestWindow = useCallback((page = 1, pageSize = rowPageSize, requestedColumnStart = safeColumnWindowStart, options = {}) => {
     if (!meta || !onRequest || !totalRows || !totalCols) return;
-    const safePageSize = Math.max(20, Math.min(240, Number(pageSize || rowPageSize) || rowPageSize));
+    const safePageSize = Math.max(64, Math.min(240, Number(pageSize || rowPageSize) || rowPageSize));
     const safePage = Math.max(1, Math.floor(Number(page || 1) || 1));
     const rowStart = Math.max(0, Math.min(Math.max(0, totalRows - 1), (safePage - 1) * safePageSize));
     const colStart = Math.max(0, Math.min(Math.max(0, totalCols - 1), Number(requestedColumnStart || 0) || 0));
@@ -17949,7 +17974,7 @@ function PivotTileGrid({ meta, view, onRequest, height = 640, filters = {}, onFi
         <Chip size="small" label={`Source ${meta.source || "active"}`} />
         <Chip size="small" label={`Renderer GraphQuery/VisualHyperTensor`} />
         <Chip size="small" label={`Window c${fmt(pivotTable.colStart + 1)}-c${fmt(pivotTable.colEnd)} / ${fmt(totalCols)}`} />
-        <SmallNumberField label="行/tile" value={rowPageSizeDraft} onChange={setRowPageSizeDraft} min="20" step="20" sx={{ width: 115 }} />
+        <SmallNumberField label="行/tile" value={rowPageSizeDraft} onChange={setRowPageSizeDraft} min="64" step="32" sx={{ width: 115 }} />
         <SmallNumberField label="列/window" value={colWindowSizeDraft} onChange={setColWindowSizeDraft} min="8" step="8" sx={{ width: 125 }} />
         <Button size="small" variant="outlined" onClick={() => moveColumnWindow(-colWindowSize)} disabled={safeColumnWindowStart <= 0}>← Cols</Button>
         <Button size="small" variant="outlined" onClick={() => moveColumnWindow(colWindowSize)} disabled={safeColumnWindowStart >= maxColumnWindowStart}>Cols →</Button>
