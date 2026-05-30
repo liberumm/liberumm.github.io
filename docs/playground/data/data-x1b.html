@@ -14353,14 +14353,15 @@ function normalizeTileCell(value) {
   return String(value);
 }
 
-function useTileColumnWidths(header, tableId, minColumnWidth = 150) {
+function useTileColumnWidths(header, tableId, minColumnWidth = 150, columnWidthResetKey = null) {
   const headerKey = useMemo(() => (header || []).join("\u001f"), [header]);
+  const effectiveColumnWidthResetKey = columnWidthResetKey == null ? headerKey : String(columnWidthResetKey);
   const [columnWidths, setColumnWidths] = useState({});
   const resizeRef = useRef(null);
 
   useEffect(() => {
     setColumnWidths({});
-  }, [headerKey, tableId]);
+  }, [effectiveColumnWidthResetKey, tableId]);
 
   useEffect(() => {
     return () => {
@@ -14570,6 +14571,7 @@ function VisualHyperTensorTableView({
   onExternalColumnFiltersChange = null,
   onExternalClearFilters = null,
   retainStaleLazyRows = false,
+  columnWidthResetKey = null,
 }) {
   const baseHeader = Array.isArray(header) ? header : [];
   const baseRows = Array.isArray(rows) ? rows : [];
@@ -14604,7 +14606,7 @@ function VisualHyperTensorTableView({
   const effectiveColumnFilters = externalLazy && externalColumnFilters && typeof externalColumnFilters === "object" ? externalColumnFilters : columnFilters;
   const hasRemoteFilterBridge = externalLazy && (typeof onExternalGlobalFilterChange === "function" || typeof onExternalColumnFiltersChange === "function");
 
-  const { columnWidths, getColumnWidth, setColumnWidth, resetColumnWidth, clearColumnWidths } = useTileColumnWidths(displayHeader, tableId, minColumnWidth);
+  const { columnWidths, getColumnWidth, setColumnWidth, resetColumnWidth, clearColumnWidths } = useTileColumnWidths(displayHeader, tableId, minColumnWidth, columnWidthResetKey);
   const columnFilterKey = useMemo(() => JSON.stringify(effectiveColumnFilters || {}), [effectiveColumnFilters]);
 
   const lazyResetKey = useMemo(() => {
@@ -17694,6 +17696,7 @@ function PivotTileGrid({ meta, view, onRequest, height = 640, filters = {}, onFi
   const filterKey = JSON.stringify(normalizedFilters);
   const lastRequestKeyRef = useRef("");
   const filterReloadTimerRef = useRef(0);
+  const lastStableHeaderRef = useRef(null);
   const [pendingViewport, setPendingViewport] = useState(null);
   const rowHeaderNames = Array.isArray(meta?.rowHeaderNames) && meta.rowHeaderNames.length ? meta.rowHeaderNames : ["Rows"];
   const rowHeaderCount = Math.max(1, rowHeaderNames.length);
@@ -17823,9 +17826,28 @@ function PivotTileGrid({ meta, view, onRequest, height = 640, filters = {}, onFi
     const colStart = Math.max(0, Number(activeView?.colStart ?? pendingViewport?.colStart ?? safeColumnWindowStart) || 0);
     const colEnd = Math.max(colStart, Number(activeView?.colEnd ?? pendingViewport?.colEnd ?? Math.min(totalCols, colStart + colWindowSize)) || colStart);
 
-    if (!activeView && pendingViewport) {
+    const fallbackHeader = () => {
       const header = [...rowHeaderNames];
       for (let c = colStart; c < colEnd; c++) header.push(c === totalCols - 1 ? "Grand Total" : `Column ${fmt(c + 1)}`);
+      return header;
+    };
+
+    const stableHeaderForWindow = () => {
+      const last = lastStableHeaderRef.current;
+      if (
+        last &&
+        Number(last.colStart) === Number(colStart) &&
+        Number(last.colEnd) === Number(colEnd) &&
+        Array.isArray(last.header) &&
+        last.header.length === rowHeaderCount + Math.max(0, colEnd - colStart)
+      ) {
+        return last.header;
+      }
+      return fallbackHeader();
+    };
+
+    if (!activeView && pendingViewport) {
+      const header = stableHeaderForWindow();
       return {
         header,
         rows: [],
@@ -17862,6 +17884,9 @@ function PivotTileGrid({ meta, view, onRequest, height = 640, filters = {}, onFi
     const header = [...rowHeaderNames];
     for (let c = colStart; c < colEnd; c++) {
       header.push(colLabels.get(c) || (c === totalCols - 1 ? "Grand Total" : `Column ${fmt(c + 1)}`));
+    }
+    if (header.length) {
+      lastStableHeaderRef.current = { colStart, colEnd, header };
     }
 
     const rows = [];
@@ -17904,6 +17929,10 @@ function PivotTileGrid({ meta, view, onRequest, height = 640, filters = {}, onFi
     requestWindow(1, rowPageSize, safeColumnWindowStart, { force: true });
   }
 
+  const handlePivotReadPage = useCallback((page, pageSize) => {
+    requestWindow(page, pageSize, safeColumnWindowStart);
+  }, [requestWindow, safeColumnWindowStart]);
+
   return (
     <Box>
       <Stack direction="row" spacing={1} useFlexGap flexWrap="wrap" alignItems="center" sx={{ mb: 0.75 }}>
@@ -17940,7 +17969,7 @@ function PivotTileGrid({ meta, view, onRequest, height = 640, filters = {}, onFi
         loadedStart={Number(pivotTable.startRow || 0)}
         page={Number(pivotTable.page || 1)}
         pageSize={rowPageSize}
-        onReadPage={(page, pageSize) => requestWindow(page, pageSize, safeColumnWindowStart)}
+        onReadPage={handlePivotReadPage}
         externalGlobalFilter={normalizedFilters.globalFilter}
         externalColumnFilters={tableColumnFilters}
         onExternalGlobalFilterChange={(value) => updateFilter("globalFilter", value)}
@@ -17949,7 +17978,8 @@ function PivotTileGrid({ meta, view, onRequest, height = 640, filters = {}, onFi
         emptyMessage="PivotをBuildすると、ここに結果が表示されます。"
         sourceLabel="Pivot Result"
         statusLabel={`全${fmt(totalRows)}行 / 表示列 ${fmt(pivotTable.header.length)} / page ${fmt(pivotTable.page)} / row tile ${fmt(rowPageSize)}${meta.filtered ? " / filtered totals recalculated" : ""}`}
-        resetKey={`pivot-result:${totalRows}:${totalCols}:${rowPageSize}:${colWindowSize}:${safeColumnWindowStart}:${filterKey}`}
+        resetKey={`pivot-result-data:${totalRows}:${totalCols}:${rowPageSize}:${colWindowSize}:${safeColumnWindowStart}:${filterKey}`}
+        columnWidthResetKey={`pivot-result-layout:${rowHeaderCount}:${colWindowSize}`}
       />
       <Typography variant="caption" color="text.secondary">
         Pivot ResultはGraph Query Resultと同じCanvas body + DOM header rendererで表示します。行ラベル・列ラベル・表示中の値列フィルターはWorker側Pivot Surfaceに接続し、Grand Totalは必要な範囲だけ再集計します。列方向は巨大Pivotに対応するためwindow単位で取得します。
