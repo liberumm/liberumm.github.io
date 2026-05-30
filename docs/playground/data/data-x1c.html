@@ -43,7 +43,7 @@ let state = {
  dataQueryMatches:null,
  dataQueryMeta:null,
  graphJoinResult:null,
- graphResultSurfaces:{activeId:null,activeDataId:null,activeJoinId:null,sequence:0,map:Object.create(null),maxSurfaces:8},
+ graphResultSurfaces:null,
  graphResultSearch:null,
  pivotTable:null,
  pivotTileIndex:null,
@@ -574,17 +574,40 @@ async function loadDatasetForWorkerReadOnly(id){
  }
  return {id,dir,manifest:checked.manifest,chunks:checked.chunks,integrity:checked.integrity};
 }
-async function openVirtualDatasetForWorkerReadOnly(ids, name){
- clearChunkCache();
- const list=($A(ids) ? ids : []).filter(Boolean);
- if (list.length < 2) throw new Error("Virtual worker pool requires at least two saved tables");
- const sources=[];
- for (const id of list) sources.push(await loadDatasetForWorkerReadOnly(id));
+function sourceDatasetSummary(x){
+ return {
+  id:x.id,
+  workspace:manifestWorkspace(x.manifest),
+  collection:manifestCollection(x.manifest),
+  tableName:manifestTableName(x.manifest),
+  name:x.manifest.name,
+  rows:x.manifest.totalRows,
+  chunks:x.manifest.chunks,
+  createdAt:x.manifest.createdAt
+ };
+}
+function mergeSourceCleanReports(sources, extra={}){
+ return mergeCleanReports(
+  ($A(sources) ? sources : []).map((x)=>({
+   cleanReport:{
+    ...x.manifest?.cleanReport,
+    sourceRows:x.manifest?.cleanReport?.sourceRows || x.manifest?.sourceRows || 0
+   }
+  })),
+  extra
+ );
+}
+function buildVirtualDatasetSurface(sources, name, options={}){
+ if (!$A(sources) || sources.length < 2) {
+  throw new Error(options.errorMessage || "Virtual Dataset requires at least two saved tables");
+ }
  const base=sources[0].manifest;
  const baseSig=schemaFullSignatureFromColumns(base.columns);
  for (const item of sources.slice(1)){
   const sig=schemaFullSignatureFromColumns(item.manifest.columns);
-  if (sig !== baseSig) throw new Error(`Virtual worker pool blocked: ${item.manifest.name || item.id} has a different column name/type layout`);
+  if (sig !== baseSig) {
+   throw new Error(`${options.errorPrefix || "Virtual Dataset blocked"}: ${item.manifest.name || item.id} has a different column name/type layout`);
+  }
  }
  let rowOffset=0;
  const globalChunks=[];
@@ -597,25 +620,39 @@ async function openVirtualDatasetForWorkerReadOnly(ids, name){
   }
   return src;
  });
- const tableName=cleanMetaValue(name || `virtual_${list.length}_tables`, `virtual_${list.length}_tables`);
+ const tableName=cleanMetaValue(name || `virtual_${sources.length}_tables`, `virtual_${sources.length}_tables`);
  const manifest={
   ...base,
-  id:`virtual:${list.join("+")}`,
+  id:`virtual:${sources.map((x)=>x.id).join("+")}`,
   name:tableName,
   storageWorkspace:"Virtual",
   storageCollection:"Cross Workspace",
   tableName,
   storagePath:`Virtual / Cross Workspace / ${tableName}`,
-  originalFileName:sources.map(x=>x.manifest.name || x.id).join(" + "),
-  sourceDatasets:sources.map(x=>({id:x.id,workspace:manifestWorkspace(x.manifest),collection:manifestCollection(x.manifest),tableName:manifestTableName(x.manifest),name:x.manifest.name,rows:x.manifest.totalRows,chunks:x.manifest.chunks,createdAt:x.manifest.createdAt})),
+  originalFileName:sources.map((x)=>x.manifest.name || x.id).join(" + "),
+  sourceDatasets:sources.map(sourceDatasetSummary),
   createdAt:new Date().toISOString(),
   mode:"virtual-dataset",
   totalRows:rowOffset,
   sourceRows:sources.reduce((a,x)=>a+$N(x.manifest.sourceRows || x.manifest.totalRows || 0),0),
   chunks:globalChunks.length,
-  fileSize:sources.reduce((a,x)=>a+$N(x.manifest.fileSize || 0),0)
+  fileSize:sources.reduce((a,x)=>a+$N(x.manifest.fileSize || 0),0),
+  ...(options.cleanReport === false ? {} : {cleanReport:mergeSourceCleanReports(sources, {totalRows:rowOffset})})
  };
- activateWorkerDataset({id:manifest.id,manifest,chunks:globalChunks,virtual:{sources:virtualSources, globalChunks},clearCache:false});
+ return {manifest,chunks:globalChunks,virtual:{sources:virtualSources, globalChunks}};
+}
+async function openVirtualDatasetForWorkerReadOnly(ids, name){
+ clearChunkCache();
+ const list=($A(ids) ? ids : []).filter(Boolean);
+ if (list.length < 2) throw new Error("Virtual worker pool requires at least two saved tables");
+ const sources=[];
+ for (const id of list) sources.push(await loadDatasetForWorkerReadOnly(id));
+ const surface=buildVirtualDatasetSurface(sources, name, {
+  errorMessage:"Virtual worker pool requires at least two saved tables",
+  errorPrefix:"Virtual worker pool blocked",
+  cleanReport:false
+ });
+ activateWorkerDataset({id:surface.manifest.id,manifest:surface.manifest,chunks:surface.chunks,virtual:surface.virtual,clearCache:false});
 }
 function colFileName(index, type){ return `col_${$S(index).padStart(4,"0")}.${type === "number" ? "f64" : "i32"}.bin`; }
 function dictFileName(index){ return `col_${$S(index).padStart(4,"0")}.dict.json`; }
@@ -3849,6 +3886,10 @@ function resetWorkerResultSurfaces(){
   state.pivotTable=null;
   state.pivotTileIndex=null;
   state.timeTable=null;
+  state.graphResultSurfaces=createGraphResultSurfaceStore();
+  if (typeof d3VizSurfaceCacheClear === "function") {
+    try { d3VizSurfaceCacheClear(); } catch {}
+  }
 }
 function clearWorkerDataset({clearSchema=false, clearFile=false}={}){
   if (clearFile) {
@@ -3909,7 +3950,7 @@ function mergeCleanReports(items, extra={}){
 }
 function normalizeCsvCellsForColumns(cells, columns){
   const expected=$N(columns?.length || 0);
-  let row=$A(cells) ? cells : [];
+  let row=$A(cells) ? cells.slice() : [];
   const malformed=row.length !== expected;
   while(row.length < expected) row.push("");
   if (row.length > expected) row=row.slice(0, expected);
@@ -4138,62 +4179,9 @@ async function openVirtualDataset(ids, name){
   for (const id of list){
     sources.push(await loadValidatedDataset(id,{rebuildStats:true}));
   }
-  const base=sources[0].manifest;
-  const baseSig=schemaFullSignatureFromColumns(base.columns);
-  for (const item of sources.slice(1)){
-    const sig=schemaFullSignatureFromColumns(item.manifest.columns);
-    if (sig !== baseSig) throw new Error(`Virtual Dataset blocked: ${item.manifest.name || item.id} has a different column name/type layout`);
-  }
-  let rowOffset=0;
-  const globalChunks=[];
-  const virtualSources=sources.map((item, sourceIndex)=>{
-    const src={
-      id:item.id,
-      dir:item.dir,
-      manifest:item.manifest,
-      chunks:item.chunks,
-      rowOffset,
-      rows:$N(item.manifest.totalRows || 0)
-    };
-    for (let c=0; c<item.chunks.length; c++){
-      const rowCount=$N(item.chunks[c]?.rowCount || 0);
-      globalChunks.push({sourceIndex, sourceChunkIndex:c, rowStart:rowOffset, rowEnd:rowOffset + rowCount, rowCount, stats:item.chunks[c]?.stats, columnStats:item.chunks[c]?.columnStats, indexVersion:item.chunks[c]?.indexVersion});
-      rowOffset += rowCount;
-    }
-    return src;
-  });
-  const tableName=cleanMetaValue(name || `virtual_${list.length}_tables`, `virtual_${list.length}_tables`);
-  const manifest={
-    ...base,
-    id:`virtual:${list.join("+")}`,
-    name:tableName,
-    storageWorkspace:"Virtual",
-    storageCollection:"Cross Workspace",
-    tableName,
-    storagePath:`Virtual / Cross Workspace / ${tableName}`,
-    originalFileName:sources.map(x=>x.manifest.name || x.id).join(" + "),
-    sourceDatasets:sources.map(x=>({
-      id:x.id,
-      workspace:manifestWorkspace(x.manifest),
-      collection:manifestCollection(x.manifest),
-      tableName:manifestTableName(x.manifest),
-      name:x.manifest.name,
-      rows:x.manifest.totalRows,
-      chunks:x.manifest.chunks,
-      createdAt:x.manifest.createdAt
-    })),
-    createdAt:new Date().toISOString(),
-    mode:"virtual-dataset",
-    totalRows:rowOffset,
-    sourceRows:sources.reduce((a,x)=>a+$N(x.manifest.sourceRows || x.manifest.totalRows || 0),0),
-    chunks:globalChunks.length,
-    fileSize:sources.reduce((a,x)=>a+$N(x.manifest.fileSize || 0),0),
-    cleanReport:mergeCleanReports(sources.map((x)=>({
-      cleanReport:{...x.manifest.cleanReport, sourceRows:x.manifest.cleanReport?.sourceRows || x.manifest.sourceRows || 0}
-    })), {totalRows:rowOffset})
-  };
-  activateWorkerDataset({id:manifest.id,manifest,chunks:globalChunks,virtual:{sources:virtualSources, globalChunks},clearCache:false});
-  return {manifest,chunks:globalChunks};
+  const surface=buildVirtualDatasetSurface(sources, name);
+  activateWorkerDataset({id:surface.manifest.id,manifest:surface.manifest,chunks:surface.chunks,virtual:surface.virtual,clearCache:false});
+  return {manifest:surface.manifest,chunks:surface.chunks};
 }
 async function openMemoryDataset(ids, name, options={}){
   clearChunkCache();
@@ -4273,9 +4261,7 @@ async function openMemoryDataset(ids, name, options={}){
     tableName,
     storagePath:`In-memory / Session / ${tableName}`,
     originalFileName:opened.map(x=>x.manifest.name || x.id).join(" + "),
-    sourceDatasets:opened.map(x=>({
-      id:x.id,workspace:manifestWorkspace(x.manifest),collection:manifestCollection(x.manifest),tableName:manifestTableName(x.manifest),name:x.manifest.name,rows:x.manifest.totalRows,chunks:x.manifest.chunks,createdAt:x.manifest.createdAt
-    })),
+    sourceDatasets:opened.map(sourceDatasetSummary),
     createdAt:new Date().toISOString(),
     mode:"memory-dataset",
     totalRows:rowOffset,
@@ -4283,9 +4269,7 @@ async function openMemoryDataset(ids, name, options={}){
     chunks:memoryChunks.length,
     fileSize:opened.reduce((a,x)=>a+$N(x.manifest.fileSize || 0),0),
     memoryReport:{estimatedBytes,estimatedMB:$round(estimatedBytes/1024/1024),maxMemoryMB:$N(options.maxMemoryMB || 512),maxRows,loadedTables:opened.length,loadMs:now()-t0},
-    cleanReport:mergeCleanReports(opened.map((x)=>({
-      cleanReport:{...x.manifest.cleanReport, sourceRows:x.manifest.cleanReport?.sourceRows || x.manifest.sourceRows || 0}
-    })), {totalRows:rowOffset})
+    cleanReport:mergeSourceCleanReports(opened, {totalRows:rowOffset})
   };
   const chunkMetas=memoryChunks.map((ch,i)=>{
     const source=opened[ch.sourceIndex];
@@ -4355,30 +4339,30 @@ async function mergeSavedDatasets(ids, datasetName, storageMeta={}){
     const sourceRows=opened.reduce((a,x)=>a+$N(x.manifest.sourceRows||0),0);
     const cleanReport=mergeCleanReports(opened.map((x)=>x.manifest), {sourceRows,totalRows});
     const storagePathMeta=buildStoragePathMeta({...storageMeta,datasetName}, `merged_${list.length}_saved`, {workspace:manifestWorkspace(base),collection:manifestCollection(base)});
-    const manifest={
+    const manifest=buildBaseColumnarManifest({
       id,
       name:datasetName || storagePathMeta.tableName,
-      ...storagePathMeta,
-      originalFileName:opened.map(x=>x.manifest.name || x.id).join(" + "),
-      sourceDatasets:opened.map(x=>({id:x.id,name:x.manifest.name,rows:x.manifest.totalRows,chunks:x.manifest.chunks,createdAt:x.manifest.createdAt})),
-      createdAt:new Date().toISOString(),
+      storageMeta:storagePathMeta,
       mode:"columnar-clean-merged-opfs",
-      formatVersion:5, features:integrityFeatureFlags({}),
-      encoding:base.encoding,
-      delimiter:base.delimiter,
-      fileSize:opened.reduce((a,x)=>a+$N(x.manifest.fileSize||0),0),
-      chunkSize:base.chunkSize,
-      totalRows,
-      sourceRows,
-      chunks:chunkMetas.length,
-      columns,
-      rules:base.rules,
-      cleanReport
-    };
-    await writeJson(targetDir,"manifest.json",manifest);
-    await writeJson(targetDir,"chunks.json",chunkMetas);
-    activateWorkerDataset({id,manifest,chunks:chunkMetas,dir:targetDir,clearCache:false});
-    return {manifest,chunks:chunkMetas};
+      formatVersion:6,
+      extra:{
+        originalFileName:opened.map(x=>x.manifest.name || x.id).join(" + "),
+        sourceDatasets:opened.map(sourceDatasetSummary),
+        encoding:base.encoding,
+        delimiter:base.delimiter,
+        fileSize:opened.reduce((a,x)=>a+$N(x.manifest.fileSize||0),0),
+        chunkSize:base.chunkSize,
+        totalRows,
+        sourceRows,
+        chunks:chunkMetas.length,
+        columns,
+        rules:base.rules,
+        cleanReport
+      }
+    });
+    const committedManifest=await commitDatasetManifest(targetDir,manifest,chunkMetas,{writeMetrics:{storageLayout:"chunk-pack-v4", mergedSavedDatasets:list.length}});
+    activateWorkerDataset({id,manifest:committedManifest,chunks:chunkMetas,dir:targetDir,clearCache:false});
+    return {manifest:committedManifest,chunks:chunkMetas};
   }catch(err){
     await cleanupDatasetDir(root,id);
     throw err;
@@ -6710,18 +6694,22 @@ function graphApplyDerivedRows(header, rows, derivedColumns=[], outputColumnName
  return {header: useProjection ? outHeader : fullHeader, rows:outRows};
 }
 const GRAPH_RESULT_SURFACE_VERSION = 1;
+function createGraphResultSurfaceStore(){
+ return {
+  activeId:null,
+  activeDataId:null,
+  activeJoinId:null,
+  sequence:0,
+  map:Object.create(null),
+  maxSurfaces:8
+ };
+}
 function ensureGraphResultSurfaceStore(){
  if (!state.graphResultSurfaces || typeof state.graphResultSurfaces !== "object"){
-  state.graphResultSurfaces = {
-   activeId:null,
-   activeDataId:null,
-   activeJoinId:null,
-   sequence:0,
-   map:Object.create(null),
-   maxSurfaces:8
-  };
+  state.graphResultSurfaces = createGraphResultSurfaceStore();
  }
  if (!state.graphResultSurfaces.map) state.graphResultSurfaces.map = Object.create(null);
+ if (!Number.isFinite($N(state.graphResultSurfaces.maxSurfaces))) state.graphResultSurfaces.maxSurfaces = 8;
  return state.graphResultSurfaces;
 }
 function graphResultSurfaceNextId(mode){
