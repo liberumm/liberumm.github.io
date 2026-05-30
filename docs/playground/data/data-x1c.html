@@ -8605,7 +8605,7 @@ function d3VizValidColumnList(indices, adapter){
   .map(d3VizColumnIndex)
   .filter((idx) => idx >= 0 && adapter.hasColumn(idx)))];
 }
-async function d3VizBuildSurfaceFromAdapter(msg, adapter){
+async function d3VizBuildSurfaceFromAdapterClassic(msg, adapter){
  const startedAt = now();
  const chartType = d3VizNormalizeChartType(msg.chartType);
  const xIdx = d3VizColumnIndex(msg.xColumnIndex);
@@ -8874,6 +8874,43 @@ async function d3VizBuildSurfaceFromAdapter(msg, adapter){
   return { surface:{ ...metadata, kind:chartType, nodes, links, reducedRows:links.length, scanned:exec.scanned, chunks:exec.chunks }, ms:now() - startedAt };
  }
  throw new Error(`Unsupported D3 surface: ${chartType}`);
+}
+function buildD3SurfaceByType(chartType){
+ return (msg, adapter)=>d3VizBuildSurfaceFromAdapterClassic({...msg, chartType}, adapter);
+}
+const buildD3BarSurface = buildD3SurfaceByType("bar");
+const buildD3HistogramSurface = buildD3SurfaceByType("histogram");
+const buildD3LineSurface = buildD3SurfaceByType("line");
+const buildD3AreaSurface = buildD3SurfaceByType("area");
+const buildD3ScatterSurface = buildD3SurfaceByType("scatter");
+const buildD3BubbleSurface = buildD3SurfaceByType("bubble");
+const buildD3HeatmapSurface = buildD3SurfaceByType("heatmap");
+const buildD3StackedBarSurface = buildD3SurfaceByType("stackedbar");
+const buildD3BoxPlotSurface = buildD3SurfaceByType("boxplot");
+const buildD3TreemapSurface = buildD3SurfaceByType("treemap");
+const buildD3CalendarSurface = buildD3SurfaceByType("calendar");
+const buildD3SankeySurface = buildD3SurfaceByType("sankey");
+const buildD3NetworkSurface = buildD3SurfaceByType("network");
+const D3_SURFACE_BUILDERS = Object.freeze({
+ bar:buildD3BarSurface,
+ histogram:buildD3HistogramSurface,
+ line:buildD3LineSurface,
+ area:buildD3AreaSurface,
+ scatter:buildD3ScatterSurface,
+ bubble:buildD3BubbleSurface,
+ heatmap:buildD3HeatmapSurface,
+ stackedbar:buildD3StackedBarSurface,
+ boxplot:buildD3BoxPlotSurface,
+ treemap:buildD3TreemapSurface,
+ calendar:buildD3CalendarSurface,
+ sankey:buildD3SankeySurface,
+ network:buildD3NetworkSurface
+});
+async function d3VizBuildSurfaceFromAdapter(msg, adapter){
+ const chartType=d3VizNormalizeChartType(msg.chartType);
+ const builder=D3_SURFACE_BUILDERS[chartType];
+ if (!builder) throw new Error(`Unsupported D3 surface: ${chartType}`);
+ return await builder({...msg, chartType}, adapter);
 }
 const d3VizSurfaceFastCache = new Map();
 const D3_VIZ_SURFACE_FAST_CACHE_MAX = 24;
@@ -9281,77 +9318,111 @@ async function buildD3VisualizationSurface(msg){
   postProgress(100, `D3 Surface cache hit: ${surface.kind || "surface"} / ${fmt(surface.reducedRows || 0)} marks`);
   return { ...cached, surface, ms:0, cacheHit:true };
  }
- const result = await d3VizBuildSurfaceFromAdapter(msg, adapter);
+const result = await d3VizBuildSurfaceFromAdapter(msg, adapter);
  result.surface = { ...result.surface, cacheHit:false };
  return d3VizSurfaceCachePut(key, result);
 }
+function workerCommandDone(doneType, task, options={}){
+ return async (msg={})=>{
+  if (options.cancelable !== false) state.cancelled=false;
+  if (options.progressStartText) {
+   post("PROGRESS", {value:$N(options.progressStartValue ?? 0), text:typeof options.progressStartText === "function" ? options.progressStartText(msg) : options.progressStartText});
+  }
+  const result=await task(msg);
+  const payload=options.project ? options.project(result,msg) : result;
+  if (doneType) post(doneType, payload);
+  if (options.afterPost) await options.afterPost(result,msg);
+  if (options.progressDoneText) {
+   postProgress(100, typeof options.progressDoneText === "function" ? options.progressDoneText(result,msg) : options.progressDoneText);
+  }
+  return result;
+ };
+}
+function workerCommandStatus(doneType, task, options={}){
+ return async (msg={})=>{
+  if (options.cancelable !== false) state.cancelled=false;
+  post(doneType, await task(msg));
+ };
+}
+function workerCommandSyncStatus(doneType, task, options={}){
+ return async (msg={})=>{
+  if (options.cancelable !== false) state.cancelled=false;
+  post(doneType, task(msg));
+ };
+}
+function workerCommandNoPost(task, options={}){
+ return async (msg={})=>{
+  if (options.cancelable !== false) state.cancelled=false;
+  return await task(msg);
+ };
+}
 const directWorkerCommandHandlers = Object.freeze({
- GENERATE_SYNTHETIC_PREVIEW: async (msg)=>handleSyntheticPreviewCommand(msg),
- GENERATE_SYNTHETIC_DATASET: async (msg)=>handleSyntheticDatasetCommand(msg),
+ GENERATE_SYNTHETIC_PREVIEW: workerCommandNoPost(handleSyntheticPreviewCommand),
+ GENERATE_SYNTHETIC_DATASET: workerCommandNoPost(handleSyntheticDatasetCommand),
  CANCEL_SYNTHETIC_GENERATION: async ()=>{ state.cancelled=true; post("SYNTHETIC_CANCELLED", {message:"Synthetic generation cancellation requested"}); },
- BUILD_D3_VIZ_SURFACE: async (msg)=>{ state.cancelled=false; const result=await buildD3VisualizationSurface(msg); post("D3_VIZ_SURFACE_DONE", result); postProgress(100, `D3 Surface ready: ${result.surface?.kind || "surface"} / ${fmt(result.surface?.reducedRows || 0)} marks / scanned ${fmt(result.surface?.scanned || 0)} rows`); },
- GRAPH_RESULT_SURFACE_STATUS: async (msg)=>{ const surface=getGraphResultSurface(msg); post("GRAPH_RESULT_SURFACE_READY", {surface:graphResultSurfaceSummary(surface), origin:msg.origin || "status"}); },
+ BUILD_D3_VIZ_SURFACE: workerCommandDone("D3_VIZ_SURFACE_DONE", buildD3VisualizationSurface, {progressDoneText:(result)=>`D3 Surface ready: ${result.surface?.kind || "surface"} / ${fmt(result.surface?.reducedRows || 0)} marks / scanned ${fmt(result.surface?.scanned || 0)} rows`}),
+ GRAPH_RESULT_SURFACE_STATUS: workerCommandSyncStatus("GRAPH_RESULT_SURFACE_READY", (msg)=>{ const surface=getGraphResultSurface(msg); return {surface:graphResultSurfaceSummary(surface), origin:msg.origin || "status"}; }, {cancelable:false}),
  EXECUTE_CHUNK_BATCH: async (msg)=>{ state.cancelled=false; await hydrateChunkExecutionContext(msg.context); const result=await executeChunkExecutionPlan(msg.plan,{...(msg.options || {}),progress:false,parallel:false}); post("CHUNK_BATCH_DONE",{requestId:msg.requestId,batchIndex:msg.batchIndex,result}); },
- REMOTE_EXECUTION_CONFIG: async (msg)=>post("REMOTE_EXECUTION_STATUS", configureRemoteExecution(msg.config || msg)),
- REMOTE_EXECUTION_STATUS: async ()=>post("REMOTE_EXECUTION_STATUS", remoteExecutionStatus()),
- REMOTE_EXECUTION_PING: async (msg)=>post("REMOTE_EXECUTION_STATUS", await probeRemoteExecution(msg.config || {})),
- EXTERNAL_STORAGE_CONFIG: async (msg)=>post("EXTERNAL_STORAGE_STATUS", configureExternalStorage(msg.config || msg)),
- EXTERNAL_STORAGE_TEST: async (msg)=>post("EXTERNAL_STORAGE_STATUS", await testExternalStorage(msg.config || {})),
- EXTERNAL_STORAGE_LIST: async ()=>{ const datasets=await listExternalDatasets(); post("EXTERNAL_STORAGE_LIST_DONE", {datasets, status:externalStorageStatus()}); },
- EXTERNAL_STORAGE_SYNC: async (msg)=>{ state.cancelled=false; const result=await syncDatasetToExternal(msg.datasetId || state.dataset?.id || state.manifest?.id); const datasets=await listExternalDatasets().catch(()=>[]); post("EXTERNAL_STORAGE_SYNC_DONE", {...result,datasets}); },
- EXTERNAL_STORAGE_OPEN: async (msg)=>{ state.cancelled=false; post("EXTERNAL_STORAGE_OPENED", await openExternalDataset(msg.id || msg.datasetId)); },
- OBSERVATION_ENGINE_CONFIG: async (msg)=>post("OBSERVATION_ENGINE_STATUS", configureObservationEngine(msg.config || msg)),
- OBSERVATION_ENGINE_STATUS: async ()=>post("OBSERVATION_ENGINE_STATUS", observationStatus()),
- HYBRID_SURFACE_CONFIG: async (msg)=>post("HYBRID_SURFACE_STATUS", configureHybridSurfaceBus(msg.config || msg)),
- HYBRID_SURFACE_STATUS: async ()=>post("HYBRID_SURFACE_STATUS", hybridSurfaceStatus()),
- HYBRID_SURFACE_CLEAR: async ()=>post("HYBRID_SURFACE_STATUS", surfaceClear()),
- ROW_SURFACE_STATUS: async ()=>post("ROW_SURFACE_STATUS", hybridSurfaceStatus({rowSurfaceOnly:true})),
+ REMOTE_EXECUTION_CONFIG: workerCommandSyncStatus("REMOTE_EXECUTION_STATUS", (msg)=>configureRemoteExecution(msg.config || msg), {cancelable:false}),
+ REMOTE_EXECUTION_STATUS: workerCommandSyncStatus("REMOTE_EXECUTION_STATUS", ()=>remoteExecutionStatus(), {cancelable:false}),
+ REMOTE_EXECUTION_PING: workerCommandStatus("REMOTE_EXECUTION_STATUS", (msg)=>probeRemoteExecution(msg.config || {}), {cancelable:false}),
+ EXTERNAL_STORAGE_CONFIG: workerCommandSyncStatus("EXTERNAL_STORAGE_STATUS", (msg)=>configureExternalStorage(msg.config || msg), {cancelable:false}),
+ EXTERNAL_STORAGE_TEST: workerCommandStatus("EXTERNAL_STORAGE_STATUS", (msg)=>testExternalStorage(msg.config || {}), {cancelable:false}),
+ EXTERNAL_STORAGE_LIST: workerCommandDone("EXTERNAL_STORAGE_LIST_DONE", async ()=>{ const datasets=await listExternalDatasets(); return {datasets, status:externalStorageStatus()}; }, {cancelable:false}),
+ EXTERNAL_STORAGE_SYNC: workerCommandDone("EXTERNAL_STORAGE_SYNC_DONE", async (msg)=>{ const result=await syncDatasetToExternal(msg.datasetId || state.dataset?.id || state.manifest?.id); const datasets=await listExternalDatasets().catch(()=>[]); return {...result,datasets}; }),
+ EXTERNAL_STORAGE_OPEN: workerCommandDone("EXTERNAL_STORAGE_OPENED", (msg)=>openExternalDataset(msg.id || msg.datasetId)),
+ OBSERVATION_ENGINE_CONFIG: workerCommandSyncStatus("OBSERVATION_ENGINE_STATUS", (msg)=>configureObservationEngine(msg.config || msg), {cancelable:false}),
+ OBSERVATION_ENGINE_STATUS: workerCommandSyncStatus("OBSERVATION_ENGINE_STATUS", ()=>observationStatus(), {cancelable:false}),
+ HYBRID_SURFACE_CONFIG: workerCommandSyncStatus("HYBRID_SURFACE_STATUS", (msg)=>configureHybridSurfaceBus(msg.config || msg), {cancelable:false}),
+ HYBRID_SURFACE_STATUS: workerCommandSyncStatus("HYBRID_SURFACE_STATUS", ()=>hybridSurfaceStatus(), {cancelable:false}),
+ HYBRID_SURFACE_CLEAR: workerCommandSyncStatus("HYBRID_SURFACE_STATUS", ()=>surfaceClear(), {cancelable:false}),
+ ROW_SURFACE_STATUS: workerCommandSyncStatus("ROW_SURFACE_STATUS", ()=>hybridSurfaceStatus({rowSurfaceOnly:true}), {cancelable:false}),
  ROW_SURFACE_CLEAR: async ()=>{ hybridSurfaceRuntime.rowSlabs.clear(); hybridSurfaceRuntime.rowSlabBytes=0; post("ROW_SURFACE_STATUS", hybridSurfaceStatus({rowSurfaceCleared:true})); },
- ROW_SURFACE_PREFETCH: async (msg)=>{ const selected=normalizeCols(msg.columns || []); const start=$max(0,$N(msg.startRow ?? (($N(msg.page || 1)-1) * $N(msg.pageSize || 500)))); const result=await prefetchRowPageSurface(start,$N(msg.pageSize || 500),selected,{manual:true}); post("ROW_SURFACE_PREFETCH_DONE",{...result,status:hybridSurfaceStatus()}); },
- EXECUTION_PLANE_CONFIG: async (msg)=>post("EXECUTION_PLANE_STATUS", configureExecutionPlane(msg.config || msg)),
- EXECUTION_PLANE_STATUS: async ()=>post("EXECUTION_PLANE_STATUS", executionPlaneStatus()),
- ADAPTIVE_KERNEL_CONFIG: async (msg)=>post("ADAPTIVE_KERNEL_STATUS", configureAdaptiveKernel(msg.config || msg)),
- ADAPTIVE_KERNEL_STATUS: async ()=>post("ADAPTIVE_KERNEL_STATUS", adaptiveStatus({hyperTensorPlan:state.hyperTensor?.lastPlan ? operatorGraphSummary(state.hyperTensor.lastPlan) : null})),
- ADAPTIVE_CACHE_CLEAR: async ()=>post("ADAPTIVE_KERNEL_STATUS", clearAdaptiveCaches()),
- HYPERTENSOR_PLAN_PREVIEW: async (msg)=>{ const previewPlan=buildQueryPlan(msg.plan || {name:"preview",predicates:[],projection:normalizeProjection(msg.projection || []),limit:msg.limit || 100}); const graph=buildOperatorGraph(previewPlan); const oplan=buildObservationPlan(previewPlan); const cost=estimatePlanCost(previewPlan, oplan); const strategy=chooseAdaptiveStrategy(previewPlan, oplan, cost, msg.options || {}); post("HYPERTENSOR_PLAN_PREVIEW_DONE", {operatorGraph:operatorGraphSummary(graph), observationPlan:observationPlanSummary(oplan), costModel:cost, adaptiveStrategy:strategy, executionPlane:chooseExecutionPlane(previewPlan,msg.options || {},strategy,cost), hybridSurface:hybridSurfaceStatus(), surfaceReadPlan:buildSurfaceReadPlan(oplan,strategy)}); },
- ADAPTIVE_PERF_BENCH: async (msg)=>{ state.cancelled=false; post("PROGRESS", {value:0, text:"Running Adaptive HyperTensor PERF_BENCH..."}); const result=await runAdaptivePerfBench(msg); post("ADAPTIVE_PERF_BENCH_DONE", result); post("PROGRESS", {value:100, text:"Adaptive PERF_BENCH complete"}); },
- PERF_BENCH: async (msg)=>{ state.cancelled=false; post("PROGRESS", {value:0, text:"Running Observation PERF_BENCH..."}); const result=await runPerfBench(msg); post("PERF_BENCH_DONE", result); post("PROGRESS", {value:100, text:"PERF_BENCH complete"}); },
+ ROW_SURFACE_PREFETCH: workerCommandDone("ROW_SURFACE_PREFETCH_DONE", async (msg)=>{ const selected=normalizeCols(msg.columns || []); const start=$max(0,$N(msg.startRow ?? (($N(msg.page || 1)-1) * $N(msg.pageSize || 500)))); const result=await prefetchRowPageSurface(start,$N(msg.pageSize || 500),selected,{manual:true}); return {...result,status:hybridSurfaceStatus()}; }, {cancelable:false}),
+ EXECUTION_PLANE_CONFIG: workerCommandSyncStatus("EXECUTION_PLANE_STATUS", (msg)=>configureExecutionPlane(msg.config || msg), {cancelable:false}),
+ EXECUTION_PLANE_STATUS: workerCommandSyncStatus("EXECUTION_PLANE_STATUS", ()=>executionPlaneStatus(), {cancelable:false}),
+ ADAPTIVE_KERNEL_CONFIG: workerCommandSyncStatus("ADAPTIVE_KERNEL_STATUS", (msg)=>configureAdaptiveKernel(msg.config || msg), {cancelable:false}),
+ ADAPTIVE_KERNEL_STATUS: workerCommandSyncStatus("ADAPTIVE_KERNEL_STATUS", ()=>adaptiveStatus({hyperTensorPlan:state.hyperTensor?.lastPlan ? operatorGraphSummary(state.hyperTensor.lastPlan) : null}), {cancelable:false}),
+ ADAPTIVE_CACHE_CLEAR: workerCommandSyncStatus("ADAPTIVE_KERNEL_STATUS", ()=>clearAdaptiveCaches(), {cancelable:false}),
+ HYPERTENSOR_PLAN_PREVIEW: workerCommandSyncStatus("HYPERTENSOR_PLAN_PREVIEW_DONE", (msg)=>{ const previewPlan=buildQueryPlan(msg.plan || {name:"preview",predicates:[],projection:normalizeProjection(msg.projection || []),limit:msg.limit || 100}); const graph=buildOperatorGraph(previewPlan); const oplan=buildObservationPlan(previewPlan); const cost=estimatePlanCost(previewPlan, oplan); const strategy=chooseAdaptiveStrategy(previewPlan, oplan, cost, msg.options || {}); return {operatorGraph:operatorGraphSummary(graph), observationPlan:observationPlanSummary(oplan), costModel:cost, adaptiveStrategy:strategy, executionPlane:chooseExecutionPlane(previewPlan,msg.options || {},strategy,cost), hybridSurface:hybridSurfaceStatus(), surfaceReadPlan:buildSurfaceReadPlan(oplan,strategy)}; }, {cancelable:false}),
+ ADAPTIVE_PERF_BENCH: workerCommandDone("ADAPTIVE_PERF_BENCH_DONE", runAdaptivePerfBench, {progressStartText:"Running Adaptive HyperTensor PERF_BENCH...", progressDoneText:"Adaptive PERF_BENCH complete"}),
+ PERF_BENCH: workerCommandDone("PERF_BENCH_DONE", runPerfBench, {progressStartText:"Running Observation PERF_BENCH...", progressDoneText:"PERF_BENCH complete"}),
  CANCEL: async ()=>{ state.cancelled=true; },
- ANALYZE: async (msg)=>{ state.cancelled=false; postProgress(0,"Analyzing schema..."); const schema=await analyzeSchema({file:msg.file,encoding:msg.encoding,delimiter:msg.delimiter,sampleRows:$N(msg.sampleRows||20000),rules:makeRules(msg)}); post("SCHEMA_DONE",{schema}); postProgress(100,"Analyze complete"); },
- VALIDATE_MERGE: async (msg)=>{ state.cancelled=false; postProgress(0,"Validating CSV merge layout..."); const result=await analyzeFilesForMerge({files:msg.files,encoding:msg.encoding,delimiter:msg.delimiter,sampleRows:$N(msg.sampleRows||20000),rules:makeRules(msg)}); post("MERGE_SCHEMA_DONE",result); postProgress(100,"Merge validation complete"); },
+ ANALYZE: workerCommandDone("SCHEMA_DONE", (msg)=>analyzeSchema({file:msg.file,encoding:msg.encoding,delimiter:msg.delimiter,sampleRows:$N(msg.sampleRows||20000),rules:makeRules(msg)}), {project:(schema)=>({schema}), progressStartText:"Analyzing schema...", progressDoneText:"Analyze complete"}),
+ VALIDATE_MERGE: workerCommandDone("MERGE_SCHEMA_DONE", (msg)=>analyzeFilesForMerge({files:msg.files,encoding:msg.encoding,delimiter:msg.delimiter,sampleRows:$N(msg.sampleRows||20000),rules:makeRules(msg)}), {progressStartText:"Validating CSV merge layout...", progressDoneText:"Merge validation complete"}),
  PREVIEW_CLEAN: async (msg)=>{ state.cancelled=false; const rules=makeRules(msg); const previewLimit=$N(msg.pageSize||200); postProgress(1, `Preparing preview: ${msg.file.name}`); let schema=state.schema; const cacheKey=schemaCacheKey(msg.file, msg.encoding, msg.delimiter, rules); if (msg.forceAnalyze || !schema || state.schemaFileKey !== cacheKey) schema=await analyzeSchema({file:msg.file,encoding:msg.encoding,delimiter:msg.delimiter,sampleRows:$max(200, $min($N(msg.sampleRows||1000), $max(1000, previewLimit))),rules}); postProgress(65, `Reading preview rows: 0/${fmt(previewLimit)}`); const iter=fileLines(msg.file,msg.encoding,0,`Reading preview ${msg.file.name}`,65,25); await iter.next(); const rows=[]; let source=0, changed=0, malformed=0; for await (const line of iter){ if (rows.length >= previewLimit) break; source++; let cells=parseCSVLine(line,msg.delimiter); if (cells.length !== schema.columns.length) malformed++; while(cells.length<schema.columns.length) cells.push(""); if (cells.length>schema.columns.length) cells=cells.slice(0,schema.columns.length); const row=[]; for (const col of schema.columns){ const c=cleanCell(cells[col.index],rules); if(c.changed) changed++; if (col.type==="number"){ const n=numberCandidate(c.value,rules); row.push(c.value==null ? "" : (n.ok ? n.value : "")); } else row.push(c.value ?? ""); } rows.push(row); if (rows.length % 25 === 0) postProgress(90, `Cleaning preview rows... ${fmt(rows.length)}/${fmt(previewLimit)}`); } postProgress(100, `Preview complete: ${fmt(rows.length)} rows`); post("CLEAN_PREVIEW",{header:schema.columns.map(c=>c.name),rows,report:{previewRows:rows.length,sourceRowsRead:source,changedCells:changed,malformedRows:malformed,fileSize:msg.file.size}}); },
- BUILD_COLUMNAR: async (msg)=>{ state.cancelled=false; postProgress(0,"Building columnar cache..."); const result=await buildColumnarCache(msg); post("COLUMNAR_DONE",result); postProgress(100,"Columnar cache complete"); },
- OPFS_LIST: async ()=>post("OPFS_LIST_DONE",{datasets:await listDatasets()}),
- OPFS_ESTIMATE: async ()=>post("OPFS_ESTIMATE_DONE", navigator.storage?.estimate ? await navigator.storage.estimate() : {usage:null,quota:null}),
- OPFS_LOAD: async (msg)=>{ state.cancelled=false; post("OPFS_LOADED",await openDataset(msg.id)); },
- OPFS_OPEN_VIRTUAL: async (msg)=>{ state.cancelled=false; post("PROGRESS",{value:1,text:"Opening Storage-backed Virtual Dataset..."}); const result=await openVirtualDataset(msg.ids, msg.name); post("OPFS_VIRTUAL_LOADED",result); post("PROGRESS",{value:100,text:"Virtual Dataset ready"}); },
- OPFS_OPEN_MEMORY: async (msg)=>{ state.cancelled=false; post("PROGRESS",{value:1,text:"Loading selected Storage Tables into In-memory Dataset..."}); const result=await openMemoryDataset(msg.ids, msg.name, {maxMemoryMB:msg.maxMemoryMB, maxRows:msg.maxRows}); post("OPFS_MEMORY_LOADED",result); post("PROGRESS",{value:100,text:"In-memory Dataset ready"}); },
- OPFS_DELETE: async (msg)=>{ await deleteDataset(msg.id); post("OPFS_DELETED",{datasets:await listDatasets()}); },
- MERGE_OPFS_DATASETS: async (msg)=>{ state.cancelled=false; post("PROGRESS",{value:0,text:"Merging saved OPFS datasets..."}); const result=await mergeSavedDatasets(msg.ids, msg.datasetName, {storageWorkspace:msg.storageWorkspace, storageCollection:msg.storageCollection, tableName:msg.tableName}); post("OPFS_MERGED",result); post("PROGRESS",{value:100,text:"Saved dataset merge complete"}); },
- PURGE_SELECTED: async (msg)=>{ await deleteDataset(msg.id); if (state.manifest && state.manifest.id === msg.id) forgetSession(); post("PURGE_DONE",{scope:"selected",datasets:await listDatasets()}); },
- PURGE_ALL: async ()=>{ const count=await purgeAllDatasets(); post("PURGE_DONE",{scope:"all",count,datasets:await listDatasets()}); },
- FORGET_SESSION: async ()=>{ forgetSession(); post("SESSION_FORGOTTEN",{datasets:await listDatasets()}); },
- READ_PAGE: async (msg)=>{ state.cancelled=false; const t0=now(); const result=await readPage($N(msg.page||1),$N(msg.pageSize||500),msg.columns||[]); post("PAGE_RESULT",{...result,page:$N(msg.page||1),ms:now()-t0,origin:msg.origin || "",requestId:msg.requestId || null,requestedStart:msg.requestedStart ?? null,requestedEnd:msg.requestedEnd ?? null}); },
+ BUILD_COLUMNAR: workerCommandDone("COLUMNAR_DONE", buildColumnarCache, {progressStartText:"Building columnar cache...", progressDoneText:"Columnar cache complete"}),
+ OPFS_LIST: workerCommandDone("OPFS_LIST_DONE", async ()=>({datasets:await listDatasets()}), {cancelable:false}),
+ OPFS_ESTIMATE: workerCommandDone("OPFS_ESTIMATE_DONE", async ()=>navigator.storage?.estimate ? await navigator.storage.estimate() : {usage:null,quota:null}, {cancelable:false}),
+ OPFS_LOAD: workerCommandDone("OPFS_LOADED", (msg)=>openDataset(msg.id)),
+ OPFS_OPEN_VIRTUAL: workerCommandDone("OPFS_VIRTUAL_LOADED", (msg)=>openVirtualDataset(msg.ids, msg.name), {progressStartText:"Opening Storage-backed Virtual Dataset...", progressStartValue:1, progressDoneText:"Virtual Dataset ready"}),
+ OPFS_OPEN_MEMORY: workerCommandDone("OPFS_MEMORY_LOADED", (msg)=>openMemoryDataset(msg.ids, msg.name, {maxMemoryMB:msg.maxMemoryMB, maxRows:msg.maxRows}), {progressStartText:"Loading selected Storage Tables into In-memory Dataset...", progressStartValue:1, progressDoneText:"In-memory Dataset ready"}),
+ OPFS_DELETE: workerCommandDone("OPFS_DELETED", async (msg)=>{ await deleteDataset(msg.id); return {datasets:await listDatasets()}; }, {cancelable:false}),
+ MERGE_OPFS_DATASETS: workerCommandDone("OPFS_MERGED", (msg)=>mergeSavedDatasets(msg.ids, msg.datasetName, {storageWorkspace:msg.storageWorkspace, storageCollection:msg.storageCollection, tableName:msg.tableName}), {progressStartText:"Merging saved OPFS datasets...", progressDoneText:"Saved dataset merge complete"}),
+ PURGE_SELECTED: workerCommandDone("PURGE_DONE", async (msg)=>{ await deleteDataset(msg.id); if (state.manifest && state.manifest.id === msg.id) forgetSession(); return {scope:"selected",datasets:await listDatasets()}; }, {cancelable:false}),
+ PURGE_ALL: workerCommandDone("PURGE_DONE", async ()=>{ const count=await purgeAllDatasets(); return {scope:"all",count,datasets:await listDatasets()}; }, {cancelable:false}),
+ FORGET_SESSION: workerCommandDone("SESSION_FORGOTTEN", async ()=>{ forgetSession(); return {datasets:await listDatasets()}; }, {cancelable:false}),
+ READ_PAGE: workerCommandDone("PAGE_RESULT", async (msg)=>{ const t0=now(); const result=await readPage($N(msg.page||1),$N(msg.pageSize||500),msg.columns||[]); return {...result,page:$N(msg.page||1),ms:now()-t0,origin:msg.origin || "",requestId:msg.requestId || null,requestedStart:msg.requestedStart ?? null,requestedEnd:msg.requestedEnd ?? null}; }),
  RUN_DATA_QUERY: async (msg)=>{ state.cancelled=false; post("PROGRESS",{value:0,text:"Building global filter/sort row index..."}); const result=await runDataQuery(msg); let graphResultSurface=null; if (msg.origin === "graph") { graphResultSurface=registerGraphResultSurface({mode:"data",projection:result.projection || msg.projection || [],reason:"RUN_DATA_QUERY:graph",result,derivedColumns:msg.derivedColumns || [],outputColumnNames:msg.graphOutputColumnNames || null,readColumns:msg.graphReadColumns || []}); post("GRAPH_RESULT_SURFACE_READY", {surface:graphResultSurfaceSummary(graphResultSurface), origin:"graph"}); } post("DATA_QUERY_DONE",{...result,origin:msg.origin || "", graphResultSurface:graphResultSurfaceSummary(graphResultSurface), surfaceId:graphResultSurface?.id || null}); post("PROGRESS",{value:100,text:result.active ? `Global data query complete: ${fmt(result.matches || 0)} rows` : "Global data query cleared"}); },
- READ_DATA_QUERY_PAGE: async (msg)=>{ state.cancelled=false; const t0=now(); const result=await readDataQueryPage($N(msg.page||1),$N(msg.pageSize||500),msg.columns||[]); post("DATA_QUERY_PAGE_RESULT",{...result,page:$N(msg.page||1),ms:now()-t0,origin:msg.origin || "",requestId:msg.requestId || null,requestedStart:msg.requestedStart ?? null,requestedEnd:msg.requestedEnd ?? null}); },
+ READ_DATA_QUERY_PAGE: workerCommandDone("DATA_QUERY_PAGE_RESULT", async (msg)=>{ const t0=now(); const result=await readDataQueryPage($N(msg.page||1),$N(msg.pageSize||500),msg.columns||[]); return {...result,page:$N(msg.page||1),ms:now()-t0,origin:msg.origin || "",requestId:msg.requestId || null,requestedStart:msg.requestedStart ?? null,requestedEnd:msg.requestedEnd ?? null}; }),
  RUN_GRAPH_JOIN_QUERY: async (msg)=>{ state.cancelled=false; post("PROGRESS",{value:0,text:"Running Graph JOIN query..."}); const result=await runGraphJoinQuery({plan:msg.plan,pageSize:$N(msg.pageSize||500)}); const graphResultSurface=registerGraphResultSurface({mode:"join", reason:"RUN_GRAPH_JOIN_QUERY", result}); post("GRAPH_RESULT_SURFACE_READY", {surface:graphResultSurfaceSummary(graphResultSurface), origin:"graph"}); post("GRAPH_JOIN_DONE",{...result, graphResultSurface:graphResultSurfaceSummary(graphResultSurface), surfaceId:graphResultSurface.id}); post("PROGRESS",{value:100,text:"Graph JOIN query complete"}); },
- READ_GRAPH_JOIN_PAGE: async (msg)=>{ state.cancelled=false; const t0=now(); const result=await readGraphJoinPage($N(msg.page||1),$N(msg.pageSize||500),msg.origin || ""); post("GRAPH_JOIN_PAGE_RESULT",{...result,ms:now()-t0,origin:msg.origin || "",requestId:msg.requestId || null,requestedStart:msg.requestedStart ?? null,requestedEnd:msg.requestedEnd ?? null}); },
- READ_GRAPH_RESULT_WINDOW: async (msg)=>{ state.cancelled=false; const t0=now(); const result=await readGraphResultWindow(msg); post("GRAPH_RESULT_PAGE_RESULT",{...result,page:$N(msg.page||1),ms:now()-t0,origin:msg.origin || "graph",requestId:msg.requestId || null,requestedStart:msg.requestedStart ?? null,requestedEnd:msg.requestedEnd ?? null}); },
- RUN_GRAPH_RESULT_SEARCH: async (msg)=>{ state.cancelled=false; post("PROGRESS",{value:0,text:"Searching Graph Query Result..."}); const result=await runGraphResultSearch(msg); post("GRAPH_RESULT_SEARCH_DONE",{...result,target:msg.target || "graph"}); post("PROGRESS",{value:100,text:`Graph Result search complete: ${fmt(result.matches)} matches`}); },
- READ_GRAPH_RESULT_SEARCH_PAGE: async (msg)=>{ const result=readGraphResultSearchPage($N(msg.page||1),$N(msg.pageSize||500)); post("GRAPH_RESULT_SEARCH_PAGE_RESULT",{...result,target:msg.target || "graph"}); },
- BUILD_GRAPH_RESULT_PIVOT: async (msg)=>{ state.cancelled=false; post("PROGRESS",{value:0,text:"Building Pivot from Graph Query Result..."}); const result=await buildGraphResultPivot(msg); post("GRAPH_RESULT_PIVOT_DONE",{...result,target:msg.target || "graph"}); post("PROGRESS",{value:100,text:`Graph Result pivot complete: ${fmt(result.rows?.length || 0)} rows`}); },
- BUILD_GRAPH_RESULT_TIME: async (msg)=>{ state.cancelled=false; post("PROGRESS",{value:0,text:"Building Time view from Graph Query Result..."}); const result=await buildGraphResultTime(msg); post("GRAPH_RESULT_TIME_DONE",{...result,target:msg.target || "graph"}); post("PROGRESS",{value:100,text:`Graph Result time complete: ${fmt(result.rows?.length || 0)} rows`}); },
- EXPORT_GRAPH_QUERY_CSV: async (msg)=>{ state.cancelled=false; post("PROGRESS",{value:0,text:"Exporting Graph Query CSV..."}); const result=await exportGraphQueryCsv(msg); post("GRAPH_QUERY_CSV",result); post("PROGRESS",{value:100,text:`Graph Query CSV export complete: ${fmt(result.rows)} rows`}); },
+ READ_GRAPH_JOIN_PAGE: workerCommandDone("GRAPH_JOIN_PAGE_RESULT", async (msg)=>{ const t0=now(); const result=await readGraphJoinPage($N(msg.page||1),$N(msg.pageSize||500),msg.origin || ""); return {...result,ms:now()-t0,origin:msg.origin || "",requestId:msg.requestId || null,requestedStart:msg.requestedStart ?? null,requestedEnd:msg.requestedEnd ?? null}; }),
+ READ_GRAPH_RESULT_WINDOW: workerCommandDone("GRAPH_RESULT_PAGE_RESULT", async (msg)=>{ const t0=now(); const result=await readGraphResultWindow(msg); return {...result,page:$N(msg.page||1),ms:now()-t0,origin:msg.origin || "graph",requestId:msg.requestId || null,requestedStart:msg.requestedStart ?? null,requestedEnd:msg.requestedEnd ?? null}; }),
+ RUN_GRAPH_RESULT_SEARCH: workerCommandDone("GRAPH_RESULT_SEARCH_DONE", runGraphResultSearch, {progressStartText:"Searching Graph Query Result...", project:(result,msg)=>({...result,target:msg.target || "graph"}), progressDoneText:(result)=>`Graph Result search complete: ${fmt(result.matches)} matches`}),
+ READ_GRAPH_RESULT_SEARCH_PAGE: workerCommandDone("GRAPH_RESULT_SEARCH_PAGE_RESULT", (msg)=>({...readGraphResultSearchPage($N(msg.page||1),$N(msg.pageSize||500)),target:msg.target || "graph"}), {cancelable:false}),
+ BUILD_GRAPH_RESULT_PIVOT: workerCommandDone("GRAPH_RESULT_PIVOT_DONE", buildGraphResultPivot, {progressStartText:"Building Pivot from Graph Query Result...", project:(result,msg)=>({...result,target:msg.target || "graph"}), progressDoneText:(result)=>`Graph Result pivot complete: ${fmt(result.rows?.length || 0)} rows`}),
+ BUILD_GRAPH_RESULT_TIME: workerCommandDone("GRAPH_RESULT_TIME_DONE", buildGraphResultTime, {progressStartText:"Building Time view from Graph Query Result...", project:(result,msg)=>({...result,target:msg.target || "graph"}), progressDoneText:(result)=>`Graph Result time complete: ${fmt(result.rows?.length || 0)} rows`}),
+ EXPORT_GRAPH_QUERY_CSV: workerCommandDone("GRAPH_QUERY_CSV", exportGraphQueryCsv, {progressStartText:"Exporting Graph Query CSV...", progressDoneText:(result)=>`Graph Query CSV export complete: ${fmt(result.rows)} rows`}),
  CLEAR_DATA_QUERY: async ()=>{ state.dataQueryMatches=null; state.dataQueryMeta=null; graphResultSurfaceInvalidate("data"); post("DATA_QUERY_CLEARED",{}); },
- RUN_SEARCH: async (msg)=>{ state.cancelled=false; post("PROGRESS",{value:0,text:"Searching columnar cache..."}); const result=await runSearch(msg); post("SEARCH_DONE",result); post("PROGRESS",{value:100,text:"Search complete"}); },
- READ_SEARCH_PAGE: async (msg)=>{ state.cancelled=false; const page=$N(msg.page||1), pageSize=$N(msg.pageSize||500); const ids=state.searchMatches.slice((page-1)*pageSize,(page-1)*pageSize+pageSize); const t0=now(); const result=await readRowsByGlobal(ids,msg.columns||[]); post("SEARCH_PAGE_RESULT",{...result,page,pageSize,totalMatches:state.searchMatches.length,ms:now()-t0}); },
+ RUN_SEARCH: workerCommandDone("SEARCH_DONE", runSearch, {progressStartText:"Searching columnar cache...", progressDoneText:"Search complete"}),
+ READ_SEARCH_PAGE: workerCommandDone("SEARCH_PAGE_RESULT", async (msg)=>{ const page=$N(msg.page||1), pageSize=$N(msg.pageSize||500); const ids=state.searchMatches.slice((page-1)*pageSize,(page-1)*pageSize+pageSize); const t0=now(); const result=await readRowsByGlobal(ids,msg.columns||[]); return {...result,page,pageSize,totalMatches:state.searchMatches.length,ms:now()-t0}; }),
  BUILD_PIVOT: async (msg)=>{ state.cancelled=false; post("PROGRESS",{value:0,text:"Building pivot tile index..."}); const result=await buildPivot(msg); post("PIVOT_TILE_READY",result); post("PIVOT_VIEWPORT_DONE",readPivotViewport({rowStart:0,colStart:0,viewportRows:90,viewportCols:40,overscan:1})); post("PROGRESS",{value:100,text:"Pivot tile index complete"}); },
- READ_PIVOT_VIEWPORT: async (msg)=>post("PIVOT_VIEWPORT_DONE",readPivotViewport(msg)),
- BUILD_TIME: async (msg)=>{ state.cancelled=false; post("PROGRESS",{value:0,text:"Building time-oriented view..."}); const result=await buildTimeSeries(msg); post("TIME_DONE",result); post("PROGRESS",{value:100,text:"Time view complete"}); },
- EXPORT_TIME: async ()=>{ if (!state.timeTable) throw new Error("Time view table is empty"); post("TIME_CSV",{csv:tableToCsv(state.timeTable)}); },
- EXPORT_GRAPH_RESULT_SEARCH: async ()=>{ if (!state.graphResultSearch) throw new Error("Graph Result Search table is empty"); post("GRAPH_RESULT_SEARCH_CSV",{csv:tableToCsv(state.graphResultSearch), rows:state.graphResultSearch.rows?.length || 0, source:"graph"}); },
- EXPORT_GRAPH_RESULT_TIME: async ()=>{ if (!state.graphResultTime) throw new Error("Graph Result Time table is empty"); post("TIME_CSV",{csv:tableToCsv(state.graphResultTime), source:"graph"}); },
- EXPORT_PIVOT: async (msg)=>{ const csv=exportPivotCsvFromTileIndex(msg.filters || {}); post("PIVOT_CSV",{csv, filters:normalizePivotResultFilters(msg.filters || {})}); },
+ READ_PIVOT_VIEWPORT: workerCommandSyncStatus("PIVOT_VIEWPORT_DONE", readPivotViewport, {cancelable:false}),
+ BUILD_TIME: workerCommandDone("TIME_DONE", buildTimeSeries, {progressStartText:"Building time-oriented view...", progressDoneText:"Time view complete"}),
+ EXPORT_TIME: workerCommandSyncStatus("TIME_CSV", ()=>{ if (!state.timeTable) throw new Error("Time view table is empty"); return {csv:tableToCsv(state.timeTable)}; }, {cancelable:false}),
+ EXPORT_GRAPH_RESULT_SEARCH: workerCommandSyncStatus("GRAPH_RESULT_SEARCH_CSV", ()=>{ if (!state.graphResultSearch) throw new Error("Graph Result Search table is empty"); return {csv:tableToCsv(state.graphResultSearch), rows:state.graphResultSearch.rows?.length || 0, source:"graph"}; }, {cancelable:false}),
+ EXPORT_GRAPH_RESULT_TIME: workerCommandSyncStatus("TIME_CSV", ()=>{ if (!state.graphResultTime) throw new Error("Graph Result Time table is empty"); return {csv:tableToCsv(state.graphResultTime), source:"graph"}; }, {cancelable:false}),
+ EXPORT_PIVOT: workerCommandSyncStatus("PIVOT_CSV", (msg)=>{ const csv=exportPivotCsvFromTileIndex(msg.filters || {}); return {csv, filters:normalizePivotResultFilters(msg.filters || {})}; }, {cancelable:false}),
  EXPORT_GRAPH_RESULT_PIVOT: async (msg)=>{ if (state.pivotTileIndex?.source === "graph" && hasPivotResultFilters(msg.filters || {})) { const csv=exportPivotCsvFromTileIndex(msg.filters || {}); post("PIVOT_CSV",{csv, source:"graph", filters:normalizePivotResultFilters(msg.filters || {})}); return; } if (!state.graphResultPivot) throw new Error("Graph Result Pivot table is empty"); post("PIVOT_CSV",{csv:tableToCsv(state.graphResultPivot), source:"graph"}); }
 });
 function tableToCsv(table){ const lines=[(table.header || []).map(csvEscape).join(",")]; for (const r of table.rows || []) lines.push((r || []).map(csvEscape).join(",")); return lines.join("\n"); }
@@ -9527,9 +9598,9 @@ function v8MakeD3Plan({ chartType, xColumn, yColumn=-1, groupColumn=-1, aggregat
   chunkRows:10000,
  };
 }
-async function v8SampleProfiles(input){
+async function buildColumnProfileSurface(input, options={}){
  if (!state.manifest || !$A(state.manifest.columns) || !state.manifest.columns.length) {
-  throw new Error("Storage Datasetを開いてからInsightsを実行してください。");
+  throw new Error(options.requiresDatasetMessage || "Storage Datasetを開いてからInsightsを実行してください。");
  }
  const maxColumns = $max(1, $min(160, $N(input?.maxColumns || 80)));
  const sampleRowsTarget = $max(1000, $min(500000, $N(input?.sampleRows || 120000)));
@@ -9641,9 +9712,11 @@ async function v8SampleProfiles(input){
  const semanticResult = applySemanticOverridesToProfiles(finalizedRaw, input?.semanticOverrides);
  const finalized = semanticResult.columns;
  return {
+  kind:options.kind || "column-profile-surface",
   columns:finalized,
   metrics:{
    version:AUTONOMOUS_ANALYSIS_KERNEL_VERSION,
+   profileSurfaceVersion:1,
    sampledRows,
    scannedChunks,
    totalRows,
@@ -9654,6 +9727,9 @@ async function v8SampleProfiles(input){
    sampleRatio:totalRows ? sampledRows / totalRows : 0,
   }
  };
+}
+async function v8SampleProfiles(input){
+ return await buildColumnProfileSurface(input, {kind:"v8-insight-profile-surface"});
 }
 function v8BuildInsights(sample, input){
  const cols = sample.columns || [];
@@ -9968,7 +10044,7 @@ function v8RunMiniBatchKMeans(rows, featureNames){
 }
 async function runAutonomousAnalysisKernelV8(input){
  const started = now();
- const sample = await v8SampleProfiles(input);
+ const sample = await buildColumnProfileSurface(input, {kind:"v8-insight-profile-surface"});
  post("AUTONOMOUS_INSIGHTS_PROGRESS", {
   sampledRows:sample.metrics.sampledRows,
   totalRows:sample.metrics.totalRows,
@@ -10749,13 +10825,13 @@ async function runKnowledgeGraphKernelV11(input){
  }
  const started = now();
  postKernelProgress("KNOWLEDGE_GRAPH_PROGRESS", { stage:"profile", progress:8 });
- const sample = await v8SampleProfiles({
+ const sample = await buildColumnProfileSurface({
   sampleRows:$N(input?.sampleRows || 180000),
   maxColumns:$N(input?.maxColumns || 160),
   topN:$N(input?.topN || 16),
   mode:"knowledge",
   semanticOverrides:normalizeSemanticOverridesForWorker(input?.semanticOverrides),
- });
+ }, {kind:"v11-knowledge-profile-surface", requiresDatasetMessage:"Storage Datasetを開いてからKnowledge Graphを実行してください。"});
  postKernelProgress("KNOWLEDGE_GRAPH_PROGRESS", { stage:"graph-build", progress:82, sampledRows:sample.metrics.sampledRows });
  const graph = v11BuildKnowledgeGraph(sample, input);
  const result = {
@@ -11061,13 +11137,13 @@ async function runSimulationWhatIfKernelV12(input){
  const started = now();
  const goal = $S(input?.goal || "").trim() || "重要なWhat-ifシナリオを作る";
  postKernelProgress("SIMULATION_WHATIF_PROGRESS", { stage:"profile", progress:8, goal });
- const sample = await v8SampleProfiles({
+ const sample = await buildColumnProfileSurface({
   sampleRows:$N(input?.sampleRows || 220000),
   maxColumns:$N(input?.maxColumns || 160),
   topN:$N(input?.topN || 12),
   mode:"simulation",
   semanticOverrides:normalizeSemanticOverridesForWorker(input?.semanticOverrides),
- });
+ }, {kind:"v12-simulation-profile-surface", requiresDatasetMessage:"Storage Datasetを開いてからSimulationを実行してください。"});
  postKernelProgress("SIMULATION_WHATIF_PROGRESS", { stage:"scenario-build", progress:76, goal, sampledRows:sample.metrics.sampledRows });
  const scenarios = v12BuildSimulationScenarios(sample, input);
  const suggestedCharts = scenarios
