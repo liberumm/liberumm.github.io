@@ -2434,16 +2434,16 @@ async function executeChunkExecutionPlan(plan, options={}){
  };
 }
 const REMOTE_EXECUTION_ADAPTER_VERSION = 1;
-function validateSafeEndpoint(rawEndpoint, { allowLocalhost = false } = {}) {
+function validateNetworkEndpoint(rawEndpoint, { allowLocalhost = false, messagePrefix = "Endpoint" } = {}) {
  const raw = $S(rawEndpoint || "").trim();
  if (!raw) return { endpoint: "", error: "" };
  let url;
  try {
   url = new URL(raw);
  } catch {
-  return { endpoint: "", error: "Endpoint URL is invalid" };
+  return { endpoint: "", error: `${messagePrefix} URL is invalid` };
  }
- const host = $S(url.hostname || "").toLowerCase();
+ const host = $S(url.hostname || "").toLowerCase().replace(/^\[|\]$/g, "");
  const isLocalhost = host === "localhost" || host === "127.0.0.1" || host === "::1";
  const isPrivateIpv4 =
   /^10\./.test(host) ||
@@ -2454,22 +2454,25 @@ function validateSafeEndpoint(rawEndpoint, { allowLocalhost = false } = {}) {
  const isPrivateIpv6 = host === "::" || host === "::1" || /^f[cd][0-9a-f]{2}:/i.test(host) || /^fe80:/i.test(host);
  const isMetadata = host === "169.254.169.254";
  if (url.username || url.password) {
-  return { endpoint: "", error: "Endpoint credentials in URL are not allowed" };
+  return { endpoint: "", error: `${messagePrefix} credentials in URL are not allowed` };
  }
  if (url.protocol !== "https:") {
   const devHttpAllowed = allowLocalhost && url.protocol === "http:" && isLocalhost;
   if (!devHttpAllowed) {
-   return { endpoint: "", error: "Endpoint must use HTTPS" };
+   return { endpoint: "", error: `${messagePrefix} must use HTTPS` };
   }
  }
  if (!allowLocalhost && (isLocalhost || isPrivateIpv4 || isPrivateIpv6 || isMetadata)) {
   return { endpoint: "", error: "Private or local network endpoints are not allowed" };
  }
  if (["file:", "javascript:", "data:", "blob:"].includes(url.protocol)) {
-  return { endpoint: "", error: "Endpoint protocol is not allowed" };
+  return { endpoint: "", error: `${messagePrefix} protocol is not allowed` };
  }
  url.hash = "";
  return { endpoint: url.toString().replace(/\/+$/g, ""), error: "" };
+}
+function validateSafeEndpoint(rawEndpoint, { allowLocalhost = false } = {}) {
+ return validateNetworkEndpoint(rawEndpoint, { allowLocalhost, messagePrefix:"Endpoint" });
 }
 function normalizeRemoteExecutionConfig(config={}){
  const mode=["off","local-first","remote-first","remote-only"].includes(config.mode) ? config.mode : (config.enabled ? "remote-first" : "off");
@@ -2533,16 +2536,10 @@ function serializableRemoteExecutionRequest(plan, options={}, chunks=[]){
  };
 }
 function validateRemoteEndpoint(url){
- let u;
- try { u = new URL($S(url || "")); }
- catch { throw new Error("Remote endpoint URL is invalid"); }
- const isLocal = ["localhost", "127.0.0.1", "::1"].includes(u.hostname);
- if (u.protocol !== "https:" && !(isLocal && u.protocol === "http:")) {
-  throw new Error("Remote endpoint must be HTTPS, except localhost development");
- }
- if (u.username || u.password) throw new Error("Remote endpoint must not include credentials");
- if (!/^https?:$/.test(u.protocol)) throw new Error("Remote endpoint protocol is not allowed");
- return u.toString();
+ const checked = validateNetworkEndpoint(url, { allowLocalhost:true, messagePrefix:"Remote endpoint" });
+ if (checked.error) throw new Error(checked.error);
+ if (!checked.endpoint) throw new Error("Remote endpoint URL is invalid");
+ return checked.endpoint;
 }
 async function fetchJsonWithTimeout(url, payload, {token="", timeoutMs=120000, maxResponseBytes=5*1024*1024}={}){
  const safeUrl = validateRemoteEndpoint(url);
@@ -3118,6 +3115,9 @@ async function executeChunkExecutionPlanMaybeParallel(plan, options={}){
  }
  return local;
 }
+async function runChunkPlanOperator(plan, options={}){
+ return await executeChunkExecutionPlanMaybeParallel(plan, options);
+}
 function compactStringColumnForMemory(idsArr, dict){
  const used=new Map();
  const newDict=[];
@@ -3148,11 +3148,10 @@ async function analyzeSchema({file, encoding, delimiter, sampleRows, rules}){
  for await (const line of iter){
   if (sampled >= sampleRows) break;
   if (!line && sampled >= sampleRows) break;
-  let cells=parseCSVLine(line, delimiter);
-  if (cells.length !== headers.length) malformed++;
-  if (rules.skipBadRows && cells.length !== headers.length) continue;
-  while(cells.length < headers.length) cells.push("");
-  if (cells.length > headers.length) cells=cells.slice(0, headers.length);
+  const normalized=normalizeCsvRowForColumns(parseCSVLine(line, delimiter), headers, rules);
+  if (normalized.malformed) malformed++;
+  if (normalized.skip) continue;
+  const cells=normalized.cells;
   for (let i=0;i<headers.length;i++){
    const c=cleanCell(cells[i], rules);
    if (c.changed) changed++;
@@ -3592,35 +3591,33 @@ async function syntheticGenerateColumnarDataset(rawPlan){
       seed:plan.seed,
       estimatedBytes:plan.estimatedBytes
     });
-    const tableName = cleanMetaValue(plan.output.datasetName, `synthetic_${plan.preset}`);
-    const manifest = {
+    const storageMeta = buildStoragePathMeta(
+      {storageWorkspace:"Synthetic", storageCollection:plan.preset, tableName:plan.output.datasetName},
+      `synthetic_${plan.preset}`
+    );
+    const tableName = storageMeta.tableName;
+    const manifest = buildBaseColumnarManifest({
       id,
       name:tableName,
-      storageWorkspace:"Synthetic",
-      storageCollection:plan.preset,
-      tableName,
-      storagePath:`Synthetic / ${plan.preset} / ${tableName}`,
-      originalFileName:`${tableName}.csv`,
-      sourceFiles:[{name:`${tableName}.csv`,size:plan.estimatedBytes,sourceRows:plan.rows,totalRows,skippedRows:0,malformedRows:0,synthetic:true}],
-      createdAt:new Date().toISOString(),
+      storageMeta,
       mode:"synthetic-columnar",
-      formatVersion:6,
-      storageLayout:"chunk-pack-v4",
-      writeKernelVersion:WRITE_KERNEL_VERSION,
-      olapKernelVersion:OLAP_KERNEL_VERSION,
-      features:columnarFeatureFlags({syntheticData:true}),
-      encoding:"utf-8",
-      delimiter:",",
-      fileSize:plan.estimatedBytes,
-      chunkSize:plan.chunkSize,
-      totalRows,
-      sourceRows:plan.rows,
-      chunks:chunkIndex,
-      columns,
-      rules,
-      syntheticPlan:plan,
-      cleanReport
-    };
+      features:{syntheticData:true},
+      extra:{
+        originalFileName:`${tableName}.csv`,
+        sourceFiles:[{name:`${tableName}.csv`,size:plan.estimatedBytes,sourceRows:plan.rows,totalRows,skippedRows:0,malformedRows:0,synthetic:true}],
+        encoding:"utf-8",
+        delimiter:",",
+        fileSize:plan.estimatedBytes,
+        chunkSize:plan.chunkSize,
+        totalRows,
+        sourceRows:plan.rows,
+        chunks:chunkIndex,
+        columns,
+        rules,
+        syntheticPlan:plan,
+        cleanReport
+      }
+    });
     const committedManifest=await commitDatasetManifest(dir,manifest,chunkMetas,{writeMetrics:{queue:writeQueue.stats(), storageLayout:"chunk-pack-v4", synthetic:true}});
     activateWorkerDataset({id,manifest:committedManifest,chunks:chunkMetas,dir,clearCache:false});
     return {
@@ -3853,6 +3850,25 @@ function resetWorkerResultSurfaces(){
   state.pivotTileIndex=null;
   state.timeTable=null;
 }
+function clearWorkerDataset({clearSchema=false, clearFile=false}={}){
+  if (clearFile) {
+    state.file=null;
+    state.encoding=null;
+    state.delimiter=null;
+  }
+  state.dataset=null;
+  state.manifest=null;
+  state.dir=null;
+  state.virtual=null;
+  state.memory=null;
+  state.externalDataset=null;
+  if (clearSchema) {
+    state.schema=null;
+    state.schemaFileKey=null;
+  }
+  resetWorkerResultSurfaces();
+  clearChunkCache();
+}
 function activateWorkerDataset({id, manifest, chunks, dir=null, virtual=null, memory=null, externalDataset=null, clearCache=true}){
   if (clearCache) clearChunkCache();
   state.dataset={id:id || manifest?.id,manifest,chunks};
@@ -3863,12 +3879,31 @@ function activateWorkerDataset({id, manifest, chunks, dir=null, virtual=null, me
   state.externalDataset=externalDataset;
   resetWorkerResultSurfaces();
 }
+function normalizeCsvRowForColumns(cells, columns, rules={}){
+  const normalized=normalizeCsvCellsForColumns(cells, columns);
+  const skip=!!rules.skipBadRows && normalized.malformed;
+  return {...normalized, skip};
+}
 function buildChunkCleanReport(chunkMetas, extra={}){
   const stats=($A(chunkMetas) ? chunkMetas : []).flatMap((chunk)=>chunk?.stats || []);
   return {
     changedCells:stats.reduce((sum,stat)=>sum+$N(stat?.changedCells || 0),0),
     nullCells:stats.reduce((sum,stat)=>sum+$N(stat?.nulls ?? stat?.nullCells ?? 0),0),
     invalidNumbers:stats.reduce((sum,stat)=>sum+$N(stat?.invalidNumbers || 0),0),
+    ...extra
+  };
+}
+function mergeCleanReports(items, extra={}){
+  const list=$A(items) ? items : [];
+  const sum=(key)=>list.reduce((acc,item)=>acc+$N((item?.cleanReport || item?.manifest?.cleanReport || item)?.[key] || 0),0);
+  return {
+    sourceRows:sum("sourceRows"),
+    totalRows:sum("totalRows"),
+    skippedRows:sum("skippedRows"),
+    malformedRows:sum("malformedRows"),
+    changedCells:sum("changedCells"),
+    nullCells:sum("nullCells"),
+    invalidNumbers:sum("invalidNumbers"),
     ...extra
   };
 }
@@ -3888,6 +3923,22 @@ function buildStoragePathMeta(input, fallbackName, defaults={}){
   const collection=cleanMetaValue(input?.storageCollection, defaults.collection || "General");
   const tableName=cleanMetaValue(input?.tableName || input?.datasetName || fallbackName, fallbackName);
   return {storageWorkspace:workspace,storageCollection:collection,tableName,storagePath:`${workspace} / ${collection} / ${tableName}`};
+}
+function buildBaseColumnarManifest(input={}){
+  const storageMeta=input.storageMeta || buildStoragePathMeta(input, input.fallbackName || input.name || "dataset", input.storageDefaults || {});
+  return {
+    id:input.id,
+    name:input.name || input.datasetName || storageMeta.tableName,
+    ...storageMeta,
+    createdAt:input.createdAt || new Date().toISOString(),
+    mode:input.mode || "columnar-clean",
+    formatVersion:input.formatVersion ?? 6,
+    storageLayout:input.storageLayout || "chunk-pack-v4",
+    writeKernelVersion:WRITE_KERNEL_VERSION,
+    olapKernelVersion:OLAP_KERNEL_VERSION,
+    features:columnarFeatureFlags(input.features || {}),
+    ...(input.extra || {})
+  };
 }
 async function buildSingleColumnarCache(msg){
   clearChunkCache();
@@ -3914,9 +3965,9 @@ async function buildSingleColumnarCache(msg){
     for await (const line of iter){
       if (state.cancelled) throw new Error("Cancelled");
       sourceRows++;
-      const normalized=normalizeCsvCellsForColumns(parseCSVLine(line, msg.delimiter), columns);
+      const normalized=normalizeCsvRowForColumns(parseCSVLine(line, msg.delimiter), columns, rules);
       if (normalized.malformed) malformedRows++;
-      if (rules.skipBadRows && normalized.malformed){ skippedRows++; continue; }
+      if (normalized.skip){ skippedRows++; continue; }
       addRowToChunk(chunk,normalized.cells,columns,rules);
       totalRows++;
       if (chunk.rows >= chunkSize){
@@ -3938,18 +3989,19 @@ async function buildSingleColumnarCache(msg){
     postProgress(88, `Finalizing columnar cache... ${fmt(totalRows)} rows / ${fmt(chunkIndex)} chunks`);
     const cleanReport=buildChunkCleanReport(chunkMetas,{sourceRows,totalRows,skippedRows,malformedRows});
     const storagePathMeta=buildStoragePathMeta(msg, msg.file.name);
-    const manifest={
+    const manifest=buildBaseColumnarManifest({
       id,
       name:msg.datasetName || storagePathMeta.tableName,
-      ...storagePathMeta,
-      originalFileName:msg.file.name,
-      sourceFiles:[{name:msg.file.name,size:msg.file.size,sourceRows,totalRows,skippedRows,malformedRows}],
-      createdAt:new Date().toISOString(), mode:"columnar-clean",
-      formatVersion:6, storageLayout:"chunk-pack-v4", writeKernelVersion:WRITE_KERNEL_VERSION, olapKernelVersion:OLAP_KERNEL_VERSION, features:columnarFeatureFlags(),
-      encoding:msg.encoding, delimiter:msg.delimiter, fileSize:msg.file.size,
-      chunkSize,totalRows,sourceRows,chunks:chunkIndex,
-      columns, rules, cleanReport
-    };
+      storageMeta:storagePathMeta,
+      mode:"columnar-clean",
+      extra:{
+        originalFileName:msg.file.name,
+        sourceFiles:[{name:msg.file.name,size:msg.file.size,sourceRows,totalRows,skippedRows,malformedRows}],
+        encoding:msg.encoding, delimiter:msg.delimiter, fileSize:msg.file.size,
+        chunkSize,totalRows,sourceRows,chunks:chunkIndex,
+        columns, rules, cleanReport
+      }
+    });
     postProgress(94, "Committing packed OLAP dataset...");
     const committedManifest=await commitDatasetManifest(dir,manifest,chunkMetas,{writeMetrics:{queue:writeQueue.stats(), storageLayout:"chunk-pack-v4"}});
     activateWorkerDataset({id,manifest:committedManifest,chunks:chunkMetas,dir,clearCache:false});
@@ -3988,9 +4040,9 @@ async function buildMergedColumnarCache(msg){
       for await (const line of iter){
         if (state.cancelled) throw new Error("Cancelled");
         fileSourceRows++; sourceRows++;
-        const normalized=normalizeCsvCellsForColumns(parseCSVLine(line, msg.delimiter), columns);
+        const normalized=normalizeCsvRowForColumns(parseCSVLine(line, msg.delimiter), columns, rules);
         if (normalized.malformed){ malformedRows++; fileMalformedRows++; }
-        if (rules.skipBadRows && normalized.malformed){ skippedRows++; fileSkippedRows++; continue; }
+        if (normalized.skip){ skippedRows++; fileSkippedRows++; continue; }
         addRowToChunk(chunk,normalized.cells,columns,rules);
         totalRows++; fileTotalRows++;
         if (chunk.rows >= chunkSize){
@@ -4013,18 +4065,19 @@ async function buildMergedColumnarCache(msg){
     postProgress(88, `Finalizing merged cache... ${fmt(totalRows)} rows / ${fmt(chunkIndex)} chunks`);
     const cleanReport=buildChunkCleanReport(chunkMetas,{sourceRows,totalRows,skippedRows,malformedRows,typeWarnings:analyzed.typeWarnings});
     const storagePathMeta=buildStoragePathMeta(msg, `merged_${files.length}_csv`);
-    const manifest={
+    const manifest=buildBaseColumnarManifest({
       id,
       name:msg.datasetName || storagePathMeta.tableName,
-      ...storagePathMeta,
-      originalFileName:files.map(f=>f.name).join(" + "),
-      sourceFiles,
-      createdAt:new Date().toISOString(), mode:"columnar-clean-merged-csv",
-      formatVersion:6, storageLayout:"chunk-pack-v4", writeKernelVersion:WRITE_KERNEL_VERSION, olapKernelVersion:OLAP_KERNEL_VERSION, features:columnarFeatureFlags(),
-      encoding:msg.encoding, delimiter:msg.delimiter, fileSize:files.reduce((a,f)=>a+(f.size||0),0),
-      chunkSize,totalRows,sourceRows,chunks:chunkIndex,
-      columns, rules, cleanReport
-    };
+      storageMeta:storagePathMeta,
+      mode:"columnar-clean-merged-csv",
+      extra:{
+        originalFileName:files.map(f=>f.name).join(" + "),
+        sourceFiles,
+        encoding:msg.encoding, delimiter:msg.delimiter, fileSize:files.reduce((a,f)=>a+(f.size||0),0),
+        chunkSize,totalRows,sourceRows,chunks:chunkIndex,
+        columns, rules, cleanReport
+      }
+    });
     const committedManifest=await commitDatasetManifest(dir,manifest,chunkMetas,{writeMetrics:{queue:writeQueue.stats(), storageLayout:"chunk-pack-v4", mergedFiles:files.length}});
     activateWorkerDataset({id,manifest:committedManifest,chunks:chunkMetas,dir,clearCache:false});
     return {manifest:committedManifest,chunks:chunkMetas,ms:now()-t0,typeWarnings:analyzed.typeWarnings,olapKernel:olapKernelStatus()};
@@ -4135,15 +4188,9 @@ async function openVirtualDataset(ids, name){
     sourceRows:sources.reduce((a,x)=>a+$N(x.manifest.sourceRows || x.manifest.totalRows || 0),0),
     chunks:globalChunks.length,
     fileSize:sources.reduce((a,x)=>a+$N(x.manifest.fileSize || 0),0),
-    cleanReport:{
-      sourceRows:sources.reduce((a,x)=>a+$N(x.manifest.cleanReport?.sourceRows || x.manifest.sourceRows || 0),0),
-      totalRows:rowOffset,
-      skippedRows:sources.reduce((a,x)=>a+$N(x.manifest.cleanReport?.skippedRows || 0),0),
-      malformedRows:sources.reduce((a,x)=>a+$N(x.manifest.cleanReport?.malformedRows || 0),0),
-      changedCells:sources.reduce((a,x)=>a+$N(x.manifest.cleanReport?.changedCells || 0),0),
-      nullCells:sources.reduce((a,x)=>a+$N(x.manifest.cleanReport?.nullCells || 0),0),
-      invalidNumbers:sources.reduce((a,x)=>a+$N(x.manifest.cleanReport?.invalidNumbers || 0),0)
-    }
+    cleanReport:mergeCleanReports(sources.map((x)=>({
+      cleanReport:{...x.manifest.cleanReport, sourceRows:x.manifest.cleanReport?.sourceRows || x.manifest.sourceRows || 0}
+    })), {totalRows:rowOffset})
   };
   activateWorkerDataset({id:manifest.id,manifest,chunks:globalChunks,virtual:{sources:virtualSources, globalChunks},clearCache:false});
   return {manifest,chunks:globalChunks};
@@ -4236,15 +4283,9 @@ async function openMemoryDataset(ids, name, options={}){
     chunks:memoryChunks.length,
     fileSize:opened.reduce((a,x)=>a+$N(x.manifest.fileSize || 0),0),
     memoryReport:{estimatedBytes,estimatedMB:$round(estimatedBytes/1024/1024),maxMemoryMB:$N(options.maxMemoryMB || 512),maxRows,loadedTables:opened.length,loadMs:now()-t0},
-    cleanReport:{
-      sourceRows:opened.reduce((a,x)=>a+$N(x.manifest.cleanReport?.sourceRows || x.manifest.sourceRows || 0),0),
-      totalRows:rowOffset,
-      skippedRows:opened.reduce((a,x)=>a+$N(x.manifest.cleanReport?.skippedRows || 0),0),
-      malformedRows:opened.reduce((a,x)=>a+$N(x.manifest.cleanReport?.malformedRows || 0),0),
-      changedCells:opened.reduce((a,x)=>a+$N(x.manifest.cleanReport?.changedCells || 0),0),
-      nullCells:opened.reduce((a,x)=>a+$N(x.manifest.cleanReport?.nullCells || 0),0),
-      invalidNumbers:opened.reduce((a,x)=>a+$N(x.manifest.cleanReport?.invalidNumbers || 0),0)
-    }
+    cleanReport:mergeCleanReports(opened.map((x)=>({
+      cleanReport:{...x.manifest.cleanReport, sourceRows:x.manifest.cleanReport?.sourceRows || x.manifest.sourceRows || 0}
+    })), {totalRows:rowOffset})
   };
   const chunkMetas=memoryChunks.map((ch,i)=>{
     const source=opened[ch.sourceIndex];
@@ -4310,17 +4351,9 @@ async function mergeSavedDatasets(ids, datasetName, storageMeta={}){
         chunkIndex++;
       }
     }
-    function sumReport(key){ return opened.reduce((a,x)=>a+$N(x.manifest.cleanReport?.[key]||0),0); }
     const totalRows=opened.reduce((a,x)=>a+$N(x.manifest.totalRows||0),0);
     const sourceRows=opened.reduce((a,x)=>a+$N(x.manifest.sourceRows||0),0);
-    const cleanReport={
-      sourceRows,totalRows,
-      skippedRows:sumReport("skippedRows"),
-      malformedRows:sumReport("malformedRows"),
-      changedCells:sumReport("changedCells"),
-      nullCells:sumReport("nullCells"),
-      invalidNumbers:sumReport("invalidNumbers")
-    };
+    const cleanReport=mergeCleanReports(opened.map((x)=>x.manifest), {sourceRows,totalRows});
     const storagePathMeta=buildStoragePathMeta({...storageMeta,datasetName}, `merged_${list.length}_saved`, {workspace:manifestWorkspace(base),collection:manifestCollection(base)});
     const manifest={
       id,
@@ -4361,33 +4394,11 @@ async function purgeAllDatasets(){
   for (const id of ids){
     await root.removeEntry(id, {recursive:true});
   }
-  state.dataset = null;
-  state.manifest = null;
-  state.dir = null;
-  state.virtual = null;
-  state.memory = null;
-  state.searchMatches = [];
-  state.pivotTable = null;
-  state.pivotTileIndex = null;
-  state.timeTable = null;
+  clearWorkerDataset();
   return ids.length;
 }
 function forgetSession(){
-  clearChunkCache();
-  state.file = null;
-  state.dataset = null;
-  state.dir = null;
-  state.manifest = null;
-  state.schema = null;
-  state.schemaFileKey = null;
-  state.virtual = null;
-  state.memory = null;
-  state.searchMatches = [];
-  state.dataQueryMatches = null;
-  state.dataQueryMeta = null;
-  state.pivotTable = null;
-  state.pivotTileIndex = null;
-  state.timeTable = null;
+  clearWorkerDataset({clearSchema:true, clearFile:true});
 }
 async function resolveChunkReadTarget(chunkIndex){
   let chunkDir, sourceManifest=state.manifest, datasetId=state.dataset?.id || state.manifest?.id || "active";
@@ -5184,7 +5195,7 @@ async function runSearch({columnIndex, op, value, maxMatches}){
     limit:cap,
     pushdown:true
   });
-  const exec=await executeChunkExecutionPlanMaybeParallel(plan,{
+  const exec=await runChunkPlanOperator(plan,{
     collectRows:true,
     limit:cap,
     progressLabel:"Searching chunks",
@@ -5245,7 +5256,7 @@ async function runDataQuery({filters, filterGroups, sort, maxRows, projection}){
     return {matches:state.manifest.totalRows, active:false, capped:false, projection:normalizedProjection, ms:0, queryPlan:queryPlanSummary(plan)};
   }
   const scanLimit = hasSort ? Number.POSITIVE_INFINITY : requestedLimit;
-  const exec=await executeChunkExecutionPlanMaybeParallel(plan,{
+  const exec=await runChunkPlanOperator(plan,{
     collectRows:!hasSort,
     collectSort:hasSort,
     limit:scanLimit,
@@ -5579,7 +5590,7 @@ async function buildPivot({rowFields,columnFields,valueField,aggregation,maxRows
   };
   state.pivotTable=null;
   state.pivotTileIndex=null;
-  const exec=await executeChunkExecutionPlanMaybeParallel(plan,{
+  const exec=await runChunkPlanOperator(plan,{
     collectPartials:true,
     progressLabel:"Pivot distributed reduce",
     progressEvery:1,
@@ -6089,7 +6100,7 @@ async function buildTimeSeries({timeField, bucket, groupField, valueField, aggre
     mode,
     bucketLimit
   };
-  const exec=await executeChunkExecutionPlanMaybeParallel(plan,{
+  const exec=await runChunkPlanOperator(plan,{
     collectPartials:true,
     progressLabel:"Time distributed reduce",
     progressEvery:1,
@@ -7510,6 +7521,9 @@ async function readGraphResultSurfaceRowsWindow(surface, sourceIndices, {start=0
   strategy
  };
 }
+async function readGraphSurfaceWindowOperator(surface, sourceIndices, options={}){
+ return await readGraphResultSurfaceRowsWindow(surface, sourceIndices, options);
+}
 async function readGraphResultWindow({mode="data", surfaceId=null, page=1, pageSize=1000, columns=[], derivedColumns=null, outputColumnNames=null, tableFilters=null}={}){
  const surface = getGraphResultSurface({mode, surfaceId});
  if (!surface) throw new Error("Graph Query Result surface is not active");
@@ -7548,7 +7562,7 @@ async function readGraphResultWindow({mode="data", surfaceId=null, page=1, pageS
     cacheHit:true
    };
   }
-  const windowResult = await readGraphResultSurfaceRowsWindow(surface, selected, {
+  const windowResult = await readGraphSurfaceWindowOperator(surface, selected, {
    start,
    limit,
    label:"GraphResultSurface page",
@@ -12460,6 +12474,18 @@ function d3VizRoot(svg, width, height){ return svg.attr("viewBox", `0 0 ${width}
 function d3VizLabel(svg, x, y, text, size=12){ return svg.append("text").attr("x", x).attr("y", y).attr("font-size", size).attr("fill", "currentColor").text(text); }
 function d3VizLabels(svg, margin, width, height, xLabel, yLabel){ d3VizLabel(svg, margin.left, height - 18, xLabel || "X"); d3VizLabel(svg, 16, 18, yLabel || "Y"); }
 function d3VizLayout(svg, width, height, margin){ d3VizRoot(svg, width, height); return { margin, chartWidth:$max(1, width - margin.left - margin.right), chartHeight:$max(1, height - margin.top - margin.bottom) }; }
+function withD3CartesianSurface(svg, layout, xAxis, yAxis, options={}){
+ const { margin, chartWidth, chartHeight } = layout;
+ const g = svg.append("g").attr("transform", `translate(${margin.left},${margin.top})`);
+ if (options.grid !== false) {
+  const gridAxis = d3.axisLeft(yAxis.scale()).tickArguments(yAxis.tickArguments()).tickValues(yAxis.tickValues()).tickSize(-chartWidth).tickFormat("");
+  g.append("g").attr("opacity", 0.22).call(gridAxis);
+ }
+ const xGroup = g.append("g").attr("transform", `translate(0,${chartHeight})`).call(xAxis);
+ if (options.rotateX) xGroup.selectAll("text").attr("transform", `rotate(${-Math.abs($N(options.rotateX || 38))})`).attr("text-anchor", "end");
+ g.append("g").call(yAxis);
+ return g;
+}
 function renderD3WorkerBar(svg, surface, options) {
  const { width, height } = options;
  const rows = $A(surface.rows) ? surface.rows : [];
@@ -12469,12 +12495,7 @@ function renderD3WorkerBar(svg, surface, options) {
  const yMin = $min(0, d3.min(rows, (d) => $N(d.value)) || 0);
  const yMax = $max(0, d3.max(rows, (d) => $N(d.value)) || 1);
  const y = d3.scaleLinear().domain([yMin, yMax]).nice().range([chartHeight, 0]);
- const g = svg.append("g").attr("transform", `translate(${margin.left},${margin.top})`);
- g.append("g").attr("opacity", 0.22).call(d3.axisLeft(y).ticks(6).tickSize(-chartWidth).tickFormat(""));
- g.append("g").attr("transform", `translate(0,${chartHeight})`)
-  .call(d3.axisBottom(x).tickFormat((d) => $S(d).slice(0, 20)))
-  .selectAll("text").attr("transform", "rotate(-38)").attr("text-anchor", "end");
- g.append("g").call(d3.axisLeft(y).ticks(6));
+ const g = withD3CartesianSurface(svg, { margin, chartWidth, chartHeight }, d3.axisBottom(x).tickFormat((d) => $S(d).slice(0, 20)), d3.axisLeft(y).ticks(6), {rotateX:38});
  g.selectAll("rect")
   .data(rows)
   .join("rect")
@@ -12496,10 +12517,7 @@ function renderD3WorkerHistogram(svg, surface, options) {
  const { margin, chartWidth, chartHeight } = d3VizLayout(svg, width, height, { top:24, right:24, bottom:58, left:78 });
  const x = d3.scaleLinear().domain([bins[0].x0, bins[bins.length - 1].x1]).nice().range([0, chartWidth]);
  const y = d3.scaleLinear().domain([0, d3.max(bins, (d) => $N(d.count)) || 1]).nice().range([chartHeight, 0]);
- const g = svg.append("g").attr("transform", `translate(${margin.left},${margin.top})`);
- g.append("g").attr("opacity", 0.22).call(d3.axisLeft(y).ticks(6).tickSize(-chartWidth).tickFormat(""));
- g.append("g").attr("transform", `translate(0,${chartHeight})`).call(d3.axisBottom(x).ticks(8));
- g.append("g").call(d3.axisLeft(y).ticks(6));
+ const g = withD3CartesianSurface(svg, { margin, chartWidth, chartHeight }, d3.axisBottom(x).ticks(8), d3.axisLeft(y).ticks(6));
  g.selectAll("rect")
   .data(bins)
   .join("rect")
@@ -12522,10 +12540,7 @@ function renderD3WorkerLine(svg, surface, options) {
  const x = d3.scaleLinear().domain(d3VizExtent(points, (d) => $N(d.x))).nice().range([0, chartWidth]);
  const y = d3.scaleLinear().domain(d3VizExtent(points, (d) => $N(d.y))).nice().range([chartHeight, 0]);
  const line = d3.line().defined((d) => Number.isFinite($N(d.x)) && Number.isFinite($N(d.y))).x((d) => x($N(d.x))).y((d) => y($N(d.y)));
- const g = svg.append("g").attr("transform", `translate(${margin.left},${margin.top})`);
- g.append("g").attr("opacity", 0.22).call(d3.axisLeft(y).ticks(6).tickSize(-chartWidth).tickFormat(""));
- g.append("g").attr("transform", `translate(0,${chartHeight})`).call(d3.axisBottom(x).ticks(8));
- g.append("g").call(d3.axisLeft(y).ticks(6));
+ const g = withD3CartesianSurface(svg, { margin, chartWidth, chartHeight }, d3.axisBottom(x).ticks(8), d3.axisLeft(y).ticks(6));
  g.append("path").datum(points).attr("fill", "none").attr("stroke", "currentColor").attr("stroke-width", 2.2).attr("opacity", 0.9).attr("d", line);
  g.selectAll("circle").data(points).join("circle").attr("cx", (d) => x($N(d.x))).attr("cy", (d) => y($N(d.y))).attr("r", 2.6).attr("fill", "currentColor").attr("opacity", 0.72)
   .append("title").text((d) => `x ${formatD3VizNumber(d.x)}\ny ${formatD3VizNumber(d.y)}\nrows ${formatD3VizNumber(d.count)}`);
@@ -12539,10 +12554,7 @@ function renderD3WorkerScatter(svg, surface, options) {
  const x = d3.scaleLinear().domain(d3VizExtent(points, (d) => $N(d.x))).nice().range([0, chartWidth]);
  const y = d3.scaleLinear().domain(d3VizExtent(points, (d) => $N(d.y))).nice().range([chartHeight, 0]);
  const r = d3.scaleSqrt().domain([0, d3.max(points, (d) => $N(d.count)) || 1]).range([2, 14]);
- const g = svg.append("g").attr("transform", `translate(${margin.left},${margin.top})`);
- g.append("g").attr("opacity", 0.22).call(d3.axisLeft(y).ticks(6).tickSize(-chartWidth).tickFormat(""));
- g.append("g").attr("transform", `translate(0,${chartHeight})`).call(d3.axisBottom(x).ticks(8));
- g.append("g").call(d3.axisLeft(y).ticks(6));
+ const g = withD3CartesianSurface(svg, { margin, chartWidth, chartHeight }, d3.axisBottom(x).ticks(8), d3.axisLeft(y).ticks(6));
  g.selectAll("circle").data(points).join("circle")
   .attr("cx", (d) => x($N(d.x)))
   .attr("cy", (d) => y($N(d.y)))
@@ -12562,10 +12574,7 @@ function renderD3WorkerArea(svg, surface, options) {
  const y = d3.scaleLinear().domain([0, $max(1, d3.max(points, (d) => $N(d.y)) || 1)]).nice().range([chartHeight, 0]);
  const area = d3.area().defined((d) => Number.isFinite($N(d.x)) && Number.isFinite($N(d.y))).x((d) => x($N(d.x))).y0(chartHeight).y1((d) => y($N(d.y)));
  const line = d3.line().defined((d) => Number.isFinite($N(d.x)) && Number.isFinite($N(d.y))).x((d) => x($N(d.x))).y((d) => y($N(d.y)));
- const g = svg.append("g").attr("transform", `translate(${margin.left},${margin.top})`);
- g.append("g").attr("opacity", 0.22).call(d3.axisLeft(y).ticks(6).tickSize(-chartWidth).tickFormat(""));
- g.append("g").attr("transform", `translate(0,${chartHeight})`).call(d3.axisBottom(x).ticks(8));
- g.append("g").call(d3.axisLeft(y).ticks(6));
+ const g = withD3CartesianSurface(svg, { margin, chartWidth, chartHeight }, d3.axisBottom(x).ticks(8), d3.axisLeft(y).ticks(6));
  g.append("path").datum(points).attr("fill", "currentColor").attr("opacity", 0.22).attr("d", area);
  g.append("path").datum(points).attr("fill", "none").attr("stroke", "currentColor").attr("stroke-width", 2).attr("opacity", 0.9).attr("d", line);
  d3VizLabels(svg, margin, width, height, surface.xLabel || "X", surface.yLabel || "Y");
@@ -12603,21 +12612,13 @@ function renderD3WorkerStackedBar(svg, surface, options) {
  const rows = $A(surface.rows) ? surface.rows : [];
  const stackKeys = $A(surface.stackKeys) ? surface.stackKeys : [];
  if (!rows.length || !stackKeys.length) return clearD3Svg(svg, width, height, "集約結果がありません");
- const margin = { top: 24, right: 140, bottom: 96, left: 78 };
- const chartWidth = $max(1, width - margin.left - margin.right);
- const chartHeight = $max(1, height - margin.top - margin.bottom);
+ const { margin, chartWidth, chartHeight } = d3VizLayout(svg, width, height, { top: 24, right: 140, bottom: 96, left: 78 });
  const normalized = rows.map((row) => ({ key: row.key, ...row.stacks }));
  const series = d3.stack().keys(stackKeys)(normalized);
  const yMax = d3.max(series, (s) => d3.max(s, (d) => d[1])) || 1;
  const x = d3.scaleBand().domain(rows.map((d) => d.key)).range([0, chartWidth]).padding(0.18);
  const y = d3.scaleLinear().domain([0, yMax]).nice().range([chartHeight, 0]);
- d3VizRoot(svg, width, height);
- const g = svg.append("g").attr("transform", `translate(${margin.left},${margin.top})`);
- g.append("g").attr("opacity", 0.22).call(d3.axisLeft(y).ticks(6).tickSize(-chartWidth).tickFormat(""));
- g.append("g").attr("transform", `translate(0,${chartHeight})`)
-  .call(d3.axisBottom(x).tickFormat((d) => $S(d).slice(0, 18)))
-  .selectAll("text").attr("transform", "rotate(-38)").attr("text-anchor", "end");
- g.append("g").call(d3.axisLeft(y).ticks(6));
+ const g = withD3CartesianSurface(svg, { margin, chartWidth, chartHeight }, d3.axisBottom(x).tickFormat((d) => $S(d).slice(0, 18)), d3.axisLeft(y).ticks(6), {rotateX:38});
  g.selectAll("g.stack").data(series).join("g")
   .attr("class", "stack")
   .attr("fill", "currentColor")
@@ -12640,18 +12641,10 @@ function renderD3WorkerBoxPlot(svg, surface, options) {
  const { width, height } = options;
  const boxes = $A(surface.boxes) ? surface.boxes : [];
  if (!boxes.length) return clearD3Svg(svg, width, height, "集約結果がありません");
- const margin = { top: 24, right: 24, bottom: 96, left: 78 };
- const chartWidth = $max(1, width - margin.left - margin.right);
- const chartHeight = $max(1, height - margin.top - margin.bottom);
+ const { margin, chartWidth, chartHeight } = d3VizLayout(svg, width, height, { top: 24, right: 24, bottom: 96, left: 78 });
  const x = d3.scaleBand().domain(boxes.map((d) => d.key)).range([0, chartWidth]).padding(0.22);
  const y = d3.scaleLinear().domain(d3VizExtent(boxes.flatMap((d) => [{v:d.min},{v:d.max}]), (d) => $N(d.v))).nice().range([chartHeight, 0]);
- d3VizRoot(svg, width, height);
- const g = svg.append("g").attr("transform", `translate(${margin.left},${margin.top})`);
- g.append("g").attr("opacity", 0.22).call(d3.axisLeft(y).ticks(6).tickSize(-chartWidth).tickFormat(""));
- g.append("g").attr("transform", `translate(0,${chartHeight})`)
-  .call(d3.axisBottom(x).tickFormat((d) => $S(d).slice(0, 18)))
-  .selectAll("text").attr("transform", "rotate(-38)").attr("text-anchor", "end");
- g.append("g").call(d3.axisLeft(y).ticks(6));
+ const g = withD3CartesianSurface(svg, { margin, chartWidth, chartHeight }, d3.axisBottom(x).tickFormat((d) => $S(d).slice(0, 18)), d3.axisLeft(y).ticks(6), {rotateX:38});
  const box = g.selectAll("g.box").data(boxes).join("g").attr("transform", (d) => `translate(${x(d.key) + x.bandwidth() / 2},0)`);
  box.append("line").attr("y1", (d) => y(d.min)).attr("y2", (d) => y(d.max)).attr("stroke", "currentColor").attr("opacity", 0.72);
  box.append("rect").attr("x", -$max(8, x.bandwidth() * 0.34)).attr("width", $max(16, x.bandwidth() * 0.68)).attr("y", (d) => y(d.q3)).attr("height", (d) => $max(1, y(d.q1) - y(d.q3))).attr("rx", 4).attr("fill", "currentColor").attr("opacity", 0.28);
@@ -12825,21 +12818,15 @@ function d3ProjectionNumber(value) {
  const n = $N(value);
  return Number.isFinite(n) ? formatD3VizNumber(n) : d3ProjectionText(value);
 }
-function d3ProjectionCsvEscape(value) {
- let s = value == null ? "" : $S(value);
- if (/^[=+\-@\t\r]/.test(s)) s = `'${s}`;
- s = s.replaceAll('"', '""');
- return /[",\r\n]/.test(s) ? `"${s}"` : s;
-}
 function d3ProjectionTableToCsv(table) {
  const rows = $A(table?.rows) ? table.rows : [];
  if (!rows.length) return "";
  const headers = D3_PROJECTION_TABLE_HEADERS;
  return [
-  headers.map(d3ProjectionCsvEscape).join(","),
+  headers.map(csvEscape).join(","),
   ...rows.map((row, index) => headers.map((key) => {
-   if (key === "#") return d3ProjectionCsvEscape(index + 1);
-   return d3ProjectionCsvEscape(row[key]);
+   if (key === "#") return csvEscape(index + 1);
+   return csvEscape(row[key]);
   }).join(",")),
  ].join("\n");
 }
