@@ -1,13 +1,13 @@
 <!DOCTYPE html>
 
 <!--
-  Quantum CSV Grid - Step2 Functional Surface Build
-  1HTML前提 / 疑似モジュール化 / 後日JS分割可能 / Compat fallback付き
+  Quantum CSV Grid - Step2.5 Capability Pipeline Build
+  1HTML前提 / Capability Manifest化 / Function Pipeline共通化 / 後日JS分割可能 / Compat fallback付き
 -->
 <html lang="ja">
 <head>
   <meta charset="UTF-8" />
-  <title>Quantum CSV Grid - Step2 Functional Surface Build</title>
+  <title>Quantum CSV Grid - Step2.5 Capability Pipeline Build</title>
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <meta name="referrer" content="no-referrer" />
   <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'unsafe-inline' https://unpkg.com https://cdn.jsdelivr.net https://esm.sh; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com https://cdn.jsdelivr.net; font-src 'self' https://fonts.gstatic.com https://fonts.googleapis.com; connect-src 'self' http://localhost:* https://localhost:*; worker-src 'self' blob:; img-src 'self' data: blob:; object-src 'none'; base-uri 'none'; form-action 'none'; upgrade-insecure-requests" />
@@ -14407,6 +14407,167 @@ registerRuntimeCommand("RUN_QUERY_PLAN", {
 });
 
 
+
+
+/*
+ * =========================================================
+ * STEP2.5 WORKER CAPABILITY EXECUTION BRIDGE v1
+ * =========================================================
+ * Purpose:
+ * - Add EXECUTE_CAPABILITY as a single worker command.
+ * - Keep all existing worker commands.
+ * - Route capability ids to Step2 structured plan execution.
+ */
+
+const STEP25_CAPABILITY_WORKER_VERSION = "step2.5-capability-worker-v1";
+
+function step25SafeCapabilityId(value){
+  const id = String(value || "").trim();
+  return /^[a-z][a-z0-9_.:-]{1,120}$/i.test(id) ? id : "unknown";
+}
+
+function step25NormalizeCapabilityInput(input){
+  const msg = input && typeof input === "object" ? input : {};
+  const capabilityId = step25SafeCapabilityId(msg.capabilityId || msg.id || msg.capability?.id);
+  const payload = msg.payload && typeof msg.payload === "object" ? msg.payload : {};
+  return {
+    capabilityId,
+    payload,
+    cacheKey:String(msg.cacheKey || ""),
+    context: msg.context && typeof msg.context === "object" ? msg.context : {}
+  };
+}
+
+function step25StructuredPlanFromCapability(input){
+  const capabilityId = step25SafeCapabilityId(input.capabilityId);
+  const payload = input.payload || {};
+  const candidate = payload.plan || payload.queryPlan || payload.graphPlan || payload;
+
+  if (capabilityId === "plan.preview") {
+    return { action:"preview", plan:step2NormalizeStructuredPlan(candidate) };
+  }
+
+  if (capabilityId === "projection.build") {
+    return { action:"projection", plan:step2NormalizeStructuredPlan(candidate) };
+  }
+
+  if (capabilityId === "query.execute") {
+    const plan = step2NormalizeStructuredPlan(candidate);
+    plan.kind = "query";
+    return { action:"projection", plan };
+  }
+
+  if (capabilityId === "formula.apply") {
+    const plan = step2NormalizeStructuredPlan(candidate);
+    plan.kind = "formula";
+    return { action:"structured", plan };
+  }
+
+  if (capabilityId === "graph.join") {
+    const plan = step2NormalizeStructuredPlan(candidate?.operators ? candidate : {
+      name:"graph-join-capability",
+      kind:"graph",
+      operators:[{ kind:"graph.join", params:payload }],
+      viewport:{ page:1, pageSize:Number(payload.pageSize || 500) }
+    });
+    return { action:"structured", plan };
+  }
+
+  if (capabilityId === "graph.resultPivot") {
+    const plan = step2NormalizeStructuredPlan(candidate?.operators ? candidate : {
+      name:"graph-pivot-capability",
+      kind:"graph",
+      operators:[{ kind:"graph.resultPivot", params:payload }]
+    });
+    return { action:"structured", plan };
+  }
+
+  if (capabilityId === "graph.resultTime") {
+    const plan = step2NormalizeStructuredPlan(candidate?.operators ? candidate : {
+      name:"graph-time-capability",
+      kind:"graph",
+      operators:[{ kind:"graph.resultTime", params:payload }]
+    });
+    return { action:"structured", plan };
+  }
+
+  if (capabilityId === "csv.inspect" || capabilityId === "csv.load") {
+    const plan = step2NormalizeStructuredPlan(candidate);
+    return { action:"preview", plan };
+  }
+
+  if (candidate && (candidate.operators || candidate.plan || candidate.kind)) {
+    return { action:"structured", plan:step2NormalizeStructuredPlan(candidate) };
+  }
+
+  throw new Error(`Unsupported capability in worker: ${capabilityId}`);
+}
+
+registerRuntimeCommand("EXECUTE_CAPABILITY", {
+  doneType: "CAPABILITY_RESULT",
+  outputMode: "surface",
+  validate(msg){ return step25NormalizeCapabilityInput(msg); },
+  plan(input){
+    const mapped = step25StructuredPlanFromCapability(input);
+    return {
+      kind:"capability",
+      capabilityId:input.capabilityId,
+      action:mapped.action,
+      cacheKey:input.cacheKey,
+      input,
+      structuredPlan:mapped.plan,
+      cost:mapped.plan?.cost || "unknown"
+    };
+  },
+  strategy(plan){
+    const rows = Number(plan.structuredPlan?.estimatedRows || 0);
+    if (plan.action === "preview") return { mode:"metadata", reason:"capability-preview", cost:plan.cost };
+    if (rows > 1000000) return { mode:"adaptive", reason:"capability-large-surface", cost:plan.cost };
+    if (rows > 100000) return { mode:"optimized", reason:"capability-medium-surface", cost:plan.cost };
+    return { mode:"classic", reason:"capability-bounded-surface", cost:plan.cost };
+  },
+  async execute(plan, runtimeState, tools){
+    const capId = plan.capabilityId;
+    tools.progress?.(1, `Executing capability: ${capId}`);
+    let result;
+
+    if (plan.action === "preview") {
+      result = {
+        ok:true,
+        type:"capability-preview",
+        capabilityId:capId,
+        version:STEP25_CAPABILITY_WORKER_VERSION,
+        plan:step2PlanSummary(plan.structuredPlan),
+        dataset:step2DatasetSummary()
+      };
+    } else if (plan.action === "projection") {
+      result = await step2BuildProjection(plan.structuredPlan);
+    } else {
+      result = await step2ExecuteStructuredPlan(plan.structuredPlan);
+    }
+
+    tools.progress?.(100, `Capability complete: ${capId}`);
+    return {
+      ok:true,
+      type:"capability-result",
+      capabilityId:capId,
+      version:STEP25_CAPABILITY_WORKER_VERSION,
+      action:plan.action,
+      result,
+      plan:step2PlanSummary(plan.structuredPlan),
+      dataset:step2DatasetSummary(),
+      metrics:{
+        rows:Number(result?.surface?.rows?.length || result?.metrics?.rows || 0),
+        capabilityId:capId,
+        action:plan.action,
+        cacheKey:plan.cacheKey || ""
+      }
+    };
+  },
+  project(result){ return result; }
+});
+
+
 const runtimeKernel = createRuntimeKernel({
   runtimeState: state,
   post,
@@ -15772,6 +15933,1062 @@ self.onmessage = (event) => {
   try { console.info("[Quantum CSV Grid] Step2 functional surface kernel ready", STEP2_VERSION); } catch {}
 })(window);
   </script>
+
+
+  <script id="step25-capability-pipeline-kernel" type="text/javascript">
+/*
+ * =========================================================
+ * STEP2.5 CAPABILITY MANIFEST + FUNCTION PIPELINE KERNEL v1
+ * =========================================================
+ * Purpose:
+ * - Keep 1HTML.
+ * - Preserve all existing features and legacy UI.
+ * - Turn feature entrypoints into Capability Manifest records.
+ * - Put validate / prepare / route / execute / normalize / cache /
+ *   fallback / commit / notify / measure into one shared pipeline.
+ * - Make the block removable into capability/*.js later.
+ *
+ * Extraction map:
+ * - QCSVCapability.Manifest          -> capability/capability-manifest.js
+ * - QCSVCapability.Registry          -> capability/capability-registry.js
+ * - QCSVCapability.FunctionCatalog   -> capability/function-catalog.js
+ * - QCSVCapability.Pipeline          -> capability/capability-pipeline.js
+ * - QCSVCapability.RuntimeExecutor   -> capability/runtime-executor.js
+ * - QCSVCapability.Cache             -> capability/capability-cache.js
+ * - QCSVCapability.UiBinder          -> capability/ui-binder.js
+ */
+(function bootstrapStep25CapabilityKernel(global) {
+  "use strict";
+
+  const STEP25_VERSION = "step2.5-capability-pipeline-v1";
+  const Kernel = global.QCSVDevKernel || {};
+  const Step2 = global.QCSVStep2 || {};
+  const Modules = global.Modules || (global.Modules = {});
+
+  const DEFAULT_TIMEOUT_MS = 60000;
+  const DEFAULT_CACHE_TTL_MS = 30000;
+  const MAX_CACHE_ENTRIES = 160;
+  const MAX_EVENT_DETAIL_BYTES = 128 * 1024;
+
+  function nowMs() {
+    try { return performance.now(); } catch { return Date.now(); }
+  }
+
+  function wallNow() {
+    return Date.now();
+  }
+
+  function safeString(value, fallback = "") {
+    const text = value == null ? fallback : String(value);
+    return text.slice(0, 2000);
+  }
+
+  function safeId(value, fallback = "capability") {
+    const id = safeString(value, fallback).trim();
+    return /^[a-z][a-z0-9_.:-]{1,120}$/i.test(id) ? id : fallback;
+  }
+
+  function isPlainObject(value) {
+    return !!value && typeof value === "object" && Object.getPrototypeOf(value) === Object.prototype;
+  }
+
+  function arrayOf(value) {
+    return Array.isArray(value) ? value : [];
+  }
+
+  function createId(prefix = "cap") {
+    if (Kernel.WorkerProtocol?.createId) return Kernel.WorkerProtocol.createId(prefix);
+    if (global.crypto?.randomUUID) return `${prefix}_${global.crypto.randomUUID()}`;
+    return `${prefix}_${Date.now().toString(36)}_${Math.random().toString(36).slice(2)}`;
+  }
+
+  function cloneSafe(value) {
+    if (Kernel.Security?.redact) {
+      try { return Kernel.Security.redact(value); } catch {}
+    }
+    try { return JSON.parse(JSON.stringify(value)); } catch { return value; }
+  }
+
+  function stableStringify(value) {
+    const seen = new WeakSet();
+    function normalize(input) {
+      if (input == null || typeof input !== "object") return input;
+      if (seen.has(input)) return "[Circular]";
+      seen.add(input);
+      if (Array.isArray(input)) return input.map(normalize);
+      const output = {};
+      for (const key of Object.keys(input).sort()) {
+        const v = input[key];
+        if (typeof v === "function" || typeof v === "undefined") continue;
+        output[key] = normalize(v);
+      }
+      return output;
+    }
+    try { return JSON.stringify(normalize(value)); } catch { return String(value); }
+  }
+
+  function fnv1a(text) {
+    let hash = 2166136261;
+    const s = String(text || "");
+    for (let i = 0; i < s.length; i += 1) {
+      hash ^= s.charCodeAt(i);
+      hash = Math.imul(hash, 16777619);
+    }
+    return (hash >>> 0).toString(36);
+  }
+
+  function byteLength(text) {
+    try { return new Blob([String(text || "")]).size; } catch { return String(text || "").length; }
+  }
+
+  function emitEvent(name, detail = {}) {
+    const safeDetail = cloneSafe(detail);
+    try {
+      const raw = stableStringify(safeDetail);
+      const finalDetail = byteLength(raw) > MAX_EVENT_DETAIL_BYTES
+        ? { truncated: true, name, bytes: byteLength(raw), at: wallNow() }
+        : safeDetail;
+      global.dispatchEvent?.(new CustomEvent(`qcsv:capability:${name}`, { detail: finalDetail }));
+    } catch {}
+  }
+
+  const Cache = (() => {
+    const table = new Map();
+
+    function cleanup() {
+      const now = wallNow();
+      for (const [key, entry] of table.entries()) {
+        if (entry.expiresAt <= now) table.delete(key);
+      }
+      while (table.size > MAX_CACHE_ENTRIES) {
+        const oldest = table.keys().next().value;
+        table.delete(oldest);
+      }
+    }
+
+    function keyFor(capability, prepared, context = {}) {
+      const declared = capability.cacheKey;
+      if (typeof declared === "function") return safeString(declared(prepared, context), "");
+      if (typeof declared === "string" && declared) {
+        return declared.replace(/\$\{([^}]+)\}/g, (_, path) => {
+          const parts = String(path || "").split(".");
+          let current = { payload: prepared, context, capability };
+          for (const part of parts) current = current?.[part];
+          return current == null ? "" : String(current);
+        });
+      }
+      return `${capability.id}:${fnv1a(stableStringify(prepared))}`;
+    }
+
+    function get(key) {
+      cleanup();
+      const entry = table.get(key);
+      if (!entry) return null;
+      if (entry.expiresAt <= wallNow()) {
+        table.delete(key);
+        return null;
+      }
+      entry.hits += 1;
+      entry.lastHitAt = wallNow();
+      return cloneSafe(entry.value);
+    }
+
+    function set(key, value, ttlMs = DEFAULT_CACHE_TTL_MS, meta = {}) {
+      if (!key) return false;
+      cleanup();
+      table.set(key, {
+        value: cloneSafe(value),
+        createdAt: wallNow(),
+        expiresAt: wallNow() + Math.max(100, Number(ttlMs || DEFAULT_CACHE_TTL_MS)),
+        hits: 0,
+        meta: cloneSafe(meta)
+      });
+      cleanup();
+      return true;
+    }
+
+    function snapshot() {
+      cleanup();
+      return [...table.entries()].map(([key, entry]) => ({
+        key,
+        expiresInMs: Math.max(0, entry.expiresAt - wallNow()),
+        hits: entry.hits,
+        meta: entry.meta
+      }));
+    }
+
+    function clear(prefix = "") {
+      const p = String(prefix || "");
+      for (const key of [...table.keys()]) {
+        if (!p || key.startsWith(p)) table.delete(key);
+      }
+      return table.size;
+    }
+
+    return { keyFor, get, set, snapshot, clear };
+  })();
+
+  const FunctionCatalog = (() => {
+    const table = new Map();
+
+    function register(name, fn) {
+      const key = safeString(name).trim();
+      if (!key || typeof fn !== "function") throw new Error(`Invalid catalog function: ${name}`);
+      table.set(key, fn);
+      return fn;
+    }
+
+    function registerMany(definitions = {}) {
+      for (const [name, fn] of Object.entries(definitions)) register(name, fn);
+      return api;
+    }
+
+    function resolve(name, fallbackName = "") {
+      if (!name) return fallbackName ? resolve(fallbackName) : null;
+      const fn = table.get(String(name));
+      if (!fn) throw new Error(`Capability function not found: ${name}`);
+      return fn;
+    }
+
+    function optional(name) {
+      if (!name) return null;
+      return table.get(String(name)) || null;
+    }
+
+    function list() {
+      return [...table.keys()].sort();
+    }
+
+    const api = { register, registerMany, resolve, optional, list };
+    return api;
+  })();
+
+  const ResultStore = (() => {
+    const table = new Map();
+
+    function commit(id, result, meta = {}) {
+      const key = safeId(id, "result");
+      table.set(key, {
+        value: cloneSafe(result),
+        meta: cloneSafe(meta),
+        updatedAt: wallNow()
+      });
+      return table.get(key);
+    }
+
+    function get(id) {
+      return cloneSafe(table.get(String(id || ""))?.value);
+    }
+
+    function snapshot() {
+      return [...table.entries()].map(([id, entry]) => ({
+        id,
+        updatedAt: entry.updatedAt,
+        meta: entry.meta
+      }));
+    }
+
+    return { commit, get, snapshot };
+  })();
+
+  function normalizePlan(payload) {
+    const candidate = payload?.plan || payload?.queryPlan || payload?.graphPlan || payload;
+    if (Step2.DomainCore?.normalizePlan) {
+      return Step2.DomainCore.normalizePlan(candidate || {});
+    }
+    return candidate || {};
+  }
+
+  function buildFormulaPlan(payload = {}) {
+    const base = normalizePlan(payload.plan || { kind: "formula", operators: [] });
+    const operators = arrayOf(base.operators).slice();
+    if (payload.operator) operators.push(payload.operator);
+    if (payload.name || payload.operation) {
+      const op = Step2.FormulaDomain?.derive
+        ? Step2.FormulaDomain.derive(payload.name, payload.operation, payload.columns || [], payload.options || {})
+        : { kind: "formula.derive", params: { name: payload.name, operation: payload.operation, columns: payload.columns || [], ...(payload.options || {}) } };
+      operators.push(op);
+    }
+    return { ...base, kind: "formula", operators };
+  }
+
+  function buildGraphPlan(payload = {}, mode = "join") {
+    if (payload.plan?.operators || payload.operators) return normalizePlan(payload.plan || payload);
+    if (mode === "join" && Step2.GraphDomain?.join) return Step2.GraphDomain.join(payload.plan || payload.graphPlan || payload, payload.options || {});
+    const kind = mode === "pivot" ? "graph.resultPivot" : mode === "time" ? "graph.resultTime" : "graph.join";
+    const operator = Step2.DomainCore?.operator ? Step2.DomainCore.operator(kind, payload) : { kind, params: payload };
+    return normalizePlan({
+      name: `graph-${mode}-capability`,
+      kind: "graph",
+      operators: [operator],
+      viewport: { page: 1, pageSize: Number(payload.pageSize || payload.viewportRows || 500) }
+    });
+  }
+
+  function buildProjectionPlan(payload = {}) {
+    if (payload.plan?.operators || payload.operators) return normalizePlan(payload.plan || payload);
+    if (Step2.ProjectionDomain?.viewport) return Step2.ProjectionDomain.viewport(payload);
+    return normalizePlan({
+      name: "projection-viewport",
+      kind: "projection",
+      viewport: {
+        page: Number(payload.page || 1),
+        pageSize: Number(payload.pageSize || 500)
+      },
+      projection: payload.columns || [],
+      operators: [{ kind: "projection.viewport", params: payload }]
+    });
+  }
+
+  FunctionCatalog.registerMany({
+    validateAny(payload) {
+      return payload == null ? {} : payload;
+    },
+
+    validateObject(payload) {
+      if (!isPlainObject(payload)) throw new Error("Payload must be an object");
+      return payload;
+    },
+
+    validateStructuredPlan(payload) {
+      const plan = normalizePlan(payload?.plan || payload);
+      if (!plan || typeof plan !== "object") throw new Error("Structured plan is required");
+      return payload;
+    },
+
+    validateSettingsPayload(payload) {
+      if (!isPlainObject(payload)) throw new Error("Settings payload must be an object");
+      return payload;
+    },
+
+    prepareIdentity(payload) {
+      return payload == null ? {} : payload;
+    },
+
+    prepareStructuredPlan(payload) {
+      return { plan: normalizePlan(payload?.plan || payload) };
+    },
+
+    prepareQueryPlan(payload) {
+      const plan = normalizePlan(payload?.plan || payload?.queryPlan || payload);
+      return { plan: { ...plan, kind: "query" } };
+    },
+
+    prepareProjectionPlan(payload) {
+      return { plan: buildProjectionPlan(payload || {}) };
+    },
+
+    prepareFormulaPlan(payload) {
+      return { plan: buildFormulaPlan(payload || {}) };
+    },
+
+    prepareGraphJoinPlan(payload) {
+      return { plan: buildGraphPlan(payload || {}, "join") };
+    },
+
+    prepareGraphPivotPlan(payload) {
+      return { plan: buildGraphPlan(payload || {}, "pivot") };
+    },
+
+    prepareGraphTimePlan(payload) {
+      return { plan: buildGraphPlan(payload || {}, "time") };
+    },
+
+    prepareCsvInspectPlan(payload = {}) {
+      const plan = Step2.CsvDomain?.inspect
+        ? Step2.CsvDomain.inspect(payload)
+        : normalizePlan({ name: "csv-inspect", kind: "csv", operators: [{ kind: "csv.inspect", params: payload }] });
+      return { plan };
+    },
+
+    prepareCsvLoadPlan(payload = {}) {
+      const plan = Step2.CsvDomain?.load
+        ? Step2.CsvDomain.load(payload)
+        : normalizePlan({ name: "csv-load", kind: "csv", operators: [{ kind: "csv.load", params: payload }] });
+      return { plan };
+    },
+
+    normalizeAny(result) {
+      return result == null ? {} : result;
+    },
+
+    normalizeWorkerResult(result) {
+      if (!result || typeof result !== "object") return { ok: true, value: result };
+      return result;
+    },
+
+    normalizeCapabilityResult(result, context = {}) {
+      const cap = context.capability || {};
+      return {
+        ok: result?.ok !== false,
+        capabilityId: cap.id || result?.capabilityId || null,
+        result: result?.result ?? result?.payload ?? result,
+        measurement: result?.measurement || result?.metrics || null,
+        raw: result
+      };
+    },
+
+    commitResult(result, context = {}) {
+      const cap = context.capability || {};
+      const id = cap.output || cap.id || "last";
+      ResultStore.commit(id, result, {
+        capabilityId: cap.id,
+        requestId: context.requestId,
+        cacheHit: Boolean(context.cacheHit)
+      });
+      return result;
+    },
+
+    commitSettings(payload) {
+      const ok = Kernel.Storage?.writeJson
+        ? Kernel.Storage.writeJson("qcsv:capability:settings", payload)
+        : (() => { localStorage.setItem("qcsv:capability:settings", JSON.stringify(payload)); return true; })();
+      return { ok, saved: ok, key: "qcsv:capability:settings" };
+    },
+
+    loadSettings() {
+      const value = Kernel.Storage?.readJson
+        ? Kernel.Storage.readJson("qcsv:capability:settings", {})
+        : JSON.parse(localStorage.getItem("qcsv:capability:settings") || "{}");
+      return { ok: true, settings: value || {} };
+    },
+
+    runtimeDiagnostics() {
+      return {
+        ok: true,
+        version: STEP25_VERSION,
+        kernel: Kernel.Diagnostics?.snapshot?.() || null,
+        measurement: Kernel.Measurement?.snapshot?.() || null,
+        cache: Cache.snapshot(),
+        results: ResultStore.snapshot(),
+        capabilities: Registry.list().map((cap) => ({
+          id: cap.id,
+          group: cap.group,
+          route: cap.route || cap.workerCommand || cap.localHandler || "unknown"
+        }))
+      };
+    },
+
+    noFallback(error) {
+      throw error;
+    }
+  });
+
+  const Registry = (() => {
+    const table = new Map();
+
+    function normalizeCapability(capability) {
+      if (!capability || typeof capability !== "object") throw new Error("Capability definition is required");
+      const id = safeId(capability.id, "");
+      if (!id) throw new Error("Capability id is required");
+      return Object.freeze({
+        id,
+        label: safeString(capability.label || id),
+        group: safeString(capability.group || "general"),
+        description: safeString(capability.description || ""),
+        input: safeString(capability.input || "object"),
+        output: safeString(capability.output || `${id}.result`),
+        route: safeString(capability.route || "worker"),
+        workerCommand: capability.workerCommand || "EXECUTE_CAPABILITY",
+        doneTypes: arrayOf(capability.doneTypes).length ? arrayOf(capability.doneTypes) : ["CAPABILITY_RESULT", "STRUCTURED_PLAN_DONE", "PROJECTION_RESULT", "QUERY_PLAN_RESULT", "STRUCTURED_PLAN_PREVIEW_DONE", "ERROR"],
+        validate: capability.validate || "validateAny",
+        prepare: capability.prepare || "prepareIdentity",
+        normalize: capability.normalize || "normalizeCapabilityResult",
+        commit: capability.commit || "commitResult",
+        fallback: capability.fallback || "noFallback",
+        localHandler: capability.localHandler || "",
+        cache: Boolean(capability.cache),
+        cacheTtlMs: Number(capability.cacheTtlMs || DEFAULT_CACHE_TTL_MS),
+        cacheKey: capability.cacheKey || "",
+        timeoutMs: Number(capability.timeoutMs || DEFAULT_TIMEOUT_MS),
+        progressLabel: safeString(capability.progressLabel || capability.label || id),
+        errorCode: safeString(capability.errorCode || `${id.replace(/[.:-]/g, "_").toUpperCase()}_FAILED`),
+        action: safeString(capability.action || "入力・実行条件・データ状態を確認してください。"),
+        ui: isPlainObject(capability.ui) ? Object.freeze({ ...capability.ui }) : Object.freeze({}),
+        measurement: isPlainObject(capability.measurement) ? Object.freeze({ ...capability.measurement }) : Object.freeze({ category: capability.group || "general" }),
+        meta: isPlainObject(capability.meta) ? Object.freeze({ ...capability.meta }) : Object.freeze({})
+      });
+    }
+
+    function register(capability) {
+      const normalized = normalizeCapability(capability);
+      table.set(normalized.id, normalized);
+      Kernel.Measurement?.mark?.("capability.register", { id: normalized.id, group: normalized.group, route: normalized.route });
+      return normalized;
+    }
+
+    function registerMany(items = []) {
+      arrayOf(items).forEach(register);
+      return api;
+    }
+
+    function get(id) {
+      const cap = table.get(String(id || ""));
+      if (!cap) throw new Error(`Capability not found: ${id}`);
+      return cap;
+    }
+
+    function has(id) {
+      return table.has(String(id || ""));
+    }
+
+    function list(filter = {}) {
+      const all = [...table.values()];
+      if (!filter.group) return all;
+      return all.filter((cap) => cap.group === filter.group);
+    }
+
+    const api = { register, registerMany, get, has, list };
+    return api;
+  })();
+
+  const RuntimeExecutor = (() => {
+    function buildWorkerCommand(capability, prepared, context = {}) {
+      const requestId = context.requestId || createId("cap_req");
+      if (capability.workerCommand === "EXECUTE_CAPABILITY") {
+        return {
+          type: "EXECUTE_CAPABILITY",
+          requestId,
+          capabilityId: capability.id,
+          payload: prepared,
+          cacheKey: context.cacheKey || "",
+          context: {
+            source: context.source || "QCSVCapability",
+            requestedAt: wallNow(),
+            timeoutMs: capability.timeoutMs
+          }
+        };
+      }
+
+      const payload = prepared?.plan ? { plan: prepared.plan } : prepared;
+      return {
+        type: capability.workerCommand,
+        requestId,
+        ...payload,
+        context: {
+          source: context.source || "QCSVCapability",
+          capabilityId: capability.id,
+          requestedAt: wallNow()
+        }
+      };
+    }
+
+    function executeWithWorkerObject(worker, command, capability) {
+      return new Promise((resolve, reject) => {
+        const requestId = command.requestId;
+        const timeoutMs = Math.max(1000, Number(capability.timeoutMs || DEFAULT_TIMEOUT_MS));
+        let settled = false;
+
+        const cleanup = () => {
+          settled = true;
+          try { worker.removeEventListener("message", onMessage); } catch {}
+          try { worker.removeEventListener("error", onError); } catch {}
+          clearTimeout(timer);
+        };
+
+        const onMessage = (event) => {
+          const msg = event?.data || {};
+          if (msg.requestId !== requestId) return;
+          const doneTypes = capability.doneTypes || [];
+          if (doneTypes.length && !doneTypes.includes(msg.type)) return;
+          cleanup();
+          if (msg.type === "ERROR" || msg.ok === false) {
+            reject(Object.assign(new Error(msg.message || "Worker capability failed"), { workerMessage: msg }));
+            return;
+          }
+          resolve(msg);
+        };
+
+        const onError = (event) => {
+          if (settled) return;
+          cleanup();
+          reject(new Error(event?.message || "Worker error"));
+        };
+
+        const timer = setTimeout(() => {
+          if (settled) return;
+          cleanup();
+          reject(new Error(`Capability timed out: ${capability.id}`));
+        }, timeoutMs);
+
+        worker.addEventListener("message", onMessage);
+        worker.addEventListener("error", onError);
+        worker.postMessage(command);
+      });
+    }
+
+    async function execute(capability, prepared, context = {}) {
+      if (capability.route === "local" || capability.localHandler) {
+        const handler = FunctionCatalog.resolve(capability.localHandler || "prepareIdentity");
+        return handler(prepared, { ...context, capability });
+      }
+
+      if (typeof context.executeWorker === "function") {
+        return context.executeWorker(buildWorkerCommand(capability, prepared, context), capability, prepared);
+      }
+
+      const command = buildWorkerCommand(capability, prepared, context);
+
+      if (context.worker && typeof context.worker.postMessage === "function") {
+        return executeWithWorkerObject(context.worker, command, capability);
+      }
+
+      if (context.gateway && typeof context.gateway.post === "function") {
+        const accepted = context.gateway.post(command);
+        return {
+          ok: accepted !== false,
+          accepted: accepted !== false,
+          async: true,
+          requestId: command.requestId,
+          command: command.type,
+          capabilityId: capability.id
+        };
+      }
+
+      if (typeof context.postMessage === "function") {
+        context.postMessage(command);
+        return {
+          ok: true,
+          accepted: true,
+          async: true,
+          requestId: command.requestId,
+          command: command.type,
+          capabilityId: capability.id
+        };
+      }
+
+      throw new Error(`No execution route available for capability: ${capability.id}`);
+    }
+
+    return { buildWorkerCommand, execute };
+  })();
+
+  const Pipeline = (() => {
+    async function run({ capability, payload, context = {} }) {
+      const cap = typeof capability === "string" ? Registry.get(capability) : capability;
+      const requestId = context.requestId || createId("cap_exec");
+      const phaseContext = {
+        ...context,
+        requestId,
+        capability: cap,
+        startedAt: nowMs(),
+        cacheHit: false
+      };
+
+      const measurementId = Kernel.Measurement?.start?.(`capability.${cap.id}`, {
+        capabilityId: cap.id,
+        group: cap.group,
+        route: cap.route
+      });
+
+      emitEvent("start", {
+        id: cap.id,
+        requestId,
+        label: cap.label,
+        progressLabel: cap.progressLabel
+      });
+
+      try {
+        const validate = FunctionCatalog.resolve(cap.validate, "validateAny");
+        const prepare = FunctionCatalog.resolve(cap.prepare, "prepareIdentity");
+        const normalize = FunctionCatalog.resolve(cap.normalize, "normalizeCapabilityResult");
+        const commit = FunctionCatalog.resolve(cap.commit, "commitResult");
+
+        const validated = await validate(payload, phaseContext);
+        const prepared = await prepare(validated, phaseContext);
+        const cacheKey = cap.cache ? Cache.keyFor(cap, prepared, phaseContext) : "";
+        phaseContext.cacheKey = cacheKey;
+
+        if (cap.cache && cacheKey) {
+          const cached = Cache.get(cacheKey);
+          if (cached) {
+            phaseContext.cacheHit = true;
+            const normalizedCached = await normalize(cached, phaseContext);
+            const committedCached = await commit(normalizedCached, phaseContext);
+            Kernel.Measurement?.end?.(measurementId, { ok: true, cacheHit: true, capabilityId: cap.id });
+            emitEvent("success", { id: cap.id, requestId, cacheHit: true, result: normalizedCached });
+            return committedCached;
+          }
+        }
+
+        const executed = await RuntimeExecutor.execute(cap, prepared, phaseContext);
+        const normalized = await normalize(executed, phaseContext);
+
+        if (cap.cache && cacheKey && normalized?.ok !== false) {
+          Cache.set(cacheKey, normalized, cap.cacheTtlMs, { capabilityId: cap.id });
+        }
+
+        const committed = await commit(normalized, phaseContext);
+        Kernel.Measurement?.end?.(measurementId, {
+          ok: true,
+          cacheHit: false,
+          capabilityId: cap.id,
+          requestId
+        });
+        emitEvent("success", { id: cap.id, requestId, cacheHit: false, result: normalized });
+        return committed;
+      } catch (error) {
+        const normalizedError = Kernel.ErrorNormalizer?.fromException
+          ? Kernel.ErrorNormalizer.fromException(error, {
+              code: cap.errorCode,
+              source: `capability.${cap.id}`,
+              action: cap.action,
+              recoverable: true
+            })
+          : {
+              code: cap.errorCode,
+              message: error?.message || String(error),
+              action: cap.action,
+              recoverable: true
+            };
+
+        Kernel.Measurement?.end?.(measurementId, { ok: false, error: normalizedError, capabilityId: cap.id, requestId });
+
+        const fallback = FunctionCatalog.optional(cap.fallback);
+        if (fallback && cap.fallback !== "noFallback") {
+          try {
+            const fallbackResult = await fallback(error, { ...phaseContext, normalizedError });
+            emitEvent("fallback", { id: cap.id, requestId, error: normalizedError });
+            return fallbackResult;
+          } catch (fallbackError) {
+            emitEvent("error", { id: cap.id, requestId, error: normalizedError, fallbackError: String(fallbackError?.message || fallbackError) });
+            throw fallbackError;
+          }
+        }
+
+        emitEvent("error", { id: cap.id, requestId, error: normalizedError });
+        throw error;
+      }
+    }
+
+    return { run };
+  })();
+
+  const UiBinder = (() => {
+    function toolbar(group = "") {
+      return Registry.list(group ? { group } : {}).map((cap) => ({
+        id: cap.id,
+        label: cap.label,
+        group: cap.group,
+        description: cap.description,
+        action: `capability:${cap.id}`,
+        progressLabel: cap.progressLabel,
+        ui: cap.ui
+      }));
+    }
+
+    function manifest() {
+      return Registry.list().map((cap) => ({
+        id: cap.id,
+        label: cap.label,
+        group: cap.group,
+        route: cap.route,
+        workerCommand: cap.workerCommand,
+        input: cap.input,
+        output: cap.output,
+        cache: cap.cache,
+        ui: cap.ui
+      }));
+    }
+
+    function installDataAttributes(root = document) {
+      const buttons = root.querySelectorAll?.("[data-qcsv-capability]");
+      buttons?.forEach((el) => {
+        if (el.__qcsvCapabilityBound) return;
+        el.__qcsvCapabilityBound = true;
+        el.addEventListener("click", () => {
+          const id = el.getAttribute("data-qcsv-capability");
+          const payloadRaw = el.getAttribute("data-qcsv-payload") || "{}";
+          let payload = {};
+          try { payload = JSON.parse(payloadRaw); } catch {}
+          execute(id, payload).catch((error) => {
+            try { console.error("[QCSVCapability] UI-bound capability failed", id, error); } catch {}
+          });
+        });
+      });
+    }
+
+    return { toolbar, manifest, installDataAttributes };
+  })();
+
+  const Manifest = Object.freeze([
+    {
+      id: "plan.preview",
+      label: "Plan Preview",
+      group: "runtime",
+      description: "Structured Planを実行せず検証・要約する",
+      input: "structuredPlan",
+      output: "planPreview",
+      route: "worker",
+      workerCommand: "EXECUTE_CAPABILITY",
+      validate: "validateStructuredPlan",
+      prepare: "prepareStructuredPlan",
+      cache: true,
+      cacheTtlMs: 15000,
+      progressLabel: "Planを検証中...",
+      errorCode: "PLAN_PREVIEW_FAILED",
+      action: "Planのoperators / viewport / projectionを確認してください。",
+      ui: { panel: "runtime", priority: 10 }
+    },
+    {
+      id: "projection.build",
+      label: "Build Projection",
+      group: "projection",
+      description: "表示範囲だけをProjectionとして構築する",
+      input: "projectionPlan",
+      output: "projection",
+      route: "worker",
+      workerCommand: "EXECUTE_CAPABILITY",
+      validate: "validateObject",
+      prepare: "prepareProjectionPlan",
+      cache: true,
+      cacheTtlMs: 30000,
+      progressLabel: "Projectionを構築中...",
+      errorCode: "PROJECTION_BUILD_FAILED",
+      action: "ページ範囲・列指定・データセット状態を確認してください。",
+      ui: { panel: "grid", priority: 20 }
+    },
+    {
+      id: "query.execute",
+      label: "Execute Query",
+      group: "query",
+      description: "Filter / Sort / ProjectをQuery Planとして実行する",
+      input: "queryPlan",
+      output: "queryProjection",
+      route: "worker",
+      workerCommand: "EXECUTE_CAPABILITY",
+      validate: "validateStructuredPlan",
+      prepare: "prepareQueryPlan",
+      cache: true,
+      cacheTtlMs: 30000,
+      progressLabel: "クエリを実行中...",
+      errorCode: "QUERY_EXECUTE_FAILED",
+      action: "列名・演算子・型・条件式を確認してください。",
+      ui: { panel: "query", priority: 30 }
+    },
+    {
+      id: "formula.apply",
+      label: "Apply Formula",
+      group: "formula",
+      description: "安全なFormula OperatorをPlanへ合成して実行する",
+      input: "formulaPlan",
+      output: "formulaProjection",
+      route: "worker",
+      workerCommand: "EXECUTE_CAPABILITY",
+      validate: "validateObject",
+      prepare: "prepareFormulaPlan",
+      cache: false,
+      progressLabel: "数式を適用中...",
+      errorCode: "FORMULA_APPLY_FAILED",
+      action: "数式名・演算・対象列を確認してください。",
+      ui: { panel: "formula", priority: 40 }
+    },
+    {
+      id: "graph.join",
+      label: "Graph Join",
+      group: "graph",
+      description: "Graph Join Planを実行し、bounded surfaceを返す",
+      input: "graphPlan",
+      output: "graphJoin",
+      route: "worker",
+      workerCommand: "EXECUTE_CAPABILITY",
+      validate: "validateObject",
+      prepare: "prepareGraphJoinPlan",
+      cache: true,
+      cacheTtlMs: 30000,
+      progressLabel: "Graph Joinを実行中...",
+      errorCode: "GRAPH_JOIN_FAILED",
+      action: "Joinキー・対象テーブル・ページサイズを確認してください。",
+      ui: { panel: "graph", priority: 50 }
+    },
+    {
+      id: "graph.resultPivot",
+      label: "Graph Pivot",
+      group: "graph",
+      description: "Graph Result SurfaceをPivot Projectionへ変換する",
+      input: "graphPivotPlan",
+      output: "graphPivot",
+      route: "worker",
+      workerCommand: "EXECUTE_CAPABILITY",
+      validate: "validateObject",
+      prepare: "prepareGraphPivotPlan",
+      cache: true,
+      cacheTtlMs: 30000,
+      progressLabel: "Graph Pivotを構築中...",
+      errorCode: "GRAPH_PIVOT_FAILED",
+      action: "Pivot対象・viewport・filter条件を確認してください。",
+      ui: { panel: "graph", priority: 60 }
+    },
+    {
+      id: "graph.resultTime",
+      label: "Graph Time Series",
+      group: "graph",
+      description: "Graph Result Surfaceを時系列Projectionへ変換する",
+      input: "graphTimePlan",
+      output: "graphTime",
+      route: "worker",
+      workerCommand: "EXECUTE_CAPABILITY",
+      validate: "validateObject",
+      prepare: "prepareGraphTimePlan",
+      cache: true,
+      cacheTtlMs: 30000,
+      progressLabel: "Graph Time Seriesを構築中...",
+      errorCode: "GRAPH_TIME_FAILED",
+      action: "日時列・集計粒度・対象列を確認してください。",
+      ui: { panel: "graph", priority: 70 }
+    },
+    {
+      id: "csv.inspect",
+      label: "CSV Inspect Plan",
+      group: "csv",
+      description: "CSV読込前のPlanを検証する。既存CSV読込UIは維持する",
+      input: "csvInspectPayload",
+      output: "csvInspectPlan",
+      route: "worker",
+      workerCommand: "EXECUTE_CAPABILITY",
+      validate: "validateObject",
+      prepare: "prepareCsvInspectPlan",
+      cache: true,
+      cacheTtlMs: 15000,
+      progressLabel: "CSV Inspect Planを作成中...",
+      errorCode: "CSV_INSPECT_CAPABILITY_FAILED",
+      action: "ファイル名・文字コード・区切り文字・サンプル行数を確認してください。",
+      ui: { panel: "csv", priority: 80 }
+    },
+    {
+      id: "csv.load",
+      label: "CSV Load Plan",
+      group: "csv",
+      description: "CSVロードPlanを構築する。既存CSVロード処理はCompatとして維持する",
+      input: "csvLoadPayload",
+      output: "csvLoadPlan",
+      route: "worker",
+      workerCommand: "EXECUTE_CAPABILITY",
+      validate: "validateObject",
+      prepare: "prepareCsvLoadPlan",
+      cache: false,
+      progressLabel: "CSV Load Planを作成中...",
+      errorCode: "CSV_LOAD_CAPABILITY_FAILED",
+      action: "ファイル名・chunk size・encodingを確認してください。",
+      ui: { panel: "csv", priority: 90 }
+    },
+    {
+      id: "storage.settings.save",
+      label: "Save Capability Settings",
+      group: "storage",
+      description: "Capability層の小さな設定だけを保存する",
+      input: "settings",
+      output: "settingsSaveResult",
+      route: "local",
+      localHandler: "commitSettings",
+      validate: "validateSettingsPayload",
+      prepare: "prepareIdentity",
+      normalize: "normalizeAny",
+      commit: "commitResult",
+      cache: false,
+      progressLabel: "設定を保存中...",
+      errorCode: "SETTINGS_SAVE_FAILED",
+      action: "設定サイズ・ブラウザの保存権限・Private Modeを確認してください。",
+      ui: { panel: "settings", priority: 100 }
+    },
+    {
+      id: "storage.settings.load",
+      label: "Load Capability Settings",
+      group: "storage",
+      description: "Capability層の設定を復元する",
+      input: "empty",
+      output: "settingsLoadResult",
+      route: "local",
+      localHandler: "loadSettings",
+      validate: "validateAny",
+      prepare: "prepareIdentity",
+      normalize: "normalizeAny",
+      commit: "commitResult",
+      cache: false,
+      progressLabel: "設定を復元中...",
+      errorCode: "SETTINGS_LOAD_FAILED",
+      action: "壊れた設定を削除して再読み込みしてください。",
+      ui: { panel: "settings", priority: 110 }
+    },
+    {
+      id: "runtime.diagnostics",
+      label: "Capability Diagnostics",
+      group: "runtime",
+      description: "Capability / Cache / Measurement / ResultStoreを診断する",
+      input: "empty",
+      output: "runtimeDiagnostics",
+      route: "local",
+      localHandler: "runtimeDiagnostics",
+      validate: "validateAny",
+      prepare: "prepareIdentity",
+      normalize: "normalizeAny",
+      commit: "commitResult",
+      cache: false,
+      progressLabel: "診断情報を収集中...",
+      errorCode: "CAPABILITY_DIAGNOSTICS_FAILED",
+      action: "Kernel初期化順序とブラウザコンソールを確認してください。",
+      ui: { panel: "runtime", priority: 120 }
+    }
+  ]);
+
+  Registry.registerMany(Manifest);
+
+  async function execute(id, payload = {}, context = {}) {
+    const cap = Registry.get(id);
+    return Pipeline.run({ capability: cap, payload, context });
+  }
+
+  function define(capability) {
+    return Registry.register(capability);
+  }
+
+  const QCSVCapability = Object.freeze({
+    version: STEP25_VERSION,
+    createdAt: wallNow(),
+    Manifest,
+    Registry,
+    FunctionCatalog,
+    RuntimeExecutor,
+    Pipeline,
+    Cache,
+    ResultStore,
+    UiBinder,
+    execute,
+    define,
+    list: Registry.list,
+    get: Registry.get,
+    diagnostics: () => FunctionCatalog.resolve("runtimeDiagnostics")()
+  });
+
+  global.QCSVCapability = QCSVCapability;
+  Object.assign(Modules, {
+    CapabilityManifest: Manifest,
+    CapabilityRegistry: Registry,
+    CapabilityFunctionCatalog: FunctionCatalog,
+    CapabilityRuntimeExecutor: RuntimeExecutor,
+    CapabilityPipeline: Pipeline,
+    CapabilityCache: Cache,
+    CapabilityUiBinder: UiBinder
+  });
+
+  Kernel.Measurement?.mark?.("step2.5.capability.ready", {
+    version: STEP25_VERSION,
+    capabilities: Manifest.length,
+    functions: FunctionCatalog.list().length
+  });
+
+  emitEvent("ready", {
+    version: STEP25_VERSION,
+    capabilities: Manifest.length,
+    functions: FunctionCatalog.list().length
+  });
+
+  try {
+    console.info("[Quantum CSV Grid] Step2.5 capability pipeline ready", STEP25_VERSION, `${Manifest.length} capabilities`);
+  } catch {}
+})(window);
+  </script>
+
 
 
   <script id="app-chunk-00" type="text/plain" data-app-chunk="plain" data-app-chunk-index="0" data-statement-count="21">
