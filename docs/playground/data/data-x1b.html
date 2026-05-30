@@ -1,9 +1,16 @@
 <!DOCTYPE html>
+
+<!--
+  Quantum CSV Grid - Dev Structural Reform Full Code
+  1HTML前提 / 疑似モジュール化 / 後日JS分割可能 / Compat fallback付き
+-->
 <html lang="ja">
 <head>
   <meta charset="UTF-8" />
-  <title>Quantum CSV Grid - Data Work Studio Build</title>
+  <title>Quantum CSV Grid - Dev Structural Reform Build</title>
   <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="referrer" content="no-referrer" />
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'unsafe-inline' https://unpkg.com https://cdn.jsdelivr.net https://esm.sh; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com https://cdn.jsdelivr.net; font-src 'self' https://fonts.gstatic.com https://fonts.googleapis.com; connect-src 'self' http://localhost:* https://localhost:*; worker-src 'self' blob:; img-src 'self' data: blob:; object-src 'none'; base-uri 'none'; form-action 'none'; upgrade-insecure-requests" />
   <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Roboto:wght@300;400;600;700&display=swap" />
   <link rel="stylesheet" href="https://fonts.googleapis.com/icon?family=Material+Icons" />
   <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@xyflow/react@12.8.4/dist/style.css" />
@@ -2904,22 +2911,50 @@ function serializableRemoteExecutionRequest(plan, options={}, chunks=[]){
   };
 }
 
-async function fetchJsonWithTimeout(url, payload, {token="", timeoutMs=120000}={}){
+function validateRemoteEndpoint(url){
+  let u;
+  try { u = new URL(String(url || "")); }
+  catch { throw new Error("Remote endpoint URL is invalid"); }
+
+  const isLocal = ["localhost", "127.0.0.1", "::1"].includes(u.hostname);
+  if (u.protocol !== "https:" && !(isLocal && u.protocol === "http:")) {
+    throw new Error("Remote endpoint must be HTTPS, except localhost development");
+  }
+  if (u.username || u.password) throw new Error("Remote endpoint must not include credentials");
+  if (!/^https?:$/.test(u.protocol)) throw new Error("Remote endpoint protocol is not allowed");
+  return u.toString();
+}
+
+async function fetchJsonWithTimeout(url, payload, {token="", timeoutMs=120000, maxResponseBytes=5*1024*1024}={}){
+  const safeUrl = validateRemoteEndpoint(url);
+  const safeTimeout = Math.max(1000, Math.min(Number(timeoutMs || 120000), 300000));
+  const safeToken = String(token || "").trim();
+
   const controller=new AbortController();
-  const timer=setTimeout(()=>controller.abort(new Error("Remote execution timeout")), timeoutMs);
+  const timer=setTimeout(()=>controller.abort(new Error("Remote execution timeout")), safeTimeout);
   try{
-    const res=await fetch(url,{
+    const res=await fetch(safeUrl,{
       method:"POST",
       headers:{
         "content-type":"application/json",
-        ...(token ? {"authorization":`Bearer ${token}`} : {})
+        "accept":"application/json",
+        ...(safeToken ? {"authorization":`Bearer ${safeToken}`} : {})
       },
       body:JSON.stringify(payload),
+      credentials:"omit",
+      cache:"no-store",
+      redirect:"error",
       signal:controller.signal
     });
+
+    const contentLength = Number(res.headers.get("content-length") || 0);
+    if (contentLength > maxResponseBytes) throw new Error("Remote response is too large");
+
     const text=await res.text();
+    if (text.length > maxResponseBytes) throw new Error("Remote response is too large");
+
     let data=null;
-    try{ data=text ? JSON.parse(text) : null; }catch{ data={raw:text}; }
+    try{ data=text ? JSON.parse(text) : null; }catch{ data={raw:text.slice(0,4096)}; }
     if (!res.ok) throw new Error(data?.message || data?.error || `Remote execution HTTP ${res.status}`);
     return data;
   }finally{
@@ -13935,6 +13970,939 @@ self.onmessage = (event) => {
 </script>
 
   <!-- JSX application source. It is transformed by Babel in the module below. -->
+  <script id="app-chunk--01-dev-kernel" type="text/plain" data-app-chunk="plain" data-app-chunk-index="-1" data-statement-count="1">
+
+/*
+ * =========================================================
+ * DEV STRUCTURAL REFORM KERNEL v1
+ * =========================================================
+ * Purpose:
+ * - Keep the product as one HTML file.
+ * - Make the internals removable into .js files later.
+ * - Move execution through Runtime / Protocol / Security / Storage /
+ *   Measurement / Compat boundaries.
+ * - Preserve the existing app as legacy-compatible runtime.
+ *
+ * Extraction map:
+ * - QCSVDevKernel.FeatureFlags     -> runtime/feature-flags.js
+ * - QCSVDevKernel.ErrorNormalizer  -> runtime/error-normalizer.js
+ * - QCSVDevKernel.Measurement      -> runtime/measurement.js
+ * - QCSVDevKernel.Security         -> runtime/security.js
+ * - QCSVDevKernel.Storage          -> storage/local-settings.js
+ * - QCSVDevKernel.WorkerProtocol   -> runtime/worker-protocol.js
+ * - QCSVDevKernel.WorkerClient     -> runtime/worker-client.js
+ * - QCSVDevKernel.WorkerSource     -> runtime/worker-source.js
+ * - QCSVDevKernel.Plan             -> domain/plan.js
+ * - QCSVDevKernel.Compat           -> compat/legacy-runtime-adapter.js
+ * - QCSVDevKernel.Boot             -> runtime/bootstrap.js
+ */
+(function bootstrapDevStructuralReformKernel(global) {
+  "use strict";
+
+  const KERNEL_VERSION = "dev-structural-reform-v1";
+  const MAX_LOG_ENTRIES = 500;
+  const MAX_MEASURE_ENTRIES = 1000;
+  const DEFAULT_STORAGE_MAX_BYTES = 200000;
+  const DEFAULT_MESSAGE_MAX_BYTES = 64 * 1024 * 1024;
+
+  const existing = global.QCSVDevKernel;
+  if (existing && existing.version === KERNEL_VERSION) return;
+
+  const now = () => {
+    try { return performance.now(); } catch { return Date.now(); }
+  };
+
+  const wallNow = () => Date.now();
+
+  function isPlainObject(value) {
+    return !!value && typeof value === "object" && Object.getPrototypeOf(value) === Object.prototype;
+  }
+
+  function clampNumber(value, min, max, fallback) {
+    const n = Number(value);
+    if (!Number.isFinite(n)) return fallback;
+    return Math.max(min, Math.min(max, n));
+  }
+
+  function createBoundedLog(limit) {
+    const entries = [];
+    return {
+      push(entry) {
+        entries.push({ at: wallNow(), ...entry });
+        if (entries.length > limit) entries.splice(0, entries.length - limit);
+      },
+      list() {
+        return entries.slice();
+      },
+      clear() {
+        entries.length = 0;
+      }
+    };
+  }
+
+  const internalLog = createBoundedLog(MAX_LOG_ENTRIES);
+
+  const FeatureFlags = (() => {
+    const defaults = Object.freeze({
+      mode: "adaptive",
+      compatibilityFallback: true,
+      protocolRequestIds: true,
+      measurementAlwaysOn: true,
+      safeRuntimeScriptExecution: true,
+      safeWorkerGateway: true,
+      safeWorkerSource: true,
+      safeStorage: true,
+      safeRemoteExecution: true,
+      developerDiagnostics: true,
+      diagnosticOverlay: false,
+      verboseConsole: false,
+      maxWorkerMessageBytes: DEFAULT_MESSAGE_MAX_BYTES
+    });
+
+    const values = { ...defaults };
+
+    function get(name, fallback) {
+      return Object.prototype.hasOwnProperty.call(values, name) ? values[name] : fallback;
+    }
+
+    function set(name, value) {
+      if (!/^[a-zA-Z0-9_.:-]{1,80}$/.test(String(name || ""))) return false;
+      values[name] = value;
+      internalLog.push({ level: "info", source: "FeatureFlags", message: `flag:${name}`, value });
+      return true;
+    }
+
+    function snapshot() {
+      return { ...values };
+    }
+
+    return { defaults, get, set, snapshot };
+  })();
+
+  const ErrorNormalizer = (() => {
+    const DEFAULT_ACTIONS = Object.freeze({
+      INVALID_WORKER_COMMAND: "操作をやり直してください。開発ログで送信コマンドを確認できます。",
+      WORKER_NOT_READY: "Workerの初期化が完了してから再実行してください。",
+      WORKER_MESSAGE_TOO_LARGE: "処理対象を小さくするか、Plan/Projection経由で分割してください。",
+      WORKER_ROUTE_FAILED: "該当メッセージのhandlerを確認してください。",
+      RUNTIME_SCRIPT_FAILED: "直前のapp chunkを確認してください。",
+      STORAGE_READ_FAILED: "設定をリセットして再読み込みしてください。",
+      STORAGE_WRITE_FAILED: "保存容量またはPrivate Modeを確認してください。",
+      REMOTE_ENDPOINT_INVALID: "localhost以外はhttps://のURLを指定してください。",
+      UNKNOWN: "ログを確認し、再現条件をScenarioとして保存してください。"
+    });
+
+    function normalizeCode(code) {
+      const raw = String(code || "UNKNOWN").trim().toUpperCase().replace(/[^A-Z0-9_]/g, "_");
+      return raw.slice(0, 80) || "UNKNOWN";
+    }
+
+    function toSafeMessage(value) {
+      const text = value == null ? "" : String(value);
+      return text.slice(0, 2000);
+    }
+
+    function fromException(error, context = {}) {
+      const code = normalizeCode(context.code || error?.code || error?.name || "UNKNOWN");
+      return {
+        code,
+        message: toSafeMessage(error?.message || context.message || "Unknown error"),
+        detail: Security.redact(toSafeMessage(context.detail || error?.stack || "")),
+        recoverable: context.recoverable !== false,
+        action: context.action || DEFAULT_ACTIONS[code] || DEFAULT_ACTIONS.UNKNOWN,
+        source: String(context.source || "runtime").slice(0, 80),
+        at: wallNow()
+      };
+    }
+
+    function fromWorkerMessage(message, context = {}) {
+      const msg = message || {};
+      if (msg.error && typeof msg.error === "object") {
+        return {
+          code: normalizeCode(msg.error.code || msg.type || "WORKER_ERROR"),
+          message: toSafeMessage(msg.error.message || msg.message || "Worker error"),
+          detail: Security.redact(toSafeMessage(msg.error.detail || msg.stack || "")),
+          recoverable: msg.error.recoverable !== false,
+          action: msg.error.action || DEFAULT_ACTIONS.UNKNOWN,
+          source: context.source || msg.origin || "worker",
+          at: wallNow()
+        };
+      }
+      return {
+        code: normalizeCode(msg.code || msg.type || "WORKER_ERROR"),
+        message: toSafeMessage(msg.message || "Worker error"),
+        detail: Security.redact(toSafeMessage(msg.stack || "")),
+        recoverable: true,
+        action: DEFAULT_ACTIONS.UNKNOWN,
+        source: context.source || msg.origin || "worker",
+        at: wallNow()
+      };
+    }
+
+    function toLogLine(error) {
+      const e = error || {};
+      return `[${e.code || "UNKNOWN"}] ${e.message || "Unknown error"}${e.action ? ` / action=${e.action}` : ""}`;
+    }
+
+    return { fromException, fromWorkerMessage, toLogLine, normalizeCode };
+  })();
+
+  const Security = (() => {
+    const REDACTED_KEYS = [
+      "token", "authorization", "apiKey", "apikey", "accessKeyId",
+      "secretAccessKey", "sessionToken", "password", "credential", "credentials"
+    ];
+
+    function shouldRedactKey(key) {
+      const k = String(key || "").toLowerCase();
+      return REDACTED_KEYS.some((needle) => k.includes(needle.toLowerCase()));
+    }
+
+    function redact(value, depth = 0) {
+      if (depth > 8) return "[MaxDepth]";
+      if (value == null) return value;
+      if (typeof value === "string") {
+        return value
+          .replace(/Bearer\s+[A-Za-z0-9._~+/=-]+/gi, "Bearer [REDACTED]")
+          .replace(/(token|api[_-]?key|secret|authorization)\s*[:=]\s*[^,\s"']+/gi, "$1=[REDACTED]")
+          .slice(0, 8000);
+      }
+      if (Array.isArray(value)) return value.slice(0, 100).map((item) => redact(item, depth + 1));
+      if (typeof value === "object") {
+        const out = {};
+        for (const [key, item] of Object.entries(value)) {
+          out[key] = shouldRedactKey(key) ? "[REDACTED]" : redact(item, depth + 1);
+        }
+        return out;
+      }
+      return value;
+    }
+
+    function safeJsonStringify(value, { maxBytes = 5 * 1024 * 1024 } = {}) {
+      const raw = JSON.stringify(redact(value));
+      if (raw.length > maxBytes) {
+        throw new Error(`JSON payload too large: ${raw.length} bytes`);
+      }
+      return raw;
+    }
+
+    function safeJsonParse(raw, fallback = null, { maxBytes = 5 * 1024 * 1024 } = {}) {
+      try {
+        if (typeof raw !== "string" || raw.length > maxBytes) return fallback;
+        return JSON.parse(raw);
+      } catch {
+        return fallback;
+      }
+    }
+
+    function estimateSerializedBytes(value) {
+      try {
+        return JSON.stringify(value)?.length || 0;
+      } catch {
+        return 0;
+      }
+    }
+
+    function validateRemoteEndpoint(url) {
+      let u;
+      try { u = new URL(String(url || "")); }
+      catch {
+        const err = new Error("Remote endpoint URL is invalid");
+        err.code = "REMOTE_ENDPOINT_INVALID";
+        throw err;
+      }
+
+      const isLocal = ["localhost", "127.0.0.1", "::1"].includes(u.hostname);
+      if (u.protocol !== "https:" && !(isLocal && u.protocol === "http:")) {
+        const err = new Error("Remote endpoint must be HTTPS, except localhost development");
+        err.code = "REMOTE_ENDPOINT_INVALID";
+        throw err;
+      }
+      if (u.username || u.password) {
+        const err = new Error("Remote endpoint must not include credentials");
+        err.code = "REMOTE_ENDPOINT_INVALID";
+        throw err;
+      }
+      return u.toString();
+    }
+
+    async function fetchJson(url, payload, {
+      token = "",
+      timeoutMs = 120000,
+      maxResponseBytes = 5 * 1024 * 1024,
+      signal
+    } = {}) {
+      const safeUrl = validateRemoteEndpoint(url);
+      const timeout = clampNumber(timeoutMs, 1000, 10 * 60 * 1000, 120000);
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), timeout);
+      const relayAbort = () => controller.abort();
+      if (signal) {
+        if (signal.aborted) controller.abort();
+        else signal.addEventListener("abort", relayAbort, { once: true });
+      }
+
+      try {
+        const headers = { "content-type": "application/json", "accept": "application/json" };
+        if (token) headers.authorization = `Bearer ${String(token).slice(0, 4096)}`;
+        const response = await fetch(safeUrl, {
+          method: "POST",
+          headers,
+          body: JSON.stringify(payload || {}),
+          credentials: "omit",
+          cache: "no-store",
+          redirect: "error",
+          signal: controller.signal
+        });
+        const text = await response.text();
+        if (text.length > maxResponseBytes) throw new Error("Remote response too large");
+        let data;
+        try { data = text ? JSON.parse(text) : null; }
+        catch { throw new Error("Remote response is not JSON"); }
+        if (!response.ok) {
+          const err = new Error(data?.message || `Remote HTTP ${response.status}`);
+          err.status = response.status;
+          err.response = data;
+          throw err;
+        }
+        return data;
+      } finally {
+        clearTimeout(timeoutId);
+        if (signal) signal.removeEventListener("abort", relayAbort);
+      }
+    }
+
+    return {
+      REDACTED_KEYS: REDACTED_KEYS.slice(),
+      redact,
+      safeJsonStringify,
+      safeJsonParse,
+      estimateSerializedBytes,
+      validateRemoteEndpoint,
+      fetchJson
+    };
+  })();
+
+  const Measurement = (() => {
+    const entries = [];
+    const counters = Object.create(null);
+    const open = new Map();
+
+    function push(entry) {
+      const safe = {
+        at: wallNow(),
+        t: now(),
+        ...Security.redact(entry || {})
+      };
+      entries.push(safe);
+      if (entries.length > MAX_MEASURE_ENTRIES) entries.splice(0, entries.length - MAX_MEASURE_ENTRIES);
+      if (FeatureFlags.get("verboseConsole", false)) {
+        try { console.debug("[QCSV measure]", safe); } catch {}
+      }
+      return safe;
+    }
+
+    function mark(name, data = {}) {
+      return push({ type: "mark", name: String(name || "unknown").slice(0, 120), data });
+    }
+
+    function count(name, delta = 1, data = {}) {
+      const key = String(name || "unknown").slice(0, 120);
+      counters[key] = (counters[key] || 0) + Number(delta || 0);
+      return push({ type: "count", name: key, value: counters[key], data });
+    }
+
+    function start(name, data = {}) {
+      const id = `${String(name || "task").slice(0, 80)}:${Math.random().toString(36).slice(2)}`;
+      open.set(id, { name, start: now(), data });
+      push({ type: "start", id, name, data });
+      return id;
+    }
+
+    function end(id, data = {}) {
+      const item = open.get(id);
+      if (!item) return push({ type: "end-missing", id, data });
+      open.delete(id);
+      return push({
+        type: "end",
+        id,
+        name: item.name,
+        elapsedMs: Math.max(0, now() - item.start),
+        data: { ...item.data, ...data }
+      });
+    }
+
+    function wrap(name, fn, data = {}) {
+      return function measuredFunction(...args) {
+        const id = start(name, data);
+        try {
+          const result = fn.apply(this, args);
+          if (result && typeof result.then === "function") {
+            return result.then(
+              (value) => { end(id, { ok: true }); return value; },
+              (error) => { end(id, { ok: false, error: ErrorNormalizer.fromException(error, { source: name }) }); throw error; }
+            );
+          }
+          end(id, { ok: true });
+          return result;
+        } catch (error) {
+          end(id, { ok: false, error: ErrorNormalizer.fromException(error, { source: name }) });
+          throw error;
+        }
+      };
+    }
+
+    function snapshot() {
+      return {
+        version: KERNEL_VERSION,
+        counters: { ...counters },
+        entries: entries.slice(),
+        open: Array.from(open.entries()).map(([id, value]) => ({ id, name: value.name, ageMs: now() - value.start }))
+      };
+    }
+
+    function reset() {
+      entries.length = 0;
+      open.clear();
+      for (const key of Object.keys(counters)) delete counters[key];
+    }
+
+    return { mark, count, start, end, wrap, snapshot, reset };
+  })();
+
+  const Storage = (() => {
+    function validateKey(key) {
+      const k = String(key || "");
+      if (!/^[a-zA-Z0-9_.:-]{1,160}$/.test(k)) {
+        throw new Error("Invalid storage key");
+      }
+      return k;
+    }
+
+    function readJson(key, fallback, validate, { maxBytes = DEFAULT_STORAGE_MAX_BYTES } = {}) {
+      const storageKey = validateKey(key);
+      try {
+        const raw = localStorage.getItem(storageKey);
+        if (!raw || raw.length > maxBytes) return fallback;
+        const parsed = JSON.parse(raw);
+        if (validate && !validate(parsed)) {
+          localStorage.removeItem(storageKey);
+          return fallback;
+        }
+        return parsed;
+      } catch (error) {
+        Measurement.count("storage.read.error", 1, { key: storageKey, error: ErrorNormalizer.fromException(error, { code: "STORAGE_READ_FAILED" }) });
+        try { localStorage.removeItem(storageKey); } catch {}
+        return fallback;
+      }
+    }
+
+    function writeJson(key, value, { maxBytes = DEFAULT_STORAGE_MAX_BYTES } = {}) {
+      const storageKey = validateKey(key);
+      try {
+        const raw = JSON.stringify(Security.redact(value));
+        if (!raw || raw.length > maxBytes) return false;
+        localStorage.setItem(storageKey, raw);
+        Measurement.count("storage.write.ok", 1, { key: storageKey, bytes: raw.length });
+        return true;
+      } catch (error) {
+        Measurement.count("storage.write.error", 1, { key: storageKey, error: ErrorNormalizer.fromException(error, { code: "STORAGE_WRITE_FAILED" }) });
+        return false;
+      }
+    }
+
+    function remove(key) {
+      try {
+        localStorage.removeItem(validateKey(key));
+        return true;
+      } catch {
+        return false;
+      }
+    }
+
+    function createVersionedSettingsStore({ key, version, defaults, validate, maxBytes = DEFAULT_STORAGE_MAX_BYTES }) {
+      const storageKey = validateKey(key);
+      function isValid(value) {
+        return isPlainObject(value) && value.version === version && (!validate || validate(value));
+      }
+      return {
+        load() {
+          return readJson(storageKey, { version, ...defaults }, isValid, { maxBytes });
+        },
+        save(value) {
+          return writeJson(storageKey, { version, ...defaults, ...(value || {}), updatedAt: wallNow() }, { maxBytes });
+        },
+        reset() {
+          return remove(storageKey);
+        }
+      };
+    }
+
+    return { readJson, writeJson, remove, createVersionedSettingsStore };
+  })();
+
+  const WorkerProtocol = (() => {
+    function createId(prefix = "req") {
+      if (global.crypto?.randomUUID) return `${prefix}_${global.crypto.randomUUID()}`;
+      return `${prefix}_${Date.now().toString(36)}_${Math.random().toString(36).slice(2)}`;
+    }
+
+    function createRequest(type, payload = {}, meta = {}) {
+      const safeType = String(type || "").trim().toUpperCase();
+      if (!/^[A-Z0-9_]{1,64}$/.test(safeType)) {
+        throw new Error("Invalid worker command type");
+      }
+      return {
+        id: createId("req"),
+        type: safeType,
+        payload: payload || {},
+        meta: {
+          createdAt: wallNow(),
+          timeoutMs: clampNumber(meta.timeoutMs, 1000, 10 * 60 * 1000, 30000),
+          source: String(meta.source || "app").slice(0, 80),
+          ...Security.redact(meta)
+        }
+      };
+    }
+
+    function sanitizeLegacyCommand(message) {
+      if (!message || typeof message !== "object") {
+        const err = new Error("Worker message must be an object");
+        err.code = "INVALID_WORKER_COMMAND";
+        throw err;
+      }
+      const type = String(message.type || "").trim();
+      if (!/^[A-Z0-9_]{1,64}$/.test(type)) {
+        const err = new Error("Invalid worker command type");
+        err.code = "INVALID_WORKER_COMMAND";
+        throw err;
+      }
+      const msg = { ...message, type };
+      if (FeatureFlags.get("protocolRequestIds", true) && !msg.__devRequestId) {
+        msg.__devRequestId = createId("legacy");
+        msg.__createdAt = wallNow();
+      }
+      const bytes = Security.estimateSerializedBytes(msg);
+      const limit = FeatureFlags.get("maxWorkerMessageBytes", DEFAULT_MESSAGE_MAX_BYTES);
+      if (bytes > limit) {
+        const err = new Error(`Worker message too large: ${bytes} bytes`);
+        err.code = "WORKER_MESSAGE_TOO_LARGE";
+        throw err;
+      }
+      return msg;
+    }
+
+    function normalizeResponse(message) {
+      const msg = message || {};
+      if (!msg || typeof msg !== "object") {
+        return {
+          ok: false,
+          type: "INVALID_WORKER_RESPONSE",
+          error: {
+            code: "INVALID_WORKER_RESPONSE",
+            message: "Worker response is invalid",
+            recoverable: true
+          }
+        };
+      }
+      if (msg.type === "ERROR") {
+        return {
+          ...msg,
+          ok: false,
+          error: ErrorNormalizer.fromWorkerMessage(msg)
+        };
+      }
+      return { ok: true, ...msg };
+    }
+
+    return { createId, createRequest, sanitizeLegacyCommand, normalizeResponse };
+  })();
+
+  const WorkerSource = (() => {
+    function createWorkerUrlFromText(source, { label = "worker-code" } = {}) {
+      const text = String(source || "");
+      if (!text.trim()) {
+        const err = new Error("Worker source is empty");
+        err.code = "WORKER_SOURCE_EMPTY";
+        throw err;
+      }
+      const safeLabel = String(label || "worker-code").replace(/[^\w./-]/g, "_");
+      const sourceWithLabel = `${text}\n//# sourceURL=quantum-csv-grid/${safeLabel}.js`;
+      const blob = new Blob([sourceWithLabel], { type: "text/javascript" });
+      const url = URL.createObjectURL(blob);
+      Measurement.mark("worker.url.created", { label: safeLabel, bytes: sourceWithLabel.length });
+      return { url, revoke: () => URL.revokeObjectURL(url), bytes: sourceWithLabel.length };
+    }
+
+    function createWorker(url, options = {}) {
+      const id = Measurement.start("worker.create", { urlType: String(url || "").slice(0, 16) });
+      try {
+        const worker = new Worker(url, options);
+        Measurement.end(id, { ok: true });
+        return worker;
+      } catch (error) {
+        Measurement.end(id, { ok: false, error: ErrorNormalizer.fromException(error, { source: "WorkerSource.createWorker" }) });
+        throw error;
+      }
+    }
+
+    return { createWorkerUrlFromText, createWorker };
+  })();
+
+  const WorkerClient = (() => {
+    function createGateway({ getWorker, onReject, onSent, sanitize } = {}) {
+      return {
+        post(message) {
+          let msg;
+          const id = Measurement.start("worker.gateway.post", { type: message?.type || "UNKNOWN" });
+          try {
+            msg = sanitize ? sanitize(message) : WorkerProtocol.sanitizeLegacyCommand(message);
+            msg = WorkerProtocol.sanitizeLegacyCommand(msg);
+          } catch (error) {
+            const normalized = ErrorNormalizer.fromException(error, { source: "WorkerClient.gateway", code: error?.code || "INVALID_WORKER_COMMAND" });
+            Measurement.end(id, { ok: false, error: normalized });
+            onReject?.(ErrorNormalizer.toLogLine(normalized), Security.redact(message));
+            return false;
+          }
+
+          const worker = getWorker?.();
+          if (!worker) {
+            const normalized = {
+              code: "WORKER_NOT_READY",
+              message: `Worker is not ready: ${msg.type}`,
+              recoverable: true,
+              action: "Workerの初期化完了後に再実行してください。",
+              source: "WorkerClient.gateway",
+              at: wallNow()
+            };
+            Measurement.end(id, { ok: false, error: normalized });
+            onReject?.(ErrorNormalizer.toLogLine(normalized), msg);
+            return false;
+          }
+
+          try {
+            worker.postMessage(msg);
+            Measurement.end(id, { ok: true, type: msg.type, requestId: msg.__devRequestId });
+            onSent?.(msg);
+            return true;
+          } catch (error) {
+            const normalized = ErrorNormalizer.fromException(error, { source: "WorkerClient.gateway.postMessage" });
+            Measurement.end(id, { ok: false, error: normalized });
+            onReject?.(ErrorNormalizer.toLogLine(normalized), msg);
+            return false;
+          }
+        }
+      };
+    }
+
+    function createRouter(handlers, { onUnhandled, onError, onRouted } = {}) {
+      const table = handlers || {};
+      return {
+        route(rawMessage) {
+          const msg = WorkerProtocol.normalizeResponse(rawMessage);
+          const type = msg.type || "UNKNOWN";
+          const id = Measurement.start("worker.router.route", { type, ok: msg.ok !== false });
+          const handler = table[type];
+          if (!handler) {
+            Measurement.end(id, { ok: false, reason: "unhandled" });
+            onUnhandled?.(msg);
+            return false;
+          }
+          try {
+            handler(msg);
+            Measurement.end(id, { ok: true });
+            onRouted?.(msg);
+            return true;
+          } catch (error) {
+            const normalized = ErrorNormalizer.fromException(error, { source: "WorkerClient.router", code: "WORKER_ROUTE_FAILED" });
+            Measurement.end(id, { ok: false, error: normalized });
+            onError?.(error, msg, normalized);
+            return false;
+          }
+        }
+      };
+    }
+
+    return { createGateway, createRouter };
+  })();
+
+  const Plan = (() => {
+    function createOperator(kind, params = {}, meta = {}) {
+      const safeKind = String(kind || "").trim().toLowerCase().replace(/[^a-z0-9_-]/g, "_").slice(0, 80);
+      if (!safeKind) throw new Error("Operator kind is required");
+      return {
+        id: WorkerProtocol.createId("op"),
+        kind: safeKind,
+        params: Security.redact(params),
+        meta: {
+          createdAt: wallNow(),
+          ...Security.redact(meta)
+        }
+      };
+    }
+
+    function createPlan({ name = "plan", input = null, operators = [], strategy = "adaptive", meta = {} } = {}) {
+      const ops = operators.map((op) => op?.kind ? op : createOperator(op.kind, op.params, op.meta));
+      return {
+        id: WorkerProtocol.createId("plan"),
+        name: String(name || "plan").slice(0, 120),
+        input,
+        operators: ops,
+        strategy,
+        meta: {
+          createdAt: wallNow(),
+          ...Security.redact(meta)
+        }
+      };
+    }
+
+    function estimateCost(plan = {}) {
+      const ops = Array.isArray(plan.operators) ? plan.operators.length : 0;
+      const rows = Number(plan.meta?.estimatedRows || plan.input?.estimatedRows || 0);
+      const cols = Number(plan.meta?.estimatedColumns || plan.input?.estimatedColumns || 0);
+      const score = ops * 10 + Math.log10(Math.max(1, rows)) * Math.max(1, cols / 10);
+      return {
+        score,
+        rows: Number.isFinite(rows) ? rows : 0,
+        columns: Number.isFinite(cols) ? cols : 0,
+        operators: ops
+      };
+    }
+
+    function chooseStrategy(plan = {}, flags = FeatureFlags.snapshot()) {
+      const cost = estimateCost(plan);
+      if (flags.mode === "classic") return { strategy: "classic", cost, reason: "flag" };
+      if (flags.mode === "optimized") return { strategy: "optimized", cost, reason: "flag" };
+      if (cost.rows >= 100000 || cost.score >= 60) return { strategy: "optimized", cost, reason: "cost" };
+      return { strategy: "classic", cost, reason: "small-surface" };
+    }
+
+    return { createOperator, createPlan, estimateCost, chooseStrategy };
+  })();
+
+  const Compat = (() => {
+    const registry = new Map();
+
+    function register(name, value, meta = {}) {
+      const key = String(name || "").slice(0, 120);
+      registry.set(key, { value, meta: Security.redact(meta), registeredAt: wallNow() });
+      Measurement.mark("compat.register", { name: key });
+      return value;
+    }
+
+    function get(name) {
+      return registry.get(String(name || ""))?.value;
+    }
+
+    function wrap(name, fn, meta = {}) {
+      if (typeof fn !== "function") return fn;
+      const wrapped = Measurement.wrap(`compat.${name}`, function compatWrapped(...args) {
+        try {
+          return fn.apply(this, args);
+        } catch (error) {
+          const normalized = ErrorNormalizer.fromException(error, { source: `compat.${name}`, meta });
+          internalLog.push({ level: "error", source: "Compat", error: normalized });
+          throw error;
+        }
+      }, meta);
+      register(name, wrapped, meta);
+      return wrapped;
+    }
+
+    function fallback(label, primary, fallbackFn) {
+      return function fallbackWrapper(...args) {
+        try {
+          return primary.apply(this, args);
+        } catch (error) {
+          Measurement.count("compat.fallback", 1, { label, error: ErrorNormalizer.fromException(error, { source: label }) });
+          if (FeatureFlags.get("compatibilityFallback", true) && typeof fallbackFn === "function") {
+            return fallbackFn.apply(this, args);
+          }
+          throw error;
+        }
+      };
+    }
+
+    function snapshot() {
+      return Array.from(registry.entries()).map(([name, item]) => ({ name, meta: item.meta, registeredAt: item.registeredAt }));
+    }
+
+    return { register, get, wrap, fallback, snapshot };
+  })();
+
+  const Diagnostics = (() => {
+    function snapshot() {
+      return {
+        version: KERNEL_VERSION,
+        flags: FeatureFlags.snapshot(),
+        measurement: Measurement.snapshot(),
+        compat: Compat.snapshot(),
+        log: internalLog.list()
+      };
+    }
+
+    function downloadSnapshot() {
+      const blob = new Blob([JSON.stringify(snapshot(), null, 2)], { type: "application/json" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `quantum-csv-grid-diagnostics-${new Date().toISOString().replace(/[:.]/g, "-")}.json`;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+    }
+
+    function installOverlay() {
+      if (!FeatureFlags.get("diagnosticOverlay", false)) return;
+      if (document.getElementById("qcsv-dev-diagnostics")) return;
+      const node = document.createElement("button");
+      node.id = "qcsv-dev-diagnostics";
+      node.type = "button";
+      node.textContent = "Diagnostics";
+      Object.assign(node.style, {
+        position: "fixed",
+        right: "12px",
+        bottom: "12px",
+        zIndex: 99999,
+        padding: "6px 10px",
+        borderRadius: "999px",
+        border: "1px solid rgba(0,0,0,.2)",
+        background: "rgba(255,255,255,.92)",
+        color: "#111827",
+        font: "12px system-ui, sans-serif",
+        boxShadow: "0 6px 20px rgba(0,0,0,.15)",
+        cursor: "pointer"
+      });
+      node.addEventListener("click", downloadSnapshot);
+      document.addEventListener("DOMContentLoaded", () => document.body.appendChild(node), { once: true });
+      if (document.body) document.body.appendChild(node);
+    }
+
+    return { snapshot, downloadSnapshot, installOverlay };
+  })();
+
+  const Boot = (() => {
+    function executeRuntimeScript(source, label) {
+      const safeLabel = String(label || "app-runtime.js").replace(/[^\w./-]/g, "_");
+      const id = Measurement.start("runtime.execute-script", { label: safeLabel, bytes: String(source || "").length });
+      try {
+        const script = document.createElement("script");
+        script.type = "text/javascript";
+        script.textContent = `${source}\n//# sourceURL=${safeLabel}`;
+        document.body.appendChild(script);
+        Measurement.end(id, { ok: true });
+        return script;
+      } catch (error) {
+        const normalized = ErrorNormalizer.fromException(error, { source: "Boot.executeRuntimeScript", code: "RUNTIME_SCRIPT_FAILED" });
+        Measurement.end(id, { ok: false, error: normalized });
+        throw error;
+      }
+    }
+
+    function runWithGuard(name, fn, fallback) {
+      const id = Measurement.start(`boot.${name}`);
+      try {
+        const result = fn();
+        Measurement.end(id, { ok: true });
+        return result;
+      } catch (error) {
+        const normalized = ErrorNormalizer.fromException(error, { source: `Boot.${name}` });
+        internalLog.push({ level: "error", source: "Boot", error: normalized });
+        Measurement.end(id, { ok: false, error: normalized });
+        if (typeof fallback === "function") return fallback(error, normalized);
+        throw error;
+      }
+    }
+
+    function installGlobalErrorHandlers() {
+      if (global.__QCSV_DEV_KERNEL_ERROR_HANDLERS__) return;
+      global.__QCSV_DEV_KERNEL_ERROR_HANDLERS__ = true;
+      global.addEventListener("error", (event) => {
+        const normalized = ErrorNormalizer.fromException(event.error || new Error(event.message), { source: "window.error" });
+        internalLog.push({ level: "error", source: "window.error", error: normalized });
+        Measurement.count("window.error", 1, normalized);
+      });
+      global.addEventListener("unhandledrejection", (event) => {
+        const reason = event.reason instanceof Error ? event.reason : new Error(String(event.reason || "Unhandled rejection"));
+        const normalized = ErrorNormalizer.fromException(reason, { source: "window.unhandledrejection" });
+        internalLog.push({ level: "error", source: "window.unhandledrejection", error: normalized });
+        Measurement.count("window.unhandledrejection", 1, normalized);
+      });
+    }
+
+    function healthCheck() {
+      const result = {
+        ok: true,
+        version: KERNEL_VERSION,
+        checks: {
+          blob: typeof Blob !== "undefined",
+          worker: typeof Worker !== "undefined",
+          localStorage: false,
+          performance: typeof performance !== "undefined",
+          crypto: !!global.crypto
+        }
+      };
+      try {
+        const key = "__qcsv_health_check__";
+        localStorage.setItem(key, "1");
+        result.checks.localStorage = localStorage.getItem(key) === "1";
+        localStorage.removeItem(key);
+      } catch {
+        result.checks.localStorage = false;
+      }
+      result.ok = Object.values(result.checks).every(Boolean);
+      Measurement.mark("boot.health", result);
+      return result;
+    }
+
+    return { executeRuntimeScript, runWithGuard, installGlobalErrorHandlers, healthCheck };
+  })();
+
+  const kernel = Object.freeze({
+    version: KERNEL_VERSION,
+    createdAt: wallNow(),
+    FeatureFlags,
+    ErrorNormalizer,
+    Measurement,
+    Security,
+    Storage,
+    WorkerProtocol,
+    WorkerClient,
+    WorkerSource,
+    Plan,
+    Compat,
+    Diagnostics,
+    Boot
+  });
+
+  global.QCSVDevKernel = kernel;
+  global.Modules = Object.assign(global.Modules || {}, {
+    FeatureFlags,
+    ErrorNormalizer,
+    Measurement,
+    Security,
+    Storage,
+    WorkerProtocol,
+    WorkerClient,
+    WorkerSource,
+    Plan,
+    Compat,
+    Diagnostics,
+    Boot
+  });
+
+  Boot.installGlobalErrorHandlers();
+  Boot.healthCheck();
+  Diagnostics.installOverlay();
+  Measurement.mark("kernel.ready", { version: KERNEL_VERSION });
+
+  try {
+    console.info("[Quantum CSV Grid] Dev structural reform kernel ready", kernel.version);
+  } catch {}
+})(window);
+  </script>
+
   <script id="app-chunk-00" type="text/plain" data-app-chunk="plain" data-app-chunk-index="0" data-statement-count="21">
 
 
@@ -16745,9 +17713,11 @@ function readJsonStorageSafe(key, fallback, validate, { maxBytes = 200000 } = {}
   }
 }
 
-function writeJsonStorageSafe(key, value) {
+function writeJsonStorageSafe(key, value, { maxBytes = 200000 } = {}) {
   try {
-    localStorage.setItem(key, JSON.stringify(value));
+    const raw = JSON.stringify(value);
+    if (!raw || raw.length > maxBytes) return false;
+    localStorage.setItem(key, raw);
     return true;
   } catch {
     return false;
@@ -20103,10 +21073,24 @@ function sanitizeWorkerMessage(message) {
     safe.formulaExpression = String(safe.formulaExpression || "").slice(0, SAFE_FORMULA_MAX_LENGTH);
   }
 
+  if (window.QCSVDevKernel?.WorkerProtocol?.sanitizeLegacyCommand) {
+    return window.QCSVDevKernel.WorkerProtocol.sanitizeLegacyCommand(safe);
+  }
+
   return safe;
 }
 
 function createWorkerGateway({ getWorker, onReject, onSent } = {}) {
+  const kernel = window.QCSVDevKernel;
+  if (kernel?.WorkerClient?.createGateway) {
+    return kernel.WorkerClient.createGateway({
+      getWorker,
+      onReject,
+      onSent,
+      sanitize: sanitizeWorkerMessage,
+    });
+  }
+
   return {
     post(message) {
       let msg;
@@ -20133,6 +21117,11 @@ function createWorkerGateway({ getWorker, onReject, onSent } = {}) {
 }
 
 function createWorkerMessageRouter(handlers, { onUnhandled, onError, onRouted } = {}) {
+  const kernel = window.QCSVDevKernel;
+  if (kernel?.WorkerClient?.createRouter) {
+    return kernel.WorkerClient.createRouter(handlers, { onUnhandled, onError, onRouted });
+  }
+
   const table = handlers || {};
   return {
     route(rawMessage) {
@@ -22496,9 +23485,17 @@ function App() {
 
 
   useEffect(() => {
-    const source = document.getElementById("worker-code").textContent;
-    const url = URL.createObjectURL(new Blob([source], { type: "text/javascript" }));
-    const worker = new Worker(url);
+    const source = document.getElementById("worker-code")?.textContent || "";
+    if (!source.trim()) {
+      setStatus("Worker code is missing");
+      return undefined;
+    }
+    const workerUrlRecord = window.QCSVDevKernel?.WorkerSource?.createWorkerUrlFromText
+      ? window.QCSVDevKernel.WorkerSource.createWorkerUrlFromText(source, { label: "worker-code" })
+      : { url: URL.createObjectURL(new Blob([source], { type: "text/javascript" })), revoke: null };
+    const worker = window.QCSVDevKernel?.WorkerSource?.createWorker
+      ? window.QCSVDevKernel.WorkerSource.createWorker(workerUrlRecord.url)
+      : new Worker(workerUrlRecord.url);
     workerRef.current = worker;
     workerGatewayRef.current = createWorkerGateway({
       getWorker: () => workerRef.current,
@@ -23386,7 +24383,8 @@ function App() {
       workerGatewayRef.current = null;
       workerRef.current = null;
       worker.terminate();
-      URL.revokeObjectURL(url);
+      if (workerUrlRecord?.revoke) workerUrlRecord.revoke();
+      else URL.revokeObjectURL(workerUrlRecord.url);
     };
   }, []);
 
@@ -26086,10 +27084,15 @@ root.render(
     });
 
     function executeAppRuntimeScript(source, label) {
+      if (window.QCSVDevKernel?.Boot?.executeRuntimeScript) {
+        return window.QCSVDevKernel.Boot.executeRuntimeScript(source, label);
+      }
+      const safeLabel = String(label || "app-runtime.js").replace(/[^\w./-]/g, "_");
       const script = document.createElement("script");
       script.type = "text/javascript";
-      script.textContent = `${source}\n//# sourceURL=${label}`;
+      script.textContent = `${source}\n//# sourceURL=${safeLabel}`;
       document.body.appendChild(script);
+      return script;
     }
 
     const appChunks = Array.from(document.querySelectorAll("script[data-app-chunk]"))
