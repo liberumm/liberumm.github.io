@@ -1,0 +1,3175 @@
+﻿<!DOCTYPE html>
+<html lang="ja">
+<head><script type="text/javascript" src="/___vscode_livepreview_injected_script"></script><script type="text/javascript" src="/___vscode_livepreview_injected_script"></script>
+  <meta charset="UTF-8" />
+  <title>スマホ完結 6業務共通モック｜Mock Launcher</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Roboto:wght@300;400;500;700;900&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="https://fonts.googleapis.com/icon?family=Material+Icons" />
+  <style>
+    html, body, #root { margin: 0; min-height: 100%; font-family: Roboto, Meiryo, sans-serif; background: #f6f7f9; }
+    * { box-sizing: border-box; }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+
+  <script crossorigin src="https://unpkg.com/react@18.3.1/umd/react.development.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18.3.1/umd/react-dom.development.js"></script>
+  <script crossorigin src="https://unpkg.com/@emotion/react@11.11.4/dist/emotion-react.umd.min.js"></script>
+  <script crossorigin src="https://unpkg.com/@emotion/styled@11.14.1/dist/emotion-styled.umd.min.js"></script>
+  <script crossorigin src="https://unpkg.com/@mui/material@5.18.0/umd/material-ui.development.js"></script>
+  <script src="https://unpkg.com/@babel/standalone@7.24.7/babel.min.js"></script>
+
+  <!--
+Workflow Mock Launcher / Runtime Constitution
+
+This file is a self-contained single-file mock launcher framework.
+Single HTML is the product boundary.
+
+Core Identity:
+- CDN / Babel / React / MUI are the dynamic runtime foundation.
+- LAUNCHER is the framework body: scenario control, viewport, step navigation, postMessage, and HTML export.
+- CORE is the 3-screen workflow app: start, scan/register, confirm/output.
+- THEME is the swappable business layer: BUSINESS definitions, master data, validation rules, and scenarios.
+- LAUNCHER and CORE are reusable assets. THEME is the only layer replaced when targeting a different domain.
+
+Architecture:
+- LAUNCHER drives CORE via iframe + postMessage (APPLY_MOCK_STATE).
+- CORE renders dynamically from THEME definitions; it owns no business-specific logic.
+- THEME defines BUSINESS fields, master constants, validateItem rules, and MOCK_SCENARIOS.
+- DynamicField renders any field declared in BUSINESS.itemFields / startFields without CORE changes.
+- ?embedded=1 in URL switches the entry point from LauncherApp to WorkflowApp (standalone mode).
+
+Runtime Principles:
+- Keep the single-file form; do not convert to npm/build structure by default.
+- Keep boot light: CDN loads, Babel transform, ReactDOM.createRoot, done.
+- Keep LAUNCHER state local to LauncherApp; do not leak into CORE or THEME.
+- Keep CORE state in React hooks + localStorage (storageKey); treat localStorage as a compact cache.
+- Keep postMessage payloads small and typed (type: "APPLY_MOCK_STATE").
+- Scenario state injected via postMessage must be applied atomically (screen + context + entries together).
+- HTML export (standalone and launcher variants) must remain functional after any THEME change.
+
+Ownership Rules:
+- APP_CONFIG owns the storage key, connection mode, and API endpoint stub.
+- SCREEN / VIEW_MODE / VIEWPORTS / VIEWPORT_CONFIG own stable UI policy constants.
+- BUSINESS owns per-workflow field declarations, labels, output actions, and complete checks.
+- PRODUCTS / master constants own the domain data fixtures for the current THEME.
+- validateItem owns all business-rule validation; getStatus derives display state from it.
+- createDefaultContext / createDefaultItem own safe state initialization from THEME definitions.
+- makeScenario / MOCK_SCENARIOS own the launcher scenario registry for the current THEME.
+- DynamicField owns field-to-component mapping; new field types are added here only.
+- WorkflowApp owns screen routing, localStorage sync, and postMessage reception.
+- LauncherApp owns scenario selection, step control, viewport switching, and HTML export.
+- App owns the embedded/launcher entry-point split; nothing else.
+
+THEME Replacement Rules:
+- To target a new domain: replace BUSINESS, PRODUCTS, master constants, validateItem, and MOCK_SCENARIOS.
+- Do not touch LAUNCHER, CORE components, APP_CONFIG, or SCREEN constants during a THEME swap.
+- New field types required by the new THEME must be added to DynamicField before use.
+- Preserve the storageKey value unless intentionally migrating stored state.
+
+Change Rule:
+Observe -> Plan -> Do -> Check -> Act -> Lock.
+
+Keep this block short.
+Update only when runtime identity, architecture, ownership, boot policy,
+storage boundary, postMessage contract, THEME boundary, or export behavior changes.
+-->
+
+  <script type="text/babel">
+    const {
+      Alert,
+      AppBar,
+      Autocomplete,
+      Badge,
+      Box,
+      Button,
+      Card,
+      CardActionArea,
+      CardContent,
+      Checkbox,
+      Chip,
+      CssBaseline,
+      Dialog,
+      DialogActions,
+      DialogContent,
+      DialogTitle,
+      Divider,
+      Drawer,
+      Fab,
+      FormControl,
+      GlobalStyles,
+      Grid,
+      Icon,
+      IconButton,
+      InputAdornment,
+      InputLabel,
+      MenuItem,
+      Paper,
+      Select,
+      Slider,
+      Stack,
+      Step,
+      StepLabel,
+      Stepper,
+      Switch,
+      Tab,
+      Table,
+      TableBody,
+      TableCell,
+      TableContainer,
+      TableHead,
+      TablePagination,
+      TableRow,
+      Tabs,
+      TextField,
+      ThemeProvider,
+      ToggleButton,
+      ToggleButtonGroup,
+      Toolbar,
+      Tooltip,
+      Typography,
+      createTheme
+    } = MaterialUI;
+
+    /**
+     * ============================================================
+     * ワークフローモック + Mock Launcher
+     * ============================================================
+     *
+     * 【アーキテクチャ概要】
+     *
+     * このファイルは「ランチャーフレームワーク」と「業務テーマ」の2層で構成される。
+     *
+     * ┌──────────────────────────────────────────────┐
+     * │  [LAUNCHER]  MockLauncher                    │
+     * │  シナリオ切替・ステップ制御・ビューポート切替  │
+     * │  postMessage で CORE へ状態を注入             │
+     * │  HTML書き出し（ランチャーなし / あり）         │
+     * └────────────────┬─────────────────────────────┘
+     *                  │ iframe + postMessage
+     * ┌────────────────▼─────────────────────────────┐
+     * │  [CORE]  WorkflowApp（3画面アプリ）           │
+     * │  開始画面 → スキャン登録画面 → 確認出力画面  │
+     * │  THEME 定義に基づいて動的にフィールドを描画    │
+     * └────────────────┬─────────────────────────────┘
+     *                  │ 参照
+     * ┌────────────────▼─────────────────────────────┐
+     * │  [THEME]  業務定義・マスタ・シナリオ           │
+     * │  BUSINESS / PRODUCTS / シナリオ42本           │
+     * │  ← ここだけ差し替えれば別業務に転用できる     │
+     * └──────────────────────────────────────────────┘
+     *
+     * 起動モード:
+     *   URL に ?embedded なし → LauncherApp（ランチャー画面）
+     *   URL に ?embedded=1   → WorkflowApp（実画面のみ・iframe内表示用）
+     * ============================================================
+     */
+
+    // ============================================================
+    // [LAUNCHER] 設定
+    // ============================================================
+
+    const APP_CONFIG = {
+      storageKey: "unified_mobile_workflow_mock_v2",
+      connectionMode: "mock",
+      apiBaseUrl: "",
+      apiEndpoint: "/store-workflows",
+      autosaveDebounceMs: 650
+    };
+
+    // [LAUNCHER] 画面ID・表示モード・ビューポート設定
+    const SCREEN = { START: "start", SCAN: "scan", CONFIRM: "confirm" };
+    const VIEW_MODE = { CARDS: "cards", TABLE: "table" };
+    const VIEWPORTS = { DESKTOP: "desktop", TABLET: "tablet", MOBILE: "mobile" };
+    const VIEWPORT_CONFIG = {
+      [VIEWPORTS.DESKTOP]: { label: "Desktop", width: "100%", height: "100vh", radius: 0 },
+      [VIEWPORTS.TABLET]: { label: "Tablet", width: 768, height: 820, radius: "4px" },
+      [VIEWPORTS.MOBILE]: { label: "iPhone", width: 390, height: 844, radius: "4px" }
+    };
+
+    // ============================================================
+    // [THEME] 業務定義（スーパーマーケット店頭 6業務）
+    // ============================================================
+    // BUSINESS・PRODUCTS・マスタ定数・シナリオがテーマ層。
+    // 別業務に転用する場合はここを差し替える。
+    // ============================================================
+
+    const BUSINESS = {
+      price: {
+        label: "価格調整", shortLabel: "価格", icon: "price_change", color: "warning",
+        purpose: "廃棄・値下・値上による調整額を把握する",
+        userPurpose: "廃棄・値下・値上した商品の個数と金額を確認します。",
+        startFields: ["department", "adjustmentType", "reason", "businessDate"],
+        itemFields: ["sku", "quantity", "beforePrice", "afterPrice"],
+        quantityLabel: "個数", amountLabel: "調整額",
+        outputActions: ["complete"],
+        completeChecks: ["合計金額確認", "理由確認", "確定確認"],
+        helpSteps: ["商品をスキャン", "個数・前売価・後売価を確認", "作業確定", "調整額と連携状況を確認"],
+        defaultValues: { adjustmentType: "廃棄", reason: "賞味期限切れ", quantity: 1 }
+      },
+      returnGoods: {
+        label: "返品", shortLabel: "返品", icon: "assignment_return", color: "error",
+        purpose: "返品による調整額を把握する",
+        userPurpose: "返品する商品の個数、販売区分、改票有無を確認します。",
+        startFields: ["department", "businessDate"],
+        itemFields: ["sku", "quantity", "saleType", "ticketChanged"],
+        quantityLabel: "個数", amountLabel: "調整額",
+        outputActions: ["pdf", "print", "complete"],
+        completeChecks: ["返品一覧表確認", "商品貼付", "所定位置保管"],
+        helpSteps: ["商品をスキャン", "個数・販売区分・改票有無を確認", "作業確定", "調整額と連携状況を確認"],
+        defaultValues: { quantity: 1, saleType: "通売", ticketChanged: false }
+      },
+      inventory: {
+        label: "棚卸", shortLabel: "棚卸", icon: "inventory", color: "success",
+        purpose: "棚卸数量と売価金額を把握する",
+        userPurpose: "売場の商品数量と売価を確認します。",
+        startFields: ["department", "salesFloor", "sequenceNo", "useCountSheet"],
+        itemFields: ["sku", "quantity", "displayPrice", "sequenceNo"],
+        quantityLabel: "数量", amountLabel: "売価金額",
+        outputActions: ["pdf", "complete"],
+        completeChecks: ["検査表確認", "数量修正完了", "店長確認"],
+        helpSteps: ["商品をスキャン", "数量・売価・連Noを確認", "作業確定", "売価金額と連携状況を確認"],
+        defaultValues: { quantity: 1, sequenceNo: "001", useCountSheet: true }
+      },
+      priceCheck: {
+        label: "売価チェック", shortLabel: "売価", icon: "fact_check", color: "info",
+        purpose: "POS登録売価と実際の売価を確認する",
+        userPurpose: "売場の表示売価がPOS登録売価と合っているか確認します。",
+        startFields: ["department", "salesFloor"],
+        itemFields: ["sku", "displayPrice"],
+        quantityLabel: "件数", amountLabel: "売価差異",
+        outputActions: ["pdf", "complete"],
+        completeChecks: ["差異修正", "POP再発行", "再チェック"],
+        helpSteps: ["商品をスキャン", "実売価を入力", "POS登録売価との差異を確認", "作業確定して実績を確認"],
+        defaultValues: { quantity: 1 }
+      },
+      pop: {
+        label: "POP発行", shortLabel: "POP", icon: "campaign", color: "primary",
+        purpose: "商品のPOP発行キューをPOPシステムへ送る",
+        userPurpose: "売場に出すPOPの枚数、売価、レイアウトを確認します。",
+        startFields: ["department", "layout", "printer"],
+        itemFields: ["sku", "quantity", "displayPrice", "layout"],
+        quantityLabel: "枚数", amountLabel: "POP売価",
+        outputActions: ["pdf", "print", "complete"],
+        completeChecks: ["POP内容確認", "売場差し替え", "旧POP回収"],
+        helpSteps: ["商品をスキャン", "枚数・POP売価・レイアウトを確認", "作業確定", "POPシステムへの発行キューを確認"],
+        defaultValues: { layout: "A4_1面", quantity: 1 }
+      },
+      label: {
+        label: "継承ラベル", shortLabel: "ラベル", icon: "label", color: "secondary",
+        purpose: "商品の産地を印字したラベルを発行する",
+        userPurpose: "商品に貼る産地ラベルの内容と枚数を確認します。",
+        startFields: ["department", "printer"],
+        itemFields: ["sku", "traceCode", "origin", "quantity"],
+        quantityLabel: "枚数", amountLabel: "枚数",
+        outputActions: ["print", "complete"],
+        completeChecks: ["ラベル印刷", "原料と一緒に保管", "不要ラベル破棄"],
+        helpSteps: ["商品をスキャン", "個体識別番号をスキャンまたは産地を入力", "枚数を確認", "ラベル発行"],
+        defaultValues: { quantity: 1, origin: "" }
+      }
+    };
+
+    const PRODUCTS = [
+      // [THEME] 商品マスタ（スーパー7品）
+      { sku: "P-1001", barcode: "4901000000012", name: "国産牛 肩ロース うすぎり", department: "精肉", currentPrice: 698 },
+      { sku: "P-1002", barcode: "4901000000029", name: "三元豚 ロース 生姜焼き用", department: "精肉", currentPrice: 398 },
+      { sku: "P-1003", barcode: "4901000000036", name: "若鶏もも肉 唐揚げ用", department: "精肉", currentPrice: 288 },
+      { sku: "P-2001", barcode: "4902000000019", name: "まぐろ切落し", department: "鮮魚", currentPrice: 598 },
+      { sku: "P-3001", barcode: "4903000000016", name: "ミックスサラダ", department: "惣菜", currentPrice: 298 },
+      { sku: "P-4001", barcode: "4904000000013", name: "北海道牛乳 1000ml", department: "日配", currentPrice: 228 },
+      { sku: "P-5001", barcode: "4905000000010", name: "バナナ 1袋", department: "青果", currentPrice: 198 }
+    ];
+
+    const DEPARTMENTS = ["青果", "鮮魚", "精肉", "惣菜", "日配", "グロサリー"]; // [THEME]
+    const LAYOUTS = ["A4_1面", "A4_4面", "A5", "棚札", "値下POP"];               // [THEME]
+    const PRINTERS = ["売場プリンター01", "バックヤード01", "ラベルプリンター01"];  // [THEME]
+    const REASONS = ["賞味期限切れ", "品質劣化", "売切促進", "競合対応", "本部指示", "売価訂正"]; // [THEME]
+    const ADJUSTMENT_TYPES = ["廃棄", "値下", "値上", "本部指示"];                // [THEME]
+    const SALE_TYPES = ["通売", "特売", "マネキン販売"];                           // [THEME]
+    const ORIGINS = ["国産", "北海道産", "青森県産", "宮城県産", "茨城県産", "千葉県産", "鹿児島県産", "オーストラリア産", "アメリカ産"]; // [THEME]
+
+    // ============================================================
+    // [CORE] ユーティリティ関数（テーマに依存しない汎用処理）
+    // ============================================================
+
+    function todayText() {
+      const date = new Date();
+      const pad = number => String(number).padStart(2, "0");
+      return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`;
+    }
+
+    function createSessionName(businessKey = "work") {
+      const date = new Date();
+      const pad = number => String(number).padStart(2, "0");
+      return `${(BUSINESS[businessKey]?.shortLabel || "作業")}-${pad(date.getHours())}${pad(date.getMinutes())}${pad(date.getSeconds())}`;
+    }
+
+    function yen(value) {
+      return new Intl.NumberFormat("ja-JP", { style: "currency", currency: "JPY", maximumFractionDigits: 0 }).format(Number(value || 0));
+    }
+
+    function inferOriginFromTraceCode(traceCode) {
+      const value = String(traceCode || "").trim().toUpperCase();
+      if (!value) return "";
+      if (value.startsWith("JP-01")) return "北海道産";
+      if (value.startsWith("JP-02")) return "青森県産";
+      if (value.startsWith("JP-04")) return "宮城県産";
+      if (value.startsWith("JP-08")) return "茨城県産";
+      if (value.startsWith("JP-12")) return "千葉県産";
+      if (value.startsWith("JP-46")) return "鹿児島県産";
+      if (value.startsWith("JP-")) return "国産";
+      if (value.startsWith("AU-")) return "オーストラリア産";
+      if (value.startsWith("US-")) return "アメリカ産";
+      return "";
+    }
+
+    function normalizeCode(value) {
+      return String(value || "").trim().replace(/[Ａ-Ｚａ-ｚ０-９]/g, char => String.fromCharCode(char.charCodeAt(0) - 0xFEE0)).replace(/\s+/g, "").toUpperCase();
+    }
+
+    function findProduct(value) {
+      const keyword = normalizeCode(value);
+      if (!keyword) return null;
+      return PRODUCTS.find(product => [product.sku, product.barcode, product.name].some(text => normalizeCode(text).includes(keyword))) || null;
+    }
+
+    // ============================================================
+    // [CORE] 状態ファクトリ・バリデーション（THEME定義を参照）
+    // ============================================================
+
+    function createDefaultContext(businessKey = "price") {
+      const business = BUSINESS[businessKey] || BUSINESS.price;
+      return {
+        businessKey,
+        workGroup: createSessionName(businessKey),
+        department: "精肉",
+        businessDate: todayText(),
+        startDate: todayText(),
+        endDate: todayText(),
+        layout: business.defaultValues.layout || "A4_1面",
+        printer: "売場プリンター01",
+        salesFloor: "精肉平台",
+        sequenceNo: business.defaultValues.sequenceNo || "001",
+        useCountSheet: business.defaultValues.useCountSheet ?? false,
+        adjustmentType: business.defaultValues.adjustmentType || "廃棄",
+        reason: business.defaultValues.reason || "売切促進"
+      };
+    }
+
+    function createDefaultItem(businessKey = "price", context = createDefaultContext(businessKey)) {
+      const business = BUSINESS[businessKey] || BUSINESS.price;
+      return {
+        id: null,
+        sku: "",
+        barcode: "",
+        productName: "",
+        workGroup: context.workGroup || "セッション1",
+        department: context.department,
+        currentPrice: 0,
+        quantity: business.defaultValues.quantity || 1,
+        beforePrice: "",
+        afterPrice: context.adjustmentType === "廃棄" ? 0 : "",
+        displayPrice: "",
+        layout: context.layout || "A4_1面",
+        traceCode: "",
+        origin: business.defaultValues.origin || "",
+        sequenceNo: context.sequenceNo || "001",
+        saleType: business.defaultValues.saleType || "通売",
+        ticketChanged: business.defaultValues.ticketChanged || false
+      };
+    }
+
+    function createEntry(productSku, businessKey, overrides = {}) {
+      const product = PRODUCTS.find(item => item.sku === productSku) || PRODUCTS[0];
+      const context = createDefaultContext(businessKey);
+      const item = createDefaultItem(businessKey, context);
+      const base = {
+        ...item,
+        id: overrides.id || `E-${Date.now()}-${Math.random().toString(16).slice(2, 7)}`,
+        sku: product.sku,
+        barcode: product.barcode,
+        productName: product.name,
+        department: product.department,
+        currentPrice: product.currentPrice,
+        beforePrice: product.currentPrice,
+        afterPrice: context.adjustmentType === "廃棄" ? 0 : Math.max(0, product.currentPrice - 50),
+        displayPrice: product.currentPrice,
+        quantity: 1
+      };
+      return { ...base, ...overrides };
+    }
+
+    function calcAmount(row, businessKey) {
+      if (businessKey === "price") return Math.abs((Number(row.beforePrice || 0) - Number(row.afterPrice || 0)) * Number(row.quantity || 1));
+      if (businessKey === "returnGoods") return Number(row.currentPrice || row.displayPrice || 0) * Number(row.quantity || 1);
+      if (businessKey === "priceCheck") return Math.abs(Number(row.displayPrice || 0) - Number(row.currentPrice || 0));
+      if (businessKey === "label") return Number(row.quantity || 1);
+      return Number(row.displayPrice || row.currentPrice || row.beforePrice || 0) * Number(row.quantity || 1);
+    }
+
+    function calcImpact(row, context) {
+      if (context.businessKey === "returnGoods") return -1 * Number(row.currentPrice || row.displayPrice || 0) * Number(row.quantity || 1);
+      if (context.businessKey !== "price") return 0;
+      return (Number(row.afterPrice || 0) - Number(row.beforePrice || 0)) * Number(row.quantity || 1);
+    }
+
+    function getMasterValueLabel(context) {
+      if (context.businessKey === "priceCheck") return "POS登録売価";
+      if (context.businessKey === "pop") return "現売価";
+      return "マスタ";
+    }
+
+    function getInputValueLabel(context) {
+      if (context.businessKey === "priceCheck") return "実売価";
+      if (context.businessKey === "pop") return "POP売価";
+      if (context.businessKey === "label") return "産地";
+      return "入力";
+    }
+
+    function formatInputValue(row, context) {
+      if (context.businessKey === "price") return yen(row.afterPrice);
+      if (context.businessKey === "label") return row.origin || row.traceCode || "-";
+      return yen(row.displayPrice || row.currentPrice);
+    }
+
+    function formatDecisionValue(row, context) {
+      if (context.businessKey === "pop") return yen(row.displayPrice || row.currentPrice);
+      if (context.businessKey === "label") return `${row.quantity || 1}枚`;
+      return yen(calcAmount(row, context.businessKey));
+    }
+
+    function calcSummaryDecisionValue(entries, context) {
+      if (context.businessKey === "pop" || context.businessKey === "label") return entries.reduce((sum, row) => sum + Number(row.quantity || 1), 0);
+      return entries.reduce((sum, row) => sum + calcAmount(row, context.businessKey), 0);
+    }
+
+    function formatSummaryDecisionValue(value, context) {
+      if (context.businessKey === "pop" || context.businessKey === "label") return `${value}枚`;
+      return yen(value);
+    }
+
+    function isBlank(value) {
+      return value === undefined || value === null || String(value).trim() === "";
+    }
+
+    function validateItem(row, context) {
+      const errors = [];
+      const businessKey = context.businessKey;
+      if (row.excluded) return errors;
+      if (row.duplicate) errors.push("重複登録");
+      if (!row.sku) errors.push("商品未選択");
+      const qty = Number(row.quantity || 0);
+      if (["pop", "price", "label", "inventory", "returnGoods"].includes(businessKey) && (!Number.isFinite(qty) || qty <= 0)) errors.push(`${BUSINESS[businessKey].quantityLabel}は1以上`);
+      if (businessKey === "pop") {
+        if (isBlank(row.displayPrice)) errors.push("売価未入力");
+        if (!isBlank(row.displayPrice) && row.sku && Number(row.displayPrice) !== Number(row.currentPrice)) errors.push("マスタ売価と印字売価が異なります");
+      }
+      if (businessKey === "price") {
+        if (isBlank(row.beforePrice)) errors.push("前売価未入力");
+        if (isBlank(row.afterPrice)) errors.push("後売価未入力");
+        if (context.adjustmentType === "廃棄" && Number(row.afterPrice) !== 0) errors.push("廃棄の後売価は0円");
+        if (context.adjustmentType === "値下" && Number(row.afterPrice) >= Number(row.beforePrice)) errors.push("値下は後売価＜前売価");
+        if (context.adjustmentType === "値上" && Number(row.afterPrice) <= Number(row.beforePrice)) errors.push("値上は後売価＞前売価");
+      }
+      if (businessKey === "label") {
+        if (!context.printer) errors.push("プリンター未選択");
+        if (!String(row.traceCode || "").trim() && !String(row.origin || "").trim()) errors.push("個体識別番号または産地が必要");
+      }
+      if (businessKey === "inventory") {
+        if (isBlank(row.displayPrice)) errors.push("売価未入力");
+      }
+      if (businessKey === "priceCheck" && row.sku && Number(row.displayPrice) !== Number(row.currentPrice)) errors.push("売価不一致");
+      if (businessKey === "returnGoods" && !row.saleType) errors.push("販売区分未選択");
+      return errors;
+    }
+
+    function getStatus(row, context) {
+      if (row.excluded) return { label: "対象外", color: "default", helper: row.excludeReason || "確認対象外" };
+      const errors = validateItem(row, context);
+      if (errors.length) return { label: "要確認", color: "error", helper: errors.join(" / ") };
+      if (context.businessKey === "priceCheck") return { label: "一致", color: "success", helper: "POS登録売価と一致" };
+      return { label: "OK", color: "success", helper: "" };
+    }
+
+    function loadState() {
+      try {
+        const raw = window.localStorage.getItem(APP_CONFIG.storageKey);
+        return raw ? JSON.parse(raw) : null;
+      } catch (error) {
+        console.warn(error);
+        return null;
+      }
+    }
+
+    function saveState(state) {
+      try { window.localStorage.setItem(APP_CONFIG.storageKey, JSON.stringify(state)); } catch (error) { console.warn(error); }
+    }
+
+    function createDraftId() {
+      return `D-${Date.now()}-${Math.random().toString(16).slice(2, 8)}`;
+    }
+
+    function createWorkflowSnapshot({ draftId, screen, context, entries, confirmedRecord, confirmedRecords = [] }) {
+      const activeEntries = getActiveEntries(entries);
+      return {
+        draftId,
+        status: confirmedRecord ? "confirmed" : "draft",
+        screen,
+        context,
+        entries,
+        activeEntryCount: activeEntries.length,
+        confirmedRecord: confirmedRecord || null,
+        confirmedRecords,
+        savedAt: new Date().toISOString()
+      };
+    }
+
+    async function syncWorkflowSnapshot(snapshot) {
+      if (APP_CONFIG.connectionMode === "mock") {
+        return { ok: true, mode: "mock", savedAt: snapshot.savedAt };
+      }
+      const endpoint = `${APP_CONFIG.apiBaseUrl || ""}${APP_CONFIG.apiEndpoint}`;
+      const response = await fetch(endpoint, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(snapshot)
+      });
+      if (!response.ok) throw new Error(`Workflow sync failed: ${response.status}`);
+      return { ok: true, mode: "server", savedAt: snapshot.savedAt };
+    }
+
+    // ============================================================
+    // [LAUNCHER] シナリオファクトリ・シナリオ定義（THEME）
+    // ============================================================
+
+    function applyScenarioToState(payload = {}) {
+      const context = { ...createDefaultContext(payload.businessKey || "price"), ...(payload.context || {}) };
+      // 互換: シナリオが単一の businessDate を渡す場合、開始日/終了日に展開する。
+      const legacyDate = payload.context && payload.context.businessDate;
+      if (legacyDate) {
+        if (!payload.context.startDate) context.startDate = legacyDate;
+        if (!payload.context.endDate) context.endDate = legacyDate;
+      }
+      const entries = Array.isArray(payload.entries) ? payload.entries : [];
+      const confirmedRecords = Array.isArray(payload.confirmedRecords) ? payload.confirmedRecords : (payload.confirmedRecord ? [payload.confirmedRecord] : []);
+      return { screen: payload.screen || SCREEN.START, context, entries, confirmedRecord: payload.confirmedRecord || null, confirmedRecords, openScanDrawer: Boolean(payload.openScanDrawer) };
+    }
+
+    function createScenarioConfirmedRecord(businessKey, entries = [], context = createDefaultContext(businessKey)) {
+      const activeCount = entries.filter(row => !row.deletedAt).length;
+      return {
+        recordId: `WF-SCENARIO-${businessKey}`,
+        status: "confirmed",
+        syncState: createIntegrationState(businessKey),
+        integrationTarget: getIntegrationTarget(businessKey),
+        integrationState: createIntegrationState(businessKey),
+        registeredAt: new Date().toISOString(),
+        businessKey,
+        workGroup: context.workGroup || "セッション1",
+        context: { ...context },
+        entries: entries.filter(row => !row.deletedAt).map(row => ({ ...row })),
+        entryCount: activeCount
+      };
+    }
+
+    function getScenarioDrawerDescription(businessKey, businessLabel) {
+      const descriptions = {
+        price: "登録ドロワーを開き、バーコード、商品、個数、前売価、後売価を入力します。",
+        returnGoods: "登録ドロワーを開き、返品する商品、個数、売価、改票有無を入力します。",
+        inventory: "登録ドロワーを開き、棚卸対象の商品、数量、売価、連Noを入力します。",
+        priceCheck: "登録ドロワーを開き、商品と実際に確認した売価を入力します。",
+        pop: "登録ドロワーを開き、商品、発行枚数、POP売価、レイアウトを入力します。",
+        label: "登録ドロワーを開き、商品コード、個体識別番号または産地、発行枚数を入力します。"
+      };
+      return descriptions[businessKey] || `${businessLabel}の登録ドロワーを開き、必要な明細を入力します。`;
+    }
+
+    function makeScenario({ id, business, label, category, context = {}, entries = [], viewport = VIEWPORTS.MOBILE, startDescription, scanDescription, confirmDescription, outputDescription }) {
+      const businessLabel = BUSINESS[business]?.label || business;
+      const scenarioContext = { ...createDefaultContext(business), ...context };
+      const hasIssues = entries.some(row => getStatus(row, scenarioContext).color === "error");
+      const canConfirmScenario = entries.filter(row => !row.deletedAt).length > 0 && !hasIssues;
+      const isLabelBusiness = business === "label";
+      const confirmedScenarioRecord = canConfirmScenario ? createScenarioConfirmedRecord(business, entries, scenarioContext) : null;
+      const confirmStepDescription = canConfirmScenario
+        ? (isLabelBusiness ? "継承ラベルの登録明細を確認し、ラベル発行ボタンで発行対象として確定します。" : `${businessLabel}の登録明細を確認し、作業確定ボタンで実績化します。`)
+        : `${businessLabel}の登録明細で要確認状態を確認します。`;
+      const outputStepDescription = outputDescription || confirmDescription || (canConfirmScenario
+        ? (isLabelBusiness ? "作業確定済みの継承ラベルを商品単位で確認し、ラベル発行・印刷に進みます。" : `${businessLabel}の確定済み実績を商品単位で確認し、修正・削除・ごみ箱を操作します。`)
+        : `${businessLabel}の要確認を登録明細で修正します。`);
+      const basePayload = { businessKey: business, context: scenarioContext };
+      const finalStepLabel = isLabelBusiness ? "発行結果" : (business === "pop" ? "POP連携確認" : (business === "priceCheck" ? "売価確認" : "実績確認"));
+      const confirmStepLabel = isLabelBusiness ? "ラベル発行" : "作業確定";
+      const steps = [
+        {
+          label: "開始",
+          description: startDescription || `${businessLabel}の基本条件を確認します。`,
+          payload: { ...basePayload, screen: SCREEN.START, entries: [] }
+        },
+        {
+          label: "条件",
+          description: `${businessLabel}の基本条件を入力します。`,
+          payload: { ...basePayload, screen: SCREEN.SCAN, entries: [], openStartSettings: true }
+        },
+        {
+          label: "入力ドロワー",
+          description: getScenarioDrawerDescription(business, businessLabel),
+          payload: { ...basePayload, screen: SCREEN.SCAN, entries: [], openScanDrawer: true }
+        },
+        {
+          label: "登録明細",
+          description: scanDescription || `${businessLabel}を連続登録し、登録明細に未確定データとして保持します。`,
+          payload: { ...basePayload, screen: SCREEN.SCAN, entries }
+        }
+      ];
+      if (canConfirmScenario) {
+        steps.push(
+          {
+            label: confirmStepLabel,
+            description: confirmStepDescription,
+            payload: { ...basePayload, screen: SCREEN.SCAN, entries }
+          },
+          {
+            label: finalStepLabel,
+            description: outputStepDescription,
+            payload: { ...basePayload, screen: SCREEN.CONFIRM, entries: [], confirmedRecord: confirmedScenarioRecord, confirmedRecords: [confirmedScenarioRecord] }
+          }
+        );
+      } else {
+        steps.push({
+          label: "是正",
+          description: outputStepDescription,
+          payload: { ...basePayload, screen: SCREEN.SCAN, entries }
+        });
+      }
+      return {
+        id,
+        business,
+        category,
+        label,
+        viewport,
+        steps
+      };
+    }
+
+    const MOCK_SCENARIOS = [
+      // [THEME] シナリオ定義 42本
+      // POP発行：7本
+      makeScenario({
+        id: "pop-01-normal",
+        business: "pop",
+        category: "正常系",
+        label: "POP-01 通常POP発行",
+        context: { department: "青果", layout: "A4_4面", printer: "売場プリンター01" },
+        entries: [createEntry("P-5001", "pop", { quantity: 2, displayPrice: 198, layout: "A4_4面" })],
+        startDescription: "部門・レイアウト・プリンターを選択してPOP発行を開始します。",
+        scanDescription: "商品を連続スキャンし、枚数と印字売価を登録明細に保持します。",
+        confirmDescription: "登録明細を作業確定し、実績一覧の商品表示とサマリー出力を確認します。"
+      }),
+      makeScenario({
+        id: "pop-02-search",
+        business: "pop",
+        category: "検索登録",
+        label: "POP-02 商品検索登録",
+        context: { department: "日配", layout: "棚札", printer: "売場プリンター01" },
+        entries: [createEntry("P-4001", "pop", { quantity: 1, displayPrice: 228, layout: "棚札" })],
+        scanDescription: "バーコードが読めない場合に商品検索で登録し、登録明細に残る状態を確認します。"
+      }),
+      makeScenario({
+        id: "pop-03-qty-missing",
+        business: "pop",
+        category: "入力漏れ",
+        label: "POP-03 枚数入力漏れ",
+        context: { department: "青果", layout: "A4_4面", printer: "売場プリンター01" },
+        entries: [createEntry("P-5001", "pop", { quantity: 0, displayPrice: 198 })],
+        confirmDescription: "枚数0件が登録明細で要確認になることを確認します。"
+      }),
+      makeScenario({
+        id: "pop-04-price-missing",
+        business: "pop",
+        category: "入力漏れ",
+        label: "POP-04 売価入力漏れ",
+        context: { department: "青果", layout: "A4_4面", printer: "売場プリンター01" },
+        entries: [createEntry("P-5001", "pop", { quantity: 1, displayPrice: "" })],
+        confirmDescription: "印字売価未入力が登録明細で要確認になることを確認します。"
+      }),
+      makeScenario({
+        id: "pop-05-price-diff",
+        business: "pop",
+        category: "売価差異",
+        label: "POP-05 売価変更確認",
+        context: { department: "青果", layout: "値下POP", printer: "売場プリンター01" },
+        entries: [createEntry("P-5001", "pop", { quantity: 1, displayPrice: 158, layout: "値下POP" })],
+        confirmDescription: "マスタ売価と印字売価が異なる場合に登録明細で要確認として検知します。"
+      }),
+      makeScenario({
+        id: "pop-06-preview",
+        business: "pop",
+        category: "印刷/出力",
+        label: "POP-06 印刷前プレビュー",
+        context: { department: "惣菜", layout: "A5", printer: "売場プリンター01" },
+        entries: [createEntry("P-3001", "pop", { quantity: 3, displayPrice: 298, layout: "A5" })],
+        confirmDescription: "実績一覧からサマリーを展開し、PDF確認へ進む導線を確認します。"
+      }),
+      makeScenario({
+        id: "pop-07-complete",
+        business: "pop",
+        category: "完了確認",
+        label: "POP-07 印刷後差し替え完了",
+        context: { department: "日配", layout: "棚札", printer: "売場プリンター01" },
+        entries: [createEntry("P-4001", "pop", { quantity: 2, displayPrice: 228, layout: "棚札" })],
+        confirmDescription: "作業確定後の実績一覧で、商品単位の確認と印刷出力を確認します。"
+      }),
+
+      // 価格調整：9本
+      makeScenario({
+        id: "price-01-disposal",
+        business: "price",
+        category: "正常系",
+        label: "PRICE-01 廃棄登録",
+        context: { department: "精肉", adjustmentType: "廃棄", reason: "賞味期限切れ", businessDate: "2026-06-29" },
+        entries: [createEntry("P-1001", "price", { quantity: 2, afterPrice: 0 }), createEntry("P-1002", "price", { quantity: 3, afterPrice: 0 })],
+        confirmDescription: "廃棄理由、個数、前売価、後売価0円、合計金額を登録明細で確認し、作業確定します。"
+      }),
+      makeScenario({
+        id: "price-02-markdown",
+        business: "price",
+        category: "正常系",
+        label: "PRICE-02 値下登録",
+        context: { department: "惣菜", adjustmentType: "値下", reason: "売切促進", businessDate: "2026-06-29" },
+        entries: [createEntry("P-3001", "price", { quantity: 5, afterPrice: 198 })],
+        confirmDescription: "後売価が前売価より低い値下登録を登録明細で確認し、作業確定します。"
+      }),
+      makeScenario({
+        id: "price-03-markup",
+        business: "price",
+        category: "正常系",
+        label: "PRICE-03 値上登録",
+        context: { department: "日配", adjustmentType: "値上", reason: "売価訂正", businessDate: "2026-06-29" },
+        entries: [createEntry("P-4001", "price", { quantity: 2, afterPrice: 258 })],
+        confirmDescription: "後売価が前売価より高い値上登録を登録明細で確認し、作業確定します。"
+      }),
+      makeScenario({
+        id: "price-04-hq",
+        business: "price",
+        category: "正常系",
+        label: "PRICE-04 本部指示登録",
+        context: { department: "鮮魚", adjustmentType: "本部指示", reason: "本部指示", businessDate: "2026-06-29" },
+        entries: [createEntry("P-2001", "price", { quantity: 4, afterPrice: 548 })],
+        confirmDescription: "本部指示理由で登録し、登録明細から作業確定できる状態を確認します。"
+      }),
+      makeScenario({
+        id: "price-05-disposal-error",
+        business: "price",
+        category: "売価不整合",
+        label: "PRICE-05 廃棄なのに後売価あり",
+        context: { department: "精肉", adjustmentType: "廃棄", reason: "品質劣化", businessDate: "2026-06-29" },
+        entries: [createEntry("P-1003", "price", { quantity: 1, afterPrice: 0 })],
+        confirmDescription: "廃棄で後売価が0円でない場合に登録明細で要確認になることを確認します。"
+      }),
+      makeScenario({
+        id: "price-06-markdown-error",
+        business: "price",
+        category: "売価不整合",
+        label: "PRICE-06 値下なのに後売価が高い",
+        context: { department: "惣菜", adjustmentType: "値下", reason: "売切促進", businessDate: "2026-06-29" },
+        entries: [createEntry("P-3001", "price", { quantity: 3, afterPrice: 348 })],
+        confirmDescription: "値下で後売価が前売価以上の場合に登録明細で要確認になることを確認します。"
+      }),
+      makeScenario({
+        id: "price-07-markup-error",
+        business: "price",
+        category: "売価不整合",
+        label: "PRICE-07 値上なのに後売価が低い",
+        context: { department: "日配", adjustmentType: "値上", reason: "売価訂正", businessDate: "2026-06-29" },
+        entries: [createEntry("P-4001", "price", { quantity: 2, afterPrice: 198 })],
+        confirmDescription: "値上で後売価が前売価以下の場合に登録明細で要確認になることを確認します。"
+      }),
+      makeScenario({
+        id: "price-08-duplicate",
+        business: "price",
+        category: "重複/対象外",
+        label: "PRICE-08 重複商品登録",
+        context: { department: "精肉", adjustmentType: "廃棄", reason: "賞味期限切れ", businessDate: "2026-06-29" },
+        entries: [createEntry("P-1001", "price", { quantity: 1, afterPrice: 0 }), createEntry("P-1001", "price", { quantity: 1, afterPrice: 0, duplicate: true })],
+        confirmDescription: "同一商品の重複登録を登録明細で要確認として検知します。"
+      }),
+      makeScenario({
+        id: "price-09-confirm-fix",
+        business: "price",
+        category: "修正導線",
+        label: "PRICE-09 実績一覧から修正",
+        context: { department: "精肉", adjustmentType: "廃棄", reason: "品質劣化", businessDate: "2026-06-29" },
+        entries: [createEntry("P-1003", "price", { quantity: 1, afterPrice: 80 })],
+        confirmDescription: "作業確定後の実績一覧で、商品単位の修正モーダルと削除・ごみ箱を確認します。"
+      }),
+
+      // 継承ラベル：6本
+      makeScenario({
+        id: "label-01-normal",
+        business: "label",
+        category: "正常系",
+        label: "LABEL-01 通常ラベル発行",
+        context: { department: "精肉", printer: "ラベルプリンター01" },
+        entries: [createEntry("P-1001", "label", { quantity: 2, traceCode: "JP-20260629-001", origin: "国産" })],
+        confirmDescription: "商品コード、個体識別番号、産地、枚数を登録明細で確認し、作業確定後にラベル発行へ進みます。"
+      }),
+      makeScenario({
+        id: "label-02-trace-scan",
+        business: "label",
+        category: "スキャン登録",
+        label: "LABEL-02 個体識別番号スキャン",
+        context: { department: "精肉", printer: "ラベルプリンター01" },
+        entries: [createEntry("P-1002", "label", { quantity: 3, traceCode: "JP-20260629-002", origin: "国産" })],
+        confirmDescription: "個体識別番号スキャンで産地が補完され、登録明細に残る状態を確認します。"
+      }),
+      makeScenario({
+        id: "label-03-origin-manual",
+        business: "label",
+        category: "手入力",
+        label: "LABEL-03 産地手入力",
+        context: { department: "精肉", printer: "ラベルプリンター01" },
+        entries: [createEntry("P-1001", "label", { quantity: 1, traceCode: "", origin: "オーストラリア産" })],
+        confirmDescription: "個体識別番号がない場合に産地手入力で登録明細へ追加できることを確認します。"
+      }),
+      makeScenario({
+        id: "label-04-qty-missing",
+        business: "label",
+        category: "入力漏れ",
+        label: "LABEL-04 枚数入力漏れ",
+        context: { department: "精肉", printer: "ラベルプリンター01" },
+        entries: [createEntry("P-1001", "label", { quantity: 0, traceCode: "JP-20260629-003", origin: "国産" })],
+        confirmDescription: "枚数0枚が登録明細で要確認になることを確認します。"
+      }),
+      makeScenario({
+        id: "label-05-printer-missing",
+        business: "label",
+        category: "印刷/出力",
+        label: "LABEL-05 プリンター未選択",
+        context: { department: "精肉", printer: "" },
+        entries: [createEntry("P-1002", "label", { quantity: 1, traceCode: "JP-20260629-004", origin: "国産" })],
+        confirmDescription: "プリンター未選択で登録明細が要確認になり、作業確定からラベル発行へ進めない状態を確認します。"
+      }),
+      makeScenario({
+        id: "label-06-storage-disposal",
+        business: "label",
+        category: "完了確認",
+        label: "LABEL-06 保管・破棄確認",
+        context: { department: "精肉", printer: "ラベルプリンター01" },
+        entries: [createEntry("P-1003", "label", { quantity: 2, traceCode: "JP-20260629-005", origin: "国産" })],
+        confirmDescription: "作業確定後にラベル発行へ進み、商品単位の確認とラベル出力を確認します。"
+      }),
+
+      // 棚卸：9本
+      makeScenario({
+        id: "inventory-01-no-sheet",
+        business: "inventory",
+        category: "正常系",
+        label: "INV-01 つけたて表なし登録",
+        context: { department: "青果", salesFloor: "青果平台", sequenceNo: "001", useCountSheet: false },
+        entries: [createEntry("P-5001", "inventory", { quantity: 12, displayPrice: 198, sequenceNo: "001" })],
+        confirmDescription: "つけたて表なしで登録し、作業確定後に商品単位の実績を確認します。"
+      }),
+      makeScenario({
+        id: "inventory-02-with-sheet",
+        business: "inventory",
+        category: "正常系",
+        label: "INV-02 つけたて表あり登録",
+        context: { department: "青果", salesFloor: "青果平台", sequenceNo: "001", useCountSheet: true },
+        entries: [createEntry("P-5001", "inventory", { quantity: 1, displayPrice: 198, sequenceNo: "001" })],
+        confirmDescription: "仮数量1で登録明細を作り、後から数量入力する導線を確認します。"
+      }),
+      makeScenario({
+        id: "inventory-03-sequence-switch",
+        business: "inventory",
+        category: "連No",
+        label: "INV-03 連No切替",
+        context: { department: "青果", salesFloor: "青果平台", sequenceNo: "002", useCountSheet: true },
+        entries: [createEntry("P-5001", "inventory", { quantity: 8, displayPrice: 198, sequenceNo: "001" }), createEntry("P-3001", "inventory", { quantity: 6, displayPrice: 298, sequenceNo: "002" })],
+        confirmDescription: "コーナー・列・平台単位で連Noを切り替え、登録明細に作業単位で残る状態を確認します。"
+      }),
+      makeScenario({
+        id: "inventory-04-random-weight",
+        business: "inventory",
+        category: "不定貫",
+        label: "INV-04 不定貫商品",
+        context: { department: "鮮魚", salesFloor: "鮮魚平台", sequenceNo: "010", useCountSheet: false },
+        entries: [createEntry("P-2001", "inventory", { quantity: 1, displayPrice: 598, sequenceNo: "010" })],
+        confirmDescription: "不定貫商品のJANスキャンと売価自動入力が登録明細に反映されることを確認します。"
+      }),
+      makeScenario({
+        id: "inventory-05-qty-missing",
+        business: "inventory",
+        category: "入力漏れ",
+        label: "INV-05 数量未入力",
+        context: { department: "青果", salesFloor: "青果平台", sequenceNo: "001", useCountSheet: false },
+        entries: [createEntry("P-5001", "inventory", { quantity: 0, displayPrice: 198, sequenceNo: "001" })],
+        confirmDescription: "数量未入力または0数量で登録明細が要確認になることを確認します。"
+      }),
+      makeScenario({
+        id: "inventory-06-price-missing",
+        business: "inventory",
+        category: "入力漏れ",
+        label: "INV-06 売価未入力",
+        context: { department: "青果", salesFloor: "青果平台", sequenceNo: "001", useCountSheet: false },
+        entries: [createEntry("P-5001", "inventory", { quantity: 5, displayPrice: "", sequenceNo: "001" })],
+        confirmDescription: "棚卸売価未入力で登録明細が要確認になることを確認します。"
+      }),
+      makeScenario({
+        id: "inventory-07-add-correction",
+        business: "inventory",
+        category: "修正導線",
+        label: "INV-07 商品追加修正",
+        context: { department: "青果", salesFloor: "青果平台", sequenceNo: "001", useCountSheet: true },
+        entries: [createEntry("P-5001", "inventory", { quantity: 10, displayPrice: 198, sequenceNo: "001" }), createEntry("P-3001", "inventory", { quantity: 4, displayPrice: 298, sequenceNo: "001" })],
+        confirmDescription: "登録明細で商品追加後に作業確定し、実績一覧で商品修正を確認します。"
+      }),
+      makeScenario({
+        id: "inventory-08-qty-price-fix",
+        business: "inventory",
+        category: "修正導線",
+        label: "INV-08 数量/売価訂正",
+        context: { department: "青果", salesFloor: "青果平台", sequenceNo: "001", useCountSheet: true },
+        entries: [createEntry("P-5001", "inventory", { quantity: 14, displayPrice: 188, sequenceNo: "001" })],
+        confirmDescription: "登録明細で検査数量・検査売価を訂正して再確認する状態を確認します。"
+      }),
+      makeScenario({
+        id: "inventory-09-manager-submit",
+        business: "inventory",
+        category: "完了確認",
+        label: "INV-09 店長提出前確認",
+        context: { department: "青果", salesFloor: "青果平台", sequenceNo: "001", useCountSheet: false },
+        entries: [createEntry("P-5001", "inventory", { quantity: 12, displayPrice: 198, sequenceNo: "001" }), createEntry("P-4001", "inventory", { quantity: 8, displayPrice: 228, sequenceNo: "002" })],
+        confirmDescription: "要確認0件で作業確定し、実績一覧の商品表示とサマリーを確認します。"
+      }),
+
+      // 売価チェック：6本
+      makeScenario({
+        id: "pricecheck-01-normal",
+        business: "priceCheck",
+        category: "正常系",
+        label: "PRICECHECK-01 通常売価チェック",
+        context: { department: "惣菜", salesFloor: "惣菜平台" },
+        entries: [createEntry("P-3001", "priceCheck", { displayPrice: 298 })],
+        confirmDescription: "部門・売場・商品・実売価を登録明細に保持し、POS登録売価と照合します。"
+      }),
+      makeScenario({
+        id: "pricecheck-02-match",
+        business: "priceCheck",
+        category: "正常系",
+        label: "PRICECHECK-02 売価一致",
+        context: { department: "青果", salesFloor: "青果平台" },
+        entries: [createEntry("P-5001", "priceCheck", { displayPrice: 198 })],
+        confirmDescription: "実売価とPOS登録売価が一致し、登録明細でOK表示になることを確認します。"
+      }),
+      makeScenario({
+        id: "pricecheck-03-mismatch",
+        business: "priceCheck",
+        category: "売価不整合",
+        label: "PRICECHECK-03 売価不一致",
+        context: { department: "惣菜", salesFloor: "惣菜平台" },
+        entries: [createEntry("P-3001", "priceCheck", { displayPrice: 198 })],
+        confirmDescription: "実売価とPOS登録売価が異なる場合に登録明細で要確認になることを確認します。"
+      }),
+      makeScenario({
+        id: "pricecheck-04-pop-reissue",
+        business: "priceCheck",
+        category: "修正導線",
+        label: "PRICECHECK-04 POP再発行導線",
+        context: { department: "惣菜", salesFloor: "惣菜平台" },
+        entries: [createEntry("P-3001", "priceCheck", { displayPrice: 198 })],
+        confirmDescription: "売価不一致の登録明細からPOP再発行・再チェックへ進む導線を確認します。"
+      }),
+      makeScenario({
+        id: "pricecheck-05-excluded",
+        business: "priceCheck",
+        category: "重複/対象外",
+        label: "PRICECHECK-05 対象外商品",
+        context: { department: "青果", salesFloor: "地場野菜売場" },
+        entries: [createEntry("P-5001", "priceCheck", { displayPrice: 198, excluded: true, excludeReason: "地場野菜のため対象外" })],
+        confirmDescription: "対象外商品を除外し、登録明細の要確認件数に含めないことを確認します。"
+      }),
+      makeScenario({
+        id: "pricecheck-06-doublecheck",
+        business: "priceCheck",
+        category: "完了確認",
+        label: "PRICECHECK-06 ダブルチェック完了",
+        context: { department: "日配", salesFloor: "日配平台" },
+        entries: [createEntry("P-4001", "priceCheck", { displayPrice: 228 }), createEntry("P-5001", "priceCheck", { displayPrice: 198 })],
+        confirmDescription: "一次確認後に作業確定し、実績一覧の商品表示でダブルチェック対象を確認します。"
+      }),
+
+      // 返品：5本
+      makeScenario({
+        id: "return-01-normal",
+        business: "returnGoods",
+        category: "正常系",
+        label: "RETURN-01 通常返品登録",
+        context: { department: "日配", businessDate: "2026-06-29" },
+        entries: [createEntry("P-4001", "returnGoods", { quantity: 4, saleType: "通売", ticketChanged: false })],
+        confirmDescription: "部門、日付、商品、個数、販売区分、改票有無を登録明細で確認し、作業確定します。"
+      }),
+      makeScenario({
+        id: "return-02-sale-type",
+        business: "returnGoods",
+        category: "区分切替",
+        label: "RETURN-02 販売区分切替",
+        context: { department: "惣菜", businessDate: "2026-06-29" },
+        entries: [createEntry("P-3001", "returnGoods", { quantity: 2, saleType: "特売" }), createEntry("P-5001", "returnGoods", { quantity: 3, saleType: "マネキン販売" })],
+        confirmDescription: "通売・特売・マネキン販売を切り替えて登録明細に保持できる状態を確認します。"
+      }),
+      makeScenario({
+        id: "return-03-ticket",
+        business: "returnGoods",
+        category: "改票",
+        label: "RETURN-03 改票あり",
+        context: { department: "日配", businessDate: "2026-06-29" },
+        entries: [createEntry("P-4001", "returnGoods", { quantity: 4, saleType: "通売", ticketChanged: true })],
+        confirmDescription: "改票ありで登録明細と実績一覧の返品表示を分けて確認する状態を確認します。"
+      }),
+      makeScenario({
+        id: "return-04-total",
+        business: "returnGoods",
+        category: "合計確認",
+        label: "RETURN-04 合計金額確認",
+        context: { department: "日配", businessDate: "2026-06-29" },
+        entries: [createEntry("P-4001", "returnGoods", { quantity: 4, saleType: "通売" }), createEntry("P-3001", "returnGoods", { quantity: 2, saleType: "特売" })],
+        confirmDescription: "返品一覧の合計金額と個別登録内容を登録明細で確認し、作業確定します。"
+      }),
+      makeScenario({
+        id: "return-05-print-store",
+        business: "returnGoods",
+        category: "印刷/出力",
+        label: "RETURN-05 印刷・貼付・保管",
+        context: { department: "日配", businessDate: "2026-06-29" },
+        entries: [createEntry("P-4001", "returnGoods", { quantity: 4, saleType: "通売", ticketChanged: true })],
+        confirmDescription: "作業確定後の実績一覧で返品一覧表のPDF・印刷出力を確認します。"
+      })
+    ];
+
+    // ============================================================
+    // [CORE] MUIテーマ設定
+    // ============================================================
+
+    const theme = createTheme({
+      palette: {
+        mode: "light",
+        // 各色に "50"（淡色トーン）を定義。コード内の `${color}.50` 参照を有効化する。
+        primary: { main: "#1976d2", light: "#63a4ff", dark: "#115293", 50: "#e8f1fb", contrastText: "#ffffff" },
+        secondary: { main: "#455a64", light: "#718792", dark: "#1c313a", 50: "#eceff1", contrastText: "#ffffff" },
+        warning: { main: "#ed6c02", light: "#ff9d3f", dark: "#b53d00", 50: "#fff3e0", contrastText: "#ffffff" },
+        success: { main: "#2e7d32", light: "#60ad5e", dark: "#005005", 50: "#e8f5e9", contrastText: "#ffffff" },
+        error: { main: "#d32f2f", light: "#ff6659", dark: "#9a0007", 50: "#fdecea", contrastText: "#ffffff" },
+        info: { main: "#0288d1", light: "#5eb8ff", dark: "#005b9f", 50: "#e6f3fb", contrastText: "#ffffff" },
+        background: { default: "#f4f6f8", paper: "#ffffff" },
+        text: { primary: "#1f2933", secondary: "#52606d" },
+        divider: "rgba(31,41,51,0.12)"
+      },
+      shape: { borderRadius: 12 },
+      // MUIの基本: タイポgrafィの太さは variant に集約し、各所の fontWeight:900 乱用を避ける。
+      typography: {
+        fontFamily: "Roboto, Meiryo, sans-serif",
+        h6: { fontWeight: 700, fontSize: "1.125rem", letterSpacing: "0.01em" },
+        subtitle1: { fontWeight: 700, fontSize: "1rem" },
+        subtitle2: { fontWeight: 700, fontSize: "0.875rem" },
+        body2: { lineHeight: 1.5 },
+        caption: { lineHeight: 1.45, color: "#52606d" },
+        button: { fontWeight: 600, textTransform: "none", letterSpacing: "0.01em" }
+      },
+      components: {
+        // 余白・密度・面の基準をテーマに集約（8pxグリッド）。
+        MuiPaper: { defaultProps: { elevation: 0 } },
+        MuiButton: {
+          defaultProps: { disableElevation: true },
+          styleOverrides: { root: { borderRadius: 10, minHeight: 40 }, sizeSmall: { minHeight: 32 } }
+        },
+        MuiCard: { styleOverrides: { root: { borderRadius: 14, border: "1px solid", borderColor: "rgba(31,41,51,0.1)" } } },
+        MuiChip: { styleOverrides: { root: { fontWeight: 600, borderRadius: 8 }, label: { paddingLeft: 10, paddingRight: 10 } } },
+        MuiTextField: { defaultProps: { size: "small" } },
+        MuiSelect: { defaultProps: { size: "small" } },
+        MuiToggleButton: { styleOverrides: { root: { fontWeight: 600, textTransform: "none" } } },
+        MuiAlert: { styleOverrides: { root: { borderRadius: 10, alignItems: "center" } } },
+        MuiTableCell: {
+          styleOverrides: {
+            head: { fontWeight: 700, backgroundColor: "#f8fafc", color: "#52606d", whiteSpace: "nowrap", borderBottom: "1px solid rgba(31,41,51,0.12)" },
+            body: { whiteSpace: "nowrap" }
+          }
+        },
+        MuiAppBar: { styleOverrides: { root: { backgroundImage: "none" } } },
+        MuiTooltip: { styleOverrides: { tooltip: { fontSize: "0.75rem", borderRadius: 8 } } }
+      }
+    });
+
+    // ============================================================
+    // [CORE] 共通UIコンポーネント
+    // ============================================================
+
+    function SummaryCard({ icon, label, value, helper, color = "primary" }) {
+      return (
+        <Paper variant="outlined" sx={{ p: 1.5, height: "100%", borderRadius: 2 }}>
+          <Stack direction="row" spacing={1} alignItems="flex-start">
+            <Box sx={{ width: 36, height: 36, borderRadius: 2, display: "grid", placeItems: "center", bgcolor: `${color}.50`, color: `${color}.main`, flex: "0 0 auto" }}><Icon>{icon}</Icon></Box>
+            <Box sx={{ minWidth: 0 }}>
+              <Typography variant="caption" color="text.secondary" display="block">{label}</Typography>
+              <Typography variant="h6" sx={{ lineHeight: 1.3 }}>{value}</Typography>
+              {helper && <Typography variant="caption" color="text.secondary">{helper}</Typography>}
+            </Box>
+          </Stack>
+        </Paper>
+      );
+    }
+
+    function BusinessIcon({ item, size = 52, iconSize = 30 }) {
+      return (
+        <Box sx={{ width: size, height: size, minWidth: size, borderRadius: "50%", display: "grid", placeItems: "center", bgcolor: `${item.color}.50`, color: `${item.color}.main`, flex: "0 0 auto" }}>
+          <Icon sx={{ width: iconSize, height: iconSize, fontSize: iconSize, display: "grid", placeItems: "center", lineHeight: 1 }}>{item.icon}</Icon>
+        </Box>
+      );
+    }
+
+    function DynamicField({ name, value, onChange, context, onFocus, inputRef, optional = false }) {
+      const common = { fullWidth: true, size: "small" };
+      const optionalItem = optional ? <MenuItem value="">指定なし</MenuItem> : null;
+      if (name === "department") return <FormControl {...common}><InputLabel>部門</InputLabel><Select label="部門" value={value || ""} onChange={e => onChange(name, e.target.value)}>{optionalItem}{DEPARTMENTS.map(item => <MenuItem key={item} value={item}>{item}</MenuItem>)}</Select></FormControl>;
+      if (name === "businessDate") return <TextField {...common} type="date" label="登録日" value={value || todayText()} onChange={e => onChange(name, e.target.value)} InputLabelProps={{ shrink: true }} />;
+      if (name === "startDate") return <TextField {...common} type="date" label="開始日" value={value || todayText()} onChange={e => onChange(name, e.target.value)} InputLabelProps={{ shrink: true }} />;
+      if (name === "endDate") return <TextField {...common} type="date" label="終了日" value={value || todayText()} onChange={e => onChange(name, e.target.value)} InputLabelProps={{ shrink: true }} inputProps={{ min: context.startDate || undefined }} />;
+      if (name === "layout") return <FormControl {...common}><InputLabel>レイアウト</InputLabel><Select label="レイアウト" value={optional ? (value || "") : (value || "A4_1面")} onChange={e => onChange(name, e.target.value)}>{optionalItem}{LAYOUTS.map(item => <MenuItem key={item} value={item}>{item}</MenuItem>)}</Select></FormControl>;
+      if (name === "printer") return <FormControl {...common}><InputLabel>プリンター</InputLabel><Select label="プリンター" value={optional ? (value || "") : (value || "売場プリンター01")} onChange={e => onChange(name, e.target.value)}>{optionalItem}{PRINTERS.map(item => <MenuItem key={item} value={item}>{item}</MenuItem>)}</Select></FormControl>;
+      if (name === "salesFloor") return <TextField {...common} label="売場" value={value || ""} onChange={e => onChange(name, e.target.value)} />;
+      if (name === "sequenceNo") return <TextField {...common} label="連No" value={optional ? (value || "") : (value || "001")} inputRef={inputRef} onFocus={event => { event.target.select(); onFocus?.(name); }} onChange={e => onChange(name, e.target.value)} inputProps={{ inputMode: "numeric" }} />;
+      if (name === "useCountSheet" && optional) return <FormControl {...common}><InputLabel>つけたて表</InputLabel><Select label="つけたて表" value={value === true ? "true" : value === false ? "false" : ""} onChange={e => onChange(name, e.target.value === "" ? null : e.target.value === "true")}><MenuItem value="">指定なし</MenuItem><MenuItem value="true">あり</MenuItem><MenuItem value="false">なし</MenuItem></Select></FormControl>;
+      if (name === "useCountSheet") return <Paper variant="outlined" sx={{ px: 1.2, py: 0.6, display: "flex", alignItems: "center", justifyContent: "space-between" }}><Typography variant="body2" sx={{ fontWeight: 800 }}>つけたて表</Typography><Switch checked={Boolean(value)} onChange={e => onChange(name, e.target.checked)} /></Paper>;
+      if (name === "adjustmentType") return <FormControl {...common}><InputLabel>区分</InputLabel><Select label="区分" value={optional ? (value || "") : (value || "廃棄")} onChange={e => onChange(name, e.target.value)}>{optionalItem}{ADJUSTMENT_TYPES.map(item => <MenuItem key={item} value={item}>{item}</MenuItem>)}</Select></FormControl>;
+      if (name === "reason") return <FormControl {...common}><InputLabel>理由</InputLabel><Select label="理由" value={value || ""} onChange={e => onChange(name, e.target.value)}>{optionalItem}{REASONS.map(item => <MenuItem key={item} value={item}>{item}</MenuItem>)}</Select></FormControl>;
+      if (name === "quantity") return <TextField {...common} type="number" label={BUSINESS[context.businessKey].quantityLabel} value={value ?? 1} inputRef={inputRef} onFocus={event => { event.target.select(); onFocus?.(name); }} onChange={e => onChange(name, Number(e.target.value))} inputProps={{ min: 1, inputMode: "numeric" }} />;
+      if (name === "beforePrice") return <TextField {...common} type="number" label="前売価" value={value ?? ""} inputRef={inputRef} onFocus={event => { event.target.select(); onFocus?.(name); }} onChange={e => onChange(name, Number(e.target.value))} inputProps={{ inputMode: "numeric" }} InputProps={{ endAdornment: <InputAdornment position="end">円</InputAdornment> }} />;
+      if (name === "afterPrice") return <TextField {...common} type="number" label="後売価" value={context.adjustmentType === "廃棄" ? 0 : (value ?? "")} disabled={context.adjustmentType === "廃棄"} inputRef={inputRef} onFocus={event => { event.target.select(); onFocus?.(name); }} onChange={e => onChange(name, Number(e.target.value))} inputProps={{ inputMode: "numeric" }} InputProps={{ endAdornment: <InputAdornment position="end">円</InputAdornment> }} />;
+      if (name === "displayPrice") return <TextField {...common} type="number" label={context.businessKey === "priceCheck" ? "実売価" : "売価"} value={value ?? ""} inputRef={inputRef} onFocus={event => { event.target.select(); onFocus?.(name); }} onChange={e => onChange(name, Number(e.target.value))} inputProps={{ inputMode: "numeric" }} InputProps={{ endAdornment: <InputAdornment position="end">円</InputAdornment> }} />;
+      if (name === "traceCode") return <TextField {...common} label="個体識別番号" value={value || ""} onChange={e => onChange(name, e.target.value)} />;
+      if (name === "origin") return <Autocomplete freeSolo options={ORIGINS} value={value || ""} onChange={(_, next) => onChange(name, next || "")} onInputChange={(_, next) => onChange(name, next || "")} renderInput={params => <TextField {...params} {...common} label="産地" />} />;
+      if (name === "saleType") return <FormControl {...common}><InputLabel>販売区分</InputLabel><Select label="販売区分" value={value || "通売"} onChange={e => onChange(name, e.target.value)}>{SALE_TYPES.map(item => <MenuItem key={item} value={item}>{item}</MenuItem>)}</Select></FormControl>;
+      if (name === "ticketChanged") return <Paper variant="outlined" sx={{ px: 1.2, py: 0.6, display: "flex", alignItems: "center", justifyContent: "space-between" }}><Typography variant="body2" sx={{ fontWeight: 800 }}>改票あり</Typography><Switch checked={Boolean(value)} onChange={e => onChange(name, e.target.checked)} /></Paper>;
+      return null;
+    }
+
+    function EmptyState({ text }) {
+      return <Paper variant="outlined" sx={{ p: 3, textAlign: "center", bgcolor: "grey.50" }}><Typography color="text.secondary">{text}</Typography></Paper>;
+    }
+
+    function CameraScanDialog({ open, onClose, onDetected }) {
+      const videoRef = React.useRef(null);
+      const streamRef = React.useRef(null);
+      const frameRef = React.useRef(null);
+      const [status, setStatus] = React.useState("idle");
+      const [errorText, setErrorText] = React.useState("");
+      const detectorSupported = typeof window !== "undefined" && "BarcodeDetector" in window;
+
+      React.useEffect(() => {
+        if (!open) return undefined;
+        let disposed = false;
+        async function startCamera() {
+          setStatus("starting");
+          setErrorText("");
+          try {
+            const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: { ideal: "environment" } }, audio: false });
+            if (disposed) {
+              stream.getTracks().forEach(track => track.stop());
+              return;
+            }
+            streamRef.current = stream;
+            if (videoRef.current) {
+              videoRef.current.srcObject = stream;
+              await videoRef.current.play();
+            }
+            if (!detectorSupported) {
+              setStatus("fallback");
+              return;
+            }
+            const detector = new window.BarcodeDetector({ formats: ["ean_13", "ean_8", "code_128", "code_39", "qr_code"] });
+            setStatus("scanning");
+            const scanFrame = async () => {
+              if (disposed || !videoRef.current) return;
+              try {
+                const codes = await detector.detect(videoRef.current);
+                if (codes.length > 0) {
+                  onDetected(codes[0].rawValue);
+                  return;
+                }
+              } catch (error) {
+                console.warn(error);
+              }
+              frameRef.current = window.requestAnimationFrame(scanFrame);
+            };
+            scanFrame();
+          } catch (error) {
+            console.warn(error);
+            setStatus("error");
+            setErrorText("カメラを起動できません。ブラウザのカメラ許可、HTTPS、端末設定を確認してください。");
+          }
+        }
+        startCamera();
+        return () => {
+          disposed = true;
+          if (frameRef.current) window.cancelAnimationFrame(frameRef.current);
+          streamRef.current?.getTracks?.().forEach(track => track.stop());
+          streamRef.current = null;
+          if (videoRef.current) videoRef.current.srcObject = null;
+        };
+      }, [open]);
+
+      return (
+        <Dialog open={open} onClose={onClose} fullWidth maxWidth="xs">
+          <DialogTitle sx={{ pb: 1 }}>カメラスキャン</DialogTitle>
+          <DialogContent dividers>
+            <Stack spacing={1.5}>
+              <Box sx={{ position: "relative", overflow: "hidden", borderRadius: 2, bgcolor: "grey.900", aspectRatio: "4 / 3" }}>
+                <video ref={videoRef} muted playsInline autoPlay style={{ width: "100%", height: "100%", objectFit: "cover", display: "block" }} />
+                <Box sx={{ position: "absolute", inset: "24% 10%", border: "2px solid rgba(255,255,255,0.86)", borderRadius: 2, boxShadow: "0 0 0 999px rgba(0,0,0,0.28)" }} />
+              </Box>
+              {status === "starting" && <Alert severity="info">カメラを起動しています。</Alert>}
+              {status === "scanning" && <Alert severity="info">バーコードを枠内に合わせてください。</Alert>}
+              {status === "fallback" && <Alert severity="warning">このブラウザは自動読取に未対応です。モック確認用に下のサンプル読取を使えます。</Alert>}
+              {status === "error" && <Alert severity="warning">{errorText}</Alert>}
+              {(status === "fallback" || status === "error") && (
+                <Stack direction="row" spacing={1} useFlexGap flexWrap="wrap">
+                  {PRODUCTS.slice(0, 4).map(product => (
+                    <Button key={product.sku} size="small" variant="outlined" onClick={() => onDetected(product.barcode)}>{product.name}</Button>
+                  ))}
+                </Stack>
+              )}
+            </Stack>
+          </DialogContent>
+          <DialogActions>
+            <Button onClick={onClose}>閉じる</Button>
+          </DialogActions>
+        </Dialog>
+      );
+    }
+
+    function ConfirmDialog({ open, title, description, confirmLabel = "削除", confirmColor = "error", onCancel, onConfirm, children }) {
+      return (
+        <Dialog open={open} onClose={onCancel} fullWidth maxWidth="xs">
+          <DialogTitle>{title}</DialogTitle>
+          <DialogContent dividers>
+            <Stack spacing={1}>
+              {description && <Typography variant="body2" color="text.secondary">{description}</Typography>}
+              {children}
+            </Stack>
+          </DialogContent>
+          <DialogActions>
+            <Button onClick={onCancel}>キャンセル</Button>
+            <Button variant="contained" color={confirmColor} onClick={onConfirm}>{confirmLabel}</Button>
+          </DialogActions>
+        </Dialog>
+      );
+    }
+
+    const NUMBER_PAD_FIELDS = ["quantity", "beforePrice", "afterPrice", "displayPrice", "sequenceNo"];
+
+    function getNumericItemFields(context) {
+      const business = BUSINESS[context.businessKey] || BUSINESS.price;
+      return business.itemFields.filter(field => NUMBER_PAD_FIELDS.includes(field) && !(field === "afterPrice" && context.adjustmentType === "廃棄"));
+    }
+
+    function NumberPad({ open, onToggle, disabled, onInput, onBackspace, onClear, onPrevious, onEnter }) {
+      const keepInputFocus = event => event.preventDefault();
+      const run = action => {
+        if (disabled) return;
+        action?.();
+      };
+      if (!open) {
+        return <Button fullWidth variant="outlined" startIcon={<Icon>dialpad</Icon>} onMouseDown={keepInputFocus} onClick={onToggle}>テンキーを表示</Button>;
+      }
+      return (
+        <Paper variant="outlined" sx={{ p: 1, borderRadius: 2, bgcolor: "background.paper" }}>
+          <Grid container spacing={0.75}>
+            {["1", "2", "3", "4", "5", "6", "7", "8", "9", "00", "0"].map(key => (
+              <Grid item xs={4} key={key}>
+                <Button fullWidth variant="outlined" size="large" disabled={disabled} onMouseDown={keepInputFocus} onClick={() => run(() => onInput(key))} sx={{ minHeight: 48, fontSize: "1.1rem", fontWeight: 900 }}>{key}</Button>
+              </Grid>
+            ))}
+            <Grid item xs={4}><Button fullWidth variant="outlined" color="secondary" size="large" disabled={disabled} onMouseDown={keepInputFocus} onClick={() => run(onBackspace)} sx={{ minHeight: 48 }}><Icon>backspace</Icon></Button></Grid>
+            <Grid item xs={4}><Button fullWidth variant="outlined" color="secondary" disabled={disabled} onMouseDown={keepInputFocus} onClick={() => run(onPrevious)} sx={{ minHeight: 44 }} startIcon={<Icon>arrow_upward</Icon>}>戻る</Button></Grid>
+            <Grid item xs={4}><Button fullWidth variant="outlined" color="secondary" disabled={disabled} onMouseDown={keepInputFocus} onClick={() => run(onClear)} sx={{ minHeight: 44 }}>C</Button></Grid>
+            <Grid item xs={4}><Button fullWidth variant="contained" disabled={disabled} onMouseDown={keepInputFocus} onClick={() => run(onEnter)} sx={{ minHeight: 44 }} endIcon={<Icon>keyboard_return</Icon>}>Enter</Button></Grid>
+            <Grid item xs={12}><Button fullWidth variant="text" color="secondary" onMouseDown={keepInputFocus} onClick={onToggle}>テンキーを閉じる</Button></Grid>
+          </Grid>
+        </Paper>
+      );
+    }
+
+    const TRASH_RETENTION_MS = 2 * 24 * 60 * 60 * 1000;
+
+    function isDeleted(row) {
+      return Boolean(row?.deletedAt);
+    }
+
+    function getActiveEntries(entries = []) {
+      return entries.filter(row => !isDeleted(row));
+    }
+
+    function getStartFields(context) {
+      const business = BUSINESS[context.businessKey] || BUSINESS.price;
+      return business.startFields || [];
+    }
+
+    function getEntryWorkGroup(row, context) {
+      return row.workGroup || context.workGroup || "未分類";
+    }
+
+    function groupEntriesByWorkGroup(entries = [], context) {
+      const groups = [];
+      entries.forEach(row => {
+        const label = getEntryWorkGroup(row, context);
+        let group = groups.find(item => item.label === label);
+        if (!group) {
+          group = { label, entries: [] };
+          groups.push(group);
+        }
+        group.entries.push(row);
+      });
+      return groups;
+    }
+
+    function getTrashEntries(entries = []) {
+      return entries.filter(isDeleted).sort((a, b) => Number(b.deletedAt || 0) - Number(a.deletedAt || 0));
+    }
+
+    function purgeExpiredTrash(entries = [], now = Date.now()) {
+      return entries.filter(row => !row.deletedAt || now - Number(row.deletedAt) < TRASH_RETENTION_MS);
+    }
+
+    function trashRemainingText(row) {
+      const remaining = TRASH_RETENTION_MS - (Date.now() - Number(row.deletedAt || Date.now()));
+      if (remaining <= 0) return "自動完全削除の対象";
+      const hours = Math.ceil(remaining / (60 * 60 * 1000));
+      if (hours >= 24) return `あと${Math.ceil(hours / 24)}日で完全削除`;
+      return `あと${hours}時間で完全削除`;
+    }
+
+    function formatDateTimeText(value) {
+      if (!value) return "-";
+      const date = new Date(value);
+      if (Number.isNaN(date.getTime())) return String(value);
+      const pad = number => String(number).padStart(2, "0");
+      return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}`;
+    }
+
+    function getIntegrationTarget(businessKey) {
+      if (businessKey === "pop") return "POPシステム";
+      if (businessKey === "label") return "印刷";
+      if (["price", "returnGoods", "inventory"].includes(businessKey)) return "基幹システム";
+      return "確認出力";
+    }
+
+    function createIntegrationState(businessKey) {
+      if (businessKey === "label") return "printed";
+      return "pendingDaily";
+    }
+
+    function getIntegrationStatus(record) {
+      const businessKey = record?.businessKey || record?.context?.businessKey || "price";
+      const target = record?.integrationTarget || getIntegrationTarget(businessKey);
+      let state = record?.integrationState || record?.syncState || createIntegrationState(businessKey);
+      if (businessKey !== "label" && isBackendLinkedRecord(record)) state = "linked";
+      const statusMap = {
+        printed: { label: "印刷済", color: "success" },
+        linked: { label: "日次連携済み", color: "secondary" },
+        pendingDaily: { label: "日次連携待ち", color: "warning" },
+        pending: { label: "連携待ち", color: "warning" },
+        failed: { label: "連携失敗", color: "error" }
+      };
+      return { target, state, ...(statusMap[state] || { label: "未連携", color: "default" }) };
+    }
+
+    function createMockRecord(context, entries) {
+      const now = new Date();
+      const pad = number => String(number).padStart(2, "0");
+      const datePart = `${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}`;
+      const timePart = `${pad(now.getHours())}${pad(now.getMinutes())}${pad(now.getSeconds())}`;
+      const integrationTarget = getIntegrationTarget(context.businessKey);
+      const integrationState = createIntegrationState(context.businessKey);
+      return {
+        recordId: `WF-${datePart}-${timePart}`,
+        status: "confirmed",
+        syncState: integrationState,
+        integrationTarget,
+        integrationState,
+        registeredAt: now.toISOString(),
+        businessKey: context.businessKey,
+        workGroup: context.workGroup || "セッション1",
+        context: { ...context },
+        entries: getActiveEntries(entries).map(row => ({ ...row })),
+        entryCount: getActiveEntries(entries).length
+      };
+    }
+
+    function isBackendLinkedRecord(record) {
+      if (!record) return false;
+      if (record.syncState === "linked" || record.backendLinkedAt) return true;
+      const businessDate = record.context?.businessDate || record.context?.endDate || "";
+      return businessDate && businessDate < todayText();
+    }
+
+    function cloneRecordEntriesForWork(record, correction = false) {
+      return (record.entries || []).map(row => ({
+        ...row,
+        id: `E-${Date.now()}-${Math.random().toString(16).slice(2, 6)}`,
+        deletedAt: null,
+        sourceRecordId: record.recordId,
+        correctionOf: correction ? record.recordId : undefined
+      }));
+    }
+
+    function TrashDialog({ open, entries, context, onClose, onRestore, onPermanentDelete }) {
+      const [permanentTarget, setPermanentTarget] = React.useState(null);
+      const trashEntries = getTrashEntries(entries);
+      React.useEffect(() => { if (!open) setPermanentTarget(null); }, [open]);
+      return (
+        <React.Fragment>
+          <Dialog open={open} onClose={onClose} fullWidth maxWidth="sm">
+            <DialogTitle sx={{ pb: 1 }}>
+              <Stack direction="row" spacing={1} alignItems="center">
+                <Icon color="error">delete</Icon>
+                <Box sx={{ minWidth: 0 }}>
+                  <Typography variant="h6">ごみ箱</Typography>
+                  <Typography variant="caption" color="text.secondary">削除した明細は2日後に自動で完全削除されます。</Typography>
+                </Box>
+              </Stack>
+            </DialogTitle>
+            <DialogContent dividers sx={{ bgcolor: "background.default" }}>
+              <Stack spacing={1}>
+                {trashEntries.length === 0 && <EmptyState text="ごみ箱は空です。" />}
+                {trashEntries.map(row => (
+                  <Paper key={row.id} variant="outlined" sx={{ p: 1.25, bgcolor: "background.paper" }}>
+                    <Stack spacing={1}>
+                      <Stack direction="row" spacing={1} alignItems="flex-start" justifyContent="space-between">
+                        <Box sx={{ minWidth: 0 }}>
+                          <Typography variant="subtitle2" noWrap>{row.productName || "商品未選択"}</Typography>
+                          <Typography variant="caption" color="text.secondary">{row.barcode || row.sku || "-"} / {trashRemainingText(row)}</Typography>
+                        </Box>
+                        <Chip size="small" color="error" variant="outlined" label="ごみ箱" />
+                      </Stack>
+                      <Stack direction="row" spacing={1} justifyContent="flex-end">
+                        <Button size="small" variant="outlined" startIcon={<Icon>restore</Icon>} onClick={() => onRestore(row.id)}>復活</Button>
+                        <Button size="small" color="error" startIcon={<Icon>delete_forever</Icon>} onClick={() => setPermanentTarget(row)}>完全削除</Button>
+                      </Stack>
+                    </Stack>
+                  </Paper>
+                ))}
+              </Stack>
+            </DialogContent>
+            <DialogActions><Button onClick={onClose}>閉じる</Button></DialogActions>
+          </Dialog>
+          <ConfirmDialog
+            open={Boolean(permanentTarget)}
+            title="完全削除しますか？"
+            description="完全削除した明細は復活できません。"
+            confirmLabel="完全削除"
+            onCancel={() => setPermanentTarget(null)}
+            onConfirm={() => { if (permanentTarget) onPermanentDelete(permanentTarget.id); setPermanentTarget(null); }}
+          >
+            {permanentTarget && <Alert severity="error" sx={{ py: 0.5 }}>{permanentTarget.productName || "商品未選択"}</Alert>}
+          </ConfirmDialog>
+        </React.Fragment>
+      );
+    }
+
+
+    function EntryCard({ row, context, onEdit, onRemove, readOnly = false, selected = false, onToggleSelect = null }) {
+      const status = getStatus(row, context);
+      const business = BUSINESS[context.businessKey];
+      const isError = status.color === "error";
+      return (
+        <Paper variant="outlined" sx={{ p: 1.5, borderRadius: 2, borderColor: selected ? "primary.main" : (isError ? "error.light" : "divider"), bgcolor: selected ? "primary.50" : (isError ? "error.50" : "background.paper") }}>
+          <Stack direction="row" spacing={1} alignItems="flex-start">
+            {!readOnly && onToggleSelect && (
+              <Checkbox
+                size="small"
+                checked={selected}
+                onChange={() => onToggleSelect(row)}
+                inputProps={{ "aria-label": `${row.productName || "明細"}を選択` }}
+                sx={{ p: 0.25, mt: -0.25 }}
+              />
+            )}
+            <Box sx={{ minWidth: 0, flex: 1 }}>
+              <Stack direction="row" spacing={1} justifyContent="space-between" alignItems="flex-start">
+                <Box sx={{ minWidth: 0 }}>
+                  <Typography variant="subtitle2" noWrap>{row.productName || "商品未選択"}</Typography>
+                  <Typography variant="caption" color="text.secondary">{row.barcode || row.sku || "-"}</Typography>
+                </Box>
+                <Chip size="small" color={status.color} variant={isError ? "filled" : "outlined"} label={status.label} />
+              </Stack>
+              <Grid container spacing={1} sx={{ mt: 0.5 }}>
+                <Grid item xs={3}><Typography variant="caption" color="text.secondary" display="block">{business.quantityLabel}</Typography><Typography variant="body2" sx={{ fontWeight: 700 }}>{row.quantity || 1}</Typography></Grid>
+                <Grid item xs={3}><Typography variant="caption" color="text.secondary" display="block">{getMasterValueLabel(context)}</Typography><Typography variant="body2" sx={{ fontWeight: 700 }}>{yen(row.currentPrice)}</Typography></Grid>
+                <Grid item xs={3}><Typography variant="caption" color="text.secondary" display="block">{getInputValueLabel(context)}</Typography><Typography variant="body2" sx={{ fontWeight: 700 }}>{formatInputValue(row, context)}</Typography></Grid>
+                <Grid item xs={3}><Typography variant="caption" color="text.secondary" display="block">{business.amountLabel}</Typography><Typography variant="body2" sx={{ fontWeight: 700 }}>{formatDecisionValue(row, context)}</Typography></Grid>
+              </Grid>
+              {status.helper && <Alert severity={status.color === "default" ? "info" : status.color} sx={{ mt: 1, py: 0 }}>{status.helper}</Alert>}
+              {!readOnly && <Stack direction="row" spacing={1} sx={{ mt: 1.2 }}>
+                <Button size="small" variant="outlined" startIcon={<Icon>edit</Icon>} onClick={() => onEdit(row)}>修正</Button>
+                <Button size="small" color="error" startIcon={<Icon>delete_outline</Icon>} onClick={() => onRemove(row)}>削除</Button>
+              </Stack>}
+            </Box>
+          </Stack>
+        </Paper>
+      );
+    }
+
+    function EntryTable({ entries, context, onEdit, onRemove, readOnly = false, selectedIds = [], allSelected = false, partialSelected = false, onToggleSelect = null, onToggleAll = null }) {
+      const business = BUSINESS[context.businessKey] || BUSINESS.price;
+      return (
+        <TableContainer component={Paper} variant="outlined" sx={{ flex: 1, minHeight: 0 }}>
+          <Table stickyHeader size="small">
+            <TableHead><TableRow>{!readOnly && <TableCell padding="checkbox"><Checkbox size="small" checked={allSelected} indeterminate={partialSelected} onChange={event => onToggleAll?.(event.target.checked)} inputProps={{ "aria-label": "登録明細をすべて選択" }} /></TableCell>}<TableCell>状態</TableCell><TableCell>作業セッション</TableCell><TableCell>商品</TableCell><TableCell align="right">数量</TableCell><TableCell align="right">{getMasterValueLabel(context)}</TableCell><TableCell align="right">{getInputValueLabel(context)}</TableCell><TableCell align="right">{business.amountLabel}</TableCell>{!readOnly && <TableCell>操作</TableCell>}</TableRow></TableHead>
+            <TableBody>
+              {entries.map(row => {
+                const status = getStatus(row, context);
+                const selected = selectedIds.includes(row.id);
+                return (
+                  <TableRow key={row.id} hover selected={selected} sx={status.color === "error" ? { bgcolor: "error.50" } : null}>
+                    {!readOnly && <TableCell padding="checkbox"><Checkbox size="small" checked={selected} onChange={() => onToggleSelect?.(row)} inputProps={{ "aria-label": `${row.productName || "明細"}を選択` }} /></TableCell>}
+                    <TableCell><Chip size="small" color={status.color} variant={status.color === "error" ? "filled" : "outlined"} label={status.label} /></TableCell>
+                    <TableCell>{getEntryWorkGroup(row, context)}</TableCell>
+                    <TableCell><Typography variant="body2" sx={{ fontWeight: 700 }}>{row.productName}</Typography><Typography variant="caption" color="text.secondary">{row.barcode}</Typography></TableCell>
+                    <TableCell align="right">{row.quantity || 1}</TableCell>
+                    <TableCell align="right">{yen(row.currentPrice)}</TableCell>
+                    <TableCell align="right">{formatInputValue(row, context)}</TableCell>
+                    <TableCell align="right" sx={{ fontWeight: 700 }}>{formatDecisionValue(row, context)}</TableCell>
+                    {!readOnly && <TableCell><Stack direction="row" spacing={0.5}><IconButton size="small" onClick={() => onEdit(row)}><Icon>edit</Icon></IconButton><IconButton size="small" color="error" onClick={() => onRemove(row)}><Icon>delete</Icon></IconButton></Stack></TableCell>}
+                  </TableRow>
+                );
+              })}
+              {entries.length === 0 && <TableRow><TableCell colSpan={readOnly ? 7 : 9} align="center" sx={{ py: 5 }}><Typography color="text.secondary">登録明細がありません。</Typography></TableCell></TableRow>}
+            </TableBody>
+          </Table>
+        </TableContainer>
+      );
+    }
+
+    function EntryGroupList({ entries, context, renderEntry }) {
+      const groups = groupEntriesByWorkGroup(entries, context);
+      return (
+        <Stack spacing={1}>
+          {groups.map(group => (
+            <Box key={group.label}>
+              <Stack spacing={1}>{group.entries.map(renderEntry)}</Stack>
+            </Box>
+          ))}
+        </Stack>
+      );
+    }
+
+    function getFieldLabel(name, context) {
+      const business = BUSINESS[context.businessKey] || BUSINESS.price;
+      const labels = {
+        department: "部門",
+        businessDate: "登録日",
+        startDate: "開始日",
+        endDate: "終了日",
+        layout: "レイアウト",
+        printer: "プリンター",
+        salesFloor: "売場",
+        sequenceNo: "連No",
+        useCountSheet: "つけたて表",
+        adjustmentType: "区分",
+        reason: "理由"
+      };
+      if (name === "quantity") return business.quantityLabel;
+      return labels[name] || name;
+    }
+
+    function formatFieldValue(name, value) {
+      if (name === "useCountSheet") return value ? "あり" : "なし";
+      if (value === undefined || value === null || value === "") return "未設定";
+      return String(value);
+    }
+
+    function hasSpecifiedConditionValue(name, value) {
+      if (name === "startDate" || name === "endDate") return true;
+      return !(value === undefined || value === null || value === "");
+    }
+
+    function StartConditionBar({ screen, context, entries, onOpenSettings }) {
+      const business = BUSINESS[context.businessKey] || BUSINESS.price;
+      const isConfirmScreen = screen === SCREEN.CONFIRM;
+      const fields = getStartFields(context);
+      const confirmFields = Array.from(new Set([...fields.filter(field => field !== "businessDate"), "startDate", "endDate"]));
+      const outputStartDate = context.startDate || context.businessDate || todayText();
+      const outputEndDate = context.endDate || context.businessDate || outputStartDate;
+      const conditionFields = isConfirmScreen
+        ? confirmFields.filter(field => hasSpecifiedConditionValue(field, field === "startDate" ? outputStartDate : field === "endDate" ? outputEndDate : context[field]))
+        : fields.slice(0, 5);
+      return (
+        <Box sx={{ px: { xs: 1.5, md: 2.5 }, py: 1, borderBottom: "1px solid", borderColor: "divider", bgcolor: "background.paper" }}>
+          <Stack direction="row" spacing={0.75} alignItems="center" useFlexGap flexWrap="wrap">
+            {conditionFields.map(field => (
+              <Chip key={field} clickable size="small" color="primary" variant="outlined" label={`${getFieldLabel(field, context)}: ${formatFieldValue(field, field === "startDate" ? outputStartDate : field === "endDate" ? outputEndDate : context[field])}`} onClick={onOpenSettings} />
+            ))}
+          </Stack>
+        </Box>
+      );
+    }
+
+    function StartSettingsDialog({ open, screen, context, setContext, onClose }) {
+      const business = BUSINESS[context.businessKey] || BUSINESS.price;
+      const isConfirmScreen = screen === SCREEN.CONFIRM;
+      const baseFields = getStartFields(context);
+      const fields = isConfirmScreen
+        ? Array.from(new Set([...baseFields.filter(field => field !== "businessDate"), "startDate", "endDate"]))
+        : baseFields;
+      function updateContext(name, value) {
+        setContext(prev => {
+          const next = { ...prev, [name]: value };
+          if (name === "adjustmentType" && value === "廃棄") next.reason = "賞味期限切れ";
+          if (name === "adjustmentType" && value === "") next.reason = "";
+          return next;
+        });
+      }
+      return (
+        <Dialog open={open} onClose={onClose} fullWidth maxWidth="sm">
+          <DialogTitle sx={{ pb: 1 }}>
+            <Stack direction="row" spacing={1} alignItems="center">
+              <Icon color={business.color}>{business.icon}</Icon>
+              <Box sx={{ minWidth: 0 }}>
+                <Typography variant="h6">{business.label} {isConfirmScreen ? "確認出力条件" : "基本条件"}</Typography>
+              </Box>
+            </Stack>
+          </DialogTitle>
+          <DialogContent dividers>
+            <Grid container spacing={1.5} sx={{ mt: 0 }}>
+              {fields.map(field => (
+                <Grid item xs={12} key={field}>
+                  <DynamicField name={field} value={context[field]} onChange={updateContext} context={context} optional={isConfirmScreen && field !== "startDate" && field !== "endDate"} />
+                </Grid>
+              ))}
+            </Grid>
+          </DialogContent>
+          <DialogActions>
+            <Button onClick={onClose}>閉じる</Button>
+            <Button variant="contained" onClick={onClose}>{isConfirmScreen ? "この条件で確認出力" : "この基本条件で続ける"}</Button>
+          </DialogActions>
+        </Dialog>
+      );
+    }
+
+    function BusinessHelpDialog({ open, context, onClose }) {
+      const business = BUSINESS[context.businessKey] || BUSINESS.price;
+      const steps = business.helpSteps || ["商品をスキャン", "登録明細を確認", context.businessKey === "label" ? "ラベル発行" : "作業確定", "確認出力で実績を確認"];
+      return (
+        <Dialog open={open} onClose={onClose} fullWidth maxWidth="xs">
+          <DialogTitle sx={{ pb: 1 }}>
+            <Stack direction="row" spacing={1} alignItems="center">
+              <Icon color={business.color}>{business.icon}</Icon>
+              <Typography variant="h6">{business.label}</Typography>
+            </Stack>
+          </DialogTitle>
+          <DialogContent dividers>
+            <Stack spacing={1.5}>
+              <Box>
+                <Typography variant="caption" color="text.secondary" display="block">目的</Typography>
+                <Typography variant="body2">{business.userPurpose || business.purpose}</Typography>
+              </Box>
+              <Box>
+                <Typography variant="caption" color="text.secondary" display="block">手順</Typography>
+                <Stack component="ol" spacing={0.5} sx={{ pl: 2, my: 0.5 }}>
+                  {steps.map(step => <Typography component="li" variant="body2" key={step}>{step}</Typography>)}
+                </Stack>
+              </Box>
+            </Stack>
+          </DialogContent>
+          <DialogActions><Button onClick={onClose}>閉じる</Button></DialogActions>
+        </Dialog>
+      );
+    }
+
+    function BusinessSelectDialog({ open, currentBusinessKey, entries, onSelect, onClose }) {
+      return (
+        <Dialog open={open} onClose={onClose} fullWidth maxWidth="sm">
+          <DialogTitle sx={{ pb: 1 }}>
+            <Stack direction="row" spacing={1} alignItems="center">
+              <Icon>apps</Icon>
+              <Box sx={{ minWidth: 0 }}>
+                <Typography variant="h6">業務選択</Typography>
+              </Box>
+            </Stack>
+          </DialogTitle>
+          <DialogContent dividers sx={{ bgcolor: "background.default" }}>
+            {entries.length > 0 && (
+              <Alert severity="warning" sx={{ mb: 1.5 }}>業務を切り替えると、現在の未確定明細 {entries.length}件はクリアされます。</Alert>
+            )}
+            <Grid container spacing={1.5}>
+              {Object.entries(BUSINESS).map(([key, item]) => {
+                const selected = currentBusinessKey === key;
+                return (
+                <Grid item xs={12} key={key}>
+                  <Card variant="outlined" sx={{ height: "100%", borderColor: selected ? `${item.color}.main` : "divider", borderWidth: selected ? 2 : 1, bgcolor: selected ? `${item.color}.50` : "background.paper" }}>
+                    <CardActionArea onClick={() => onSelect(key)} sx={{ p: 1.75, height: "100%" }}>
+                      <Stack direction="row" spacing={1.5} alignItems="center">
+                        <BusinessIcon item={item} size={44} iconSize={26} />
+                        <Box sx={{ minWidth: 0 }}>
+                          <Typography variant="subtitle2">{item.label}</Typography>
+                        </Box>
+                      </Stack>
+                    </CardActionArea>
+                  </Card>
+                </Grid>
+                );
+              })}
+            </Grid>
+          </DialogContent>
+          <DialogActions>
+            <Button onClick={onClose}>閉じる</Button>
+          </DialogActions>
+        </Dialog>
+      );
+    }
+
+    function ResponsiveShell({ screen, setScreen, context, entries, children, bottomBar, onReset, onOpenSettings, onOpenBusinessMenu, onOpenBusinessHelp }) {
+      const business = BUSINESS[context.businessKey] || BUSINESS.price;
+      const isFlow = screen !== SCREEN.START;
+      const issueCount = entries.filter(row => getStatus(row, context).color === "error").length;
+      const tabValue = screen === SCREEN.CONFIRM ? SCREEN.CONFIRM : SCREEN.SCAN;
+      return (
+        <Box sx={{ height: "100vh", display: "flex", flexDirection: "column", overflow: "hidden", bgcolor: "background.default" }}>
+          <AppBar position="static" elevation={0} sx={{ bgcolor: `${business.color}.main`, color: `${business.color}.contrastText`, backgroundImage: "none" }}>
+            <Toolbar sx={{ minHeight: { xs: 56, md: 64 }, gap: 1 }}>
+              <Tooltip title="業務を選択"><IconButton color="inherit" onClick={onOpenBusinessMenu} edge="start"><Icon>menu</Icon></IconButton></Tooltip>
+              <Box sx={{ minWidth: 0, display: "flex", alignItems: "center", gap: 0.5 }}>
+                <Button color="inherit" onClick={onOpenBusinessHelp} sx={{ minWidth: 0, px: 0, textTransform: "none" }}>
+                  <Typography variant="h6" noWrap>{isFlow ? business.label : "業務選択"}</Typography>
+                </Button>
+                <Tooltip title="リセット"><IconButton color="inherit" size="small" onClick={onReset}><Icon sx={{ fontSize: 20 }}>restart_alt</Icon></IconButton></Tooltip>
+              </Box>
+              <Box sx={{ flex: 1 }} />
+              <Tooltip title="アカウント情報">
+                <Box sx={{ display: "flex", alignItems: "center", gap: 0.75, minWidth: 0 }}>
+                  <Box sx={{ width: 30, height: 30, borderRadius: "50%", display: "grid", placeItems: "center", bgcolor: "rgba(255,255,255,0.22)", fontWeight: 900, fontSize: 13 }}>山</Box>
+                  <Box sx={{ display: { xs: "none", sm: "block" }, minWidth: 0 }}>
+                    <Typography variant="body2" noWrap sx={{ fontWeight: 800, lineHeight: 1.2 }}>山田 太郎</Typography>
+                    <Typography variant="caption" noWrap sx={{ display: "block", opacity: 0.85, lineHeight: 1.1 }}>新宿店</Typography>
+                  </Box>
+                </Box>
+              </Tooltip>
+            </Toolbar>
+          </AppBar>
+
+          {isFlow && (
+            <Paper square elevation={0} sx={{ borderBottom: "1px solid", borderColor: "divider" }}>
+              <Tabs value={tabValue} onChange={(_, next) => setScreen(next)} variant="fullWidth" indicatorColor="primary" textColor="primary" sx={{ minHeight: 50 }}>
+                <Tab value={SCREEN.SCAN} icon={<Icon>edit_note</Icon>} iconPosition="start" label={`登録 ${entries.length}`} sx={{ minHeight: 50 }} />
+                <Tab value={SCREEN.CONFIRM} icon={issueCount ? <Badge color="error" variant="dot"><Icon>fact_check</Icon></Badge> : <Icon>fact_check</Icon>} iconPosition="start" label="確認出力" sx={{ minHeight: 50 }} />
+              </Tabs>
+            </Paper>
+          )}
+
+          {isFlow && <StartConditionBar screen={screen} context={context} entries={entries} onOpenSettings={onOpenSettings} />}
+
+          <Box sx={{ flex: 1, minHeight: 0, overflowY: "auto", overflowX: "hidden" }}>
+            <Box sx={{ width: "100%", maxWidth: screen === SCREEN.CONFIRM ? { xs: 760, md: "none" } : 760, mx: "auto", p: { xs: 1.5, md: 2.5 } }}>{children}</Box>
+          </Box>
+
+          <Paper elevation={8} square sx={{ borderTop: "1px solid", borderColor: "divider", bgcolor: "background.paper" }}>
+            <Box sx={{ maxWidth: 760, mx: "auto", px: { xs: 1.25, md: 1.5 }, pt: 1.25, pb: "calc(env(safe-area-inset-bottom) + 10px)" }}>{bottomBar}</Box>
+          </Paper>
+        </Box>
+      );
+    }
+
+    function StartScreen({ context, setContext }) {
+      function selectBusiness(key) {
+        setContext(createDefaultContext(key));
+      }
+      return (
+        <Box sx={{ display: "grid", gap: 1.25 }}>
+          <Typography variant="subtitle2" sx={{ fontWeight: 700 }}>業務を選択</Typography>
+          <Grid container spacing={1.25}>
+            {Object.entries(BUSINESS).map(([key, item]) => {
+              const selected = context.businessKey === key;
+              return (
+              <Grid item xs={6} md={4} key={key}>
+                <Card
+                  variant="outlined"
+                  sx={{
+                    height: "100%",
+                    borderRadius: 2,
+                    borderColor: selected ? `${item.color}.main` : "divider",
+                    borderWidth: selected ? 2 : 1,
+                    bgcolor: selected ? `${item.color}.50` : "background.paper",
+                    transition: "border-color .15s, background-color .15s, box-shadow .15s",
+                    boxShadow: selected ? 1 : 0
+                  }}
+                >
+                  <CardActionArea onClick={() => selectBusiness(key)} sx={{ minHeight: 94, height: "100%", p: 1.5, display: "grid", placeItems: "center" }}>
+                    <Box sx={{ display: "grid", justifyItems: "center", alignItems: "center", gap: 1, width: "100%" }}>
+                      <BusinessIcon item={item} size={44} iconSize={26} />
+                      <Typography variant="subtitle2" align="center" sx={{ width: "100%", fontWeight: 800, lineHeight: 1.3 }}>{item.label}</Typography>
+                    </Box>
+                  </CardActionArea>
+                </Card>
+              </Grid>
+              );
+            })}
+          </Grid>
+        </Box>
+      );
+    }
+
+    function ScanScreen({ context, setContext, entries, setEntries, setScreen, confirmedRecord, openDrawerRequest, closeDrawerRequest, onBindActions }) {
+      const business = BUSINESS[context.businessKey] || BUSINESS.price;
+      const activeEntries = getActiveEntries(entries);
+      const isConfirmed = Boolean(confirmedRecord) && activeEntries.length === 0;
+      const trashEntries = getTrashEntries(entries);
+      const numericFields = getNumericItemFields(context);
+      const [productInput, setProductInput] = React.useState("");
+      const [item, setItem] = React.useState(() => createDefaultItem(context.businessKey, context));
+      const [message, setMessage] = React.useState(null);
+      const [sheetOpen, setSheetOpen] = React.useState(false);
+      const [numberPadOpen, setNumberPadOpen] = React.useState(true);
+      const [activeNumberField, setActiveNumberField] = React.useState(null);
+      const [deleteTarget, setDeleteTarget] = React.useState(null);
+      const [trashOpen, setTrashOpen] = React.useState(false);
+      const [selectedEntryIds, setSelectedEntryIds] = React.useState([]);
+      const [entryViewMode, setEntryViewMode] = React.useState(VIEW_MODE.CARDS);
+      const [cameraOpen, setCameraOpen] = React.useState(false);
+      const productInputRef = React.useRef(null);
+      const numberInputRefs = React.useRef({});
+      const issueCount = activeEntries.filter(row => getStatus(row, context).color === "error").length;
+      const selectedEntries = activeEntries.filter(row => selectedEntryIds.includes(row.id));
+      const allEntriesSelected = activeEntries.length > 0 && selectedEntryIds.length === activeEntries.length;
+      const partialEntriesSelected = selectedEntryIds.length > 0 && selectedEntryIds.length < activeEntries.length;
+
+      React.useEffect(() => {
+        setItem(createDefaultItem(context.businessKey, context));
+        setProductInput("");
+        setMessage(null);
+        setSheetOpen(false);
+        setNumberPadOpen(true);
+        setActiveNumberField(null);
+      }, [context.businessKey]);
+      React.useEffect(() => { if (context.adjustmentType === "廃棄") setItem(prev => ({ ...prev, afterPrice: 0 })); }, [context.adjustmentType]);
+      React.useEffect(() => {
+        if (activeNumberField && !numericFields.includes(activeNumberField)) setActiveNumberField(numericFields[0] || null);
+      }, [context.businessKey, context.adjustmentType, activeNumberField, numericFields.join("|")]);
+      React.useEffect(() => {
+        if (!sheetOpen) return;
+        window.setTimeout(() => {
+          if (item.sku) focusNumberField("quantity");
+          else productInputRef.current?.focus();
+          if (!item.sku) productInputRef.current?.select?.();
+        }, 120);
+      }, [sheetOpen]);
+      React.useEffect(() => {
+        if (openDrawerRequest) openForNew();
+      }, [openDrawerRequest]);
+      React.useEffect(() => {
+        if (closeDrawerRequest) setSheetOpen(false);
+      }, [closeDrawerRequest]);
+      React.useEffect(() => {
+        setSelectedEntryIds(prev => prev.filter(id => activeEntries.some(row => row.id === id)));
+      }, [activeEntries.length, context.businessKey]);
+
+      function updateItem(name, value) {
+        setItem(prev => {
+          const next = { ...prev, [name]: value };
+          if (context.businessKey === "label" && name === "traceCode") {
+            const inferredOrigin = inferOriginFromTraceCode(value);
+            if (inferredOrigin) next.origin = inferredOrigin;
+          }
+          return next;
+        });
+      }
+      function focusNumberField(field) {
+        if (!field || !numericFields.includes(field)) return;
+        setActiveNumberField(field);
+        setNumberPadOpen(true);
+        window.setTimeout(() => {
+          const input = numberInputRefs.current[field];
+          input?.focus?.();
+          input?.select?.();
+        }, 80);
+      }
+      function moveNumberFocus(delta) {
+        if (!numericFields.length) return;
+        const currentIndex = activeNumberField ? numericFields.indexOf(activeNumberField) : -1;
+        const nextIndex = currentIndex < 0 ? 0 : Math.max(0, Math.min(currentIndex + delta, numericFields.length - 1));
+        focusNumberField(numericFields[nextIndex]);
+      }
+      function selectProduct(product) {
+        if (!product) return;
+        setProductInput(product.barcode);
+        setContext(prev => ({ ...prev, department: product.department }));
+        setItem(prev => ({
+          ...prev,
+          sku: product.sku,
+          barcode: product.barcode,
+          productName: product.name,
+          workGroup: context.workGroup || prev.workGroup || "セッション1",
+          department: product.department,
+          currentPrice: product.currentPrice,
+          quantity: 1,
+          beforePrice: product.currentPrice,
+          afterPrice: context.adjustmentType === "廃棄" ? 0 : Math.max(0, product.currentPrice - 50),
+          displayPrice: product.currentPrice
+        }));
+        window.setTimeout(() => focusNumberField("quantity"), 120);
+      }
+      function searchProduct() {
+        if (!String(productInput || "").trim()) { productInputRef.current?.focus?.(); productInputRef.current?.select?.(); return; }
+        const product = findProduct(productInput);
+        if (!product) { setMessage({ severity: "warning", text: "商品が見つかりません。一覧から選択してください。" }); productInputRef.current?.focus?.(); productInputRef.current?.select?.(); return; }
+        selectProduct(product);
+      }
+      function handleCameraDetected(code) {
+        setCameraOpen(false);
+        setProductInput(code);
+        const product = findProduct(code);
+        if (product) {
+          selectProduct(product);
+          setMessage(null);
+        } else {
+          setMessage({ severity: "warning", text: "読み取ったコードの商品が見つかりません。一覧から選択してください。" });
+          window.setTimeout(() => { productInputRef.current?.focus?.(); productInputRef.current?.select?.(); }, 80);
+        }
+      }
+      function runPrimaryDrawerAction() {
+        if (item.sku) { saveItem(); return; }
+        if (String(productInput || "").trim()) { searchProduct(); return; }
+        setMessage(null);
+        setCameraOpen(true);
+      }
+      function clearItem() {
+        setItem(createDefaultItem(context.businessKey, context));
+        setProductInput("");
+        setActiveNumberField(null);
+        window.setTimeout(() => { productInputRef.current?.focus?.(); productInputRef.current?.select?.(); }, 80);
+      }
+      function openForNew() { clearItem(); setMessage(null); setNumberPadOpen(true); setSheetOpen(true); }
+      function startEdit(row) {
+        setItem({ ...row });
+        setProductInput(row.barcode || row.sku);
+        setMessage(null);
+        setNumberPadOpen(true);
+        setSheetOpen(true);
+        window.setTimeout(() => focusNumberField("quantity"), 160);
+      }
+      function saveItem() {
+        const errors = validateItem(item, context);
+        if (errors.length && !(context.businessKey === "priceCheck" && errors.includes("売価不一致"))) { setMessage({ severity: "error", text: errors.join(" / ") }); return; }
+        const isEdit = Boolean(item.id);
+        const next = { ...item, workGroup: item.workGroup || context.workGroup || "セッション1", id: item.id || `E-${Date.now()}-${Math.random().toString(16).slice(2, 6)}`, deletedAt: null };
+        setEntries(prev => isEdit ? prev.map(row => row.id === item.id ? next : row) : [next, ...prev]);
+        setSheetOpen(!isEdit);
+        if (errors.length) setMessage({ severity: "warning", text: "登録しました。まだ確認が必要です。" });
+        else setMessage(null);
+        clearItem();
+      }
+      function requestRemoveItem(row) { setDeleteTarget(row); }
+      function confirmRemoveItem() {
+        if (!deleteTarget) return;
+        const now = Date.now();
+        setEntries(prev => prev.map(row => row.id === deleteTarget.id ? { ...row, deletedAt: now } : row));
+        setSelectedEntryIds(prev => prev.filter(id => id !== deleteTarget.id));
+        setDeleteTarget(null);
+        setMessage({ severity: "info", text: "明細をごみ箱に移動しました。2日後に完全削除されます。" });
+      }
+      function toggleEntrySelection(row) {
+        setSelectedEntryIds(prev => prev.includes(row.id) ? prev.filter(id => id !== row.id) : [...prev, row.id]);
+      }
+      function toggleAllEntries(checked) {
+        setSelectedEntryIds(checked ? activeEntries.map(row => row.id) : []);
+      }
+      function bulkRemoveItems() {
+        if (selectedEntries.length === 0) return;
+        const now = Date.now();
+        const selectedIds = new Set(selectedEntryIds);
+        setEntries(prev => prev.map(row => selectedIds.has(row.id) ? { ...row, deletedAt: now } : row));
+        setSelectedEntryIds([]);
+        setMessage({ severity: "info", text: `${selectedEntries.length}件の明細をごみ箱に移動しました。` });
+      }
+      function restoreItem(id) { setEntries(prev => prev.map(row => row.id === id ? { ...row, deletedAt: null } : row)); setMessage({ severity: "success", text: "明細を復活しました。" }); }
+      function permanentDeleteItem(id) { setEntries(prev => prev.filter(row => row.id !== id)); setMessage({ severity: "info", text: "明細を完全削除しました。" }); }
+      function setNumberField(field, rawValue) {
+        if (!field) return;
+        const normalized = rawValue === "" ? "" : (field === "sequenceNo" ? rawValue : Number(rawValue));
+        updateItem(field, normalized);
+      }
+      function appendNumberPadValue(key) {
+        const field = activeNumberField;
+        if (!field) return;
+        const current = item[field];
+        const raw = `${current === undefined || current === null ? "" : current}${key}`;
+        const nextRaw = field === "sequenceNo" ? raw : raw.replace(/^0+(?=\d)/, "");
+        setNumberField(field, nextRaw);
+      }
+      function backspaceNumberPadValue() {
+        const field = activeNumberField;
+        if (!field) return;
+        const current = item[field];
+        const nextRaw = String(current === undefined || current === null ? "" : current).slice(0, -1);
+        setNumberField(field, nextRaw);
+      }
+      function clearNumberPadValue() { setNumberField(activeNumberField, ""); }
+      React.useEffect(() => onBindActions({ search: searchProduct, save: saveItem, clear: clearItem, openForm: openForNew }), [productInput, item, context, entries, activeNumberField]);
+
+      const priceCheckMismatch = context.businessKey === "priceCheck" && item.sku && Number(item.displayPrice) !== Number(item.currentPrice);
+
+      return (
+        <Stack spacing={1}>
+          {!sheetOpen && message && <Alert severity={message.severity} onClose={() => setMessage(null)}>{message.text}</Alert>}
+
+          <Stack spacing={0.75}>
+            <Stack direction="row" spacing={0.75} alignItems="center" justifyContent="space-between">
+              <Stack direction="row" spacing={0.75} alignItems="center" sx={{ minWidth: 0 }}>
+                <Typography variant="subtitle1" noWrap>登録明細（{context.workGroup || "セッション"}：{activeEntries.length}件）</Typography>
+              </Stack>
+              <Stack direction="row" spacing={0.75} alignItems="center" justifyContent="flex-end" useFlexGap flexWrap="wrap">
+                <Tooltip title={`ごみ箱 ${trashEntries.length}件`}>
+                  <Button size="small" color={trashEntries.length ? "error" : "inherit"} onClick={() => setTrashOpen(true)} sx={{ minHeight: 30, px: 0.75, fontSize: "1rem", fontWeight: 700, color: trashEntries.length ? "error.main" : "text.secondary" }}>
+                    ごみ箱（{trashEntries.length}件）
+                  </Button>
+                </Tooltip>
+              </Stack>
+            </Stack>
+            <Stack direction="row" spacing={0.75} alignItems="center" justifyContent="flex-start" useFlexGap flexWrap="wrap">
+              {activeEntries.length > 0 && (
+                <Checkbox
+                  size="small"
+                  checked={allEntriesSelected}
+                  indeterminate={partialEntriesSelected}
+                  onChange={event => toggleAllEntries(event.target.checked)}
+                  inputProps={{ "aria-label": "登録明細をすべて選択" }}
+                  sx={{ p: 0.25 }}
+                />
+              )}
+              {activeEntries.length > 0 && (
+                <ToggleButtonGroup value={entryViewMode} exclusive onChange={(_, next) => next && setEntryViewMode(next)} size="small" color="primary">
+                  <ToggleButton value={VIEW_MODE.CARDS}>カード</ToggleButton>
+                  <ToggleButton value={VIEW_MODE.TABLE}>テーブル</ToggleButton>
+                </ToggleButtonGroup>
+              )}
+              {selectedEntryIds.length > 0 && <Button size="small" color="error" variant="outlined" onClick={bulkRemoveItems}>選択削除 {selectedEntryIds.length}</Button>}
+            </Stack>
+          </Stack>
+
+          {activeEntries.length === 0 ? (
+            <Paper variant="outlined" sx={{ p: 4, textAlign: "center", borderStyle: "dashed", bgcolor: "grey.50" }}>
+              <Icon sx={{ fontSize: 46, color: "text.disabled" }}>qr_code_scanner</Icon>
+              <Typography color="text.secondary" sx={{ mt: 1, mb: 2 }}>登録明細がありません。</Typography>
+              <Button variant="contained" size="large" startIcon={<Icon>add</Icon>} onClick={openForNew}>スキャン登録する</Button>
+            </Paper>
+          ) : (
+            entryViewMode === VIEW_MODE.TABLE ? (
+              <EntryTable
+                entries={activeEntries}
+                context={context}
+                selectedIds={selectedEntryIds}
+                allSelected={allEntriesSelected}
+                partialSelected={partialEntriesSelected}
+                onToggleSelect={toggleEntrySelection}
+                onToggleAll={toggleAllEntries}
+                onEdit={startEdit}
+                onRemove={requestRemoveItem}
+              />
+            ) : (
+              <EntryGroupList entries={activeEntries} context={context} renderEntry={row => (
+              <EntryCard
+                key={row.id}
+                row={row}
+                context={context}
+                selected={selectedEntryIds.includes(row.id)}
+                onToggleSelect={toggleEntrySelection}
+                onEdit={startEdit}
+                onRemove={requestRemoveItem}
+              />
+              )} />
+            )
+          )}
+
+          <Drawer anchor="bottom" open={sheetOpen} onClose={() => setSheetOpen(false)} PaperProps={{ sx: { borderTopLeftRadius: 18, borderTopRightRadius: 18, maxHeight: "96vh", maxWidth: 760, mx: "auto", width: "100%" } }}>
+            <Box sx={{ pt: 1, display: "grid", placeItems: "center" }}><Box sx={{ width: 40, height: 4, borderRadius: 2, bgcolor: "divider" }} /></Box>
+            <Box sx={{ px: 2, pt: 1, pb: 1.25, display: "flex", alignItems: "center", gap: 1 }}>
+              <Box sx={{ width: 32, height: 32, borderRadius: 1.5, display: "grid", placeItems: "center", bgcolor: `${business.color}.50`, color: `${business.color}.main` }}><Icon sx={{ fontSize: 20 }}>{business.icon}</Icon></Box>
+              <Typography variant="subtitle1" sx={{ flex: 1 }}>{item.id ? "明細を修正" : `${business.label} 登録`}</Typography>
+              <Chip size="small" color={activeEntries.length ? "primary" : "default"} variant="outlined" label={`登録中 ${activeEntries.length}件`} />
+              <Button size="small" variant="text" color="secondary" onClick={clearItem}>クリア</Button>
+              <IconButton onClick={() => setSheetOpen(false)}><Icon>close</Icon></IconButton>
+            </Box>
+            <Divider />
+            <Box sx={{ px: 2, py: 2, overflow: "auto" }}>
+              <Stack spacing={1.5}>
+                {message && <Alert severity={message.severity} onClose={() => setMessage(null)}>{message.text}</Alert>}
+                <TextField label="バーコード / 商品名" value={productInput} inputRef={productInputRef} onFocus={event => event.target.select()} onChange={event => setProductInput(event.target.value)} onKeyDown={event => { if (event.key === "Enter") searchProduct(); }} fullWidth placeholder="スキャンまたは入力" InputProps={{ startAdornment: <InputAdornment position="start"><Icon>qr_code_scanner</Icon></InputAdornment>, endAdornment: <InputAdornment position="end"><Button size="small" onClick={searchProduct}>検索</Button></InputAdornment> }} />
+                <FormControl fullWidth><InputLabel>商品</InputLabel><Select label="商品" value={item.sku || ""} onChange={event => selectProduct(PRODUCTS.find(p => p.sku === event.target.value))}><MenuItem value="">未選択</MenuItem>{PRODUCTS.map(product => <MenuItem key={product.sku} value={product.sku}>{product.name}</MenuItem>)}</Select></FormControl>
+                {business.itemFields.filter(field => field !== "sku").map(field => <DynamicField key={field} name={field} value={item[field]} onChange={updateItem} context={context} inputRef={node => { if (node) numberInputRefs.current[field] = node; }} onFocus={fieldName => { if (numericFields.includes(fieldName)) { setActiveNumberField(fieldName); setNumberPadOpen(true); } }} />)}
+                {numericFields.length > 0 && <NumberPad open={numberPadOpen} onToggle={() => setNumberPadOpen(prev => !prev)} disabled={!activeNumberField} onInput={appendNumberPadValue} onBackspace={backspaceNumberPadValue} onClear={clearNumberPadValue} onPrevious={() => moveNumberFocus(-1)} onEnter={() => moveNumberFocus(1)} />}
+                {priceCheckMismatch && <Alert severity="error">POS登録売価 {yen(item.currentPrice)} と実売価 {yen(item.displayPrice)} が不一致です。登録後、確認出力画面で修正対象になります。</Alert>}
+              </Stack>
+            </Box>
+            <Divider />
+            <Box sx={{ px: 2, py: 1.5, pb: "calc(env(safe-area-inset-bottom) + 12px)", display: "flex", alignItems: "center", gap: 1 }}>
+              <Button variant="outlined" size="large" onClick={() => setSheetOpen(false)}>閉じる</Button>
+              <Box sx={{ flex: 1 }} />
+              <Button
+                variant="contained"
+                size="large"
+                startIcon={<Icon>{item.sku ? "check" : "qr_code_scanner"}</Icon>}
+                onClick={runPrimaryDrawerAction}
+              >
+                {item.sku ? (item.id ? "更新" : "登録") : "スキャン"}
+              </Button>
+            </Box>
+          </Drawer>
+
+          <CameraScanDialog open={cameraOpen} onClose={() => setCameraOpen(false)} onDetected={handleCameraDetected} />
+
+          <ConfirmDialog
+            open={Boolean(deleteTarget)}
+            title="この明細をごみ箱に移動しますか？"
+            description="ごみ箱へ移動した明細は復活できます。2日後に完全削除されます。"
+            confirmLabel="ごみ箱へ移動"
+            onCancel={() => setDeleteTarget(null)}
+            onConfirm={confirmRemoveItem}
+          >
+            {deleteTarget && <Alert severity="warning" sx={{ py: 0.5 }}>{deleteTarget.productName || "商品未選択"}</Alert>}
+          </ConfirmDialog>
+          <TrashDialog open={trashOpen} entries={entries} context={context} onClose={() => setTrashOpen(false)} onRestore={restoreItem} onPermanentDelete={permanentDeleteItem} />
+        </Stack>
+      );
+    }
+
+
+    function ConfirmScreen({ context, setContext, entries, setEntries, confirmedRecord, confirmedRecords, syncStatus, onConfirmRecord, onEditRecord, onUpdateRecord, onBindAction }) {
+      const business = BUSINESS[context.businessKey] || BUSINESS.price;
+      const recordsForBusiness = (confirmedRecords || []).filter(record => record.businessKey === context.businessKey);
+      const recordRows = recordsForBusiness.flatMap(record => (record.entries || []).map((row, index) => ({ ...row, __record: record, __recordIndex: index })));
+      const outputEntries = recordRows.filter(row => !row.deletedAt);
+      const recordTrashEntries = recordRows.filter(row => row.deletedAt);
+      const activeEntries = getActiveEntries(entries);
+      const isConfirmed = Boolean(confirmedRecord) && activeEntries.length === 0;
+      const trashEntries = getTrashEntries(entries);
+      const editNumericFields = getNumericItemFields(context);
+      const [message, setMessage] = React.useState(null);
+      const [previewOpen, setPreviewOpen] = React.useState(false);
+      const [editingItem, setEditingItem] = React.useState(null);
+      const [deleteTarget, setDeleteTarget] = React.useState(null);
+      const [trashOpen, setTrashOpen] = React.useState(false);
+      const [recordTrashOpen, setRecordTrashOpen] = React.useState(false);
+      const [summaryOpen, setSummaryOpen] = React.useState(false);
+      const [recordDisplayUnit, setRecordDisplayUnit] = React.useState("data");
+      const [recordViewMode, setRecordViewMode] = React.useState(VIEW_MODE.CARDS);
+      const [selectedRecordRows, setSelectedRecordRows] = React.useState([]);
+      const [dataPage, setDataPage] = React.useState(0);
+      const [dataRowsPerPage, setDataRowsPerPage] = React.useState(10);
+      const [workPage, setWorkPage] = React.useState(0);
+      const [workRowsPerPage, setWorkRowsPerPage] = React.useState(10);
+      const [editNumberPadOpen, setEditNumberPadOpen] = React.useState(true);
+      const [activeEditNumberField, setActiveEditNumberField] = React.useState(null);
+      const editNumberInputRefs = React.useRef({});
+      const issueEntries = outputEntries.filter(row => getStatus(row, context).color === "error");
+      const totalQty = outputEntries.reduce((sum, row) => sum + Number(row.quantity || 1), 0);
+      const totalAmount = calcSummaryDecisionValue(outputEntries, context);
+      const totalImpact = outputEntries.reduce((sum, row) => sum + calcImpact(row, context), 0);
+      const outputStartDate = context.startDate || context.businessDate || todayText();
+      const outputEndDate = context.endDate || context.businessDate || outputStartDate;
+      const periodText = outputStartDate === outputEndDate ? outputStartDate : `${outputStartDate} 〜 ${outputEndDate}`;
+      const syncText = syncStatus?.state === "saving" ? "下書き同期中" : syncStatus?.state === "error" ? "下書き同期失敗" : APP_CONFIG.connectionMode === "mock" ? "下書き保存済み（mock）" : "下書き保存済み";
+      const stateLabel = recordsForBusiness.length ? "確定済み" : "実績なし";
+      const stateColor = recordsForBusiness.length ? "success" : (syncStatus?.state === "error" ? "warning" : "info");
+      const stateDetail = recordsForBusiness.length ? `${recordsForBusiness.length}件 / 最新 ${formatDateTimeText(recordsForBusiness[0].registeredAt)}` : "登録タブで作業確定すると表示されます";
+      const impactText = ["price", "returnGoods"].includes(context.businessKey) ? `調整影響 ${yen(totalImpact)}` : null;
+      const showAmountSummary = !["pop", "label"].includes(context.businessKey);
+      const primaryMetric = (() => {
+        if (context.businessKey === "price" || context.businessKey === "returnGoods") return { label: business.amountLabel, value: yen(totalAmount), color: totalImpact < 0 ? "warning" : "primary" };
+        if (context.businessKey === "inventory") return { label: "売価金額", value: yen(totalAmount), color: "success" };
+        if (context.businessKey === "priceCheck") return { label: "売価差異", value: yen(totalAmount), color: issueEntries.length ? "error" : "success" };
+        if (context.businessKey === "pop") return { label: "発行枚数", value: `${totalQty}枚`, color: "primary" };
+        if (context.businessKey === "label") return { label: "発行枚数", value: `${totalQty}枚`, color: "secondary" };
+        return { label: "明細", value: `${outputEntries.length}件`, color: "primary" };
+      })();
+      const outputActionLabels = { pdf: "PDF", print: "印刷" };
+      const getRecordRowKey = row => `${row.__record?.recordId || "record"}-${row.id || row.__recordIndex}`;
+      const pagedOutputEntries = outputEntries.slice(dataPage * dataRowsPerPage, dataPage * dataRowsPerPage + dataRowsPerPage);
+      const pagedRecordsForBusiness = recordsForBusiness.slice(workPage * workRowsPerPage, workPage * workRowsPerPage + workRowsPerPage);
+      const selectedRows = outputEntries.filter(row => selectedRecordRows.includes(getRecordRowKey(row)));
+      const allDataRowsSelected = outputEntries.length > 0 && selectedRecordRows.length === outputEntries.length;
+      const partialDataRowsSelected = selectedRecordRows.length > 0 && selectedRecordRows.length < outputEntries.length;
+      function updatePeriod(name, value) { setContext(prev => ({ ...prev, [name]: value })); }
+      function simulateAction(action) {
+        if (["pdf", "print"].includes(action) && recordsForBusiness.length === 0) { setMessage({ severity: "warning", text: "作業確定後に実行できます。" }); return; }
+        if (action === "pdf") { setPreviewOpen(true); return; }
+        setMessage({ severity: "success", text: `${outputActionLabels[action] || action}しました。` });
+      }
+      function updateEditingItem(name, value) { setEditingItem(prev => ({ ...prev, [name]: value })); }
+      function focusEditNumberField(field) {
+        if (!field || !editNumericFields.includes(field)) return;
+        setActiveEditNumberField(field);
+        setEditNumberPadOpen(true);
+        window.setTimeout(() => {
+          const input = editNumberInputRefs.current[field];
+          input?.focus?.();
+          input?.select?.();
+        }, 80);
+      }
+      function moveEditNumberFocus(delta) {
+        if (!editNumericFields.length) return;
+        const currentIndex = activeEditNumberField ? editNumericFields.indexOf(activeEditNumberField) : -1;
+        const nextIndex = currentIndex < 0 ? 0 : Math.max(0, Math.min(currentIndex + delta, editNumericFields.length - 1));
+        focusEditNumberField(editNumericFields[nextIndex]);
+      }
+      function startConfirmEdit(target) {
+        const { __record, __recordIndex, ...entry } = target;
+        setEditingItem({ ...entry, __recordId: __record?.recordId, __recordIndex });
+        setEditNumberPadOpen(true);
+        setActiveEditNumberField(null);
+        window.setTimeout(() => focusEditNumberField("quantity"), 160);
+      }
+      function saveEditingItem() {
+        const errors = validateItem(editingItem, context);
+        const blockingErrors = errors.filter(error => !(context.businessKey === "priceCheck" && error === "売価不一致"));
+        if (blockingErrors.length) { setMessage({ severity: "error", text: blockingErrors.join(" / ") }); return; }
+        const { __recordId, __recordIndex, ...nextEntry } = editingItem;
+        onUpdateRecord?.(__recordId, record => ({
+          ...record,
+          entries: (record.entries || []).map((row, index) => {
+            const sameEntry = nextEntry.id ? row.id === nextEntry.id : index === __recordIndex;
+            return sameEntry ? { ...row, ...nextEntry, deletedAt: null } : row;
+          })
+        }));
+        setEditingItem(null);
+        if (errors.length) setMessage({ severity: "warning", text: "修正しました。まだ確認が必要です。" });
+        else setMessage(null);
+      }
+      function updateRecordEntry(recordId, entryId, entryIndex, updater) {
+        onUpdateRecord?.(recordId, record => ({
+          ...record,
+          entries: (record.entries || []).map((row, index) => {
+            const sameEntry = entryId ? row.id === entryId : index === entryIndex;
+            return sameEntry ? updater(row) : row;
+          })
+        }));
+      }
+      function deleteEditingItem() {
+        if (!editingItem) return;
+        updateRecordEntry(editingItem.__recordId, editingItem.id, editingItem.__recordIndex, row => ({ ...row, deletedAt: Date.now() }));
+        setEditingItem(null);
+        setMessage({ severity: "info", text: "実績明細をごみ箱に移動しました。" });
+      }
+      function deleteRecordRow(row) {
+        updateRecordEntry(row.__record?.recordId, row.id, row.__recordIndex, entry => ({ ...entry, deletedAt: Date.now() }));
+        setMessage({ severity: "info", text: "実績明細をごみ箱に移動しました。" });
+      }
+      function toggleRecordRowSelection(row) {
+        const key = getRecordRowKey(row);
+        setSelectedRecordRows(prev => prev.includes(key) ? prev.filter(item => item !== key) : [...prev, key]);
+      }
+      function toggleAllRecordRows(checked) {
+        setSelectedRecordRows(checked ? outputEntries.map(getRecordRowKey) : []);
+      }
+      function bulkDeleteRecordRows() {
+        selectedRows.forEach(row => updateRecordEntry(row.__record?.recordId, row.id, row.__recordIndex, entry => ({ ...entry, deletedAt: Date.now() })));
+        setSelectedRecordRows([]);
+        setMessage({ severity: "info", text: `${selectedRows.length}件の実績明細をごみ箱に移動しました。` });
+      }
+      function restoreRecordEntry(row) {
+        updateRecordEntry(row.__record?.recordId, row.id, row.__recordIndex, entry => ({ ...entry, deletedAt: null }));
+      }
+      function permanentDeleteRecordEntry(row) {
+        const recordId = row.__record?.recordId;
+        onUpdateRecord?.(recordId, record => ({
+          ...record,
+          entries: (record.entries || []).filter((entry, index) => row.id ? entry.id !== row.id : index !== row.__recordIndex)
+        }));
+      }
+      function confirmRemoveItem() {
+        if (!deleteTarget) return;
+        const now = Date.now();
+        setEntries(prev => prev.map(row => row.id === deleteTarget.id ? { ...row, deletedAt: now } : row));
+        setDeleteTarget(null);
+        setMessage({ severity: "info", text: "明細をごみ箱に移動しました。2日後に完全削除されます。" });
+      }
+      function restoreItem(id) { setEntries(prev => prev.map(row => row.id === id ? { ...row, deletedAt: null } : row)); setMessage({ severity: "success", text: "明細を復活しました。" }); }
+      function permanentDeleteItem(id) { setEntries(prev => prev.filter(row => row.id !== id)); setMessage({ severity: "info", text: "明細を完全削除しました。" }); }
+      function setEditNumberField(field, rawValue) {
+        if (!field || !editingItem) return;
+        const normalized = rawValue === "" ? "" : (field === "sequenceNo" ? rawValue : Number(rawValue));
+        updateEditingItem(field, normalized);
+      }
+      function appendEditNumberPadValue(key) {
+        const field = activeEditNumberField;
+        if (!field || !editingItem) return;
+        const current = editingItem[field];
+        const raw = `${current === undefined || current === null ? "" : current}${key}`;
+        const nextRaw = field === "sequenceNo" ? raw : raw.replace(/^0+(?=\d)/, "");
+        setEditNumberField(field, nextRaw);
+      }
+      function backspaceEditNumberPadValue() {
+        const field = activeEditNumberField;
+        if (!field || !editingItem) return;
+        const current = editingItem[field];
+        const nextRaw = String(current === undefined || current === null ? "" : current).slice(0, -1);
+        setEditNumberField(field, nextRaw);
+      }
+      function clearEditNumberPadValue() { setEditNumberField(activeEditNumberField, ""); }
+      React.useEffect(() => {
+        setSelectedRecordRows(prev => prev.filter(key => outputEntries.some(row => getRecordRowKey(row) === key)));
+        if (dataPage > 0 && dataPage * dataRowsPerPage >= outputEntries.length) setDataPage(0);
+        if (workPage > 0 && workPage * workRowsPerPage >= recordsForBusiness.length) setWorkPage(0);
+      }, [outputEntries.length, recordsForBusiness.length, context.businessKey]);
+      React.useEffect(() => {
+        if (recordDisplayUnit !== "data") setSelectedRecordRows([]);
+      }, [recordDisplayUnit]);
+      React.useEffect(() => onBindAction(simulateAction), [context, recordsForBusiness.length, outputEntries.length]);
+      return (
+        <Stack spacing={1}>
+          {message && <Alert severity={message.severity} onClose={() => setMessage(null)}>{message.text}</Alert>}
+          <Paper variant="outlined" sx={{ overflow: "hidden" }}>
+            <Box sx={{ px: 1.2, py: 0.9 }}>
+              <Stack direction="row" alignItems="center" justifyContent="space-between" spacing={1}>
+                <Stack direction="row" spacing={0.75} alignItems="center" sx={{ minWidth: 0 }}>
+                  <Chip size="small" color={primaryMetric.color} variant="outlined" label={`${primaryMetric.label} ${primaryMetric.value}`} />
+                  {issueEntries.length > 0 && <Chip size="small" color="error" variant="outlined" label={`要確認 ${issueEntries.length}`} />}
+                </Stack>
+                <Button
+                  size="small"
+                  variant="text"
+                  startIcon={<Icon>{summaryOpen ? "expand_less" : "expand_more"}</Icon>}
+                  onClick={() => setSummaryOpen(prev => !prev)}
+                >
+                  {summaryOpen ? "閉じる" : "詳細"}
+                </Button>
+              </Stack>
+            </Box>
+            {summaryOpen && (
+              <Box sx={{ p: 1.5, borderTop: "1px solid", borderColor: "divider", bgcolor: "background.default" }}>
+                <Grid container spacing={1}>
+                  <Grid item xs={6} md={showAmountSummary ? 3 : 4}>
+                    <Paper variant="outlined" sx={{ p: 1.5, height: "100%" }}>
+                      <Typography variant="caption" color="text.secondary" display="block">明細件数</Typography>
+                      <Typography variant="h5" sx={{ fontWeight: 900 }}>{outputEntries.length}件</Typography>
+                    </Paper>
+                  </Grid>
+                  <Grid item xs={6} md={showAmountSummary ? 3 : 4}>
+                    <Paper variant="outlined" sx={{ p: 1.5, height: "100%" }}>
+                      <Typography variant="caption" color="text.secondary" display="block">{business.quantityLabel}</Typography>
+                      <Typography variant="h5" sx={{ fontWeight: 900 }}>{totalQty}</Typography>
+                    </Paper>
+                  </Grid>
+                  {showAmountSummary && <Grid item xs={6} md={3}>
+                    <Paper variant="outlined" sx={{ p: 1.5, height: "100%" }}>
+                      <Typography variant="caption" color="text.secondary" display="block">{business.amountLabel}</Typography>
+                      <Typography variant="h5" sx={{ fontWeight: 900 }}>{formatSummaryDecisionValue(totalAmount, context)}</Typography>
+                      {impactText && <Typography variant="caption" color={totalImpact < 0 ? "warning.main" : "text.secondary"}>{impactText}</Typography>}
+                    </Paper>
+                  </Grid>}
+                  <Grid item xs={6} md={showAmountSummary ? 3 : 4}>
+                    <Paper variant="outlined" sx={{ p: 1.5, height: "100%", borderColor: issueEntries.length ? "error.light" : "divider" }}>
+                      <Typography variant="caption" color="text.secondary" display="block">要確認</Typography>
+                      <Typography variant="h5" color={issueEntries.length ? "error.main" : "success.main"} sx={{ fontWeight: 900 }}>{issueEntries.length}件</Typography>
+                    </Paper>
+                  </Grid>
+                </Grid>
+                {recordsForBusiness.length > 0 && (
+                  <React.Fragment>
+                    <Divider sx={{ my: 1.5 }} />
+                    <Stack direction="row" spacing={1} alignItems="center" sx={{ overflowX: "auto" }}>
+                      {business.outputActions.filter(action => action !== "complete").map(action => (
+                        <Button key={action} variant={action === "complete" ? "contained" : "outlined"} onClick={() => simulateAction(action)}>
+                          {outputActionLabels[action]}
+                        </Button>
+                      ))}
+                    </Stack>
+                  </React.Fragment>
+                )}
+              </Box>
+            )}
+          </Paper>
+
+          <Stack spacing={0.75}>
+            <Stack direction="row" spacing={0.75} alignItems="center" justifyContent="space-between">
+              <Stack direction="row" spacing={0.75} alignItems="center" sx={{ minWidth: 0 }}>
+                <Typography variant="subtitle1" noWrap>実績一覧（{recordDisplayUnit === "data" ? outputEntries.length : recordsForBusiness.length}件）</Typography>
+              </Stack>
+              <Stack direction="row" spacing={0.75} alignItems="center" justifyContent="flex-end" useFlexGap flexWrap="wrap">
+                <Tooltip title={`ごみ箱 ${recordTrashEntries.length}件`}>
+                  <Button size="small" color={recordTrashEntries.length ? "error" : "inherit"} onClick={() => setRecordTrashOpen(true)} sx={{ minHeight: 30, px: 0.75, fontSize: "1rem", fontWeight: 700, color: recordTrashEntries.length ? "error.main" : "text.secondary" }}>
+                    ごみ箱（{recordTrashEntries.length}件）
+                  </Button>
+                </Tooltip>
+              </Stack>
+            </Stack>
+            <Stack direction="row" spacing={0.75} alignItems="center" justifyContent="flex-start" useFlexGap flexWrap="wrap">
+              {recordDisplayUnit === "data" && outputEntries.length > 0 && (
+                <Checkbox
+                  size="small"
+                  checked={allDataRowsSelected}
+                  indeterminate={partialDataRowsSelected}
+                  onChange={event => toggleAllRecordRows(event.target.checked)}
+                  inputProps={{ "aria-label": "実績明細をすべて選択" }}
+                  sx={{ p: 0.25 }}
+                />
+              )}
+              <ToggleButtonGroup value={recordViewMode} exclusive onChange={(_, next) => next && setRecordViewMode(next)} size="small" color="primary">
+                <ToggleButton value={VIEW_MODE.CARDS}>カード</ToggleButton>
+                <ToggleButton value={VIEW_MODE.TABLE}>テーブル</ToggleButton>
+              </ToggleButtonGroup>
+              <ToggleButtonGroup value={recordDisplayUnit} exclusive onChange={(_, next) => next && setRecordDisplayUnit(next)} size="small" color="primary">
+                <ToggleButton value="data">商品</ToggleButton>
+                <ToggleButton value="work">作業</ToggleButton>
+              </ToggleButtonGroup>
+              {recordDisplayUnit === "data" && selectedRecordRows.length > 0 && (
+                <Button size="small" color="error" variant="outlined" onClick={bulkDeleteRecordRows}>選択削除 {selectedRecordRows.length}</Button>
+              )}
+            </Stack>
+            <Box>
+              {recordsForBusiness.length === 0 ? (
+                <EmptyState text="登録済み実績がありません。" />
+              ) : recordDisplayUnit === "data" && recordViewMode === VIEW_MODE.TABLE ? (
+                <TableContainer>
+                  <Table size="small">
+                    <TableHead>
+                      <TableRow>
+                        <TableCell padding="checkbox">
+                          <Checkbox
+                            size="small"
+                            checked={allDataRowsSelected}
+                            indeterminate={partialDataRowsSelected}
+                            onChange={event => toggleAllRecordRows(event.target.checked)}
+                            inputProps={{ "aria-label": "実績明細をすべて選択" }}
+                          />
+                        </TableCell>
+                        <TableCell>商品</TableCell>
+                        <TableCell>作業</TableCell>
+                        <TableCell>登録日時</TableCell>
+                        <TableCell align="right">数量</TableCell>
+                        <TableCell align="right">{business.amountLabel}</TableCell>
+                        <TableCell>連携先</TableCell>
+                        <TableCell>連携状況</TableCell>
+                        <TableCell>操作</TableCell>
+                      </TableRow>
+                    </TableHead>
+                    <TableBody>
+                      {pagedOutputEntries.map(row => {
+                        const record = row.__record;
+                        const linked = isBackendLinkedRecord(record);
+                        const integration = getIntegrationStatus(record);
+                        const rowKey = getRecordRowKey(row);
+                        const selected = selectedRecordRows.includes(rowKey);
+                        return (
+                        <TableRow key={rowKey} hover selected={selected}>
+                          <TableCell padding="checkbox">
+                            <Checkbox
+                              size="small"
+                              checked={selected}
+                              onChange={() => toggleRecordRowSelection(row)}
+                              inputProps={{ "aria-label": `${row.productName || row.sku}を選択` }}
+                            />
+                          </TableCell>
+                          <TableCell>{row.productName || row.sku}</TableCell>
+                          <TableCell>{record.workGroup || row.workGroup || "セッション"}</TableCell>
+                          <TableCell>{formatDateTimeText(record.registeredAt)}</TableCell>
+                          <TableCell align="right">{row.quantity || 1}</TableCell>
+                          <TableCell align="right">{formatDecisionValue(row, context)}</TableCell>
+                          <TableCell>{integration.target}</TableCell>
+                          <TableCell><Chip size="small" color={integration.color} variant="outlined" label={integration.label} /></TableCell>
+                          <TableCell>
+                            <Button size="small" variant="text" onClick={() => startConfirmEdit(row)}>
+                              {linked ? "訂正登録" : "当日修正"}
+                            </Button>
+                            <Button size="small" color="error" onClick={() => deleteRecordRow(row)}>削除</Button>
+                          </TableCell>
+                        </TableRow>
+                        );
+                      })}
+                    </TableBody>
+                  </Table>
+                  <TablePagination
+                    component="div"
+                    count={outputEntries.length}
+                    page={dataPage}
+                    onPageChange={(_, nextPage) => setDataPage(nextPage)}
+                    rowsPerPage={dataRowsPerPage}
+                    onRowsPerPageChange={event => { setDataRowsPerPage(Number(event.target.value)); setDataPage(0); }}
+                    rowsPerPageOptions={[5, 10, 25]}
+                    labelRowsPerPage="表示件数"
+                  />
+                </TableContainer>
+              ) : recordDisplayUnit === "data" ? (
+                <Stack spacing={1.2}>
+                  {outputEntries.map(row => {
+                    const record = row.__record;
+                    const linked = isBackendLinkedRecord(record);
+                    const integration = getIntegrationStatus(record);
+                    const rowKey = getRecordRowKey(row);
+                    const selected = selectedRecordRows.includes(rowKey);
+                    return (
+                    <Paper key={rowKey} variant="outlined" sx={{ p: 1.25, borderColor: selected ? "primary.main" : "divider", bgcolor: selected ? "primary.50" : "background.paper" }}>
+                      <Stack spacing={0.75}>
+                        <Stack direction="row" spacing={1} alignItems="flex-start" justifyContent="space-between">
+                          <Box sx={{ minWidth: 0, display: "flex", alignItems: "flex-start", gap: 0.75 }}>
+                            <Checkbox
+                              size="small"
+                              checked={selected}
+                              onChange={() => toggleRecordRowSelection(row)}
+                              sx={{ p: 0.25, mt: -0.25 }}
+                              inputProps={{ "aria-label": `${row.productName || row.sku}を選択` }}
+                            />
+                            <Box sx={{ minWidth: 0 }}>
+                              <Typography variant="subtitle2" noWrap>{row.productName || row.sku}</Typography>
+                              <Typography variant="caption" color="text.secondary">{record.workGroup || row.workGroup || "セッション"} / {formatDateTimeText(record.registeredAt)} / {integration.target}</Typography>
+                            </Box>
+                          </Box>
+                          <Stack direction="row" spacing={0.75}>
+                            <Chip size="small" color={integration.color} variant="outlined" label={integration.label} />
+                            <Chip size="small" variant="outlined" label={`${row.quantity || 1}`} />
+                          </Stack>
+                        </Stack>
+                        <Stack direction="row" spacing={1} alignItems="center" justifyContent="space-between">
+                          <Typography variant="body2" color="text.secondary">{formatDecisionValue(row, context)}</Typography>
+                          <Stack direction="row" spacing={0.75}>
+                            <Button size="small" variant="outlined" onClick={() => startConfirmEdit(row)}>
+                              {linked ? "訂正登録" : "当日修正"}
+                            </Button>
+                            <Button size="small" color="error" onClick={() => deleteRecordRow(row)}>削除</Button>
+                          </Stack>
+                        </Stack>
+                      </Stack>
+                    </Paper>
+                    );
+                  })}
+                </Stack>
+              ) : recordViewMode === VIEW_MODE.TABLE ? (
+                <TableContainer>
+                  <Table size="small">
+                    <TableHead>
+                      <TableRow>
+                        <TableCell>作業</TableCell>
+                        <TableCell>登録日時</TableCell>
+                        <TableCell>連携先</TableCell>
+                        <TableCell>連携状況</TableCell>
+                        <TableCell>商品</TableCell>
+                        <TableCell align="right">件数</TableCell>
+                        <TableCell>操作</TableCell>
+                      </TableRow>
+                    </TableHead>
+                    <TableBody>
+                      {pagedRecordsForBusiness.map(record => {
+                        const activeRecordEntries = (record.entries || []).filter(row => !row.deletedAt);
+                        const productSummary = activeRecordEntries.slice(0, 2).map(row => row.productName || row.sku).filter(Boolean).join(" / ");
+                        const moreCount = Math.max(0, activeRecordEntries.length - 2);
+                        const integration = getIntegrationStatus(record);
+                        return (
+                        <TableRow key={record.recordId} hover>
+                          <TableCell>{record.workGroup || "セッション"}</TableCell>
+                          <TableCell>{formatDateTimeText(record.registeredAt)}</TableCell>
+                          <TableCell>{integration.target}</TableCell>
+                          <TableCell><Chip size="small" color={integration.color} variant="outlined" label={integration.label} /></TableCell>
+                          <TableCell>{productSummary}{moreCount ? ` 他${moreCount}件` : ""}</TableCell>
+                          <TableCell align="right">{activeRecordEntries.length}</TableCell>
+                          <TableCell>
+                            <Button size="small" variant="text" onClick={() => setRecordDisplayUnit("data")}>
+                              商品を表示
+                            </Button>
+                          </TableCell>
+                        </TableRow>
+                        );
+                      })}
+                    </TableBody>
+                  </Table>
+                  <TablePagination
+                    component="div"
+                    count={recordsForBusiness.length}
+                    page={workPage}
+                    onPageChange={(_, nextPage) => setWorkPage(nextPage)}
+                    rowsPerPage={workRowsPerPage}
+                    onRowsPerPageChange={event => { setWorkRowsPerPage(Number(event.target.value)); setWorkPage(0); }}
+                    rowsPerPageOptions={[5, 10, 25]}
+                    labelRowsPerPage="表示件数"
+                  />
+                </TableContainer>
+              ) : (
+              <Stack spacing={1.2}>
+                {recordsForBusiness.map(record => {
+                  const activeRecordEntries = (record.entries || []).filter(row => !row.deletedAt);
+                  const productSummary = activeRecordEntries.slice(0, 3).map(row => row.productName || row.sku).filter(Boolean).join(" / ");
+                  const moreCount = Math.max(0, activeRecordEntries.length - 3);
+                  const integration = getIntegrationStatus(record);
+                  return (
+                  <Paper key={record.recordId} variant="outlined" sx={{ p: 1.25 }}>
+                    <Stack spacing={0.75}>
+                      <Stack direction="row" spacing={1} alignItems="flex-start" justifyContent="space-between">
+                        <Box sx={{ minWidth: 0 }}>
+                          <Typography variant="subtitle2" noWrap>{record.workGroup || "セッション"}</Typography>
+                          <Typography variant="caption" color="text.secondary">{record.recordId} / {formatDateTimeText(record.registeredAt)} / {integration.target}</Typography>
+                        </Box>
+                        <Stack direction="row" spacing={0.75}>
+                          <Chip size="small" color={integration.color} variant="outlined" label={integration.label} />
+                          <Chip size="small" variant="outlined" label={`${activeRecordEntries.length}件`} />
+                        </Stack>
+                      </Stack>
+                      {productSummary && <Typography variant="body2" color="text.secondary" noWrap>{productSummary}{moreCount ? ` 他${moreCount}件` : ""}</Typography>}
+                      <Stack direction="row" spacing={1} justifyContent="flex-end">
+                        <Button size="small" variant="outlined" onClick={() => setRecordDisplayUnit("data")}>
+                          商品を表示
+                        </Button>
+                      </Stack>
+                    </Stack>
+                  </Paper>
+                  );
+                })}
+              </Stack>
+              )}
+            </Box>
+          </Stack>
+
+          <Drawer anchor="bottom" open={Boolean(editingItem)} onClose={() => setEditingItem(null)} PaperProps={{ sx: { borderTopLeftRadius: 18, borderTopRightRadius: 18, maxHeight: "96vh", maxWidth: 760, mx: "auto", width: "100%" } }}>
+            <Box sx={{ pt: 1, display: "grid", placeItems: "center" }}><Box sx={{ width: 40, height: 4, borderRadius: 2, bgcolor: "divider" }} /></Box>
+            <Box sx={{ px: 2, pt: 1, pb: 1.25, display: "flex", alignItems: "center", gap: 1 }}>
+              <Box sx={{ width: 32, height: 32, borderRadius: 1.5, display: "grid", placeItems: "center", bgcolor: `${business.color}.50`, color: `${business.color}.main` }}><Icon sx={{ fontSize: 20 }}>{business.icon}</Icon></Box>
+              <Typography variant="subtitle1" sx={{ flex: 1 }}>訂正登録</Typography>
+              <Chip size="small" color="primary" variant="outlined" label="実績修正" />
+              <IconButton onClick={() => setEditingItem(null)}><Icon>close</Icon></IconButton>
+            </Box>
+            <Divider />
+            {editingItem && (
+              <Box sx={{ px: 2, py: 2, overflow: "auto" }}>
+                <Stack spacing={1.5}>
+                  <Paper variant="outlined" sx={{ p: 1.5, bgcolor: "grey.50" }}>
+                    <Typography variant="subtitle2">{editingItem.productName}</Typography>
+                    <Typography variant="caption" color="text.secondary">JAN {editingItem.barcode}　{getMasterValueLabel(context)} {yen(editingItem.currentPrice)}</Typography>
+                  </Paper>
+                  {business.itemFields.filter(field => field !== "sku").map(field => (
+                    <DynamicField key={field} name={field} value={editingItem[field]} onChange={updateEditingItem} context={context} inputRef={node => { if (node) editNumberInputRefs.current[field] = node; }} onFocus={fieldName => { if (editNumericFields.includes(fieldName)) { setActiveEditNumberField(fieldName); setEditNumberPadOpen(true); } }} />
+                  ))}
+                  {editNumericFields.length > 0 && <NumberPad open={editNumberPadOpen} onToggle={() => setEditNumberPadOpen(prev => !prev)} disabled={!activeEditNumberField} onInput={appendEditNumberPadValue} onBackspace={backspaceEditNumberPadValue} onClear={clearEditNumberPadValue} onPrevious={() => moveEditNumberFocus(-1)} onEnter={() => moveEditNumberFocus(1)} />}
+                  {validateItem(editingItem, context).length > 0 && <Alert severity="warning">{validateItem(editingItem, context).join(" / ")}</Alert>}
+                </Stack>
+              </Box>
+            )}
+            <Divider />
+            <Box sx={{ px: 2, py: 1.5, pb: "calc(env(safe-area-inset-bottom) + 12px)", display: "flex", alignItems: "center", gap: 1 }}>
+              <Button variant="outlined" size="large" onClick={() => setEditingItem(null)}>閉じる</Button>
+              <Box sx={{ flex: 1 }} />
+              <Button color="error" size="large" onClick={deleteEditingItem}>削除</Button>
+              <Button variant="contained" size="large" onClick={saveEditingItem}>保存</Button>
+            </Box>
+          </Drawer>
+
+          <Dialog open={recordTrashOpen} onClose={() => setRecordTrashOpen(false)} maxWidth="sm" fullWidth>
+            <DialogTitle>実績ごみ箱</DialogTitle>
+            <DialogContent dividers>
+              <Stack spacing={1}>
+                {recordTrashEntries.length === 0 && <EmptyState text="実績ごみ箱は空です。" />}
+                {recordTrashEntries.map(row => (
+                  <Paper key={`${row.__record?.recordId}-${row.id || row.__recordIndex}`} variant="outlined" sx={{ p: 1.2 }}>
+                    <Stack direction="row" spacing={1} alignItems="center">
+                      <Box sx={{ flex: 1, minWidth: 0 }}>
+                        <Typography variant="subtitle2" noWrap>{row.productName || row.sku}</Typography>
+                        <Typography variant="caption" color="text.secondary">{row.__record?.workGroup || row.workGroup || "セッション"} / {formatDateTimeText(row.__record?.registeredAt)}</Typography>
+                      </Box>
+                      <Button size="small" variant="outlined" onClick={() => restoreRecordEntry(row)}>復活</Button>
+                      <Button size="small" color="error" onClick={() => permanentDeleteRecordEntry(row)}>完全削除</Button>
+                    </Stack>
+                  </Paper>
+                ))}
+              </Stack>
+            </DialogContent>
+            <DialogActions>
+              <Button onClick={() => setRecordTrashOpen(false)}>閉じる</Button>
+            </DialogActions>
+          </Dialog>
+
+          <ConfirmDialog
+            open={Boolean(deleteTarget)}
+            title="この明細をごみ箱に移動しますか？"
+            description="ごみ箱へ移動した明細は復活できます。2日後に完全削除されます。"
+            confirmLabel="ごみ箱へ移動"
+            onCancel={() => setDeleteTarget(null)}
+            onConfirm={confirmRemoveItem}
+          >
+            {deleteTarget && <Alert severity="warning" sx={{ py: 0.5 }}>{deleteTarget.productName || "商品未選択"}</Alert>}
+          </ConfirmDialog>
+          {!isConfirmed && <TrashDialog open={trashOpen} entries={entries} context={context} onClose={() => setTrashOpen(false)} onRestore={restoreItem} onPermanentDelete={permanentDeleteItem} />}
+
+          <Dialog open={previewOpen} onClose={() => setPreviewOpen(false)} maxWidth="sm" fullWidth>
+            <DialogTitle>{business.label} 登録済み出力プレビュー</DialogTitle>
+            <DialogContent dividers><Stack spacing={1}><Typography variant="subtitle2">{business.label} / {context.department}{` / ${periodText}`}</Typography><Divider />{outputEntries.map((row, index) => <Stack key={`${row.id}-${index}`} direction="row" justifyContent="space-between" spacing={1}><Typography variant="body2">{index + 1}. {row.productName}</Typography><Typography variant="body2" sx={{ fontWeight: 700 }}>{row.quantity || 1} / {formatDecisionValue(row, context)}</Typography></Stack>)}<Divider /><Typography align="right" variant="subtitle1">合計 {formatSummaryDecisionValue(totalAmount, context)}</Typography></Stack></DialogContent>
+            <DialogActions><Button onClick={() => setPreviewOpen(false)}>閉じる</Button><Button variant="contained" onClick={() => { setPreviewOpen(false); setMessage({ severity: "success", text: "PDFを確認しました。" }); }}>確認済みにする</Button></DialogActions>
+          </Dialog>
+        </Stack>
+      );
+    }
+
+
+    // ============================================================
+    // [CORE] WorkflowApp（3画面アプリ本体）
+    // ============================================================
+    // LAUNCHER から iframe + postMessage で状態を受け取り描画する。
+    // スタンドアロン（?embedded=1）でも単体動作可能。
+    // ============================================================
+
+    function WorkflowApp() {
+      const loaded = loadState();
+      const [screen, setScreen] = React.useState(loaded?.screen || SCREEN.START);
+      const [context, setContext] = React.useState(loaded?.context || createDefaultContext("price"));
+      const [entries, setEntries] = React.useState(() => purgeExpiredTrash(loaded?.entries || []));
+      const [confirmedRecord, setConfirmedRecord] = React.useState(loaded?.confirmedRecord || null);
+      const [confirmedRecords, setConfirmedRecords] = React.useState(loaded?.confirmedRecords || (loaded?.confirmedRecord ? [loaded.confirmedRecord] : []));
+      const [draftId, setDraftId] = React.useState(loaded?.draftId || createDraftId());
+      const [syncStatus, setSyncStatus] = React.useState({ state: "idle", savedAt: null, error: null });
+      const [startSettingsOpen, setStartSettingsOpen] = React.useState(false);
+      const [scanDrawerRequest, setScanDrawerRequest] = React.useState(0);
+      const [scanDrawerCloseRequest, setScanDrawerCloseRequest] = React.useState(0);
+      const [businessMenuOpen, setBusinessMenuOpen] = React.useState(false);
+      const [businessHelpOpen, setBusinessHelpOpen] = React.useState(false);
+      const [resetConfirmOpen, setResetConfirmOpen] = React.useState(false);
+      const [businessSwitchTarget, setBusinessSwitchTarget] = React.useState(null);
+      const scanActionsRef = React.useRef({ search: null, save: null, clear: null });
+      const confirmActionRef = React.useRef(null);
+      const visibleEntries = getActiveEntries(entries);
+      const issueCount = visibleEntries.filter(row => getStatus(row, context).color === "error").length;
+
+      React.useEffect(() => {
+        const purged = purgeExpiredTrash(entries);
+        if (purged.length !== entries.length) setEntries(purged);
+      }, [entries]);
+      React.useEffect(() => saveState({ draftId, screen, context, entries: purgeExpiredTrash(entries), confirmedRecord, confirmedRecords }), [draftId, screen, context, entries, confirmedRecord, confirmedRecords]);
+      React.useEffect(() => {
+        const snapshot = createWorkflowSnapshot({ draftId, screen, context, entries: purgeExpiredTrash(entries), confirmedRecord, confirmedRecords });
+        setSyncStatus(prev => ({ ...prev, state: "saving", error: null }));
+        const timer = window.setTimeout(() => {
+          syncWorkflowSnapshot(snapshot)
+            .then(result => setSyncStatus({ state: "saved", savedAt: result.savedAt, error: null, mode: result.mode }))
+            .catch(error => {
+              console.warn(error);
+              setSyncStatus({ state: "error", savedAt: null, error: error.message || String(error) });
+            });
+        }, APP_CONFIG.autosaveDebounceMs);
+        return () => window.clearTimeout(timer);
+      }, [draftId, screen, context, entries, confirmedRecord, confirmedRecords]);
+      React.useEffect(() => {
+        function handleMessage(event) {
+          const data = event.data;
+          if (!data || data.type !== "APPLY_MOCK_STATE") return;
+          const nextState = applyScenarioToState(data.payload || {});
+          setScreen(nextState.screen);
+          setContext(nextState.context);
+          setEntries(purgeExpiredTrash(nextState.entries));
+          setConfirmedRecord(nextState.confirmedRecord || null);
+          setConfirmedRecords(nextState.confirmedRecords || []);
+          setDraftId(data.payload?.draftId || createDraftId());
+          setStartSettingsOpen(Boolean(data.payload?.openStartSettings));
+          if (nextState.openScanDrawer) setScanDrawerRequest(prev => prev + 1);
+          else setScanDrawerCloseRequest(prev => prev + 1);
+        }
+        window.addEventListener("message", handleMessage);
+        if (window.__EXPORTED_MOCK_STATE__) {
+          const nextState = applyScenarioToState(window.__EXPORTED_MOCK_STATE__);
+          setScreen(nextState.screen); setContext(nextState.context); setEntries(purgeExpiredTrash(nextState.entries)); setConfirmedRecord(nextState.confirmedRecord || null); setConfirmedRecords(nextState.confirmedRecords || []); setDraftId(window.__EXPORTED_MOCK_STATE__.draftId || createDraftId());
+          setStartSettingsOpen(Boolean(window.__EXPORTED_MOCK_STATE__.openStartSettings));
+          if (nextState.openScanDrawer) setScanDrawerRequest(prev => prev + 1);
+          else setScanDrawerCloseRequest(prev => prev + 1);
+        }
+        return () => window.removeEventListener("message", handleMessage);
+      }, []);
+
+      function resetAll() {
+        const next = createDefaultContext("price");
+        const nextDraftId = createDraftId();
+        setDraftId(nextDraftId); setContext(next); setEntries([]); setConfirmedRecord(null); setConfirmedRecords([]); setScreen(SCREEN.START); setStartSettingsOpen(false); setBusinessMenuOpen(false); setBusinessHelpOpen(false); setResetConfirmOpen(false); setBusinessSwitchTarget(null);
+        saveState({ draftId: nextDraftId, screen: SCREEN.START, context: next, entries: [], confirmedRecord: null, confirmedRecords: [] });
+      }
+
+      function requestReset() {
+        if (screen === SCREEN.START && entries.length === 0 && !confirmedRecord) { resetAll(); return; }
+        setResetConfirmOpen(true);
+      }
+
+      function applyBusinessSelection(key) {
+        const next = createDefaultContext(key);
+        setDraftId(createDraftId());
+        setContext(next);
+        setEntries([]);
+        setConfirmedRecord(null);
+        setScreen(SCREEN.SCAN);
+        setBusinessMenuOpen(false);
+        setBusinessSwitchTarget(null);
+        window.setTimeout(() => setStartSettingsOpen(true), 0);
+      }
+
+      function selectBusinessFromMenu(key) {
+        if (key === context.businessKey) { setBusinessMenuOpen(false); return; }
+        if (visibleEntries.length > 0) { setBusinessSwitchTarget(key); return; }
+        applyBusinessSelection(key);
+      }
+
+      function editConfirmedRecord(record) {
+        const linked = isBackendLinkedRecord(record);
+        const nextContext = {
+          ...createDefaultContext(record.businessKey || context.businessKey),
+          ...(record.context || {}),
+          workGroup: linked ? `${record.workGroup || "セッション"} 訂正` : (record.workGroup || "セッション1")
+        };
+        const nextEntries = cloneRecordEntriesForWork(record, linked).map(row => ({
+          ...row,
+          workGroup: nextContext.workGroup
+        }));
+        setContext(nextContext);
+        setEntries(nextEntries);
+        setConfirmedRecord(null);
+        if (!linked) {
+          setConfirmedRecords(prev => prev.filter(item => item.recordId !== record.recordId));
+        }
+        setScreen(SCREEN.SCAN);
+        setStartSettingsOpen(false);
+      }
+
+      function confirmCurrentWork() {
+        if (visibleEntries.length === 0 || issueCount > 0) return;
+        const record = createMockRecord(context, entries);
+        setConfirmedRecord(record);
+        setConfirmedRecords(prev => [record, ...prev.filter(item => item.recordId !== record.recordId)]);
+        setEntries([]);
+        setContext(prev => ({ ...prev, workGroup: createSessionName(prev.businessKey) }));
+        setScreen(SCREEN.CONFIRM);
+      }
+
+      let content = null;
+      if (screen === SCREEN.START) content = <StartScreen context={context} setContext={setContext} />;
+      if (screen === SCREEN.SCAN) content = <ScanScreen context={context} setContext={setContext} entries={entries} setEntries={setEntries} setScreen={setScreen} confirmedRecord={confirmedRecord} openDrawerRequest={scanDrawerRequest} closeDrawerRequest={scanDrawerCloseRequest} onBindActions={(actions) => { scanActionsRef.current = actions; }} />;
+      if (screen === SCREEN.CONFIRM) content = <ConfirmScreen context={context} setContext={setContext} entries={entries} setEntries={setEntries} confirmedRecord={confirmedRecord} confirmedRecords={confirmedRecords} syncStatus={syncStatus} onConfirmRecord={(record) => { setConfirmedRecord(record); setConfirmedRecords(prev => [record, ...prev.filter(item => item.recordId !== record.recordId)]); }} onEditRecord={editConfirmedRecord} onUpdateRecord={(recordId, updater) => { setConfirmedRecords(prev => prev.map(record => record.recordId === recordId ? updater(record) : record)); setConfirmedRecord(prev => prev?.recordId === recordId ? updater(prev) : prev); }} onBindAction={(action) => { confirmActionRef.current = action; }} />;
+
+      function bottomBar() {
+        const confirmWorkLabel = context.businessKey === "label" ? "ラベル発行" : "作業確定";
+        if (screen === SCREEN.START) {
+          return <Stack direction="row" spacing={1}><Button fullWidth variant="contained" onClick={() => { setScreen(SCREEN.SCAN); setStartSettingsOpen(true); }}>選択中の業務で開始</Button></Stack>;
+        }
+        if (screen === SCREEN.SCAN) {
+          if (visibleEntries.length > 0) {
+            return (
+              <Stack direction="row" spacing={1} alignItems="center">
+                <Button fullWidth variant="contained" size="large" onClick={confirmCurrentWork} disabled={issueCount > 0}>{confirmWorkLabel}</Button>
+                <Button fullWidth variant="outlined" size="large" onClick={() => scanActionsRef.current.openForm?.()}>スキャン</Button>
+              </Stack>
+            );
+          }
+          return <Stack direction="row" spacing={1} alignItems="center"><Button fullWidth variant="contained" size="large" onClick={() => scanActionsRef.current.openForm?.()}>スキャン</Button></Stack>;
+        }
+        const recordsForBusiness = (confirmedRecords || []).filter(record => record.businessKey === context.businessKey);
+        if (visibleEntries.length > 0) {
+          return <Stack direction="row" spacing={1} alignItems="center"><Button fullWidth variant="contained" size="large" onClick={() => setScreen(SCREEN.SCAN)}>登録明細へ戻る</Button></Stack>;
+        }
+        if (recordsForBusiness.length === 0) {
+          return <Stack direction="row" spacing={1} alignItems="center"><Button fullWidth variant="contained" size="large" onClick={() => setScreen(SCREEN.SCAN)}>登録へ戻る</Button></Stack>;
+        }
+        return (
+          <Stack direction="row" spacing={1} alignItems="center">
+            <Button fullWidth variant="outlined" size="large" onClick={() => setScreen(SCREEN.SCAN)}>登録へ戻る</Button>
+            <Button fullWidth variant="contained" size="large" color="secondary" onClick={() => setBusinessMenuOpen(true)}>次の作業</Button>
+          </Stack>
+        );
+      }
+
+      return (
+        <React.Fragment>
+          <ResponsiveShell screen={screen} setScreen={setScreen} context={context} entries={visibleEntries} onReset={requestReset} onOpenSettings={() => setStartSettingsOpen(true)} onOpenBusinessMenu={() => setBusinessMenuOpen(true)} onOpenBusinessHelp={() => setBusinessHelpOpen(true)} bottomBar={bottomBar()}>{content}</ResponsiveShell>
+          <StartSettingsDialog open={startSettingsOpen} screen={screen} context={context} setContext={setContext} onClose={() => setStartSettingsOpen(false)} />
+          <BusinessHelpDialog open={businessHelpOpen} context={context} onClose={() => setBusinessHelpOpen(false)} />
+          <BusinessSelectDialog open={businessMenuOpen} currentBusinessKey={context.businessKey} entries={visibleEntries} onSelect={selectBusinessFromMenu} onClose={() => setBusinessMenuOpen(false)} />
+          <ConfirmDialog open={resetConfirmOpen} title="入力内容をリセットしますか？" description="未確定の明細と現在の画面状態をすべてクリアします。" confirmLabel="リセット" onCancel={() => setResetConfirmOpen(false)} onConfirm={resetAll} />
+          <ConfirmDialog open={Boolean(businessSwitchTarget)} title="業務を切り替えますか？" description={`現在の未確定明細 ${visibleEntries.length}件はクリアされます。`} confirmLabel="切り替える" confirmColor="warning" onCancel={() => setBusinessSwitchTarget(null)} onConfirm={() => applyBusinessSelection(businessSwitchTarget)} />
+        </React.Fragment>
+      );
+    }
+
+    // ============================================================
+    // [LAUNCHER] ユーティリティ（HTML書き出し・URL生成）
+    // ============================================================
+
+    function getBaseUrlWithParams(params = {}) {
+      const url = new URL(window.location.href);
+      url.search = ""; url.hash = "";
+      Object.entries(params).forEach(([key, value]) => url.searchParams.set(key, value));
+      return url.toString();
+    }
+
+    function saveTextFile(filename, content, mimeType = "text/plain;charset=utf-8;") {
+      const blob = new Blob([content], { type: mimeType });
+      const url = URL.createObjectURL(blob);
+      const anchor = document.createElement("a");
+      anchor.href = url; anchor.download = filename; document.body.appendChild(anchor); anchor.click(); document.body.removeChild(anchor); URL.revokeObjectURL(url);
+    }
+
+    async function getCurrentHtmlSource() {
+      const baseUrl = new URL(window.location.href); baseUrl.search = ""; baseUrl.hash = "";
+      try {
+        const response = await fetch(baseUrl.toString(), { cache: "no-store" });
+        if (response.ok) return await response.text();
+      } catch (error) { console.warn("HTML fetch failed", error); }
+      return "<!DOCTYPE html>\n" + document.documentElement.outerHTML;
+    }
+
+    function formatFileDate(date) {
+      const pad = number => String(number).padStart(2, "0");
+      return `${date.getFullYear()}${pad(date.getMonth() + 1)}${pad(date.getDate())}_${pad(date.getHours())}${pad(date.getMinutes())}${pad(date.getSeconds())}`;
+    }
+
+    function injectStandaloneState(htmlSource, payload) {
+      const bootstrap = `  <!-- Export bootstrap: ランチャーなし実画面として起動 -->\n  <script>\n    window.__EXPORTED_MOCK_STATE__ = ${JSON.stringify(payload || {})};\n    try { window.history.replaceState(null, document.title, window.location.pathname + "?embedded=1"); } catch (error) {}\n  <\/script>`;
+      return htmlSource.replace("<script type=\"text/babel\">", `${bootstrap}\n\n  <script type=\"text/babel\">`);
+    }
+
+    // ============================================================
+    // [LAUNCHER] LauncherApp（ランチャーUI本体）
+    // ============================================================
+    // 右側パネルでシナリオ・ステップ・ビューポートを制御し、
+    // iframe 内の WorkflowApp へ postMessage で状態を送る。
+    // ============================================================
+
+    function LauncherApp() {
+      const [selectedBusinessKey, setSelectedBusinessKey] = React.useState("price");
+      const [selectedScenarioId, setSelectedScenarioId] = React.useState("price-01-disposal");
+      const [stepIndex, setStepIndex] = React.useState(0);
+      const [viewport, setViewport] = React.useState(VIEWPORTS.MOBILE);
+      const [launcherOpen, setLauncherOpen] = React.useState(true);
+      const [toast, setToast] = React.useState(null);
+      const [launcherSize, setLauncherSize] = React.useState({ width: 500, height: 760 });
+      const [frameSize, setFrameSize] = React.useState({ width: 390, height: 844 });
+      const iframeRef = React.useRef(null);
+      const panelRef = React.useRef(null);
+
+      const scenariosForBusiness = MOCK_SCENARIOS.filter(item => item.business === selectedBusinessKey);
+      const activeScenario = scenariosForBusiness.find(item => item.id === selectedScenarioId) || scenariosForBusiness[0] || MOCK_SCENARIOS[0];
+      const steps = activeScenario.steps || [];
+      const activeStep = steps[stepIndex] || steps[0];
+      const viewportConfig = VIEWPORT_CONFIG[viewport];
+      const frameSrc = React.useMemo(() => getBaseUrlWithParams({ embedded: "1" }), []);
+      const scenarioCounts = React.useMemo(() => Object.keys(BUSINESS).reduce((acc, key) => ({ ...acc, [key]: MOCK_SCENARIOS.filter(item => item.business === key).length }), {}), []);
+
+      React.useEffect(() => setViewport(activeScenario.viewport || VIEWPORTS.MOBILE), [activeScenario.id]);
+      React.useEffect(() => {
+        const nextConfig = VIEWPORT_CONFIG[viewport] || VIEWPORT_CONFIG[VIEWPORTS.MOBILE];
+        setFrameSize({
+          width: nextConfig.width === "100%" ? Math.max(1024, window.innerWidth) : nextConfig.width,
+          height: nextConfig.height === "100vh" ? Math.max(700, window.innerHeight) : nextConfig.height
+        });
+      }, [viewport]);
+      React.useEffect(() => { const timer = window.setTimeout(() => postState(activeStep?.payload || {}), 120); return () => window.clearTimeout(timer); }, [selectedBusinessKey, selectedScenarioId, stepIndex]);
+
+      function postState(payload) {
+        if (!iframeRef.current?.contentWindow) return;
+        iframeRef.current.contentWindow.postMessage({ type: "APPLY_MOCK_STATE", payload: { ...(payload || {}), revision: Date.now() } }, "*");
+      }
+      function changeBusiness(key) {
+        const firstScenario = MOCK_SCENARIOS.find(item => item.business === key) || MOCK_SCENARIOS[0];
+        setSelectedBusinessKey(key);
+        setSelectedScenarioId(firstScenario.id);
+        setStepIndex(0);
+      }
+      function changeScenario(id) {
+        const scenario = MOCK_SCENARIOS.find(item => item.id === id);
+        if (scenario?.business) setSelectedBusinessKey(scenario.business);
+        setSelectedScenarioId(id);
+        setStepIndex(0);
+      }
+      function moveStep(delta) { setStepIndex(prev => Math.max(0, Math.min(prev + delta, steps.length - 1))); }
+      function clampNumber(value, min, max) { return Math.max(min, Math.min(value, max)); }
+      function beginResize(event) {
+        event.preventDefault();
+        const panel = panelRef.current; if (!panel) return;
+        const startX = event.clientX, startY = event.clientY, startWidth = panel.offsetWidth, startHeight = panel.offsetHeight;
+        function handleMove(moveEvent) {
+          const maxWidth = Math.max(360, window.innerWidth - 32);
+          const maxHeight = Math.max(420, window.innerHeight - 32);
+          setLauncherSize({ width: clampNumber(startWidth + (startX - moveEvent.clientX), 360, Math.min(760, maxWidth)), height: clampNumber(startHeight + (moveEvent.clientY - startY), 420, maxHeight) });
+        }
+        function handleUp() { window.removeEventListener("pointermove", handleMove); window.removeEventListener("pointerup", handleUp); document.body.style.userSelect = ""; document.body.style.cursor = ""; }
+        document.body.style.userSelect = "none"; document.body.style.cursor = "nesw-resize";
+        window.addEventListener("pointermove", handleMove); window.addEventListener("pointerup", handleUp);
+      }
+      function updateFrameDimension(name, value) {
+        const numericValue = Number(value);
+        if (!Number.isFinite(numericValue)) return;
+        const maxWidth = Math.max(320, window.innerWidth - 32);
+        const maxHeight = Math.max(480, window.innerHeight - 32);
+        setFrameSize(prev => ({
+          ...prev,
+          [name]: name === "width" ? clampNumber(numericValue, 320, maxWidth) : clampNumber(numericValue, 480, maxHeight)
+        }));
+      }
+      async function exportCurrent() {
+        try {
+          const source = await getCurrentHtmlSource();
+          const html = injectStandaloneState(source, activeStep?.payload || {});
+          saveTextFile(`workflow_mock_embedded_${formatFileDate(new Date())}.html`, html, "text/html;charset=utf-8;");
+          setToast({ severity: "success", text: "ランチャーなしの実画面HTMLを出力しました。" });
+        } catch (error) { console.error(error); setToast({ severity: "error", text: "HTML出力に失敗しました。" }); }
+      }
+      async function exportLauncher() {
+        try {
+          const source = await getCurrentHtmlSource();
+          saveTextFile(`workflow_mock_launcher_${formatFileDate(new Date())}.html`, source, "text/html;charset=utf-8;");
+          setToast({ severity: "success", text: "ランチャー込みHTMLを出力しました。" });
+        } catch (error) { console.error(error); setToast({ severity: "error", text: "ランチャーHTML出力に失敗しました。" }); }
+      }
+      function exportScenarioList() {
+        const csvEscape = value => `"${String(value ?? "").replace(/"/g, '""')}"`;
+        const rows = [
+          ["シナリオID", "業務", "分類", "シナリオ名", "段数", "ステップ", "説明"],
+          ...MOCK_SCENARIOS.flatMap(scenario => {
+            const businessLabel = BUSINESS[scenario.business]?.label || scenario.business;
+            const stepLabels = (scenario.steps || []).map(step => step.label).join(" > ");
+            return (scenario.steps || []).map((step, index) => [
+              scenario.id,
+              businessLabel,
+              scenario.category || "",
+              scenario.label,
+              `${index + 1}/${scenario.steps.length}`,
+              stepLabels,
+              step.description || ""
+            ]);
+          })
+        ];
+        const csv = "\uFEFF" + rows.map(row => row.map(csvEscape).join(",")).join("\r\n");
+        saveTextFile(`workflow_mock_scenarios_${formatFileDate(new Date())}.csv`, csv, "text/csv;charset=utf-8;");
+        setToast({ severity: "success", text: "シナリオ一覧CSVを出力しました。" });
+      }
+
+      return (
+        <Box sx={{ minHeight: "100vh", bgcolor: "#0f172a", overflow: "hidden" }}>
+          <Box sx={{ minHeight: "100vh", width: "100%", display: "flex", alignItems: "center", justifyContent: "center", p: 2, overflow: "auto" }}>
+            <Box sx={{ position: "relative", width: frameSize.width, maxWidth: "calc(100vw - 32px)", height: frameSize.height, maxHeight: "calc(100vh - 32px)", bgcolor: "white", borderRadius: viewportConfig.radius, overflow: "hidden", boxShadow: "0 22px 70px rgba(0,0,0,0.42)", border: "1px solid rgba(255,255,255,0.16)" }}>
+              <iframe ref={iframeRef} title="実画面プレビュー" src={frameSrc} onLoad={() => window.setTimeout(() => postState(activeStep?.payload || {}), 120)} style={{ width: "100%", height: "100%", border: 0, display: "block", background: "#ffffff" }} />
+            </Box>
+          </Box>
+
+          {!launcherOpen && <Fab color="primary" variant="extended" onClick={() => setLauncherOpen(true)} sx={{ position: "fixed", top: 16, right: 16, zIndex: 1800 }}><Icon sx={{ mr: 1 }}>tune</Icon>Launcher</Fab>}
+
+          {launcherOpen && (
+            <Paper ref={panelRef} elevation={14} sx={{ position: "fixed", top: 16, right: 16, zIndex: 1800, width: { xs: "calc(100% - 32px)", sm: launcherSize.width }, height: { xs: "auto", sm: launcherSize.height }, maxHeight: "calc(100vh - 32px)", minWidth: { xs: "auto", sm: 360 }, minHeight: { xs: "auto", sm: 420 }, overflow: "hidden", display: "flex", flexDirection: "column", borderRadius: 2, border: "1px solid rgba(15,23,42,0.14)", bgcolor: "rgba(255,255,255,0.97)", backdropFilter: "blur(10px)", boxShadow: "0 18px 48px rgba(15,23,42,0.24)" }}>
+              <Box sx={{ p: 2, borderBottom: "1px solid", borderColor: "divider" }}>
+                <Stack direction="row" alignItems="flex-start" justifyContent="space-between" spacing={2}>
+                  <Box>
+                    <Stack direction="row" spacing={1} alignItems="center" flexWrap="wrap" useFlexGap>
+                      <Typography variant="h6" sx={{ fontWeight: 900 }}>6業務共通モック</Typography>
+                      <Chip size="small" color="warning" variant="outlined" label="Mock Launcher" />
+                      <Chip size="small" color="primary" variant="outlined" label={APP_CONFIG.connectionMode.toUpperCase()} />
+                    </Stack>
+                  </Box>
+                  <Tooltip title="最小化"><IconButton onClick={() => setLauncherOpen(false)} size="small"><Icon>minimize</Icon></IconButton></Tooltip>
+                </Stack>
+              </Box>
+              <Box sx={{ p: 2, overflow: "auto", flex: 1 }}>
+                <Stack spacing={2}>
+                  {toast && <Alert severity={toast.severity} onClose={() => setToast(null)}>{toast.text}</Alert>}
+                  <Paper variant="outlined" sx={{ p: 1.5, bgcolor: "grey.50" }}>
+                    <Stack direction="row" alignItems="center" justifyContent="space-between" spacing={1} sx={{ mb: 1 }}>
+                      <Typography variant="subtitle2" sx={{ fontWeight: 900 }}>確認シナリオ</Typography>
+                      <Chip size="small" color="primary" variant="outlined" label={`${MOCK_SCENARIOS.length}本`} />
+                    </Stack>
+                    <Stack spacing={1}>
+                      <FormControl fullWidth size="small">
+                        <InputLabel>業務</InputLabel>
+                        <Select label="業務" value={selectedBusinessKey} onChange={event => changeBusiness(event.target.value)} MenuProps={{ disablePortal: true, PaperProps: { sx: { maxHeight: 320 } } }}>
+                          {Object.entries(BUSINESS).map(([key, item]) => <MenuItem key={key} value={key}>{item.label}（{scenarioCounts[key] || 0}本）</MenuItem>)}
+                        </Select>
+                      </FormControl>
+                      <FormControl fullWidth size="small">
+                        <InputLabel>シナリオ</InputLabel>
+                        <Select label="シナリオ" value={activeScenario.id} onChange={event => changeScenario(event.target.value)} MenuProps={{ disablePortal: true, PaperProps: { sx: { maxHeight: 360 } } }}>
+                          {scenariosForBusiness.map(scenario => <MenuItem key={scenario.id} value={scenario.id}>{scenario.label}</MenuItem>)}
+                        </Select>
+                      </FormControl>
+                      <Stack direction="row" spacing={0.75} flexWrap="wrap" useFlexGap>
+                        <Chip size="small" color={BUSINESS[activeScenario.business]?.color || "primary"} variant="outlined" label={BUSINESS[activeScenario.business]?.label || activeScenario.business} />
+                        <Chip size="small" variant="outlined" label={activeScenario.category || "確認"} />
+                        <Chip size="small" variant="outlined" label={`${stepIndex + 1}/${steps.length}`} />
+                      </Stack>
+                    </Stack>
+                    <Box sx={{ mt: 1.5 }}>
+                      <Stepper activeStep={stepIndex} alternativeLabel sx={{ mb: 1 }}>{steps.map(step => <Step key={step.label}><StepLabel>{step.label}</StepLabel></Step>)}</Stepper>
+                      <Stack direction="row" spacing={1} justifyContent="space-between"><Button size="small" variant="outlined" startIcon={<Icon>arrow_back</Icon>} onClick={() => moveStep(-1)} disabled={stepIndex === 0}>戻る</Button><Button size="small" variant="contained" endIcon={<Icon>arrow_forward</Icon>} onClick={() => moveStep(1)} disabled={stepIndex >= steps.length - 1}>次へ</Button></Stack>
+                    </Box>
+                  </Paper>
+                  <Box>
+                    <Typography variant="caption" color="text.secondary" display="block" sx={{ mb: 0.8 }}>プレビュー幅</Typography>
+                    <ToggleButtonGroup value={viewport} exclusive onChange={(_, next) => next && setViewport(next)} size="small" color="secondary" fullWidth><ToggleButton value={VIEWPORTS.DESKTOP}>Desktop</ToggleButton><ToggleButton value={VIEWPORTS.TABLET}>Tablet</ToggleButton><ToggleButton value={VIEWPORTS.MOBILE}>iPhone</ToggleButton></ToggleButtonGroup>
+                    <Stack spacing={1.25} sx={{ mt: 1.2 }}>
+                      <Box>
+                        <Stack direction="row" justifyContent="space-between" alignItems="center" spacing={1}>
+                          <Typography variant="caption" color="text.secondary">横幅</Typography>
+                          <Chip size="small" variant="outlined" label={`${Math.round(frameSize.width)}px`} />
+                        </Stack>
+                        <Slider
+                          size="small"
+                          value={Math.round(frameSize.width)}
+                          min={320}
+                          max={Math.max(320, window.innerWidth - 32)}
+                          step={10}
+                          onChange={(_, value) => updateFrameDimension("width", value)}
+                          valueLabelDisplay="auto"
+                        />
+                      </Box>
+                      <Box>
+                        <Stack direction="row" justifyContent="space-between" alignItems="center" spacing={1}>
+                          <Typography variant="caption" color="text.secondary">縦幅</Typography>
+                          <Chip size="small" variant="outlined" label={`${Math.round(frameSize.height)}px`} />
+                        </Stack>
+                        <Slider
+                          size="small"
+                          value={Math.round(frameSize.height)}
+                          min={480}
+                          max={Math.max(480, window.innerHeight - 32)}
+                          step={10}
+                          onChange={(_, value) => updateFrameDimension("height", value)}
+                          valueLabelDisplay="auto"
+                        />
+                      </Box>
+                    </Stack>
+                  </Box>
+                  <Paper variant="outlined" sx={{ p: 1.5 }}>
+                    <Typography variant="subtitle2" sx={{ fontWeight: 900, mb: 1 }}>出力</Typography>
+                    <Stack direction={{ xs: "column", sm: "row" }} spacing={1} flexWrap="wrap" useFlexGap><Button variant="outlined" startIcon={<Icon>open_in_new</Icon>} onClick={() => window.open(frameSrc, "_blank", "noopener,noreferrer")}>別タブ</Button><Button variant="contained" color="secondary" startIcon={<Icon>download</Icon>} onClick={exportCurrent}>実画面HTML</Button><Button variant="outlined" color="secondary" startIcon={<Icon>table_view</Icon>} onClick={exportScenarioList}>シナリオCSV</Button><Button variant="text" color="secondary" startIcon={<Icon>code</Icon>} onClick={exportLauncher}>ランチャー込み</Button></Stack>
+                  </Paper>
+                  <Paper variant="outlined" sx={{ p: 1.5, bgcolor: "grey.50" }}>
+                    <Typography variant="subtitle2" sx={{ fontWeight: 900, mb: 1 }}>現在の状態</Typography>
+                    <Stack spacing={0.8}><Stack direction="row" justifyContent="space-between" spacing={2}><Typography variant="body2" color="text.secondary">シナリオ</Typography><Typography variant="body2" sx={{ fontWeight: 900 }}>{activeScenario.label}</Typography></Stack><Stack direction="row" justifyContent="space-between" spacing={2}><Typography variant="body2" color="text.secondary">ステップ</Typography><Typography variant="body2" sx={{ fontWeight: 900 }}>{activeStep?.label}</Typography></Stack><Stack direction="row" justifyContent="space-between" spacing={2}><Typography variant="body2" color="text.secondary">表示幅</Typography><Typography variant="body2" sx={{ fontWeight: 900 }}>{viewportConfig.label}</Typography></Stack><Stack direction="row" justifyContent="space-between" spacing={2}><Typography variant="body2" color="text.secondary">表示サイズ</Typography><Typography variant="body2" sx={{ fontWeight: 900 }}>{Math.round(frameSize.width)} × {Math.round(frameSize.height)}</Typography></Stack></Stack>
+                  </Paper>
+                </Stack>
+              </Box>
+              <Tooltip title="ドラッグしてランチャーのサイズを変更"><Box role="separator" aria-label="ランチャーサイズ変更" onPointerDown={beginResize} sx={{ position: "absolute", left: 0, bottom: 0, width: 34, height: 34, display: { xs: "none", sm: "grid" }, placeItems: "center", cursor: "nesw-resize", color: "text.secondary", borderTop: "1px solid", borderRight: "1px solid", borderColor: "divider", bgcolor: "rgba(248,250,252,0.92)", '&:hover': { bgcolor: "grey.100", color: "primary.main" } }}><Icon fontSize="small" sx={{ transform: "rotate(45deg)" }}>drag_indicator</Icon></Box></Tooltip>
+            </Paper>
+          )}
+        </Box>
+      );
+    }
+
+    // ============================================================
+    // [CORE] エントリポイント
+    // ?embedded=1 → WorkflowApp（実画面）
+    // それ以外    → LauncherApp（ランチャー）
+    // ============================================================
+
+    function App() {
+      const params = new URLSearchParams(window.location.search);
+      const isEmbedded = params.has("embedded");
+      return (
+        <ThemeProvider theme={theme}>
+          <CssBaseline />
+          <GlobalStyles styles={{ body: { background: isEmbedded ? "radial-gradient(circle at top left, rgba(25,118,210,0.12), transparent 34rem), #f6f7f9" : "#0f172a" }, "input, button, select, textarea": { fontFamily: "Roboto, Meiryo, sans-serif" } }} />
+          {isEmbedded ? <WorkflowApp /> : <LauncherApp />}
+        </ThemeProvider>
+      );
+    }
+
+    const root = ReactDOM.createRoot(document.getElementById("root"));
+    root.render(<App />);
+  </script>
+</body>
+</html>
