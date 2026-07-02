@@ -21,6 +21,8 @@
   <script crossorigin src="https://unpkg.com/@emotion/react@11.11.4/dist/emotion-react.umd.min.js"></script>
   <script crossorigin src="https://unpkg.com/@emotion/styled@11.14.1/dist/emotion-styled.umd.min.js"></script>
   <script crossorigin src="https://unpkg.com/@mui/material@5.18.0/umd/material-ui.development.js"></script>
+  <script src="https://unpkg.com/html2canvas@1.4.1/dist/html2canvas.min.js"></script>
+  <script src="https://unpkg.com/jszip@3.10.1/dist/jszip.min.js"></script>
   <script src="https://unpkg.com/@babel/standalone@7.24.7/babel.min.js"></script>
 
   <!--
@@ -31,7 +33,7 @@ Single HTML is the product boundary.
 
 Core Identity:
 - CDN / Babel / React / MUI are the dynamic runtime foundation.
-- LAUNCHER is the framework body: scenario control, viewport, step navigation, postMessage, and HTML export.
+- LAUNCHER is the framework body: scenario control, viewport, step navigation, postMessage, and HTML/PNG export.
 - CORE is the 3-screen workflow app: start, scan/register, confirm/output.
 - THEME is the swappable business layer: BUSINESS definitions, master data, validation rules, and scenarios.
 - LAUNCHER and CORE are reusable assets. THEME is the only layer replaced when targeting a different domain.
@@ -50,10 +52,10 @@ Runtime Principles:
 - Keep CORE state in React hooks + localStorage (storageKey); treat localStorage as a compact cache.
 - Keep postMessage payloads small and typed (type: "APPLY_MOCK_STATE").
 - Scenario state injected via postMessage must be applied atomically (screen + context + entries together).
-- HTML export (standalone and launcher variants) must remain functional after any THEME change.
+- HTML/PNG export (current, scenario, full list, and launcher variants) must remain functional after any THEME change.
 
 Ownership Rules:
-- APP_CONFIG owns the storage key, connection mode, and API endpoint stub.
+- APP_CONFIG owns the storage key, connection mode, API endpoint stub, autoplay, and export timing.
 - SCREEN / VIEW_MODE / VIEWPORTS / VIEWPORT_CONFIG own stable UI policy constants.
 - BUSINESS owns per-workflow field declarations, labels, output actions, and complete checks.
 - PRODUCTS / master constants own the domain data fixtures for the current THEME.
@@ -62,7 +64,7 @@ Ownership Rules:
 - makeScenario / MOCK_SCENARIOS own the launcher scenario registry for the current THEME.
 - DynamicField owns field-to-component mapping; new field types are added here only.
 - WorkflowApp owns screen routing, localStorage sync, and postMessage reception.
-- LauncherApp owns scenario selection, step control, viewport switching, and HTML export.
+- LauncherApp owns scenario selection, step control, viewport switching, and HTML/PNG export.
 - App owns the embedded/launcher entry-point split; nothing else.
 
 THEME Replacement Rules:
@@ -107,14 +109,12 @@ storage boundary, postMessage contract, THEME boundary, or export behavior chang
       IconButton,
       InputAdornment,
       InputLabel,
+      LinearProgress,
       MenuItem,
       Paper,
       Select,
       Slider,
       Stack,
-      Step,
-      StepLabel,
-      Stepper,
       Switch,
       Tab,
       Table,
@@ -178,7 +178,11 @@ storage boundary, postMessage contract, THEME boundary, or export behavior chang
       connectionMode: "mock",
       apiBaseUrl: "",
       apiEndpoint: "/store-workflows",
-      autosaveDebounceMs: 650
+      autosaveDebounceMs: 650,
+      scenarioAutoplayMs: 1400,
+      screenshotCaptureWaitMs: 220,
+      screenshotOverlayWaitMs: 420,
+      screenshotFrameWaitCount: 2
     };
 
     // [LAUNCHER] 画面ID・表示モード・ビューポート設定
@@ -311,6 +315,11 @@ storage boundary, postMessage contract, THEME boundary, or export behavior chang
     function yen(value) {
       return new Intl.NumberFormat("ja-JP", { style: "currency", currency: "JPY", maximumFractionDigits: 0 }).format(Number(value || 0));
     }
+    function signedYen(value) {
+      const numericValue = Number(value || 0);
+      if (numericValue > 0) return `+${yen(numericValue)}`;
+      return yen(numericValue);
+    }
 
     function inferOriginFromTraceCode(traceCode) {
       const value = String(traceCode || "").trim().toUpperCase();
@@ -412,6 +421,7 @@ storage boundary, postMessage contract, THEME boundary, or export behavior chang
     }
 
     function calcImpact(row, context) {
+      if (Number.isFinite(Number(row.correctionDeltaAmount))) return Number(row.correctionDeltaAmount);
       if (context.businessKey === "returnGoods") return -1 * Number(row.currentPrice || row.displayPrice || 0) * Number(row.quantity || 1);
       if (context.businessKey !== "price") return 0;
       return (Number(row.afterPrice || 0) - Number(row.beforePrice || 0)) * Number(row.quantity || 1);
@@ -439,16 +449,19 @@ storage boundary, postMessage contract, THEME boundary, or export behavior chang
     function formatDecisionValue(row, context) {
       if (context.businessKey === "pop") return yen(row.displayPrice || row.currentPrice);
       if (context.businessKey === "label") return `${row.quantity || 1}枚`;
+      if (context.businessKey === "price") return signedYen(calcImpact(row, context));
       return yen(calcAmount(row, context.businessKey));
     }
 
     function calcSummaryDecisionValue(entries, context) {
       if (context.businessKey === "pop" || context.businessKey === "label") return entries.reduce((sum, row) => sum + Number(row.quantity || 1), 0);
+      if (context.businessKey === "price") return entries.reduce((sum, row) => sum + calcImpact(row, context), 0);
       return entries.reduce((sum, row) => sum + calcAmount(row, context.businessKey), 0);
     }
 
     function formatSummaryDecisionValue(value, context) {
       if (context.businessKey === "pop" || context.businessKey === "label") return `${value}枚`;
+      if (context.businessKey === "price") return signedYen(value);
       return yen(value);
     }
 
@@ -556,17 +569,32 @@ storage boundary, postMessage contract, THEME boundary, or export behavior chang
       }
       const entries = Array.isArray(payload.entries) ? payload.entries : [];
       const confirmedRecords = Array.isArray(payload.confirmedRecords) ? payload.confirmedRecords : (payload.confirmedRecord ? [payload.confirmedRecord] : []);
-      return { screen: payload.screen || SCREEN.START, context, entries, confirmedRecord: payload.confirmedRecord || null, confirmedRecords, openScanDrawer: Boolean(payload.openScanDrawer) };
+      if (payload.outputSearch !== undefined) context.outputSearch = payload.outputSearch;
+      return {
+        screen: payload.screen || SCREEN.START,
+        context,
+        entries,
+        confirmedRecord: payload.confirmedRecord || null,
+        confirmedRecords,
+        openScanDrawer: Boolean(payload.openScanDrawer),
+        screenshotModal: payload.screenshotModal || null,
+        screenshotRevision: payload.screenshotRevision || payload.revision || null
+      };
     }
 
     function createScenarioConfirmedRecord(businessKey, entries = [], context = createDefaultContext(businessKey)) {
       const activeCount = entries.filter(row => !row.deletedAt).length;
+      const approvalStatus = "unapproved";
+      const integrationState = createIntegrationState(businessKey, approvalStatus);
       return {
         recordId: `WF-SCENARIO-${businessKey}`,
         status: "confirmed",
-        syncState: createIntegrationState(businessKey),
+        approvalStatus,
+        approvedAt: null,
+        syncState: integrationState,
         integrationTarget: getIntegrationTarget(businessKey),
-        integrationState: createIntegrationState(businessKey),
+        integrationState,
+        integrationDate: null,
         registeredAt: new Date().toISOString(),
         businessKey,
         workGroup: context.workGroup || "セッション1",
@@ -574,6 +602,38 @@ storage boundary, postMessage contract, THEME boundary, or export behavior chang
         entries: entries.filter(row => !row.deletedAt).map(row => ({ ...row })),
         entryCount: activeCount
       };
+    }
+
+    function createScenarioRecordVariant(record, overrides = {}) {
+      if (!record) return null;
+      const businessKey = record.businessKey || record.context?.businessKey || "price";
+      const approvalStatus = overrides.approvalStatus || record.approvalStatus || "unapproved";
+      const integrationState = overrides.integrationState || createIntegrationState(businessKey, approvalStatus);
+      const approvedAt = approvalStatus === "approved" ? (overrides.approvedAt || record.approvedAt || new Date().toISOString()) : null;
+      return {
+        ...record,
+        ...overrides,
+        approvalStatus,
+        approvedAt,
+        syncState: integrationState,
+        integrationState,
+        integrationDate: overrides.integrationDate ?? (["linked", "printed"].includes(integrationState) ? todayText() : null),
+        backendLinkedAt: integrationState === "linked" ? (overrides.backendLinkedAt || approvedAt || new Date().toISOString()) : null
+      };
+    }
+
+    function createScenarioCorrectionRecord(sourceRecord, context) {
+      if (!sourceRecord) return null;
+      const sourceEntry = (sourceRecord.entries || []).find(row => !row.deletedAt);
+      if (!sourceEntry) return null;
+      const sourceContext = context || sourceRecord.context || createDefaultContext(sourceRecord.businessKey);
+      const nextQuantity = sourceRecord.businessKey === "price"
+        ? Math.max(1, Number(sourceEntry.quantity || 1) - 1)
+        : Number(sourceEntry.quantity || 1) + 1;
+      const correctionEntry = sourceRecord.businessKey === "price"
+        ? { ...sourceEntry, quantity: nextQuantity, correctionScenarioNote: "数量減による値上げ訂正" }
+        : { ...sourceEntry, quantity: nextQuantity };
+      return createCorrectionRecord(sourceRecord, [correctionEntry], sourceContext);
     }
 
     function getScenarioDrawerDescription(businessKey, businessLabel) {
@@ -595,13 +655,20 @@ storage boundary, postMessage contract, THEME boundary, or export behavior chang
       const canConfirmScenario = entries.filter(row => !row.deletedAt).length > 0 && !hasIssues;
       const isLabelBusiness = business === "label";
       const confirmedScenarioRecord = canConfirmScenario ? createScenarioConfirmedRecord(business, entries, scenarioContext) : null;
+      const approvedScenarioRecord = confirmedScenarioRecord ? createScenarioRecordVariant(confirmedScenarioRecord, { recordId: `${confirmedScenarioRecord.recordId}-APPROVED`, workGroup: `${confirmedScenarioRecord.workGroup || "セッション1"} 承認済`, approvalStatus: "approved" }) : null;
+      const linkedScenarioRecord = approvedScenarioRecord && !isLabelBusiness ? createScenarioRecordVariant(approvedScenarioRecord, { recordId: `${confirmedScenarioRecord.recordId}-LINKED`, workGroup: `${confirmedScenarioRecord.workGroup || "セッション1"} 日次連携済`, integrationState: "linked", syncState: "linked", integrationDate: todayText(), backendLinkedAt: new Date().toISOString() }) : null;
+      const correctionScenarioRecord = linkedScenarioRecord ? createScenarioCorrectionRecord(linkedScenarioRecord, scenarioContext) : null;
+      const approvalScenarioRecords = [confirmedScenarioRecord, approvedScenarioRecord].filter(Boolean);
+      const correctionScenarioRecords = [linkedScenarioRecord, correctionScenarioRecord].filter(Boolean);
       const confirmStepDescription = canConfirmScenario
-        ? (isLabelBusiness ? "継承ラベルの登録明細を確認し、ラベル発行ボタンで発行対象として確定します。" : `${businessLabel}の登録明細を確認し、作業確定ボタンで実績化します。`)
+        ? (isLabelBusiness ? "継承ラベルの登録明細を確認し、ラベル発行ボタンで未承認の実績として確定します。" : `${businessLabel}の登録明細を確認し、作業確定ボタンで未承認の実績として保存します。`)
         : `${businessLabel}の登録明細で要確認状態を確認します。`;
-      const outputStepDescription = outputDescription || confirmDescription || (canConfirmScenario
-        ? (isLabelBusiness ? "作業確定済みの継承ラベルを商品単位で確認し、ラベル発行・印刷に進みます。" : `${businessLabel}の確定済み実績を商品単位で確認し、修正・削除・ごみ箱を操作します。`)
+      const outputStepDescription = outputDescription || (canConfirmScenario
+        ? (isLabelBusiness ? "確定済みの継承ラベルを商品単位で確認し、未承認・承認済・印刷状態を確認します。" : `${businessLabel}の確定済み実績を商品単位で確認し、未承認は連携対象外、承認済は日次連携対象になることを確認します。`)
         : `${businessLabel}の要確認を登録明細で修正します。`);
+      const correctionStepDescription = outputDescription || confirmDescription || outputStepDescription;
       const basePayload = { businessKey: business, context: scenarioContext };
+      const searchKeyword = entries.find(row => row.productName || row.sku)?.productName || entries.find(row => row.productName || row.sku)?.sku || businessLabel;
       const finalStepLabel = isLabelBusiness ? "発行結果" : (business === "pop" ? "POP連携確認" : (business === "priceCheck" ? "売価確認" : "実績確認"));
       const confirmStepLabel = isLabelBusiness ? "ラベル発行" : "作業確定";
       const steps = [
@@ -621,6 +688,11 @@ storage boundary, postMessage contract, THEME boundary, or export behavior chang
           payload: { ...basePayload, screen: SCREEN.SCAN, entries: [], openScanDrawer: true }
         },
         {
+          label: "カメラ読取",
+          description: "カメラスキャンを開き、背面/前面のカメラ切替と読取枠を確認します。",
+          payload: { ...basePayload, screen: SCREEN.SCAN, entries: [], screenshotModal: "cameraScan" }
+        },
+        {
           label: "登録明細",
           description: scanDescription || `${businessLabel}を連続登録し、登録明細に未確定データとして保持します。`,
           payload: { ...basePayload, screen: SCREEN.SCAN, entries }
@@ -637,12 +709,39 @@ storage boundary, postMessage contract, THEME boundary, or export behavior chang
             label: finalStepLabel,
             description: outputStepDescription,
             payload: { ...basePayload, screen: SCREEN.CONFIRM, entries: [], confirmedRecord: confirmedScenarioRecord, confirmedRecords: [confirmedScenarioRecord] }
+          },
+          {
+            label: "詳細確認",
+            description: "確認出力のカードをクリックし、数量、金額、承認、連携、訂正元を詳細モーダルで確認します。",
+            payload: { ...basePayload, screen: SCREEN.CONFIRM, entries: [], confirmedRecord: confirmedScenarioRecord, confirmedRecords: [confirmedScenarioRecord], screenshotModal: "recordDetail" }
+          },
+          {
+            label: "承認状態",
+            description: `${businessLabel}の実績一覧で未承認と承認済を見比べ、承認済だけが日次連携対象になることを確認します。`,
+            payload: { ...basePayload, screen: SCREEN.CONFIRM, entries: [], confirmedRecord: approvedScenarioRecord || confirmedScenarioRecord, confirmedRecords: approvalScenarioRecords }
+          },
+          {
+            label: "一括操作",
+            description: "2行目のチェックで商品または作業を選択し、4行目の一括承認・一括未承認・選択削除を確認します。",
+            payload: { ...basePayload, screen: SCREEN.CONFIRM, entries: [], confirmedRecord: approvedScenarioRecord || confirmedScenarioRecord, confirmedRecords: approvalScenarioRecords }
+          },
+          {
+            label: "実績検索",
+            description: `${businessLabel}の実績一覧で検索ボタンから3行目の検索エリアを開閉し、検索実行で絞り込み、入力欄右端の×でクリアできることを確認します。`,
+            payload: { ...basePayload, screen: SCREEN.CONFIRM, entries: [], confirmedRecord: confirmedScenarioRecord, confirmedRecords: [confirmedScenarioRecord], outputSearch: searchKeyword }
           }
         );
+        if (correctionScenarioRecords.length > 1) {
+          steps.push({
+            label: "訂正データ",
+            description: business === "price" ? "日次連携済みの価格調整で数量を減らした場合、元の値下げ額との差分が値上げ訂正として追加され、元データ側に訂正ありと紐づきが表示されることを確認します。" : "日次連携済みデータの修正は元データを直接変更せず、訂正データとして追加され、元データ側に訂正ありと紐づきが表示されることを確認します。",
+            payload: { ...basePayload, screen: SCREEN.CONFIRM, entries: [], confirmedRecord: correctionScenarioRecord, confirmedRecords: correctionScenarioRecords }
+          });
+        }
       } else {
         steps.push({
           label: "是正",
-          description: outputStepDescription,
+          description: correctionStepDescription,
           payload: { ...basePayload, screen: SCREEN.SCAN, entries }
         });
       }
@@ -1167,6 +1266,7 @@ storage boundary, postMessage contract, THEME boundary, or export behavior chang
       const frameRef = React.useRef(null);
       const [status, setStatus] = React.useState("idle");
       const [errorText, setErrorText] = React.useState("");
+      const [cameraFacingMode, setCameraFacingMode] = React.useState("environment");
       const detectorSupported = typeof window !== "undefined" && "BarcodeDetector" in window;
 
       React.useEffect(() => {
@@ -1176,7 +1276,13 @@ storage boundary, postMessage contract, THEME boundary, or export behavior chang
           setStatus("starting");
           setErrorText("");
           try {
-            const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: { ideal: "environment" } }, audio: false });
+            let stream;
+            try {
+              stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: { ideal: cameraFacingMode } }, audio: false });
+            } catch (cameraModeError) {
+              console.warn(cameraModeError);
+              stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
+            }
             if (disposed) {
               stream.getTracks().forEach(track => track.stop());
               return;
@@ -1220,11 +1326,24 @@ storage boundary, postMessage contract, THEME boundary, or export behavior chang
           streamRef.current = null;
           if (videoRef.current) videoRef.current.srcObject = null;
         };
-      }, [open]);
+      }, [open, cameraFacingMode]);
 
       return (
         <Dialog open={open} onClose={onClose} fullWidth maxWidth="xs">
-          <DialogTitle sx={{ pb: 1 }}>カメラスキャン</DialogTitle>
+          <DialogTitle sx={{ pb: 1 }}>
+            <Stack direction="row" spacing={1} alignItems="center" justifyContent="space-between">
+              <Typography variant="h6">カメラスキャン</Typography>
+              <ToggleButtonGroup
+                value={cameraFacingMode}
+                exclusive
+                onChange={(_, next) => next && setCameraFacingMode(next)}
+                size="small"
+              >
+                <ToggleButton value="environment">外部/背面</ToggleButton>
+                <ToggleButton value="user">内側/前面</ToggleButton>
+              </ToggleButtonGroup>
+            </Stack>
+          </DialogTitle>
           <DialogContent dividers>
             <Stack spacing={1.5}>
               <Box sx={{ position: "relative", overflow: "hidden", borderRadius: 2, bgcolor: "grey.900", aspectRatio: "4 / 3" }}>
@@ -1367,7 +1486,18 @@ storage boundary, postMessage contract, THEME boundary, or export behavior chang
       return "確認出力";
     }
 
-    function createIntegrationState(businessKey) {
+    function getApprovalStatus(record) {
+      return record?.approvalStatus || record?.approvalState || "unapproved";
+    }
+
+    function getApprovalStatusInfo(record) {
+      const approvalStatus = getApprovalStatus(record);
+      if (approvalStatus === "approved") return { state: approvalStatus, label: "承認済", color: "success" };
+      return { state: "unapproved", label: "未承認", color: "warning" };
+    }
+
+    function createIntegrationState(businessKey, approvalStatus = "approved") {
+      if (approvalStatus !== "approved") return "unapproved";
       if (businessKey === "label") return "printed";
       return "pendingDaily";
     }
@@ -1375,16 +1505,20 @@ storage boundary, postMessage contract, THEME boundary, or export behavior chang
     function getIntegrationStatus(record) {
       const businessKey = record?.businessKey || record?.context?.businessKey || "price";
       const target = record?.integrationTarget || getIntegrationTarget(businessKey);
-      let state = record?.integrationState || record?.syncState || createIntegrationState(businessKey);
-      if (businessKey !== "label" && isBackendLinkedRecord(record)) state = "linked";
+      const approvalStatus = getApprovalStatus(record);
+      let state = record?.integrationState || record?.syncState || createIntegrationState(businessKey, approvalStatus);
+      if (approvalStatus !== "approved") state = "unapproved";
+      else if (businessKey !== "label" && isBackendLinkedRecord(record)) state = "linked";
+      const integrationDate = record?.integrationDate || (state === "linked" ? (record?.backendLinkedAt || "").slice(0, 10) || todayText() : "");
       const statusMap = {
+        unapproved: { label: "連携対象外", color: "default" },
         printed: { label: "印刷済", color: "success" },
         linked: { label: "日次連携済み", color: "secondary" },
         pendingDaily: { label: "日次連携待ち", color: "warning" },
         pending: { label: "連携待ち", color: "warning" },
         failed: { label: "連携失敗", color: "error" }
       };
-      return { target, state, ...(statusMap[state] || { label: "未連携", color: "default" }) };
+      return { target, state, integrationDate, ...(statusMap[state] || { label: "未連携", color: "default" }) };
     }
 
     function createMockRecord(context, entries) {
@@ -1393,27 +1527,114 @@ storage boundary, postMessage contract, THEME boundary, or export behavior chang
       const datePart = `${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}`;
       const timePart = `${pad(now.getHours())}${pad(now.getMinutes())}${pad(now.getSeconds())}`;
       const integrationTarget = getIntegrationTarget(context.businessKey);
-      const integrationState = createIntegrationState(context.businessKey);
+      const approvalStatus = "unapproved";
+      const integrationState = createIntegrationState(context.businessKey, approvalStatus);
+      const activeEntries = getActiveEntries(entries);
+      const sourceRecordId = activeEntries.find(row => row.sourceRecordId || row.correctionOf)?.sourceRecordId || activeEntries.find(row => row.sourceRecordId || row.correctionOf)?.correctionOf;
       return {
-        recordId: `WF-${datePart}-${timePart}`,
+        recordId: sourceRecordId ? `WF-CORRECTION-${datePart}-${timePart}` : `WF-${datePart}-${timePart}`,
         status: "confirmed",
+        approvalStatus,
+        approvedAt: null,
+        correctionOf: sourceRecordId || undefined,
+        correctionType: sourceRecordId ? "daily-linked-correction" : undefined,
+        sourceRecordId: sourceRecordId || undefined,
         syncState: integrationState,
         integrationTarget,
         integrationState,
+        integrationDate: null,
         registeredAt: now.toISOString(),
         businessKey: context.businessKey,
         workGroup: context.workGroup || "セッション1",
         context: { ...context },
-        entries: getActiveEntries(entries).map(row => ({ ...row })),
-        entryCount: getActiveEntries(entries).length
+        entries: activeEntries.map(row => ({ ...row, sourceRecordId: row.sourceRecordId || sourceRecordId, correctionOf: row.correctionOf || sourceRecordId })),
+        entryCount: activeEntries.length
+      };
+    }
+
+    function createCorrectionRecord(originalRecord, correctedEntries, context) {
+      const now = new Date();
+      const pad = number => String(number).padStart(2, "0");
+      const datePart = `${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}`;
+      const timePart = `${pad(now.getHours())}${pad(now.getMinutes())}${pad(now.getSeconds())}`;
+      const businessKey = originalRecord.businessKey || context.businessKey;
+      const integrationTarget = getIntegrationTarget(businessKey);
+      const approvalStatus = "unapproved";
+      const integrationState = createIntegrationState(businessKey, approvalStatus);
+      const normalizedEntries = correctedEntries.filter(row => row && !row.deletedAt).map(row => {
+        const { __record, __recordIndex, __recordId, ...entry } = row;
+        const sourceEntry = (originalRecord.entries || []).find(source => source.id === (entry.sourceEntryId || entry.id)) || {};
+        const sourceContext = originalRecord.context || context;
+        const sourceImpact = calcImpact(sourceEntry, sourceContext);
+        const correctedImpact = entry.correctionAction === "delete" ? 0 : calcImpact(entry, context);
+        const correctionDeltaAmount = businessKey === "price" ? correctedImpact - sourceImpact : undefined;
+        const quantityDelta = Number(entry.quantity || 0) - Number(sourceEntry.quantity || 0);
+        return {
+          ...entry,
+          id: `E-CORR-${Date.now()}-${Math.random().toString(16).slice(2, 6)}`,
+          sourceEntryId: entry.sourceEntryId || entry.id,
+          sourceRecordId: originalRecord.recordId,
+          correctionOf: originalRecord.recordId,
+          correctionType: "daily-linked-correction",
+          sourceQuantity: sourceEntry.quantity,
+          correctedQuantity: entry.correctionAction === "delete" ? 0 : entry.quantity,
+          quantityDelta,
+          sourceImpact,
+          correctedImpact,
+          correctionDeltaAmount,
+          correctedAt: now.toISOString(),
+          deletedAt: null
+        };
+      });
+      return {
+        recordId: `WF-CORRECTION-${datePart}-${timePart}-${Math.random().toString(16).slice(2, 5).toUpperCase()}`,
+        status: "confirmed",
+        approvalStatus,
+        approvedAt: null,
+        correctionOf: originalRecord.recordId,
+        correctionType: "daily-linked-correction",
+        sourceRecordId: originalRecord.recordId,
+        sourceRegisteredAt: originalRecord.registeredAt,
+        sourceWorkGroup: originalRecord.workGroup,
+        syncState: integrationState,
+        integrationTarget,
+        integrationState,
+        integrationDate: null,
+        registeredAt: now.toISOString(),
+        businessKey,
+        workGroup: `${originalRecord.workGroup || "セッション"} 訂正`,
+        context: { ...(originalRecord.context || context), workGroup: `${originalRecord.workGroup || "セッション"} 訂正` },
+        entries: normalizedEntries,
+        entryCount: normalizedEntries.length
       };
     }
 
     function isBackendLinkedRecord(record) {
       if (!record) return false;
+      if (getApprovalStatus(record) !== "approved") return false;
       if (record.syncState === "linked" || record.backendLinkedAt) return true;
       const businessDate = record.context?.businessDate || record.context?.endDate || "";
       return businessDate && businessDate < todayText();
+    }
+
+    function getCorrectionRelationLabel(record, row) {
+      const sourceRecordId = record?.correctionOf || record?.sourceRecordId || row?.sourceRecordId || row?.correctionOf;
+      if (!sourceRecordId) return "";
+      const sourceEntryId = row?.sourceEntryId ? ` / 元明細 ${row.sourceEntryId}` : "";
+      const actionLabel = row?.correctionAction === "delete" ? " / 削除訂正" : "";
+      return `訂正元 ${sourceRecordId}${sourceEntryId}${actionLabel}`;
+    }
+
+    function getCorrectionPreviewText(sourceRecord, nextEntry, context) {
+      if (!sourceRecord || !nextEntry || context.businessKey !== "price") return "";
+      const sourceEntry = (sourceRecord.entries || []).find(row => row.id === (nextEntry.sourceEntryId || nextEntry.id)) || {};
+      const sourceImpact = calcImpact(sourceEntry, sourceRecord.context || context);
+      const nextImpact = nextEntry.correctionAction === "delete" ? 0 : calcImpact(nextEntry, context);
+      const delta = nextImpact - sourceImpact;
+      if (!delta) return "連動差分なし";
+      const direction = delta > 0 ? "値上げ訂正" : "値下げ訂正";
+      const quantityText = Number.isFinite(Number(sourceEntry.quantity)) ? ` / 数量 ${sourceEntry.quantity || 0} -> ${nextEntry.correctionAction === "delete" ? 0 : (nextEntry.quantity || 0)}` : "";
+      return `${direction} ${signedYen(delta)}${quantityText}`;
     }
 
     function cloneRecordEntriesForWork(record, correction = false) {
@@ -1505,12 +1726,21 @@ storage boundary, postMessage contract, THEME boundary, or export behavior chang
                 </Box>
                 <Chip size="small" color={status.color} variant={isError ? "filled" : "outlined"} label={status.label} />
               </Stack>
-              <Grid container spacing={1} sx={{ mt: 0.5 }}>
-                <Grid item xs={3}><Typography variant="caption" color="text.secondary" display="block">{business.quantityLabel}</Typography><Typography variant="body2" sx={{ fontWeight: 700 }}>{row.quantity || 1}</Typography></Grid>
-                <Grid item xs={3}><Typography variant="caption" color="text.secondary" display="block">{getMasterValueLabel(context)}</Typography><Typography variant="body2" sx={{ fontWeight: 700 }}>{yen(row.currentPrice)}</Typography></Grid>
-                <Grid item xs={3}><Typography variant="caption" color="text.secondary" display="block">{getInputValueLabel(context)}</Typography><Typography variant="body2" sx={{ fontWeight: 700 }}>{formatInputValue(row, context)}</Typography></Grid>
-                <Grid item xs={3}><Typography variant="caption" color="text.secondary" display="block">{business.amountLabel}</Typography><Typography variant="body2" sx={{ fontWeight: 700 }}>{formatDecisionValue(row, context)}</Typography></Grid>
-              </Grid>
+              <Paper variant="outlined" sx={{ mt: 0.75, p: 1, bgcolor: "background.default" }}>
+                <Stack direction="row" spacing={1.5} alignItems="baseline" justifyContent="space-between">
+                  <Box>
+                    <Typography variant="caption" color="text.secondary" display="block">{business.quantityLabel}</Typography>
+                    <Typography variant="subtitle2" sx={{ fontWeight: 800, lineHeight: 1.3 }}>{row.quantity || 1}</Typography>
+                  </Box>
+                  <Box sx={{ textAlign: "right", minWidth: 0 }}>
+                    <Typography variant="caption" color="text.secondary" display="block">{business.amountLabel}</Typography>
+                    <Typography variant="subtitle2" sx={{ fontWeight: 800, lineHeight: 1.3 }} noWrap>{formatDecisionValue(row, context)}</Typography>
+                  </Box>
+                </Stack>
+                <Typography variant="caption" color="text.secondary" display="block" sx={{ mt: 0.5 }} noWrap>
+                  {getMasterValueLabel(context)} {yen(row.currentPrice)} / {getInputValueLabel(context)} {formatInputValue(row, context)}
+                </Typography>
+              </Paper>
               {status.helper && <Alert severity={status.color === "default" ? "info" : status.color} sx={{ mt: 1, py: 0 }}>{status.helper}</Alert>}
               {!readOnly && <Stack direction="row" spacing={1} sx={{ mt: 1.2 }}>
                 <Button size="small" variant="outlined" startIcon={<Icon>edit</Icon>} onClick={() => onEdit(row)}>修正</Button>
@@ -1652,8 +1882,8 @@ storage boundary, postMessage contract, THEME boundary, or export behavior chang
             </Grid>
           </DialogContent>
           <DialogActions>
-            <Button onClick={onClose}>閉じる</Button>
-            <Button variant="contained" onClick={onClose}>{isConfirmScreen ? "この条件で確認出力" : "この基本条件で続ける"}</Button>
+            <Button onClick={onClose}>キャンセル</Button>
+            <Button variant="contained" onClick={onClose}>確定</Button>
           </DialogActions>
         </Dialog>
       );
@@ -1821,7 +2051,7 @@ storage boundary, postMessage contract, THEME boundary, or export behavior chang
       );
     }
 
-    function ScanScreen({ context, setContext, entries, setEntries, setScreen, confirmedRecord, openDrawerRequest, closeDrawerRequest, onBindActions }) {
+    function ScanScreen({ context, setContext, entries, setEntries, setScreen, confirmedRecord, openDrawerRequest, closeDrawerRequest, screenshotModal, screenshotRevision, onBindActions }) {
       const business = BUSINESS[context.businessKey] || BUSINESS.price;
       const activeEntries = getActiveEntries(entries);
       const isConfirmed = Boolean(confirmedRecord) && activeEntries.length === 0;
@@ -1836,14 +2066,38 @@ storage boundary, postMessage contract, THEME boundary, or export behavior chang
       const [deleteTarget, setDeleteTarget] = React.useState(null);
       const [trashOpen, setTrashOpen] = React.useState(false);
       const [selectedEntryIds, setSelectedEntryIds] = React.useState([]);
+      const [entrySearchOpen, setEntrySearchOpen] = React.useState(false);
+      const [entrySearchInput, setEntrySearchInput] = React.useState("");
+      const [entrySearchQuery, setEntrySearchQuery] = React.useState("");
       const [entryViewMode, setEntryViewMode] = React.useState(VIEW_MODE.CARDS);
       const [cameraOpen, setCameraOpen] = React.useState(false);
       const productInputRef = React.useRef(null);
       const numberInputRefs = React.useRef({});
+      const normalizedEntrySearchQuery = normalizeCode(entrySearchQuery);
+      const entryMatchesSearch = row => {
+        if (!normalizedEntrySearchQuery) return true;
+        const status = getStatus(row, context);
+        return normalizeCode([
+          row.sku,
+          row.barcode,
+          row.productName,
+          row.department,
+          row.workGroup,
+          row.saleType,
+          row.origin,
+          row.traceCode,
+          row.reason,
+          row.adjustmentType,
+          status.label,
+          status.helper,
+          formatDecisionValue(row, context)
+        ].filter(Boolean).join(" ")).includes(normalizedEntrySearchQuery);
+      };
+      const displayedEntries = normalizedEntrySearchQuery ? activeEntries.filter(entryMatchesSearch) : activeEntries;
       const issueCount = activeEntries.filter(row => getStatus(row, context).color === "error").length;
       const selectedEntries = activeEntries.filter(row => selectedEntryIds.includes(row.id));
-      const allEntriesSelected = activeEntries.length > 0 && selectedEntryIds.length === activeEntries.length;
-      const partialEntriesSelected = selectedEntryIds.length > 0 && selectedEntryIds.length < activeEntries.length;
+      const allEntriesSelected = displayedEntries.length > 0 && displayedEntries.every(row => selectedEntryIds.includes(row.id));
+      const partialEntriesSelected = displayedEntries.some(row => selectedEntryIds.includes(row.id)) && !allEntriesSelected;
 
       React.useEffect(() => {
         setItem(createDefaultItem(context.businessKey, context));
@@ -1852,6 +2106,10 @@ storage boundary, postMessage contract, THEME boundary, or export behavior chang
         setSheetOpen(false);
         setNumberPadOpen(true);
         setActiveNumberField(null);
+        setEntrySearchOpen(false);
+        setEntrySearchInput("");
+        setEntrySearchQuery("");
+        setSelectedEntryIds([]);
       }, [context.businessKey]);
       React.useEffect(() => { if (context.adjustmentType === "廃棄") setItem(prev => ({ ...prev, afterPrice: 0 })); }, [context.adjustmentType]);
       React.useEffect(() => {
@@ -1874,6 +2132,11 @@ storage boundary, postMessage contract, THEME boundary, or export behavior chang
       React.useEffect(() => {
         setSelectedEntryIds(prev => prev.filter(id => activeEntries.some(row => row.id === id)));
       }, [activeEntries.length, context.businessKey]);
+      React.useEffect(() => {
+        setTrashOpen(screenshotModal === "scanTrash");
+        setCameraOpen(screenshotModal === "cameraScan");
+        setDeleteTarget(screenshotModal === "scanDeleteConfirm" ? (activeEntries[0] || null) : null);
+      }, [screenshotModal, screenshotRevision, activeEntries.length, context.businessKey]);
 
       function updateItem(name, value) {
         setItem(prev => {
@@ -1983,7 +2246,24 @@ storage boundary, postMessage contract, THEME boundary, or export behavior chang
         setSelectedEntryIds(prev => prev.includes(row.id) ? prev.filter(id => id !== row.id) : [...prev, row.id]);
       }
       function toggleAllEntries(checked) {
-        setSelectedEntryIds(checked ? activeEntries.map(row => row.id) : []);
+        const visibleIds = new Set(displayedEntries.map(row => row.id));
+        setSelectedEntryIds(prev => checked ? Array.from(new Set([...prev, ...displayedEntries.map(row => row.id)])) : prev.filter(id => !visibleIds.has(id)));
+      }
+      function applyEntrySearch(value = entrySearchInput) {
+        const nextQuery = String(value || "").trim();
+        setEntrySearchInput(nextQuery);
+        setEntrySearchQuery(nextQuery);
+        setEntrySearchOpen(Boolean(nextQuery));
+        setSelectedEntryIds([]);
+      }
+      function toggleEntrySearchArea() {
+        setEntrySearchOpen(prev => !prev);
+      }
+      function clearEntrySearch() {
+        setEntrySearchInput("");
+        setEntrySearchQuery("");
+        setEntrySearchOpen(true);
+        setSelectedEntryIds([]);
       }
       function bulkRemoveItems() {
         if (selectedEntries.length === 0) return;
@@ -2027,7 +2307,7 @@ storage boundary, postMessage contract, THEME boundary, or export behavior chang
           <Stack spacing={0.75}>
             <Stack direction="row" spacing={0.75} alignItems="center" justifyContent="space-between">
               <Stack direction="row" spacing={0.75} alignItems="center" sx={{ minWidth: 0 }}>
-                <Typography variant="subtitle1" noWrap>登録明細（{context.workGroup || "セッション"}：{activeEntries.length}件）</Typography>
+                <Typography variant="subtitle1" noWrap>登録明細（{context.workGroup || "セッション"}：{displayedEntries.length}件）</Typography>
               </Stack>
               <Stack direction="row" spacing={0.75} alignItems="center" justifyContent="flex-end" useFlexGap flexWrap="wrap">
                 <Tooltip title={`ごみ箱 ${trashEntries.length}件`}>
@@ -2037,25 +2317,63 @@ storage boundary, postMessage contract, THEME boundary, or export behavior chang
                 </Tooltip>
               </Stack>
             </Stack>
-            <Stack direction="row" spacing={0.75} alignItems="center" justifyContent="flex-start" useFlexGap flexWrap="wrap">
-              {activeEntries.length > 0 && (
-                <Checkbox
-                  size="small"
-                  checked={allEntriesSelected}
-                  indeterminate={partialEntriesSelected}
-                  onChange={event => toggleAllEntries(event.target.checked)}
-                  inputProps={{ "aria-label": "登録明細をすべて選択" }}
-                  sx={{ p: 0.25 }}
-                />
-              )}
-              {activeEntries.length > 0 && (
-                <ToggleButtonGroup value={entryViewMode} exclusive onChange={(_, next) => next && setEntryViewMode(next)} size="small" color="primary">
-                  <ToggleButton value={VIEW_MODE.CARDS}>カード</ToggleButton>
-                  <ToggleButton value={VIEW_MODE.TABLE}>テーブル</ToggleButton>
-                </ToggleButtonGroup>
-              )}
-              {selectedEntryIds.length > 0 && <Button size="small" color="error" variant="outlined" onClick={bulkRemoveItems}>選択削除 {selectedEntryIds.length}</Button>}
+            <Stack direction="row" spacing={0.75} alignItems="center" justifyContent="space-between" useFlexGap flexWrap="wrap">
+              <Stack direction="row" spacing={0.75} alignItems="center" useFlexGap flexWrap="wrap">
+                {displayedEntries.length > 0 && (
+                  <Checkbox
+                    size="small"
+                    checked={allEntriesSelected}
+                    indeterminate={partialEntriesSelected}
+                    onChange={event => toggleAllEntries(event.target.checked)}
+                    inputProps={{ "aria-label": "表示中の登録明細をすべて選択" }}
+                    sx={{ p: 0.25 }}
+                  />
+                )}
+                {activeEntries.length > 0 && (
+                  <ToggleButtonGroup value={entryViewMode} exclusive onChange={(_, next) => next && setEntryViewMode(next)} size="small" color="primary">
+                    <ToggleButton value={VIEW_MODE.CARDS}>カード</ToggleButton>
+                    <ToggleButton value={VIEW_MODE.TABLE}>テーブル</ToggleButton>
+                  </ToggleButtonGroup>
+                )}
+              </Stack>
+              <Button size="small" variant={entrySearchOpen || entrySearchQuery ? "contained" : "outlined"} onClick={toggleEntrySearchArea} sx={{ ml: "auto", minWidth: 76 }}>
+                検索
+              </Button>
             </Stack>
+            {entrySearchOpen && (
+              <Stack direction="row" spacing={0.75} alignItems="center">
+                <TextField
+                  fullWidth
+                  size="small"
+                  label="フリーワード検索"
+                  placeholder="商品名、SKU、作業、状態、入力値で検索"
+                  value={entrySearchInput}
+                  onChange={event => setEntrySearchInput(event.target.value)}
+                  onKeyDown={event => { if (event.key === "Enter") applyEntrySearch(event.currentTarget.value); }}
+                  InputProps={{
+                    endAdornment: (entrySearchInput || entrySearchQuery) ? (
+                      <InputAdornment position="end">
+                        <IconButton
+                          size="small"
+                          aria-label="検索条件をクリア"
+                          onMouseDown={event => event.preventDefault()}
+                          onClick={clearEntrySearch}
+                        >
+                          <Icon fontSize="small">close</Icon>
+                        </IconButton>
+                      </InputAdornment>
+                    ) : null
+                  }}
+                />
+                <Button variant="contained" size="medium" onClick={() => applyEntrySearch(entrySearchInput)} sx={{ minWidth: 104, minHeight: 40 }}>検索実行</Button>
+              </Stack>
+            )}
+            {selectedEntryIds.length > 0 && (
+              <Stack direction="row" spacing={0.75} alignItems="center" justifyContent="flex-end" useFlexGap flexWrap="wrap">
+                <Typography variant="caption" color="text.secondary" sx={{ mr: "auto" }}>選択中 {selectedEntryIds.length}件</Typography>
+                <Button size="small" color="error" variant="outlined" onClick={bulkRemoveItems}>選択削除 {selectedEntryIds.length}</Button>
+              </Stack>
+            )}
           </Stack>
 
           {activeEntries.length === 0 ? (
@@ -2064,10 +2382,12 @@ storage boundary, postMessage contract, THEME boundary, or export behavior chang
               <Typography color="text.secondary" sx={{ mt: 1, mb: 2 }}>登録明細がありません。</Typography>
               <Button variant="contained" size="large" startIcon={<Icon>add</Icon>} onClick={openForNew}>スキャン登録する</Button>
             </Paper>
+          ) : displayedEntries.length === 0 ? (
+            <EmptyState text="検索条件に一致する登録明細がありません。" />
           ) : (
             entryViewMode === VIEW_MODE.TABLE ? (
               <EntryTable
-                entries={activeEntries}
+                entries={displayedEntries}
                 context={context}
                 selectedIds={selectedEntryIds}
                 allSelected={allEntriesSelected}
@@ -2078,7 +2398,7 @@ storage boundary, postMessage contract, THEME boundary, or export behavior chang
                 onRemove={requestRemoveItem}
               />
             ) : (
-              <EntryGroupList entries={activeEntries} context={context} renderEntry={row => (
+              <EntryGroupList entries={displayedEntries} context={context} renderEntry={row => (
               <EntryCard
                 key={row.id}
                 row={row}
@@ -2145,12 +2465,79 @@ storage boundary, postMessage contract, THEME boundary, or export behavior chang
     }
 
 
-    function ConfirmScreen({ context, setContext, entries, setEntries, confirmedRecord, confirmedRecords, syncStatus, onConfirmRecord, onEditRecord, onUpdateRecord, onBindAction }) {
+    function ConfirmScreen({ context, setContext, entries, setEntries, confirmedRecord, confirmedRecords, syncStatus, screenshotModal, screenshotRevision, onConfirmRecord, onEditRecord, onUpdateRecord, onAddCorrectionRecord, onBindAction }) {
       const business = BUSINESS[context.businessKey] || BUSINESS.price;
-      const recordsForBusiness = (confirmedRecords || []).filter(record => record.businessKey === context.businessKey);
-      const recordRows = recordsForBusiness.flatMap(record => (record.entries || []).map((row, index) => ({ ...row, __record: record, __recordIndex: index })));
+      const [searchInput, setSearchInput] = React.useState(context.outputSearch || "");
+      const [searchQuery, setSearchQuery] = React.useState(context.outputSearch || "");
+      const allRecordsForBusiness = (confirmedRecords || []).filter(record => record.businessKey === context.businessKey);
+      const allRecordRows = allRecordsForBusiness.flatMap(record => (record.entries || []).map((row, index) => ({ ...row, __record: record, __recordIndex: index })));
+      const recordTrashEntries = allRecordRows.filter(row => row.deletedAt);
+      const normalizedSearchQuery = normalizeCode(searchQuery);
+      const recordMatchesSearch = record => {
+        if (!normalizedSearchQuery) return true;
+        const addedCorrections = allRecordsForBusiness.filter(item => (item.correctionOf || item.sourceRecordId) === record.recordId && (item.entries || []).some(row => !row.deletedAt));
+        const addedCorrectionText = addedCorrections.length ? `訂正データあり ${addedCorrections.length}件` : "";
+        return normalizeCode([
+          record.recordId,
+          record.workGroup,
+          record.status,
+          getApprovalStatusInfo(record).label,
+          getIntegrationStatus(record).label,
+          record.integrationState,
+          record.syncState,
+          record.integrationDate,
+          record.approvedAt,
+          record.integrationTarget,
+          record.correctionOf,
+          record.sourceRecordId,
+          record.sourceWorkGroup,
+          addedCorrectionText,
+          formatDateTimeText(record.registeredAt)
+        ].filter(Boolean).join(" ")).includes(normalizedSearchQuery);
+      };
+      const rowMatchesSearch = row => {
+        if (!normalizedSearchQuery) return true;
+        const record = row.__record || {};
+        if (recordMatchesSearch(record)) return true;
+        return normalizeCode([
+          row.sku,
+          row.barcode,
+          row.productName,
+          row.department,
+          row.workGroup,
+          row.saleType,
+          row.origin,
+          row.traceCode,
+          row.sourceEntryId,
+          row.sourceRecordId,
+          row.correctionOf,
+          row.correctionAction,
+          getCorrectionRelationLabel(record, row),
+          formatDecisionValue(row, context)
+        ].filter(Boolean).join(" ")).includes(normalizedSearchQuery);
+      };
+      const recordsForBusiness = normalizedSearchQuery
+        ? allRecordsForBusiness.filter(record => recordMatchesSearch(record) || allRecordRows.some(row => row.__record?.recordId === record.recordId && rowMatchesSearch(row)))
+        : allRecordsForBusiness;
+      const recordRows = allRecordRows.filter(row => !normalizedSearchQuery || rowMatchesSearch(row));
       const outputEntries = recordRows.filter(row => !row.deletedAt);
-      const recordTrashEntries = recordRows.filter(row => row.deletedAt);
+      const correctionsBySourceRecordId = allRecordsForBusiness.reduce((acc, record) => {
+        const sourceRecordId = record.correctionOf || record.sourceRecordId;
+        if (!sourceRecordId) return acc;
+        if (!(record.entries || []).some(row => !row.deletedAt)) return acc;
+        acc[sourceRecordId] = [...(acc[sourceRecordId] || []), record];
+        return acc;
+      }, {});
+      const getAddedCorrections = record => correctionsBySourceRecordId[record?.recordId] || [];
+      const getAddedCorrectionDetail = record => {
+        const corrections = getAddedCorrections(record);
+        if (!corrections.length) return "";
+        const deleteCount = corrections.reduce((sum, correction) => sum + (correction.entries || []).filter(row => !row.deletedAt && row.correctionAction === "delete").length, 0);
+        const priceDelta = corrections.reduce((sum, correction) => sum + (correction.entries || []).reduce((entrySum, row) => entrySum + (Number.isFinite(Number(row.correctionDeltaAmount)) ? Number(row.correctionDeltaAmount) : 0), 0), 0);
+        const deltaText = priceDelta ? ` / ${priceDelta > 0 ? "値上げ訂正" : "値下げ訂正"} ${signedYen(priceDelta)}` : "";
+        return deleteCount ? `訂正データあり ${corrections.length}件 / 削除訂正 ${deleteCount}件${deltaText}` : `訂正データあり ${corrections.length}件${deltaText}`;
+      };
+      const hasAddedCorrection = record => getAddedCorrections(record).length > 0;
       const activeEntries = getActiveEntries(entries);
       const isConfirmed = Boolean(confirmedRecord) && activeEntries.length === 0;
       const trashEntries = getTrashEntries(entries);
@@ -2158,13 +2545,16 @@ storage boundary, postMessage contract, THEME boundary, or export behavior chang
       const [message, setMessage] = React.useState(null);
       const [previewOpen, setPreviewOpen] = React.useState(false);
       const [editingItem, setEditingItem] = React.useState(null);
+      const [detailTarget, setDetailTarget] = React.useState(null);
       const [deleteTarget, setDeleteTarget] = React.useState(null);
       const [trashOpen, setTrashOpen] = React.useState(false);
       const [recordTrashOpen, setRecordTrashOpen] = React.useState(false);
       const [summaryOpen, setSummaryOpen] = React.useState(false);
+      const [recordSearchOpen, setRecordSearchOpen] = React.useState(Boolean(context.outputSearch));
       const [recordDisplayUnit, setRecordDisplayUnit] = React.useState("data");
       const [recordViewMode, setRecordViewMode] = React.useState(VIEW_MODE.CARDS);
       const [selectedRecordRows, setSelectedRecordRows] = React.useState([]);
+      const [selectedWorkRecordIds, setSelectedWorkRecordIds] = React.useState([]);
       const [dataPage, setDataPage] = React.useState(0);
       const [dataRowsPerPage, setDataRowsPerPage] = React.useState(10);
       const [workPage, setWorkPage] = React.useState(0);
@@ -2183,10 +2573,10 @@ storage boundary, postMessage contract, THEME boundary, or export behavior chang
       const stateLabel = recordsForBusiness.length ? "確定済み" : "実績なし";
       const stateColor = recordsForBusiness.length ? "success" : (syncStatus?.state === "error" ? "warning" : "info");
       const stateDetail = recordsForBusiness.length ? `${recordsForBusiness.length}件 / 最新 ${formatDateTimeText(recordsForBusiness[0].registeredAt)}` : "登録タブで作業確定すると表示されます";
-      const impactText = ["price", "returnGoods"].includes(context.businessKey) ? `調整影響 ${yen(totalImpact)}` : null;
+      const impactText = ["price", "returnGoods"].includes(context.businessKey) ? `調整影響 ${signedYen(totalImpact)}` : null;
       const showAmountSummary = !["pop", "label"].includes(context.businessKey);
       const primaryMetric = (() => {
-        if (context.businessKey === "price" || context.businessKey === "returnGoods") return { label: business.amountLabel, value: yen(totalAmount), color: totalImpact < 0 ? "warning" : "primary" };
+        if (context.businessKey === "price" || context.businessKey === "returnGoods") return { label: business.amountLabel, value: formatSummaryDecisionValue(totalAmount, context), color: totalImpact < 0 ? "warning" : "primary" };
         if (context.businessKey === "inventory") return { label: "売価金額", value: yen(totalAmount), color: "success" };
         if (context.businessKey === "priceCheck") return { label: "売価差異", value: yen(totalAmount), color: issueEntries.length ? "error" : "success" };
         if (context.businessKey === "pop") return { label: "発行枚数", value: `${totalQty}枚`, color: "primary" };
@@ -2198,9 +2588,80 @@ storage boundary, postMessage contract, THEME boundary, or export behavior chang
       const pagedOutputEntries = outputEntries.slice(dataPage * dataRowsPerPage, dataPage * dataRowsPerPage + dataRowsPerPage);
       const pagedRecordsForBusiness = recordsForBusiness.slice(workPage * workRowsPerPage, workPage * workRowsPerPage + workRowsPerPage);
       const selectedRows = outputEntries.filter(row => selectedRecordRows.includes(getRecordRowKey(row)));
+      const selectedWorkRecords = recordsForBusiness.filter(record => selectedWorkRecordIds.includes(record.recordId));
+      const selectedApprovalRecords = recordDisplayUnit === "work"
+        ? selectedWorkRecords
+        : Array.from(new Map(selectedRows.map(row => [row.__record?.recordId, row.__record]).filter(([recordId, record]) => recordId && record)).values());
+      const canBulkApprove = selectedApprovalRecords.some(record => getApprovalStatus(record) !== "approved");
+      const canBulkUnapprove = selectedApprovalRecords.some(record => getApprovalStatus(record) === "approved" && !isBackendLinkedRecord(record));
       const allDataRowsSelected = outputEntries.length > 0 && selectedRecordRows.length === outputEntries.length;
       const partialDataRowsSelected = selectedRecordRows.length > 0 && selectedRecordRows.length < outputEntries.length;
+      const allWorkRecordsSelected = recordsForBusiness.length > 0 && selectedWorkRecordIds.length === recordsForBusiness.length;
+      const partialWorkRecordsSelected = selectedWorkRecordIds.length > 0 && selectedWorkRecordIds.length < recordsForBusiness.length;
       function updatePeriod(name, value) { setContext(prev => ({ ...prev, [name]: value })); }
+      function applyRecordSearch(value = searchInput) {
+        const nextQuery = String(value || "").trim();
+        setSearchInput(nextQuery);
+        setSearchQuery(nextQuery);
+        setRecordSearchOpen(Boolean(nextQuery));
+        setDataPage(0);
+        setWorkPage(0);
+        setSelectedRecordRows([]);
+        setSelectedWorkRecordIds([]);
+        setContext(prev => ({ ...prev, outputSearch: nextQuery }));
+      }
+      function handleRecordSearchButton() {
+        setRecordSearchOpen(prev => !prev);
+      }
+      function clearRecordSearch() {
+        setSearchInput("");
+        setSearchQuery("");
+        setRecordSearchOpen(true);
+        setDataPage(0);
+        setWorkPage(0);
+        setSelectedRecordRows([]);
+        setSelectedWorkRecordIds([]);
+        setContext(prev => ({ ...prev, outputSearch: "" }));
+      }
+      function updateRecordApproval(record, approvalStatus) {
+        if (!record?.recordId) return false;
+        const now = new Date().toISOString();
+        onUpdateRecord?.(record.recordId, current => {
+          const businessKey = current.businessKey || current.context?.businessKey || context.businessKey;
+          const businessDate = current.context?.businessDate || current.context?.endDate || "";
+          const shouldLinkToday = approvalStatus === "approved" && businessKey !== "label" && businessDate && businessDate < todayText();
+          const nextIntegrationState = shouldLinkToday ? "linked" : createIntegrationState(businessKey, approvalStatus);
+          return {
+            ...current,
+            approvalStatus,
+            approvedAt: approvalStatus === "approved" ? now : null,
+            syncState: nextIntegrationState,
+            integrationState: nextIntegrationState,
+            integrationDate: approvalStatus === "approved" && ["printed", "linked"].includes(nextIntegrationState) ? todayText() : null,
+            backendLinkedAt: nextIntegrationState === "linked" ? now : null
+          };
+        });
+        return true;
+      }
+      function setRecordApproval(record, approvalStatus) {
+        if (!updateRecordApproval(record, approvalStatus)) return;
+        setMessage({ severity: approvalStatus === "approved" ? "success" : "info", text: approvalStatus === "approved" ? "承認済みにしました。日次連携の対象になります。" : "未承認に戻しました。日次連携の対象外になります。" });
+      }
+      function bulkSetRecordApproval(approvalStatus) {
+        const targetRecords = selectedApprovalRecords.filter(record => {
+          if (approvalStatus === "approved") return getApprovalStatus(record) !== "approved";
+          return getApprovalStatus(record) === "approved" && !isBackendLinkedRecord(record);
+        });
+        targetRecords.forEach(record => updateRecordApproval(record, approvalStatus));
+        setSelectedRecordRows([]);
+        setSelectedWorkRecordIds([]);
+        setMessage({
+          severity: approvalStatus === "approved" ? "success" : "info",
+          text: approvalStatus === "approved"
+            ? `${targetRecords.length}件を承認済みにしました。日次連携の対象になります。`
+            : `${targetRecords.length}件を未承認に戻しました。日次連携の対象外になります。`
+        });
+      }
       function simulateAction(action) {
         if (["pdf", "print"].includes(action) && recordsForBusiness.length === 0) { setMessage({ severity: "warning", text: "作業確定後に実行できます。" }); return; }
         if (action === "pdf") { setPreviewOpen(true); return; }
@@ -2235,6 +2696,15 @@ storage boundary, postMessage contract, THEME boundary, or export behavior chang
         const blockingErrors = errors.filter(error => !(context.businessKey === "priceCheck" && error === "売価不一致"));
         if (blockingErrors.length) { setMessage({ severity: "error", text: blockingErrors.join(" / ") }); return; }
         const { __recordId, __recordIndex, ...nextEntry } = editingItem;
+        const originalRecord = (confirmedRecords || []).find(record => record.recordId === __recordId);
+        if (isBackendLinkedRecord(originalRecord)) {
+          const correctionRecord = createCorrectionRecord(originalRecord, [nextEntry], context);
+          onAddCorrectionRecord?.(correctionRecord);
+          setEditingItem(null);
+          setRecordDisplayUnit("data");
+          setMessage({ severity: errors.length ? "warning" : "success", text: `訂正データを追加しました。訂正元: ${originalRecord.recordId}` });
+          return;
+        }
         onUpdateRecord?.(__recordId, record => ({
           ...record,
           entries: (record.entries || []).map((row, index) => {
@@ -2257,11 +2727,25 @@ storage boundary, postMessage contract, THEME boundary, or export behavior chang
       }
       function deleteEditingItem() {
         if (!editingItem) return;
+        const originalRecord = (confirmedRecords || []).find(record => record.recordId === editingItem.__recordId);
+        if (isBackendLinkedRecord(originalRecord)) {
+          const correctionRecord = createCorrectionRecord(originalRecord, [{ ...editingItem, correctionAction: "delete" }], context);
+          onAddCorrectionRecord?.(correctionRecord);
+          setEditingItem(null);
+          setMessage({ severity: "success", text: `削除訂正データを追加しました。訂正元: ${originalRecord.recordId}` });
+          return;
+        }
         updateRecordEntry(editingItem.__recordId, editingItem.id, editingItem.__recordIndex, row => ({ ...row, deletedAt: Date.now() }));
         setEditingItem(null);
         setMessage({ severity: "info", text: "実績明細をごみ箱に移動しました。" });
       }
       function deleteRecordRow(row) {
+        if (isBackendLinkedRecord(row.__record)) {
+          const correctionRecord = createCorrectionRecord(row.__record, [{ ...row, correctionAction: "delete" }], context);
+          onAddCorrectionRecord?.(correctionRecord);
+          setMessage({ severity: "success", text: `削除訂正データを追加しました。訂正元: ${row.__record.recordId}` });
+          return;
+        }
         updateRecordEntry(row.__record?.recordId, row.id, row.__recordIndex, entry => ({ ...entry, deletedAt: Date.now() }));
         setMessage({ severity: "info", text: "実績明細をごみ箱に移動しました。" });
       }
@@ -2272,10 +2756,22 @@ storage boundary, postMessage contract, THEME boundary, or export behavior chang
       function toggleAllRecordRows(checked) {
         setSelectedRecordRows(checked ? outputEntries.map(getRecordRowKey) : []);
       }
+      function toggleWorkRecordSelection(record) {
+        setSelectedWorkRecordIds(prev => prev.includes(record.recordId) ? prev.filter(id => id !== record.recordId) : [...prev, record.recordId]);
+      }
+      function toggleAllWorkRecords(checked) {
+        setSelectedWorkRecordIds(checked ? recordsForBusiness.map(record => record.recordId) : []);
+      }
       function bulkDeleteRecordRows() {
-        selectedRows.forEach(row => updateRecordEntry(row.__record?.recordId, row.id, row.__recordIndex, entry => ({ ...entry, deletedAt: Date.now() })));
+        selectedRows.forEach(row => {
+          if (isBackendLinkedRecord(row.__record)) {
+            onAddCorrectionRecord?.(createCorrectionRecord(row.__record, [{ ...row, correctionAction: "delete" }], context));
+            return;
+          }
+          updateRecordEntry(row.__record?.recordId, row.id, row.__recordIndex, entry => ({ ...entry, deletedAt: Date.now() }));
+        });
         setSelectedRecordRows([]);
-        setMessage({ severity: "info", text: `${selectedRows.length}件の実績明細をごみ箱に移動しました。` });
+        setMessage({ severity: "info", text: `${selectedRows.length}件の実績明細を削除または削除訂正として処理しました。` });
       }
       function restoreRecordEntry(row) {
         updateRecordEntry(row.__record?.recordId, row.id, row.__recordIndex, entry => ({ ...entry, deletedAt: null }));
@@ -2319,22 +2815,50 @@ storage boundary, postMessage contract, THEME boundary, or export behavior chang
       function clearEditNumberPadValue() { setEditNumberField(activeEditNumberField, ""); }
       React.useEffect(() => {
         setSelectedRecordRows(prev => prev.filter(key => outputEntries.some(row => getRecordRowKey(row) === key)));
+        setSelectedWorkRecordIds(prev => prev.filter(id => recordsForBusiness.some(record => record.recordId === id)));
         if (dataPage > 0 && dataPage * dataRowsPerPage >= outputEntries.length) setDataPage(0);
         if (workPage > 0 && workPage * workRowsPerPage >= recordsForBusiness.length) setWorkPage(0);
       }, [outputEntries.length, recordsForBusiness.length, context.businessKey]);
       React.useEffect(() => {
         if (recordDisplayUnit !== "data") setSelectedRecordRows([]);
+        if (recordDisplayUnit !== "work") setSelectedWorkRecordIds([]);
       }, [recordDisplayUnit]);
+      React.useEffect(() => {
+        const nextSearch = context.outputSearch || "";
+        setSearchInput(nextSearch);
+        setSearchQuery(nextSearch);
+        setRecordSearchOpen(Boolean(nextSearch));
+        setSelectedRecordRows([]);
+        setSelectedWorkRecordIds([]);
+        setDataPage(0);
+        setWorkPage(0);
+      }, [context.businessKey, context.outputSearch]);
+      React.useEffect(() => {
+        setPreviewOpen(screenshotModal === "outputPreview");
+        setRecordTrashOpen(screenshotModal === "recordTrash");
+        setTrashOpen(screenshotModal === "confirmTrash");
+        setEditingItem(screenshotModal === "recordEditDrawer" ? (outputEntries[0] ? { ...outputEntries[0], __recordId: outputEntries[0].__record?.recordId, __recordIndex: outputEntries[0].__recordIndex } : null) : null);
+        setDetailTarget(screenshotModal === "recordDetail" ? (outputEntries[0] || null) : null);
+        setDeleteTarget(screenshotModal === "recordDeleteConfirm" ? (outputEntries[0] || null) : null);
+      }, [screenshotModal, screenshotRevision, outputEntries.length, recordTrashEntries.length, context.businessKey]);
       React.useEffect(() => onBindAction(simulateAction), [context, recordsForBusiness.length, outputEntries.length]);
+      const editingSourceRecord = editingItem ? (confirmedRecords || []).find(record => record.recordId === editingItem.__recordId) : null;
+      const editingLinkedRecord = isBackendLinkedRecord(editingSourceRecord);
+      const detailRecord = detailTarget?.__record || null;
+      const detailLinked = isBackendLinkedRecord(detailRecord);
+      const detailApproval = detailRecord ? getApprovalStatusInfo(detailRecord) : null;
+      const detailIntegration = detailRecord ? getIntegrationStatus(detailRecord) : null;
+      const detailRelationLabel = detailTarget ? getCorrectionRelationLabel(detailRecord, detailTarget) : "";
+      const detailAddedCorrection = detailRecord ? getAddedCorrectionDetail(detailRecord) : "";
       return (
         <Stack spacing={1}>
           {message && <Alert severity={message.severity} onClose={() => setMessage(null)}>{message.text}</Alert>}
           <Paper variant="outlined" sx={{ overflow: "hidden" }}>
             <Box sx={{ px: 1.2, py: 0.9 }}>
               <Stack direction="row" alignItems="center" justifyContent="space-between" spacing={1}>
-                <Stack direction="row" spacing={0.75} alignItems="center" sx={{ minWidth: 0 }}>
-                  <Chip size="small" color={primaryMetric.color} variant="outlined" label={`${primaryMetric.label} ${primaryMetric.value}`} />
-                  {issueEntries.length > 0 && <Chip size="small" color="error" variant="outlined" label={`要確認 ${issueEntries.length}`} />}
+                <Stack direction="row" spacing={1.25} alignItems="baseline" sx={{ minWidth: 0, overflow: "hidden" }}>
+                  <Typography variant="body2" sx={{ fontWeight: 800 }} noWrap>{primaryMetric.label} {primaryMetric.value}</Typography>
+                  <Typography variant="body2" color={issueEntries.length ? "error.main" : "text.secondary"} noWrap>要確認 {issueEntries.length}件</Typography>
                 </Stack>
                 <Button
                   size="small"
@@ -2404,32 +2928,90 @@ storage boundary, postMessage contract, THEME boundary, or export behavior chang
                 </Tooltip>
               </Stack>
             </Stack>
-            <Stack direction="row" spacing={0.75} alignItems="center" justifyContent="flex-start" useFlexGap flexWrap="wrap">
-              {recordDisplayUnit === "data" && outputEntries.length > 0 && (
-                <Checkbox
-                  size="small"
-                  checked={allDataRowsSelected}
-                  indeterminate={partialDataRowsSelected}
-                  onChange={event => toggleAllRecordRows(event.target.checked)}
-                  inputProps={{ "aria-label": "実績明細をすべて選択" }}
-                  sx={{ p: 0.25 }}
-                />
-              )}
-              <ToggleButtonGroup value={recordViewMode} exclusive onChange={(_, next) => next && setRecordViewMode(next)} size="small" color="primary">
-                <ToggleButton value={VIEW_MODE.CARDS}>カード</ToggleButton>
-                <ToggleButton value={VIEW_MODE.TABLE}>テーブル</ToggleButton>
-              </ToggleButtonGroup>
-              <ToggleButtonGroup value={recordDisplayUnit} exclusive onChange={(_, next) => next && setRecordDisplayUnit(next)} size="small" color="primary">
-                <ToggleButton value="data">商品</ToggleButton>
-                <ToggleButton value="work">作業</ToggleButton>
-              </ToggleButtonGroup>
-              {recordDisplayUnit === "data" && selectedRecordRows.length > 0 && (
-                <Button size="small" color="error" variant="outlined" onClick={bulkDeleteRecordRows}>選択削除 {selectedRecordRows.length}</Button>
-              )}
+            <Stack direction="row" spacing={0.75} alignItems="center" justifyContent="space-between" useFlexGap flexWrap="wrap">
+              <Stack direction="row" spacing={0.75} alignItems="center" useFlexGap flexWrap="wrap">
+                {recordDisplayUnit === "data" && outputEntries.length > 0 && (
+                  <Checkbox
+                    size="small"
+                    checked={allDataRowsSelected}
+                    indeterminate={partialDataRowsSelected}
+                    onChange={event => toggleAllRecordRows(event.target.checked)}
+                    inputProps={{ "aria-label": "実績明細をすべて選択" }}
+                    sx={{ p: 0.25 }}
+                  />
+                )}
+                {recordDisplayUnit === "work" && recordsForBusiness.length > 0 && (
+                  <Checkbox
+                    size="small"
+                    checked={allWorkRecordsSelected}
+                    indeterminate={partialWorkRecordsSelected}
+                    onChange={event => toggleAllWorkRecords(event.target.checked)}
+                    inputProps={{ "aria-label": "実績作業をすべて選択" }}
+                    sx={{ p: 0.25 }}
+                  />
+                )}
+                <ToggleButtonGroup value={recordViewMode} exclusive onChange={(_, next) => next && setRecordViewMode(next)} size="small" color="primary">
+                  <ToggleButton value={VIEW_MODE.CARDS}>カード</ToggleButton>
+                  <ToggleButton value={VIEW_MODE.TABLE}>テーブル</ToggleButton>
+                </ToggleButtonGroup>
+                <ToggleButtonGroup value={recordDisplayUnit} exclusive onChange={(_, next) => next && setRecordDisplayUnit(next)} size="small" color="primary">
+                  <ToggleButton value="data">商品</ToggleButton>
+                  <ToggleButton value="work">作業</ToggleButton>
+                </ToggleButtonGroup>
+              </Stack>
+              <Button size="small" variant={recordSearchOpen || searchQuery ? "contained" : "outlined"} onClick={handleRecordSearchButton} sx={{ ml: "auto", minWidth: 76 }}>
+                検索
+              </Button>
             </Stack>
+            {recordSearchOpen && (
+              <Stack direction="row" spacing={0.75} alignItems="center">
+                <TextField
+                  fullWidth
+                  size="small"
+                  label="フリーワード検索"
+                  placeholder="商品名、SKU、作業、レコードID、訂正元で検索"
+                  value={searchInput}
+                  onChange={event => setSearchInput(event.target.value)}
+                  onKeyDown={event => { if (event.key === "Enter") applyRecordSearch(event.currentTarget.value); }}
+                  InputProps={{
+                    endAdornment: (searchInput || searchQuery) ? (
+                      <InputAdornment position="end">
+                        <IconButton
+                          size="small"
+                          aria-label="検索条件をクリア"
+                          onMouseDown={event => event.preventDefault()}
+                          onClick={clearRecordSearch}
+                        >
+                          <Icon fontSize="small">close</Icon>
+                        </IconButton>
+                      </InputAdornment>
+                    ) : null
+                  }}
+                />
+                <Button variant="contained" size="medium" onClick={() => applyRecordSearch(searchInput)} sx={{ minWidth: 104, minHeight: 40 }}>検索実行</Button>
+              </Stack>
+            )}
+            {(selectedApprovalRecords.length > 0 || selectedRecordRows.length > 0) && (
+              <Stack direction="row" spacing={0.75} alignItems="center" justifyContent="flex-end" useFlexGap flexWrap="wrap">
+                <Typography variant="caption" color="text.secondary" sx={{ mr: "auto" }}>
+                  選択中 {recordDisplayUnit === "work" ? selectedWorkRecordIds.length : selectedRecordRows.length}件
+                </Typography>
+                {selectedApprovalRecords.length > 0 && canBulkApprove && (
+                  <Button size="small" variant="outlined" onClick={() => bulkSetRecordApproval("approved")}>一括承認 {selectedApprovalRecords.length}</Button>
+                )}
+                {selectedApprovalRecords.length > 0 && canBulkUnapprove && (
+                  <Button size="small" color="warning" variant="outlined" onClick={() => bulkSetRecordApproval("unapproved")}>一括未承認</Button>
+                )}
+                {recordDisplayUnit === "data" && selectedRecordRows.length > 0 && (
+                  <Button size="small" color="error" variant="outlined" onClick={bulkDeleteRecordRows}>選択削除 {selectedRecordRows.length}</Button>
+                )}
+              </Stack>
+            )}
             <Box>
-              {recordsForBusiness.length === 0 ? (
+              {allRecordsForBusiness.length === 0 ? (
                 <EmptyState text="登録済み実績がありません。" />
+              ) : (recordDisplayUnit === "data" && outputEntries.length === 0) || (recordDisplayUnit === "work" && recordsForBusiness.length === 0) ? (
+                <EmptyState text={searchQuery ? "検索条件に一致する実績がありません。" : "表示できる実績がありません。"} />
               ) : recordDisplayUnit === "data" && recordViewMode === VIEW_MODE.TABLE ? (
                 <TableContainer>
                   <Table size="small">
@@ -2459,11 +3041,15 @@ storage boundary, postMessage contract, THEME boundary, or export behavior chang
                         const record = row.__record;
                         const linked = isBackendLinkedRecord(record);
                         const integration = getIntegrationStatus(record);
+                        const approval = getApprovalStatusInfo(record);
+                        const relationLabel = getCorrectionRelationLabel(record, row);
+                        const addedCorrectionDetail = getAddedCorrectionDetail(record);
+                        const addedCorrection = hasAddedCorrection(record);
                         const rowKey = getRecordRowKey(row);
                         const selected = selectedRecordRows.includes(rowKey);
                         return (
-                        <TableRow key={rowKey} hover selected={selected}>
-                          <TableCell padding="checkbox">
+                        <TableRow key={rowKey} hover selected={selected} onClick={() => setDetailTarget(row)} onKeyDown={event => { if (event.key === "Enter" || event.key === " ") { event.preventDefault(); setDetailTarget(row); } }} role="button" tabIndex={0} sx={{ cursor: "pointer" }}>
+                          <TableCell padding="checkbox" onClick={event => event.stopPropagation()}>
                             <Checkbox
                               size="small"
                               checked={selected}
@@ -2472,13 +3058,29 @@ storage boundary, postMessage contract, THEME boundary, or export behavior chang
                             />
                           </TableCell>
                           <TableCell>{row.productName || row.sku}</TableCell>
-                          <TableCell>{record.workGroup || row.workGroup || "セッション"}</TableCell>
+                          <TableCell>
+                            <Typography variant="body2">{record.workGroup || row.workGroup || "セッション"}</Typography>
+                            {relationLabel && <Typography variant="caption" color="text.secondary">{relationLabel}</Typography>}
+                            {addedCorrectionDetail && <Typography variant="caption" color="text.secondary" display="block">{addedCorrectionDetail}</Typography>}
+                          </TableCell>
                           <TableCell>{formatDateTimeText(record.registeredAt)}</TableCell>
                           <TableCell align="right">{row.quantity || 1}</TableCell>
                           <TableCell align="right">{formatDecisionValue(row, context)}</TableCell>
                           <TableCell>{integration.target}</TableCell>
-                          <TableCell><Chip size="small" color={integration.color} variant="outlined" label={integration.label} /></TableCell>
                           <TableCell>
+                            <Stack spacing={0.5} alignItems="flex-start">
+                              <Chip size="small" color={approval.color} variant="outlined" label={approval.label} />
+                              <Chip size="small" color={integration.color} variant="outlined" label={integration.label} />
+                              <Typography variant="caption" color="text.secondary">連携日 {integration.integrationDate || "未定"}</Typography>
+                              {addedCorrection && <Chip size="small" color="warning" variant="outlined" label="訂正あり" />}
+                            </Stack>
+                          </TableCell>
+                          <TableCell onClick={event => event.stopPropagation()}>
+                            {approval.state === "unapproved" ? (
+                              <Button size="small" variant="text" onClick={() => setRecordApproval(record, "approved")}>承認</Button>
+                            ) : !linked && (
+                              <Button size="small" variant="text" color="warning" onClick={() => setRecordApproval(record, "unapproved")}>未承認へ</Button>
+                            )}
                             <Button size="small" variant="text" onClick={() => startConfirmEdit(row)}>
                               {linked ? "訂正登録" : "当日修正"}
                             </Button>
@@ -2506,10 +3108,14 @@ storage boundary, postMessage contract, THEME boundary, or export behavior chang
                     const record = row.__record;
                     const linked = isBackendLinkedRecord(record);
                     const integration = getIntegrationStatus(record);
+                    const approval = getApprovalStatusInfo(record);
+                    const relationLabel = getCorrectionRelationLabel(record, row);
+                    const addedCorrectionDetail = getAddedCorrectionDetail(record);
+                    const addedCorrection = hasAddedCorrection(record);
                     const rowKey = getRecordRowKey(row);
                     const selected = selectedRecordRows.includes(rowKey);
                     return (
-                    <Paper key={rowKey} variant="outlined" sx={{ p: 1.25, borderColor: selected ? "primary.main" : "divider", bgcolor: selected ? "primary.50" : "background.paper" }}>
+                    <Paper key={rowKey} variant="outlined" onClick={() => setDetailTarget(row)} onKeyDown={event => { if (event.key === "Enter" || event.key === " ") { event.preventDefault(); setDetailTarget(row); } }} role="button" tabIndex={0} sx={{ p: 1.25, borderColor: selected ? "primary.main" : "divider", bgcolor: selected ? "primary.50" : "background.paper", cursor: "pointer", '&:hover': { borderColor: "primary.light", bgcolor: selected ? "primary.50" : "grey.50" } }}>
                       <Stack spacing={0.75}>
                         <Stack direction="row" spacing={1} alignItems="flex-start" justifyContent="space-between">
                           <Box sx={{ minWidth: 0, display: "flex", alignItems: "flex-start", gap: 0.75 }}>
@@ -2517,22 +3123,32 @@ storage boundary, postMessage contract, THEME boundary, or export behavior chang
                               size="small"
                               checked={selected}
                               onChange={() => toggleRecordRowSelection(row)}
+                              onClick={event => event.stopPropagation()}
                               sx={{ p: 0.25, mt: -0.25 }}
                               inputProps={{ "aria-label": `${row.productName || row.sku}を選択` }}
                             />
                             <Box sx={{ minWidth: 0 }}>
                               <Typography variant="subtitle2" noWrap>{row.productName || row.sku}</Typography>
                               <Typography variant="caption" color="text.secondary">{record.workGroup || row.workGroup || "セッション"} / {formatDateTimeText(record.registeredAt)} / {integration.target}</Typography>
+                              <Typography variant="caption" color="text.secondary" display="block">
+                                {approval.label} / {integration.label} / 連携日 {integration.integrationDate || "未定"}{addedCorrection ? " / 訂正あり" : ""}
+                              </Typography>
+                              {relationLabel && <Typography variant="caption" color="text.secondary" display="block">{relationLabel}</Typography>}
+                              {addedCorrectionDetail && <Typography variant="caption" color="text.secondary" display="block">{addedCorrectionDetail}</Typography>}
                             </Box>
                           </Box>
-                          <Stack direction="row" spacing={0.75}>
-                            <Chip size="small" color={integration.color} variant="outlined" label={integration.label} />
-                            <Chip size="small" variant="outlined" label={`${row.quantity || 1}`} />
-                          </Stack>
+                          <Typography variant="body2" sx={{ fontWeight: 800, whiteSpace: "nowrap", flexShrink: 0 }}>
+                            数量 {row.quantity || 1}
+                          </Typography>
                         </Stack>
                         <Stack direction="row" spacing={1} alignItems="center" justifyContent="space-between">
-                          <Typography variant="body2" color="text.secondary">{formatDecisionValue(row, context)}</Typography>
-                          <Stack direction="row" spacing={0.75}>
+                          <Typography variant="subtitle2" sx={{ fontWeight: 800, lineHeight: 1.3 }}>{formatDecisionValue(row, context)}</Typography>
+                          <Stack direction="row" spacing={0.75} onClick={event => event.stopPropagation()}>
+                            {approval.state === "unapproved" ? (
+                              <Button size="small" variant="outlined" onClick={() => setRecordApproval(record, "approved")}>承認</Button>
+                            ) : !linked && (
+                              <Button size="small" variant="text" color="warning" onClick={() => setRecordApproval(record, "unapproved")}>未承認へ</Button>
+                            )}
                             <Button size="small" variant="outlined" onClick={() => startConfirmEdit(row)}>
                               {linked ? "訂正登録" : "当日修正"}
                             </Button>
@@ -2549,6 +3165,15 @@ storage boundary, postMessage contract, THEME boundary, or export behavior chang
                   <Table size="small">
                     <TableHead>
                       <TableRow>
+                        <TableCell padding="checkbox">
+                          <Checkbox
+                            size="small"
+                            checked={allWorkRecordsSelected}
+                            indeterminate={partialWorkRecordsSelected}
+                            onChange={event => toggleAllWorkRecords(event.target.checked)}
+                            inputProps={{ "aria-label": "実績作業をすべて選択" }}
+                          />
+                        </TableCell>
                         <TableCell>作業</TableCell>
                         <TableCell>登録日時</TableCell>
                         <TableCell>連携先</TableCell>
@@ -2561,18 +3186,50 @@ storage boundary, postMessage contract, THEME boundary, or export behavior chang
                     <TableBody>
                       {pagedRecordsForBusiness.map(record => {
                         const activeRecordEntries = (record.entries || []).filter(row => !row.deletedAt);
+                        const firstEntry = activeRecordEntries[0] || null;
+                        const firstEntryIndex = firstEntry ? (record.entries || []).findIndex(row => row.id === firstEntry.id) : -1;
                         const productSummary = activeRecordEntries.slice(0, 2).map(row => row.productName || row.sku).filter(Boolean).join(" / ");
                         const moreCount = Math.max(0, activeRecordEntries.length - 2);
                         const integration = getIntegrationStatus(record);
+                        const approval = getApprovalStatusInfo(record);
+                        const linked = isBackendLinkedRecord(record);
+                        const relationLabel = getCorrectionRelationLabel(record);
+                        const addedCorrectionDetail = getAddedCorrectionDetail(record);
+                        const addedCorrection = hasAddedCorrection(record);
+                        const selected = selectedWorkRecordIds.includes(record.recordId);
                         return (
-                        <TableRow key={record.recordId} hover>
-                          <TableCell>{record.workGroup || "セッション"}</TableCell>
+                        <TableRow key={record.recordId} hover selected={selected} onClick={() => { if (firstEntry) setDetailTarget({ ...firstEntry, __record: record, __recordIndex: firstEntryIndex }); }} onKeyDown={event => { if ((event.key === "Enter" || event.key === " ") && firstEntry) { event.preventDefault(); setDetailTarget({ ...firstEntry, __record: record, __recordIndex: firstEntryIndex }); } }} role="button" tabIndex={0} sx={{ cursor: firstEntry ? "pointer" : "default" }}>
+                          <TableCell padding="checkbox" onClick={event => event.stopPropagation()}>
+                            <Checkbox
+                              size="small"
+                              checked={selected}
+                              onChange={() => toggleWorkRecordSelection(record)}
+                              inputProps={{ "aria-label": `${record.workGroup || record.recordId}を選択` }}
+                            />
+                          </TableCell>
+                          <TableCell>
+                            <Typography variant="body2">{record.workGroup || "セッション"}</Typography>
+                            {relationLabel && <Typography variant="caption" color="text.secondary">{relationLabel}</Typography>}
+                            {addedCorrectionDetail && <Typography variant="caption" color="text.secondary" display="block">{addedCorrectionDetail}</Typography>}
+                          </TableCell>
                           <TableCell>{formatDateTimeText(record.registeredAt)}</TableCell>
                           <TableCell>{integration.target}</TableCell>
-                          <TableCell><Chip size="small" color={integration.color} variant="outlined" label={integration.label} /></TableCell>
+                          <TableCell>
+                            <Stack spacing={0.5} alignItems="flex-start">
+                              <Chip size="small" color={approval.color} variant="outlined" label={approval.label} />
+                              <Chip size="small" color={integration.color} variant="outlined" label={integration.label} />
+                              <Typography variant="caption" color="text.secondary">連携日 {integration.integrationDate || "未定"}</Typography>
+                              {addedCorrection && <Chip size="small" color="warning" variant="outlined" label="訂正あり" />}
+                            </Stack>
+                          </TableCell>
                           <TableCell>{productSummary}{moreCount ? ` 他${moreCount}件` : ""}</TableCell>
                           <TableCell align="right">{activeRecordEntries.length}</TableCell>
-                          <TableCell>
+                          <TableCell onClick={event => event.stopPropagation()}>
+                            {approval.state === "unapproved" ? (
+                              <Button size="small" variant="text" onClick={() => setRecordApproval(record, "approved")}>承認</Button>
+                            ) : !linked && (
+                              <Button size="small" variant="text" color="warning" onClick={() => setRecordApproval(record, "unapproved")}>未承認へ</Button>
+                            )}
                             <Button size="small" variant="text" onClick={() => setRecordDisplayUnit("data")}>
                               商品を表示
                             </Button>
@@ -2600,21 +3257,49 @@ storage boundary, postMessage contract, THEME boundary, or export behavior chang
                   const productSummary = activeRecordEntries.slice(0, 3).map(row => row.productName || row.sku).filter(Boolean).join(" / ");
                   const moreCount = Math.max(0, activeRecordEntries.length - 3);
                   const integration = getIntegrationStatus(record);
+                  const approval = getApprovalStatusInfo(record);
+                  const linked = isBackendLinkedRecord(record);
+                  const relationLabel = getCorrectionRelationLabel(record);
+                  const addedCorrectionDetail = getAddedCorrectionDetail(record);
+                  const addedCorrection = hasAddedCorrection(record);
+                  const selected = selectedWorkRecordIds.includes(record.recordId);
                   return (
-                  <Paper key={record.recordId} variant="outlined" sx={{ p: 1.25 }}>
+                  <Paper key={record.recordId} variant="outlined" sx={{ p: 1.25, borderColor: selected ? "primary.main" : "divider", bgcolor: selected ? "primary.50" : "background.paper" }}>
                     <Stack spacing={0.75}>
                       <Stack direction="row" spacing={1} alignItems="flex-start" justifyContent="space-between">
-                        <Box sx={{ minWidth: 0 }}>
-                          <Typography variant="subtitle2" noWrap>{record.workGroup || "セッション"}</Typography>
-                          <Typography variant="caption" color="text.secondary">{record.recordId} / {formatDateTimeText(record.registeredAt)} / {integration.target}</Typography>
+                        <Box sx={{ minWidth: 0, display: "flex", alignItems: "flex-start", gap: 0.75 }}>
+                          <Checkbox
+                            size="small"
+                            checked={selected}
+                            onChange={() => toggleWorkRecordSelection(record)}
+                            sx={{ p: 0.25, mt: -0.25 }}
+                            inputProps={{ "aria-label": `${record.workGroup || record.recordId}を選択` }}
+                          />
+                          <Box sx={{ minWidth: 0 }}>
+                            <Typography variant="subtitle2" noWrap>{record.workGroup || "セッション"}</Typography>
+                            <Typography variant="caption" color="text.secondary">{record.recordId} / {formatDateTimeText(record.registeredAt)} / {integration.target}</Typography>
+                            <Typography variant="caption" color="text.secondary" display="block">
+                              {approval.label} / {integration.label} / 連携日 {integration.integrationDate || "未定"}{addedCorrection ? " / 訂正あり" : ""}
+                            </Typography>
+                            {relationLabel && <Typography variant="caption" color="text.secondary" display="block">{relationLabel}</Typography>}
+                            {addedCorrectionDetail && <Typography variant="caption" color="text.secondary" display="block">{addedCorrectionDetail}</Typography>}
+                          </Box>
                         </Box>
-                        <Stack direction="row" spacing={0.75}>
-                          <Chip size="small" color={integration.color} variant="outlined" label={integration.label} />
-                          <Chip size="small" variant="outlined" label={`${activeRecordEntries.length}件`} />
-                        </Stack>
+                        <Typography variant="body2" sx={{ fontWeight: 800, whiteSpace: "nowrap", flexShrink: 0 }}>
+                          {activeRecordEntries.length}件
+                        </Typography>
                       </Stack>
                       {productSummary && <Typography variant="body2" color="text.secondary" noWrap>{productSummary}{moreCount ? ` 他${moreCount}件` : ""}</Typography>}
                       <Stack direction="row" spacing={1} justifyContent="flex-end">
+                        {approval.state === "unapproved" ? (
+                          <Button size="small" variant="outlined" onClick={() => setRecordApproval(record, "approved")}>
+                            承認
+                          </Button>
+                        ) : !linked && (
+                          <Button size="small" variant="text" color="warning" onClick={() => setRecordApproval(record, "unapproved")}>
+                            未承認へ
+                          </Button>
+                        )}
                         <Button size="small" variant="outlined" onClick={() => setRecordDisplayUnit("data")}>
                           商品を表示
                         </Button>
@@ -2632,8 +3317,8 @@ storage boundary, postMessage contract, THEME boundary, or export behavior chang
             <Box sx={{ pt: 1, display: "grid", placeItems: "center" }}><Box sx={{ width: 40, height: 4, borderRadius: 2, bgcolor: "divider" }} /></Box>
             <Box sx={{ px: 2, pt: 1, pb: 1.25, display: "flex", alignItems: "center", gap: 1 }}>
               <Box sx={{ width: 32, height: 32, borderRadius: 1.5, display: "grid", placeItems: "center", bgcolor: `${business.color}.50`, color: `${business.color}.main` }}><Icon sx={{ fontSize: 20 }}>{business.icon}</Icon></Box>
-              <Typography variant="subtitle1" sx={{ flex: 1 }}>訂正登録</Typography>
-              <Chip size="small" color="primary" variant="outlined" label="実績修正" />
+              <Typography variant="subtitle1" sx={{ flex: 1 }}>{editingLinkedRecord ? "訂正登録" : "実績修正"}</Typography>
+              <Chip size="small" color={editingLinkedRecord ? "warning" : "primary"} variant="outlined" label={editingLinkedRecord ? "未承認の訂正として追加" : "当日修正"} />
               <IconButton onClick={() => setEditingItem(null)}><Icon>close</Icon></IconButton>
             </Box>
             <Divider />
@@ -2643,6 +3328,12 @@ storage boundary, postMessage contract, THEME boundary, or export behavior chang
                   <Paper variant="outlined" sx={{ p: 1.5, bgcolor: "grey.50" }}>
                     <Typography variant="subtitle2">{editingItem.productName}</Typography>
                     <Typography variant="caption" color="text.secondary">JAN {editingItem.barcode}　{getMasterValueLabel(context)} {yen(editingItem.currentPrice)}</Typography>
+                    {editingLinkedRecord && <Typography variant="caption" color="text.secondary" display="block">訂正元 {editingSourceRecord.recordId} / {formatDateTimeText(editingSourceRecord.registeredAt)}</Typography>}
+                    {editingLinkedRecord && getCorrectionPreviewText(editingSourceRecord, editingItem, context) && (
+                      <Typography variant="body2" sx={{ mt: 0.75, fontWeight: 900 }} color={getCorrectionPreviewText(editingSourceRecord, editingItem, context).startsWith("値上げ") ? "success.main" : "warning.main"}>
+                        連動差分: {getCorrectionPreviewText(editingSourceRecord, editingItem, context)}
+                      </Typography>
+                    )}
                   </Paper>
                   {business.itemFields.filter(field => field !== "sku").map(field => (
                     <DynamicField key={field} name={field} value={editingItem[field]} onChange={updateEditingItem} context={context} inputRef={node => { if (node) editNumberInputRefs.current[field] = node; }} onFocus={fieldName => { if (editNumericFields.includes(fieldName)) { setActiveEditNumberField(fieldName); setEditNumberPadOpen(true); } }} />
@@ -2702,6 +3393,58 @@ storage boundary, postMessage contract, THEME boundary, or export behavior chang
             <DialogContent dividers><Stack spacing={1}><Typography variant="subtitle2">{business.label} / {context.department}{` / ${periodText}`}</Typography><Divider />{outputEntries.map((row, index) => <Stack key={`${row.id}-${index}`} direction="row" justifyContent="space-between" spacing={1}><Typography variant="body2">{index + 1}. {row.productName}</Typography><Typography variant="body2" sx={{ fontWeight: 700 }}>{row.quantity || 1} / {formatDecisionValue(row, context)}</Typography></Stack>)}<Divider /><Typography align="right" variant="subtitle1">合計 {formatSummaryDecisionValue(totalAmount, context)}</Typography></Stack></DialogContent>
             <DialogActions><Button onClick={() => setPreviewOpen(false)}>閉じる</Button><Button variant="contained" onClick={() => { setPreviewOpen(false); setMessage({ severity: "success", text: "PDFを確認しました。" }); }}>確認済みにする</Button></DialogActions>
           </Dialog>
+
+          <Dialog open={Boolean(detailTarget)} onClose={() => setDetailTarget(null)} maxWidth="sm" fullWidth>
+            <DialogTitle sx={{ pb: 1 }}>
+              <Stack direction="row" spacing={1} alignItems="center">
+                <Box sx={{ width: 34, height: 34, borderRadius: 1.5, display: "grid", placeItems: "center", bgcolor: `${business.color}.50`, color: `${business.color}.main` }}><Icon sx={{ fontSize: 20 }}>{business.icon}</Icon></Box>
+                <Box sx={{ minWidth: 0 }}>
+                  <Typography variant="subtitle1" noWrap>{detailTarget?.productName || detailTarget?.sku || "実績詳細"}</Typography>
+                  <Typography variant="caption" color="text.secondary" noWrap display="block">{detailRecord?.recordId || ""}</Typography>
+                </Box>
+              </Stack>
+            </DialogTitle>
+            <DialogContent dividers>
+              {detailTarget && (
+                <Stack spacing={1.25}>
+                  <Paper variant="outlined" sx={{ p: 1.5, bgcolor: "background.default" }}>
+                    <Stack direction="row" spacing={1.5} alignItems="baseline" justifyContent="space-between">
+                      <Box>
+                        <Typography variant="caption" color="text.secondary" display="block">{business.quantityLabel}</Typography>
+                        <Typography variant="h5" sx={{ fontWeight: 900 }}>{detailTarget.quantity || 1}</Typography>
+                      </Box>
+                      <Box sx={{ textAlign: "right" }}>
+                        <Typography variant="caption" color="text.secondary" display="block">{business.amountLabel}</Typography>
+                        <Typography variant="h5" sx={{ fontWeight: 900 }}>{formatDecisionValue(detailTarget, context)}</Typography>
+                      </Box>
+                    </Stack>
+                  </Paper>
+                  <Grid container spacing={1}>
+                    <Grid item xs={12} sm={6}><Typography variant="caption" color="text.secondary" display="block">JAN / SKU</Typography><Typography variant="body2">{detailTarget.barcode || detailTarget.sku || "-"}</Typography></Grid>
+                    <Grid item xs={12} sm={6}><Typography variant="caption" color="text.secondary" display="block">作業</Typography><Typography variant="body2">{detailRecord?.workGroup || detailTarget.workGroup || "セッション"}</Typography></Grid>
+                    <Grid item xs={12} sm={6}><Typography variant="caption" color="text.secondary" display="block">{getMasterValueLabel(context)}</Typography><Typography variant="body2">{yen(detailTarget.currentPrice)}</Typography></Grid>
+                    <Grid item xs={12} sm={6}><Typography variant="caption" color="text.secondary" display="block">{getInputValueLabel(context)}</Typography><Typography variant="body2">{formatInputValue(detailTarget, context)}</Typography></Grid>
+                    <Grid item xs={12} sm={6}><Typography variant="caption" color="text.secondary" display="block">登録日時</Typography><Typography variant="body2">{formatDateTimeText(detailRecord?.registeredAt)}</Typography></Grid>
+                    <Grid item xs={12} sm={6}><Typography variant="caption" color="text.secondary" display="block">連携先</Typography><Typography variant="body2">{detailIntegration?.target || "-"}</Typography></Grid>
+                    <Grid item xs={12} sm={6}><Typography variant="caption" color="text.secondary" display="block">承認</Typography><Typography variant="body2">{detailApproval?.label || "-"}</Typography></Grid>
+                    <Grid item xs={12} sm={6}><Typography variant="caption" color="text.secondary" display="block">連携状況</Typography><Typography variant="body2">{detailIntegration?.label || "-"} / 連携日 {detailIntegration?.integrationDate || "未定"}</Typography></Grid>
+                  </Grid>
+                  {(detailRelationLabel || detailAddedCorrection || Number.isFinite(Number(detailTarget.correctionDeltaAmount))) && (
+                    <Paper variant="outlined" sx={{ p: 1.25, bgcolor: "warning.50", borderColor: "warning.light" }}>
+                      {detailRelationLabel && <Typography variant="body2">{detailRelationLabel}</Typography>}
+                      {detailAddedCorrection && <Typography variant="body2">{detailAddedCorrection}</Typography>}
+                      {Number.isFinite(Number(detailTarget.correctionDeltaAmount)) && <Typography variant="body2" sx={{ fontWeight: 900 }}>連動差分 {Number(detailTarget.correctionDeltaAmount) > 0 ? "値上げ訂正" : "値下げ訂正"} {signedYen(detailTarget.correctionDeltaAmount)}</Typography>}
+                    </Paper>
+                  )}
+                </Stack>
+              )}
+            </DialogContent>
+            <DialogActions>
+              <Button onClick={() => setDetailTarget(null)}>閉じる</Button>
+              {detailTarget && <Button color="error" onClick={() => { const target = detailTarget; setDetailTarget(null); deleteRecordRow(target); }}>削除</Button>}
+              {detailTarget && <Button variant="contained" onClick={() => { const target = detailTarget; setDetailTarget(null); startConfirmEdit(target); }}>{detailLinked ? "訂正登録" : "当日修正"}</Button>}
+            </DialogActions>
+          </Dialog>
         </Stack>
       );
     }
@@ -2730,6 +3473,8 @@ storage boundary, postMessage contract, THEME boundary, or export behavior chang
       const [businessHelpOpen, setBusinessHelpOpen] = React.useState(false);
       const [resetConfirmOpen, setResetConfirmOpen] = React.useState(false);
       const [businessSwitchTarget, setBusinessSwitchTarget] = React.useState(null);
+      const [screenshotModal, setScreenshotModal] = React.useState(null);
+      const [screenshotRevision, setScreenshotRevision] = React.useState(null);
       const scanActionsRef = React.useRef({ search: null, save: null, clear: null });
       const confirmActionRef = React.useRef(null);
       const visibleEntries = getActiveEntries(entries);
@@ -2764,7 +3509,13 @@ storage boundary, postMessage contract, THEME boundary, or export behavior chang
           setConfirmedRecord(nextState.confirmedRecord || null);
           setConfirmedRecords(nextState.confirmedRecords || []);
           setDraftId(data.payload?.draftId || createDraftId());
-          setStartSettingsOpen(Boolean(data.payload?.openStartSettings));
+          setScreenshotModal(nextState.screenshotModal);
+          setScreenshotRevision(nextState.screenshotRevision);
+          setStartSettingsOpen(Boolean(data.payload?.openStartSettings || nextState.screenshotModal === "startSettings"));
+          setBusinessHelpOpen(nextState.screenshotModal === "businessHelp");
+          setBusinessMenuOpen(nextState.screenshotModal === "businessSelect");
+          setResetConfirmOpen(nextState.screenshotModal === "resetConfirm");
+          setBusinessSwitchTarget(nextState.screenshotModal === "businessSwitchConfirm" ? Object.keys(BUSINESS).find(key => key !== nextState.context.businessKey) : null);
           if (nextState.openScanDrawer) setScanDrawerRequest(prev => prev + 1);
           else setScanDrawerCloseRequest(prev => prev + 1);
         }
@@ -2772,7 +3523,13 @@ storage boundary, postMessage contract, THEME boundary, or export behavior chang
         if (window.__EXPORTED_MOCK_STATE__) {
           const nextState = applyScenarioToState(window.__EXPORTED_MOCK_STATE__);
           setScreen(nextState.screen); setContext(nextState.context); setEntries(purgeExpiredTrash(nextState.entries)); setConfirmedRecord(nextState.confirmedRecord || null); setConfirmedRecords(nextState.confirmedRecords || []); setDraftId(window.__EXPORTED_MOCK_STATE__.draftId || createDraftId());
-          setStartSettingsOpen(Boolean(window.__EXPORTED_MOCK_STATE__.openStartSettings));
+          setScreenshotModal(nextState.screenshotModal);
+          setScreenshotRevision(nextState.screenshotRevision);
+          setStartSettingsOpen(Boolean(window.__EXPORTED_MOCK_STATE__.openStartSettings || nextState.screenshotModal === "startSettings"));
+          setBusinessHelpOpen(nextState.screenshotModal === "businessHelp");
+          setBusinessMenuOpen(nextState.screenshotModal === "businessSelect");
+          setResetConfirmOpen(nextState.screenshotModal === "resetConfirm");
+          setBusinessSwitchTarget(nextState.screenshotModal === "businessSwitchConfirm" ? Object.keys(BUSINESS).find(key => key !== nextState.context.businessKey) : null);
           if (nextState.openScanDrawer) setScanDrawerRequest(prev => prev + 1);
           else setScanDrawerCloseRequest(prev => prev + 1);
         }
@@ -2782,7 +3539,7 @@ storage boundary, postMessage contract, THEME boundary, or export behavior chang
       function resetAll() {
         const next = createDefaultContext("price");
         const nextDraftId = createDraftId();
-        setDraftId(nextDraftId); setContext(next); setEntries([]); setConfirmedRecord(null); setConfirmedRecords([]); setScreen(SCREEN.START); setStartSettingsOpen(false); setBusinessMenuOpen(false); setBusinessHelpOpen(false); setResetConfirmOpen(false); setBusinessSwitchTarget(null);
+        setDraftId(nextDraftId); setContext(next); setEntries([]); setConfirmedRecord(null); setConfirmedRecords([]); setScreen(SCREEN.START); setStartSettingsOpen(false); setBusinessMenuOpen(false); setBusinessHelpOpen(false); setResetConfirmOpen(false); setBusinessSwitchTarget(null); setScreenshotModal(null); setScreenshotRevision(null);
         saveState({ draftId: nextDraftId, screen: SCREEN.START, context: next, entries: [], confirmedRecord: null, confirmedRecords: [] });
       }
 
@@ -2842,8 +3599,8 @@ storage boundary, postMessage contract, THEME boundary, or export behavior chang
 
       let content = null;
       if (screen === SCREEN.START) content = <StartScreen context={context} setContext={setContext} />;
-      if (screen === SCREEN.SCAN) content = <ScanScreen context={context} setContext={setContext} entries={entries} setEntries={setEntries} setScreen={setScreen} confirmedRecord={confirmedRecord} openDrawerRequest={scanDrawerRequest} closeDrawerRequest={scanDrawerCloseRequest} onBindActions={(actions) => { scanActionsRef.current = actions; }} />;
-      if (screen === SCREEN.CONFIRM) content = <ConfirmScreen context={context} setContext={setContext} entries={entries} setEntries={setEntries} confirmedRecord={confirmedRecord} confirmedRecords={confirmedRecords} syncStatus={syncStatus} onConfirmRecord={(record) => { setConfirmedRecord(record); setConfirmedRecords(prev => [record, ...prev.filter(item => item.recordId !== record.recordId)]); }} onEditRecord={editConfirmedRecord} onUpdateRecord={(recordId, updater) => { setConfirmedRecords(prev => prev.map(record => record.recordId === recordId ? updater(record) : record)); setConfirmedRecord(prev => prev?.recordId === recordId ? updater(prev) : prev); }} onBindAction={(action) => { confirmActionRef.current = action; }} />;
+      if (screen === SCREEN.SCAN) content = <ScanScreen context={context} setContext={setContext} entries={entries} setEntries={setEntries} setScreen={setScreen} confirmedRecord={confirmedRecord} openDrawerRequest={scanDrawerRequest} closeDrawerRequest={scanDrawerCloseRequest} screenshotModal={screenshotModal} screenshotRevision={screenshotRevision} onBindActions={(actions) => { scanActionsRef.current = actions; }} />;
+      if (screen === SCREEN.CONFIRM) content = <ConfirmScreen context={context} setContext={setContext} entries={entries} setEntries={setEntries} confirmedRecord={confirmedRecord} confirmedRecords={confirmedRecords} syncStatus={syncStatus} screenshotModal={screenshotModal} screenshotRevision={screenshotRevision} onConfirmRecord={(record) => { setConfirmedRecord(record); setConfirmedRecords(prev => [record, ...prev.filter(item => item.recordId !== record.recordId)]); }} onEditRecord={editConfirmedRecord} onUpdateRecord={(recordId, updater) => { setConfirmedRecords(prev => prev.map(record => record.recordId === recordId ? updater(record) : record)); setConfirmedRecord(prev => prev?.recordId === recordId ? updater(prev) : prev); }} onAddCorrectionRecord={(record) => { setConfirmedRecord(record); setConfirmedRecords(prev => [record, ...prev]); }} onBindAction={(action) => { confirmActionRef.current = action; }} />;
 
       function bottomBar() {
         const confirmWorkLabel = context.businessKey === "label" ? "ラベル発行" : "作業確定";
@@ -2901,10 +3658,24 @@ storage boundary, postMessage contract, THEME boundary, or export behavior chang
 
     function saveTextFile(filename, content, mimeType = "text/plain;charset=utf-8;") {
       const blob = new Blob([content], { type: mimeType });
+      saveBlob(filename, blob);
+    }
+
+    function saveBlob(filename, blob) {
       const url = URL.createObjectURL(blob);
       const anchor = document.createElement("a");
       anchor.href = url; anchor.download = filename; document.body.appendChild(anchor); anchor.click(); document.body.removeChild(anchor); URL.revokeObjectURL(url);
     }
+
+    function safeFilePart(value) {
+      return String(value || "untitled").trim().replace(/[\\/:*?"<>|]+/g, "_").replace(/\s+/g, "_").slice(0, 80);
+    }
+
+    const SCENARIO_AUTOPLAY_SPEEDS = [
+      { label: "速い", value: 800 },
+      { label: "標準", value: 1400 },
+      { label: "遅い", value: 2200 }
+    ];
 
     async function getCurrentHtmlSource() {
       const baseUrl = new URL(window.location.href); baseUrl.search = ""; baseUrl.hash = "";
@@ -2938,9 +3709,17 @@ storage boundary, postMessage contract, THEME boundary, or export behavior chang
       const [stepIndex, setStepIndex] = React.useState(0);
       const [viewport, setViewport] = React.useState(VIEWPORTS.MOBILE);
       const [launcherOpen, setLauncherOpen] = React.useState(true);
+      const [launcherIconOnly, setLauncherIconOnly] = React.useState(false);
       const [toast, setToast] = React.useState(null);
       const [launcherSize, setLauncherSize] = React.useState({ width: 500, height: 760 });
+      const [launcherPosition, setLauncherPosition] = React.useState({ top: 16, right: 16 });
+      const [launcherTranslucent, setLauncherTranslucent] = React.useState(false);
       const [frameSize, setFrameSize] = React.useState({ width: 390, height: 844 });
+      const [screenshotExport, setScreenshotExport] = React.useState({ running: false, done: 0, total: 0, label: "", mode: null });
+      const [currentScreenshotRunning, setCurrentScreenshotRunning] = React.useState(false);
+      const [scenarioAutoplay, setScenarioAutoplay] = React.useState(false);
+      const [scenarioAutoplayMs, setScenarioAutoplayMs] = React.useState(APP_CONFIG.scenarioAutoplayMs);
+      const [scenarioListHeight, setScenarioListHeight] = React.useState(260);
       const iframeRef = React.useRef(null);
       const panelRef = React.useRef(null);
 
@@ -2951,8 +3730,10 @@ storage boundary, postMessage contract, THEME boundary, or export behavior chang
       const viewportConfig = VIEWPORT_CONFIG[viewport];
       const frameSrc = React.useMemo(() => getBaseUrlWithParams({ embedded: "1" }), []);
       const scenarioCounts = React.useMemo(() => Object.keys(BUSINESS).reduce((acc, key) => ({ ...acc, [key]: MOCK_SCENARIOS.filter(item => item.business === key).length }), {}), []);
+      const imageExportRunning = screenshotExport.running || currentScreenshotRunning;
 
       React.useEffect(() => setViewport(activeScenario.viewport || VIEWPORTS.MOBILE), [activeScenario.id]);
+      React.useEffect(() => setScenarioAutoplay(false), [activeScenario.id]);
       React.useEffect(() => {
         const nextConfig = VIEWPORT_CONFIG[viewport] || VIEWPORT_CONFIG[VIEWPORTS.MOBILE];
         setFrameSize({
@@ -2961,25 +3742,217 @@ storage boundary, postMessage contract, THEME boundary, or export behavior chang
         });
       }, [viewport]);
       React.useEffect(() => { const timer = window.setTimeout(() => postState(activeStep?.payload || {}), 120); return () => window.clearTimeout(timer); }, [selectedBusinessKey, selectedScenarioId, stepIndex]);
+      React.useEffect(() => {
+        if (!scenarioAutoplay || imageExportRunning || steps.length <= 1) return undefined;
+        const timer = window.setInterval(() => {
+          setStepIndex(prev => {
+            if (prev >= steps.length - 1) {
+              setScenarioAutoplay(false);
+              return prev;
+            }
+            return prev + 1;
+          });
+        }, scenarioAutoplayMs);
+        return () => window.clearInterval(timer);
+      }, [scenarioAutoplay, imageExportRunning, steps.length, scenarioAutoplayMs]);
 
       function postState(payload) {
         if (!iframeRef.current?.contentWindow) return;
         iframeRef.current.contentWindow.postMessage({ type: "APPLY_MOCK_STATE", payload: { ...(payload || {}), revision: Date.now() } }, "*");
       }
+      function wait(ms) {
+        return new Promise(resolve => window.setTimeout(resolve, ms));
+      }
+      function waitForAnimationFrames(count = 2) {
+        return new Promise(resolve => {
+          let remaining = count;
+          function next() {
+            remaining -= 1;
+            if (remaining <= 0) resolve();
+            else window.requestAnimationFrame(next);
+          }
+          window.requestAnimationFrame(next);
+        });
+      }
+      function getScreenshotViewportConfig(viewportKey) {
+        if (viewportKey === VIEWPORTS.DESKTOP) return { label: "desktop", width: 1280, height: 900 };
+        if (viewportKey === VIEWPORTS.TABLET) return { label: "tablet", width: 768, height: 820 };
+        return { label: "mobile", width: 390, height: 844 };
+      }
+      function enumerateScreenshotTargets() {
+        const viewportKeys = [VIEWPORTS.MOBILE, VIEWPORTS.TABLET, VIEWPORTS.DESKTOP];
+        const scenarioTargets = MOCK_SCENARIOS.flatMap(scenario => enumerateScenarioScreenshotTargets(scenario, viewportKeys));
+        return [...scenarioTargets, ...enumerateModalScreenshotTargets(viewportKeys)];
+      }
+      function enumerateScenarioScreenshotTargets(scenario, viewportKeys = [VIEWPORTS.MOBILE, VIEWPORTS.TABLET, VIEWPORTS.DESKTOP]) {
+        return viewportKeys.flatMap(viewportKey =>
+          (scenario.steps || []).map((step, stepIndex) => ({
+            kind: "scenario",
+            scenario,
+            step,
+            stepIndex,
+            viewportKey,
+            viewportConfig: getScreenshotViewportConfig(viewportKey)
+          }))
+        );
+      }
+      function clonePayload(payload = {}) {
+        return JSON.parse(JSON.stringify(payload || {}));
+      }
+      function getRepresentativeScreenshotSteps() {
+        const scenario = MOCK_SCENARIOS.find(item => item.id === "price-01-disposal") || MOCK_SCENARIOS.find(item => item.steps?.some(step => step.payload?.entries?.length)) || MOCK_SCENARIOS[0];
+        const scanStep = scenario.steps.find(step => step.payload?.screen === SCREEN.SCAN && Array.isArray(step.payload.entries) && step.payload.entries.length > 0) || scenario.steps.find(step => step.payload?.screen === SCREEN.SCAN) || scenario.steps[0];
+        const confirmStep = scenario.steps.find(step => step.payload?.screen === SCREEN.CONFIRM && (step.payload?.confirmedRecords?.length || step.payload?.confirmedRecord)) || scenario.steps[scenario.steps.length - 1] || scanStep;
+        return { scenario, scanStep, confirmStep };
+      }
+      function withDeletedWorkingEntry(payload) {
+        const next = clonePayload(payload);
+        const entries = Array.isArray(next.entries) ? next.entries : [];
+        next.entries = entries.length ? entries.map((row, index) => index === 0 ? { ...row, deletedAt: Date.now() - 60000 } : row) : [];
+        return next;
+      }
+      function withDeletedConfirmedEntry(payload) {
+        const next = clonePayload(payload);
+        const records = Array.isArray(next.confirmedRecords) ? next.confirmedRecords : (next.confirmedRecord ? [next.confirmedRecord] : []);
+        next.confirmedRecords = records.map((record, recordIndex) => ({
+          ...record,
+          entries: (record.entries || []).map((row, rowIndex) => recordIndex === 0 && rowIndex === 0 ? { ...row, deletedAt: Date.now() - 60000 } : row)
+        }));
+        next.confirmedRecord = next.confirmedRecords[0] || null;
+        return next;
+      }
+      function enumerateModalScreenshotTargets(viewportKeys) {
+        const { scenario, scanStep, confirmStep } = getRepresentativeScreenshotSteps();
+        const scanPayload = clonePayload(scanStep?.payload || {});
+        const confirmPayload = clonePayload(confirmStep?.payload || scanPayload);
+        const modalDefinitions = [
+          { id: "start-settings", label: "登録条件", payload: { ...scanPayload, openStartSettings: true, screenshotModal: "startSettings" } },
+          { id: "confirm-settings", label: "確認出力条件", payload: { ...confirmPayload, openStartSettings: true, screenshotModal: "startSettings" } },
+          { id: "business-help", label: "業務ヘルプ", payload: { ...scanPayload, screenshotModal: "businessHelp" } },
+          { id: "business-select", label: "業務選択", payload: { ...scanPayload, screenshotModal: "businessSelect" } },
+          { id: "reset-confirm", label: "リセット確認", payload: { ...scanPayload, screenshotModal: "resetConfirm" } },
+          { id: "business-switch-confirm", label: "業務切替確認", payload: { ...scanPayload, screenshotModal: "businessSwitchConfirm" } },
+          { id: "scan-drawer", label: "登録ドロワー", payload: { ...scanPayload, openScanDrawer: true } },
+          { id: "camera-scan", label: "カメラ読取", payload: { ...scanPayload, screenshotModal: "cameraScan" } },
+          { id: "scan-trash", label: "登録ごみ箱", payload: { ...withDeletedWorkingEntry(scanPayload), screenshotModal: "scanTrash" } },
+          { id: "scan-delete-confirm", label: "登録削除確認", payload: { ...scanPayload, screenshotModal: "scanDeleteConfirm" } },
+          { id: "output-preview", label: "出力プレビュー", payload: { ...confirmPayload, screenshotModal: "outputPreview" } },
+          { id: "record-detail", label: "実績詳細", payload: { ...confirmPayload, screenshotModal: "recordDetail" } },
+          { id: "record-edit-drawer", label: "実績修正ドロワー", payload: { ...confirmPayload, screenshotModal: "recordEditDrawer" } },
+          { id: "record-trash", label: "実績ごみ箱", payload: { ...withDeletedConfirmedEntry(confirmPayload), screenshotModal: "recordTrash" } },
+          { id: "record-delete-confirm", label: "実績削除確認", payload: { ...confirmPayload, screenshotModal: "recordDeleteConfirm" } }
+        ];
+        return modalDefinitions.flatMap((modal, modalIndex) =>
+          viewportKeys.map(viewportKey => ({
+            kind: "modal",
+            scenario,
+            modal,
+            step: { label: modal.label, payload: modal.payload },
+            stepIndex: modalIndex,
+            viewportKey,
+            viewportConfig: getScreenshotViewportConfig(viewportKey)
+          }))
+        );
+      }
+      function makeScreenshotFilename(target) {
+        if (target.kind === "modal") {
+          return [
+            "_modal-screens",
+            `${String(target.stepIndex + 1).padStart(2, "0")}_${safeFilePart(target.modal.id)}_${safeFilePart(target.modal.label)}`,
+            `${safeFilePart(target.modal.id)}_${target.viewportConfig.label}.png`
+          ].join("/");
+        }
+        const stepNo = String(target.stepIndex + 1).padStart(2, "0");
+        return [
+          safeFilePart(target.scenario.business),
+          `${safeFilePart(target.scenario.id)}_${safeFilePart(target.scenario.label)}`,
+          `${stepNo}_${safeFilePart(target.step.label)}_${target.viewportConfig.label}.png`
+        ].join("/");
+      }
+      async function applyScreenshotTarget(target) {
+        setFrameSize({ width: target.viewportConfig.width, height: target.viewportConfig.height });
+        await waitForAnimationFrames(1);
+        postState({ ...(target.step?.payload || {}), screenshotRevision: Date.now() });
+        const hasOverlay = target.kind === "modal" || target.step?.payload?.openScanDrawer || target.step?.payload?.openStartSettings || target.step?.payload?.screenshotModal;
+        await wait(hasOverlay ? APP_CONFIG.screenshotOverlayWaitMs : APP_CONFIG.screenshotCaptureWaitMs);
+        await waitForAnimationFrames(APP_CONFIG.screenshotFrameWaitCount);
+      }
+      function getScreenshotProgressLabel(target) {
+        if (!target) return "";
+        const viewportLabel = target.viewportConfig?.label || target.viewportKey || "";
+        if (target.kind === "modal") return `モーダル: ${target.modal?.label || target.step?.label || ""} / ${viewportLabel}`;
+        return `${target.scenario?.label || ""} / ${target.step?.label || ""} / ${viewportLabel}`;
+      }
+      async function captureCurrentFrameBlob() {
+        if (!window.html2canvas) throw new Error("html2canvas is not loaded");
+        const frameWindow = iframeRef.current?.contentWindow;
+        const frameDocument = iframeRef.current?.contentDocument;
+        if (!frameWindow || !frameDocument) throw new Error("preview frame is not ready");
+        frameWindow.scrollTo(0, 0);
+        const target = frameDocument.body;
+        const canvas = await window.html2canvas(target, {
+          backgroundColor: "#ffffff",
+          scale: Math.min(2, window.devicePixelRatio || 1),
+          width: frameWindow.innerWidth,
+          height: frameWindow.innerHeight,
+          windowWidth: frameWindow.innerWidth,
+          windowHeight: frameWindow.innerHeight,
+          scrollX: 0,
+          scrollY: 0,
+          x: 0,
+          y: 0,
+          useCORS: true
+        });
+        return await new Promise((resolve, reject) => {
+          canvas.toBlob(blob => blob ? resolve(blob) : reject(new Error("PNG blob creation failed")), "image/png");
+        });
+      }
       function changeBusiness(key) {
         const firstScenario = MOCK_SCENARIOS.find(item => item.business === key) || MOCK_SCENARIOS[0];
+        setScenarioAutoplay(false);
         setSelectedBusinessKey(key);
         setSelectedScenarioId(firstScenario.id);
         setStepIndex(0);
       }
       function changeScenario(id) {
         const scenario = MOCK_SCENARIOS.find(item => item.id === id);
+        setScenarioAutoplay(false);
         if (scenario?.business) setSelectedBusinessKey(scenario.business);
         setSelectedScenarioId(id);
         setStepIndex(0);
       }
       function moveStep(delta) { setStepIndex(prev => Math.max(0, Math.min(prev + delta, steps.length - 1))); }
+      function jumpToStep(nextIndex) {
+        if (imageExportRunning) return;
+        setScenarioAutoplay(false);
+        setStepIndex(clampNumber(nextIndex, 0, Math.max(0, steps.length - 1)));
+      }
       function clampNumber(value, min, max) { return Math.max(min, Math.min(value, max)); }
+      function beginLauncherDrag(event) {
+        if (event.button !== 0) return;
+        if (event.target.closest("button,[role='button'],input,textarea,select,.MuiSelect-select")) return;
+        event.preventDefault();
+        const surface = event.currentTarget.closest("[data-launcher-surface='true']") || panelRef.current;
+        if (!surface) return;
+        const startX = event.clientX, startY = event.clientY, startTop = launcherPosition.top, startRight = launcherPosition.right;
+        const rect = surface.getBoundingClientRect();
+        function handleMove(moveEvent) {
+          const maxTop = Math.max(8, window.innerHeight - rect.height - 8);
+          const maxRight = Math.max(8, window.innerWidth - rect.width - 8);
+          setLauncherPosition({
+            top: clampNumber(startTop + (moveEvent.clientY - startY), 8, maxTop),
+            right: clampNumber(startRight - (moveEvent.clientX - startX), 8, maxRight)
+          });
+        }
+        function handleUp() {
+          window.removeEventListener("pointermove", handleMove);
+          window.removeEventListener("pointerup", handleUp);
+          document.body.style.userSelect = "";
+          document.body.style.cursor = "";
+        }
+        document.body.style.userSelect = "none"; document.body.style.cursor = "move";
+        window.addEventListener("pointermove", handleMove); window.addEventListener("pointerup", handleUp);
+      }
       function beginResize(event) {
         event.preventDefault();
         const panel = panelRef.current; if (!panel) return;
@@ -2991,6 +3964,23 @@ storage boundary, postMessage contract, THEME boundary, or export behavior chang
         }
         function handleUp() { window.removeEventListener("pointermove", handleMove); window.removeEventListener("pointerup", handleUp); document.body.style.userSelect = ""; document.body.style.cursor = ""; }
         document.body.style.userSelect = "none"; document.body.style.cursor = "nesw-resize";
+        window.addEventListener("pointermove", handleMove); window.addEventListener("pointerup", handleUp);
+      }
+      function beginScenarioListResize(event) {
+        event.preventDefault();
+        event.stopPropagation();
+        const startY = event.clientY;
+        const startHeight = scenarioListHeight;
+        function handleMove(moveEvent) {
+          setScenarioListHeight(clampNumber(startHeight + (moveEvent.clientY - startY), 160, 520));
+        }
+        function handleUp() {
+          window.removeEventListener("pointermove", handleMove);
+          window.removeEventListener("pointerup", handleUp);
+          document.body.style.userSelect = "";
+          document.body.style.cursor = "";
+        }
+        document.body.style.userSelect = "none"; document.body.style.cursor = "ns-resize";
         window.addEventListener("pointermove", handleMove); window.addEventListener("pointerup", handleUp);
       }
       function updateFrameDimension(name, value) {
@@ -3010,6 +4000,35 @@ storage boundary, postMessage contract, THEME boundary, or export behavior chang
           saveTextFile(`workflow_mock_embedded_${formatFileDate(new Date())}.html`, html, "text/html;charset=utf-8;");
           setToast({ severity: "success", text: "ランチャーなしの実画面HTMLを出力しました。" });
         } catch (error) { console.error(error); setToast({ severity: "error", text: "HTML出力に失敗しました。" }); }
+      }
+      async function exportCurrentScreenshot() {
+        if (!window.html2canvas) {
+          setToast({ severity: "error", text: "画像出力ライブラリを読み込めていません。" });
+          return;
+        }
+        setCurrentScreenshotRunning(true);
+        setToast({ severity: "info", text: "現在の画面画像を出力中です。" });
+        try {
+          await waitForAnimationFrames(2);
+          const blob = await captureCurrentFrameBlob();
+          const filename = [
+            "workflow_mock_current",
+            safeFilePart(activeScenario.business),
+            safeFilePart(activeScenario.id),
+            String(stepIndex + 1).padStart(2, "0"),
+            safeFilePart(activeStep?.label || "step"),
+            safeFilePart(viewportConfig.label || viewport),
+            `${Math.round(frameSize.width)}x${Math.round(frameSize.height)}`,
+            formatFileDate(new Date())
+          ].join("_") + ".png";
+          saveBlob(filename, blob);
+          setToast({ severity: "success", text: "現在の画面画像PNGを出力しました。" });
+        } catch (error) {
+          console.error(error);
+          setToast({ severity: "error", text: "現在の画面画像の出力に失敗しました。" });
+        } finally {
+          setCurrentScreenshotRunning(false);
+        }
       }
       async function exportLauncher() {
         try {
@@ -3040,6 +4059,79 @@ storage boundary, postMessage contract, THEME boundary, or export behavior chang
         saveTextFile(`workflow_mock_scenarios_${formatFileDate(new Date())}.csv`, csv, "text/csv;charset=utf-8;");
         setToast({ severity: "success", text: "シナリオ一覧CSVを出力しました。" });
       }
+      async function exportScreenshotTargets(targets, filename, successLabel, mode) {
+        if (!window.JSZip || !window.html2canvas) {
+          setToast({ severity: "error", text: "画像出力ライブラリを読み込めていません。" });
+          return;
+        }
+        const zip = new window.JSZip();
+        const errors = [];
+        const originalFrameSize = { ...frameSize };
+        setScreenshotExport({ running: true, done: 0, total: targets.length, label: "準備中", mode });
+        setToast({ severity: "info", text: `画面画像を出力中です。0/${targets.length}` });
+        try {
+          for (let index = 0; index < targets.length; index += 1) {
+            const target = targets[index];
+            const label = getScreenshotProgressLabel(target);
+            setScreenshotExport({ running: true, done: index, total: targets.length, label, mode });
+            try {
+              await applyScreenshotTarget(target);
+              const blob = await captureCurrentFrameBlob();
+              zip.file(makeScreenshotFilename(target), blob);
+            } catch (error) {
+              console.error(error);
+              errors.push({
+                kind: target.kind,
+                business: target.scenario.business,
+                scenarioId: target.scenario.id,
+                modal: target.modal?.id || "",
+                step: target.step?.label,
+                viewport: target.viewportConfig.label,
+                message: error.message || String(error)
+              });
+            }
+            const done = index + 1;
+            setScreenshotExport({ running: true, done, total: targets.length, label, mode });
+            if (done % 10 === 0 || done === targets.length) {
+              setToast({ severity: errors.length ? "warning" : "info", text: `画面画像を出力中です。${done}/${targets.length}` });
+            }
+          }
+          zip.file("manifest.json", JSON.stringify({
+            generatedAt: new Date().toISOString(),
+            total: targets.length,
+            captured: targets.length - errors.length,
+            errors
+          }, null, 2));
+          if (errors.length) zip.file("errors.json", JSON.stringify(errors, null, 2));
+          const zipBlob = await zip.generateAsync({ type: "blob" });
+          saveBlob(filename, zipBlob);
+          setToast({ severity: errors.length ? "warning" : "success", text: errors.length ? `画像ZIPを出力しました。一部失敗: ${errors.length}件` : successLabel });
+        } catch (error) {
+          console.error(error);
+          setToast({ severity: "error", text: "画面画像の出力に失敗しました。" });
+        } finally {
+          setScreenshotExport({ running: false, done: 0, total: 0, label: "", mode: null });
+          setFrameSize(originalFrameSize);
+          await waitForAnimationFrames(2);
+          postState(activeStep?.payload || {});
+        }
+      }
+      async function exportAllScreenshots() {
+        await exportScreenshotTargets(
+          enumerateScreenshotTargets(),
+          `workflow_mock_screens_${formatFileDate(new Date())}.zip`,
+          "全画面画像ZIPを出力しました。",
+          "all"
+        );
+      }
+      async function exportActiveScenarioScreenshots() {
+        await exportScreenshotTargets(
+          enumerateScenarioScreenshotTargets(activeScenario),
+          `workflow_mock_scenario_${safeFilePart(activeScenario.id)}_${formatFileDate(new Date())}.zip`,
+          "このシナリオの画像ZIPを出力しました。",
+          "scenario"
+        );
+      }
 
       return (
         <Box sx={{ minHeight: "100vh", bgcolor: "#0f172a", overflow: "hidden" }}>
@@ -3049,11 +4141,38 @@ storage boundary, postMessage contract, THEME boundary, or export behavior chang
             </Box>
           </Box>
 
-          {!launcherOpen && <Fab color="primary" variant="extended" onClick={() => setLauncherOpen(true)} sx={{ position: "fixed", top: 16, right: 16, zIndex: 1800 }}><Icon sx={{ mr: 1 }}>tune</Icon>Launcher</Fab>}
+          {!launcherOpen && launcherIconOnly && (
+            <Tooltip title={`ランチャーを開く - ${activeStep?.label || ""}`}>
+              <Fab color="primary" size="medium" onClick={() => { setLauncherIconOnly(false); setLauncherOpen(true); }} sx={{ position: "fixed", top: launcherPosition.top, right: launcherPosition.right, zIndex: 1800, boxShadow: launcherTranslucent ? "0 10px 28px rgba(15,23,42,0.14)" : undefined }}>
+                <Icon>tune</Icon>
+              </Fab>
+            </Tooltip>
+          )}
+
+          {!launcherOpen && !launcherIconOnly && (
+            <Paper data-launcher-surface="true" onPointerDown={beginLauncherDrag} elevation={12} sx={{ position: "fixed", top: launcherPosition.top, right: launcherPosition.right, zIndex: 1800, p: 1, borderRadius: 2, bgcolor: launcherTranslucent ? "rgba(255,255,255,0.68)" : "rgba(255,255,255,0.96)", backdropFilter: "blur(10px)", border: "1px solid rgba(15,23,42,0.14)", width: { xs: "calc(100% - 32px)", sm: 520 }, maxWidth: "calc(100vw - 32px)", cursor: "move", boxShadow: launcherTranslucent ? "0 10px 28px rgba(15,23,42,0.14)" : undefined }}>
+              <Stack direction="row" spacing={1} alignItems="center" sx={{ minWidth: 0 }}>
+                <Button size="small" variant="text" startIcon={<Icon>tune</Icon>} onClick={() => { setLauncherIconOnly(false); setLauncherOpen(true); }} sx={{ flexShrink: 0 }}>開く</Button>
+                <Box sx={{ minWidth: 0, flex: 1 }}>
+                  <Typography variant="caption" color="text.secondary" noWrap display="block">{activeScenario.label}</Typography>
+                  <Typography variant="body2" sx={{ fontWeight: 900 }} noWrap>{activeStep?.label} <Typography component="span" variant="caption" color="text.secondary">({stepIndex + 1}/{steps.length})</Typography></Typography>
+                </Box>
+                <IconButton size="small" onClick={() => { setScenarioAutoplay(false); moveStep(-1); }} disabled={stepIndex === 0 || imageExportRunning} aria-label="前のステップ"><Icon fontSize="small">arrow_back</Icon></IconButton>
+                <IconButton size="small" color={scenarioAutoplay ? "warning" : "secondary"} onClick={() => setScenarioAutoplay(prev => !prev)} disabled={imageExportRunning || steps.length <= 1 || stepIndex >= steps.length - 1} aria-label={scenarioAutoplay ? "自動再生を停止" : "自動再生"}><Icon fontSize="small">{scenarioAutoplay ? "pause" : "play_arrow"}</Icon></IconButton>
+                <IconButton size="small" color="primary" onClick={() => { setScenarioAutoplay(false); moveStep(1); }} disabled={stepIndex >= steps.length - 1 || imageExportRunning} aria-label="次のステップ"><Icon fontSize="small">arrow_forward</Icon></IconButton>
+                <FormControl size="small" sx={{ width: 86, flexShrink: 0 }}>
+                  <Select value={scenarioAutoplayMs} onChange={event => setScenarioAutoplayMs(Number(event.target.value))} displayEmpty>
+                    {SCENARIO_AUTOPLAY_SPEEDS.map(item => <MenuItem key={item.value} value={item.value}>{item.label}</MenuItem>)}
+                  </Select>
+                </FormControl>
+                <Tooltip title="アイコン化"><IconButton size="small" onClick={() => setLauncherIconOnly(true)} aria-label="ランチャーをアイコン化"><Icon fontSize="small">radio_button_checked</Icon></IconButton></Tooltip>
+              </Stack>
+            </Paper>
+          )}
 
           {launcherOpen && (
-            <Paper ref={panelRef} elevation={14} sx={{ position: "fixed", top: 16, right: 16, zIndex: 1800, width: { xs: "calc(100% - 32px)", sm: launcherSize.width }, height: { xs: "auto", sm: launcherSize.height }, maxHeight: "calc(100vh - 32px)", minWidth: { xs: "auto", sm: 360 }, minHeight: { xs: "auto", sm: 420 }, overflow: "hidden", display: "flex", flexDirection: "column", borderRadius: 2, border: "1px solid rgba(15,23,42,0.14)", bgcolor: "rgba(255,255,255,0.97)", backdropFilter: "blur(10px)", boxShadow: "0 18px 48px rgba(15,23,42,0.24)" }}>
-              <Box sx={{ p: 2, borderBottom: "1px solid", borderColor: "divider" }}>
+            <Paper ref={panelRef} data-launcher-surface="true" elevation={14} sx={{ position: "fixed", top: launcherPosition.top, right: launcherPosition.right, zIndex: 1800, width: { xs: "calc(100% - 32px)", sm: launcherSize.width }, height: { xs: "auto", sm: launcherSize.height }, maxHeight: "calc(100vh - 32px)", minWidth: { xs: "auto", sm: 360 }, minHeight: { xs: "auto", sm: 420 }, overflow: "hidden", display: "flex", flexDirection: "column", borderRadius: 2, border: "1px solid rgba(15,23,42,0.14)", bgcolor: launcherTranslucent ? "rgba(255,255,255,0.68)" : "rgba(255,255,255,0.97)", backdropFilter: "blur(10px)", boxShadow: launcherTranslucent ? "0 10px 28px rgba(15,23,42,0.14)" : "0 18px 48px rgba(15,23,42,0.24)" }}>
+              <Box onPointerDown={beginLauncherDrag} sx={{ p: 2, borderBottom: "1px solid", borderColor: "divider", cursor: "move", bgcolor: launcherTranslucent ? "rgba(255,255,255,0.34)" : "transparent" }}>
                 <Stack direction="row" alignItems="flex-start" justifyContent="space-between" spacing={2}>
                   <Box>
                     <Stack direction="row" spacing={1} alignItems="center" flexWrap="wrap" useFlexGap>
@@ -3062,7 +4181,13 @@ storage boundary, postMessage contract, THEME boundary, or export behavior chang
                       <Chip size="small" color="primary" variant="outlined" label={APP_CONFIG.connectionMode.toUpperCase()} />
                     </Stack>
                   </Box>
-                  <Tooltip title="最小化"><IconButton onClick={() => setLauncherOpen(false)} size="small"><Icon>minimize</Icon></IconButton></Tooltip>
+                  <Stack direction="row" spacing={0.5} alignItems="center" sx={{ flexShrink: 0 }}>
+                    <Tooltip title={launcherTranslucent ? "通常表示" : "半透明表示"}>
+                      <Switch size="small" checked={launcherTranslucent} onChange={event => setLauncherTranslucent(event.target.checked)} inputProps={{ "aria-label": "半透明表示を切り替え" }} />
+                    </Tooltip>
+                    <Tooltip title="アイコン化"><IconButton onClick={() => { setLauncherIconOnly(true); setLauncherOpen(false); }} size="small" aria-label="ランチャーをアイコン化"><Icon>radio_button_checked</Icon></IconButton></Tooltip>
+                    <Tooltip title="操作ツールバーへ最小化"><IconButton onClick={() => { setLauncherIconOnly(false); setLauncherOpen(false); }} size="small"><Icon>minimize</Icon></IconButton></Tooltip>
+                  </Stack>
                 </Stack>
               </Box>
               <Box sx={{ p: 2, overflow: "auto", flex: 1 }}>
@@ -3093,8 +4218,49 @@ storage boundary, postMessage contract, THEME boundary, or export behavior chang
                       </Stack>
                     </Stack>
                     <Box sx={{ mt: 1.5 }}>
-                      <Stepper activeStep={stepIndex} alternativeLabel sx={{ mb: 1 }}>{steps.map(step => <Step key={step.label}><StepLabel>{step.label}</StepLabel></Step>)}</Stepper>
-                      <Stack direction="row" spacing={1} justifyContent="space-between"><Button size="small" variant="outlined" startIcon={<Icon>arrow_back</Icon>} onClick={() => moveStep(-1)} disabled={stepIndex === 0}>戻る</Button><Button size="small" variant="contained" endIcon={<Icon>arrow_forward</Icon>} onClick={() => moveStep(1)} disabled={stepIndex >= steps.length - 1}>次へ</Button></Stack>
+                      <Stack spacing={0.6} sx={{ maxHeight: scenarioListHeight, overflowY: "auto", pr: 0.5 }}>
+                        {steps.map((step, index) => {
+                          const active = index === stepIndex;
+                          return (
+                            <Button
+                              key={`${step.label}-${index}`}
+                              fullWidth
+                              size="small"
+                              variant={active ? "contained" : "outlined"}
+                              color={active ? "primary" : "inherit"}
+                              disabled={imageExportRunning}
+                              onClick={() => jumpToStep(index)}
+                              sx={{ justifyContent: "flex-start", textAlign: "left", py: 0.65, px: 1, borderColor: active ? "primary.main" : "divider" }}
+                            >
+                              <Stack direction="row" spacing={1} alignItems="center" sx={{ minWidth: 0, width: "100%" }}>
+                                <Box sx={{ width: 24, height: 24, borderRadius: "50%", display: "grid", placeItems: "center", flexShrink: 0, bgcolor: active ? "rgba(255,255,255,0.22)" : "grey.100", color: active ? "inherit" : "text.secondary", fontSize: 12, fontWeight: 900 }}>
+                                  {index + 1}
+                                </Box>
+                                <Box sx={{ minWidth: 0, flex: 1 }}>
+                                  <Typography variant="body2" sx={{ fontWeight: 900, lineHeight: 1.2 }} noWrap>{step.label}</Typography>
+                                  <Typography variant="caption" color={active ? "inherit" : "text.secondary"} display="block" noWrap>{step.description}</Typography>
+                                </Box>
+                              </Stack>
+                            </Button>
+                          );
+                        })}
+                      </Stack>
+                      <Tooltip title="ドラッグしてシナリオリストの高さを変更">
+                        <Box onPointerDown={beginScenarioListResize} role="separator" aria-label="シナリオリスト高さ変更" sx={{ height: 14, my: 0.5, display: "grid", placeItems: "center", cursor: "ns-resize", color: "text.secondary", borderRadius: 1, '&:hover': { bgcolor: "grey.100", color: "primary.main" } }}>
+                          <Box sx={{ width: 44, height: 4, borderRadius: 2, bgcolor: "divider" }} />
+                        </Box>
+                      </Tooltip>
+                      <Stack direction="row" spacing={1} justifyContent="space-between" alignItems="center">
+                        <Button size="small" variant="outlined" startIcon={<Icon>arrow_back</Icon>} onClick={() => { setScenarioAutoplay(false); moveStep(-1); }} disabled={stepIndex === 0 || imageExportRunning}>戻る</Button>
+                        <Button size="small" variant={scenarioAutoplay ? "contained" : "outlined"} color={scenarioAutoplay ? "warning" : "secondary"} startIcon={<Icon>{scenarioAutoplay ? "pause" : "play_arrow"}</Icon>} onClick={() => setScenarioAutoplay(prev => !prev)} disabled={imageExportRunning || steps.length <= 1 || stepIndex >= steps.length - 1}>{scenarioAutoplay ? "停止" : "自動再生"}</Button>
+                        <Button size="small" variant="contained" endIcon={<Icon>arrow_forward</Icon>} onClick={() => { setScenarioAutoplay(false); moveStep(1); }} disabled={stepIndex >= steps.length - 1 || imageExportRunning}>次へ</Button>
+                      </Stack>
+                      <Stack direction="row" spacing={1} alignItems="center" sx={{ mt: 1 }}>
+                        <Typography variant="caption" color="text.secondary" sx={{ flexShrink: 0 }}>再生速度</Typography>
+                        <ToggleButtonGroup value={scenarioAutoplayMs} exclusive onChange={(_, next) => next && setScenarioAutoplayMs(next)} size="small" color="secondary" fullWidth>
+                          {SCENARIO_AUTOPLAY_SPEEDS.map(item => <ToggleButton key={item.value} value={item.value}>{item.label}</ToggleButton>)}
+                        </ToggleButtonGroup>
+                      </Stack>
                     </Box>
                   </Paper>
                   <Box>
@@ -3135,7 +4301,25 @@ storage boundary, postMessage contract, THEME boundary, or export behavior chang
                   </Box>
                   <Paper variant="outlined" sx={{ p: 1.5 }}>
                     <Typography variant="subtitle2" sx={{ fontWeight: 900, mb: 1 }}>出力</Typography>
-                    <Stack direction={{ xs: "column", sm: "row" }} spacing={1} flexWrap="wrap" useFlexGap><Button variant="outlined" startIcon={<Icon>open_in_new</Icon>} onClick={() => window.open(frameSrc, "_blank", "noopener,noreferrer")}>別タブ</Button><Button variant="contained" color="secondary" startIcon={<Icon>download</Icon>} onClick={exportCurrent}>実画面HTML</Button><Button variant="outlined" color="secondary" startIcon={<Icon>table_view</Icon>} onClick={exportScenarioList}>シナリオCSV</Button><Button variant="text" color="secondary" startIcon={<Icon>code</Icon>} onClick={exportLauncher}>ランチャー込み</Button></Stack>
+                    <Stack direction={{ xs: "column", sm: "row" }} spacing={1} flexWrap="wrap" useFlexGap>
+                      <Button variant="outlined" startIcon={<Icon>open_in_new</Icon>} onClick={() => window.open(frameSrc, "_blank", "noopener,noreferrer")} disabled={imageExportRunning}>別タブ</Button>
+                      <Button variant="contained" color="secondary" startIcon={<Icon>download</Icon>} onClick={exportCurrent} disabled={imageExportRunning}>実画面HTML</Button>
+                      <Button variant="outlined" color="secondary" startIcon={<Icon>photo_camera</Icon>} onClick={exportCurrentScreenshot} disabled={imageExportRunning}>{currentScreenshotRunning ? "現在画像出力中" : "現在PNG"}</Button>
+                      <Button variant="outlined" color="secondary" startIcon={<Icon>collections</Icon>} onClick={exportActiveScenarioScreenshots} disabled={imageExportRunning}>{screenshotExport.running && screenshotExport.mode === "scenario" ? "シナリオ出力中" : "このシナリオPNG"}</Button>
+                      <Button variant="outlined" color="secondary" startIcon={<Icon>image</Icon>} onClick={exportAllScreenshots} disabled={imageExportRunning}>{screenshotExport.running && screenshotExport.mode === "all" ? "一覧出力中" : "画面一覧PNG"}</Button>
+                      <Button variant="outlined" color="secondary" startIcon={<Icon>table_view</Icon>} onClick={exportScenarioList} disabled={imageExportRunning}>シナリオCSV</Button>
+                      <Button variant="text" color="secondary" startIcon={<Icon>code</Icon>} onClick={exportLauncher} disabled={imageExportRunning}>ランチャー込み</Button>
+                    </Stack>
+                    {screenshotExport.running && (
+                      <Box sx={{ mt: 1.25 }}>
+                        <Stack direction="row" justifyContent="space-between" spacing={1} alignItems="center" sx={{ mb: 0.5 }}>
+                          <Typography variant="caption" color="text.secondary">{screenshotExport.mode === "scenario" ? "シナリオ画像出力" : "画面一覧画像出力"}</Typography>
+                          <Typography variant="caption" sx={{ fontWeight: 900 }}>{screenshotExport.done}/{screenshotExport.total}（{Math.round((screenshotExport.done / Math.max(1, screenshotExport.total)) * 100)}%）</Typography>
+                        </Stack>
+                        <LinearProgress variant="determinate" value={Math.min(100, Math.round((screenshotExport.done / Math.max(1, screenshotExport.total)) * 100))} sx={{ height: 8, borderRadius: 1 }} />
+                        {screenshotExport.label && <Typography variant="caption" color="text.secondary" display="block" noWrap sx={{ mt: 0.5 }}>{screenshotExport.label}</Typography>}
+                      </Box>
+                    )}
                   </Paper>
                   <Paper variant="outlined" sx={{ p: 1.5, bgcolor: "grey.50" }}>
                     <Typography variant="subtitle2" sx={{ fontWeight: 900, mb: 1 }}>現在の状態</Typography>
