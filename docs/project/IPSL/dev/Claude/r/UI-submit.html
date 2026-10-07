@@ -1,0 +1,702 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <meta name="description" content="店舗データの店舗確定・本部確定・データ連携を管理する画面" />
+  <title>店舗データ確定・連携管理</title>
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Roboto:wght@400;500;700&display=swap" />
+  <style>
+    html, body, #root { margin: 0; min-height: 100%; }
+    html { background: var(--page-bg, #f5f6f8); }
+    body { min-width: 0; font-family: "Roboto", "Noto Sans JP", "Yu Gothic UI", sans-serif; }
+    * { box-sizing: border-box; }
+    article > footer { background-color: #fff !important; }
+    table[aria-label="店舗データ一覧"] { width: 100% !important; min-width: 980px !important; table-layout: fixed; }
+    table[aria-label="店舗データ一覧"] th,
+    table[aria-label="店舗データ一覧"] td,
+    table[aria-label="操作対象データと処理設定"] th,
+    table[aria-label="操作対象データと処理設定"] td { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    table[aria-label="店舗データ一覧"] th:not(:last-child),
+    table[aria-label="店舗データ一覧"] td:not(:last-child),
+    table[aria-label="操作対象データと処理設定"] th:not(:last-child),
+    table[aria-label="操作対象データと処理設定"] td:not(:last-child) { border-right: 1px solid var(--table-grid, #d6dbe1); }
+    table[aria-label="店舗データ一覧"] th,
+    table[aria-label="店舗データ一覧"] td,
+    table[aria-label="操作対象データと処理設定"] th,
+    table[aria-label="操作対象データと処理設定"] td { border-bottom: 1px solid var(--table-grid, #d6dbe1) !important; }
+    table[aria-label="店舗データ一覧"] tbody tr:last-child td,
+    table[aria-label="操作対象データと処理設定"] tbody tr:last-child td { border-bottom: 0 !important; }
+    section[aria-label="表示条件"] { background-color: var(--panel-filter-bg, #fff); border-left: var(--panel-accent-width, 0) solid var(--panel-filter-accent, transparent); }
+    section[aria-label="対象データ"] { background-color: var(--panel-target-bg, #fff); border-left: var(--panel-accent-width, 0) solid var(--panel-target-accent, transparent); }
+    section[aria-label="進捗状況"] { background-color: var(--panel-summary-bg, #fff); border-left: var(--panel-accent-width, 0) solid var(--panel-summary-accent, transparent); }
+    section[aria-label="店舗一覧"] { border-left: var(--panel-accent-width, 0) solid var(--panel-store-accent, transparent); }
+    section[aria-label="店舗一覧"] > header { background-color: var(--panel-store-header, #fff); }
+    section[aria-label="表示条件"],
+    section[aria-label="対象データ"],
+    section[aria-label="進捗状況"],
+    section[aria-label="店舗一覧"] { box-shadow: var(--panel-shadow, none); }
+    section[aria-label="店舗一覧"] div:has(> article) { gap: 6px; }
+    #boot-status { padding: 24px; color: #52606d; font: 14px/1.5 "Roboto", "Noto Sans JP", "Yu Gothic UI", sans-serif; }
+  </style>
+</head>
+<body>
+  <div id="root"><div id="boot-status">Loading application...</div></div>
+  <noscript>このアプリケーションにはJavaScriptが必要です。</noscript>
+  <script src="https://unpkg.com/@babel/standalone@8.0.4/babel.min.js"></script>
+  <script id="app-source" type="text/plain">
+    const { useEffect, useMemo, useRef, useState } = React;
+    const {
+      Alert, AppBar, Autocomplete, Box, Button, Checkbox, Chip, Container, CssBaseline,
+      Dialog, DialogActions, DialogContent, DialogTitle, FormControl, IconButton,
+      InputLabel, List, ListItemButton, MenuItem, Paper, Select, Snackbar, Stack,
+      SvgIcon, Switch, Table, TableBody, TableCell, TableContainer, TableHead, TableRow, TableSortLabel,
+      TextField, ThemeProvider, Toolbar, Tooltip, Typography, createTheme,
+    } = MaterialUI;
+
+    const LOCAL_TODAY = (() => {
+      const now = new Date();
+      const pad = (value) => String(value).padStart(2, "0");
+      const year = String(now.getFullYear());
+      const month = pad(now.getMonth() + 1);
+      const day = pad(now.getDate());
+      const slashDate = `${year}/${month}/${day}`;
+      return { year, month: String(Number(month)), date: `${year}-${month}-${day}`, slashDate, compactDate: `${year}${month}${day}`, period: `${year}-${month}`, dateTime: `${slashDate} ${pad(now.getHours())}:${pad(now.getMinutes())}` };
+    })();
+    const APP_CONFIG = {
+      name: "店舗データ確定・連携管理",
+      version: "3.3.10-material2-default",
+      defaultPeriod: LOCAL_TODAY.period,
+      demoCurrentAt: new URLSearchParams(window.location.search).get("demoNow") || LOCAL_TODAY.dateTime,
+      api: {
+        mode: new URLSearchParams(window.location.search).get("api") === "real" ? "real" : "mock",
+        baseUrl: new URLSearchParams(window.location.search).get("apiBase") || "http://localhost:3000/api",
+        timeoutMs: 10000,
+        mockLatencyMs: 180,
+        mockIntegrationMs: 700,
+        mockStorageKey: "store-data-confirmation-api-mock-v3",
+      },
+    };
+
+    const CONFIRMATION_STATUS = {
+      draft: { label: "未確定", color: "var(--status-draft, #6b7280)" },
+      storeConfirmed: { label: "店舗確定", color: "var(--status-store, #2563eb)" },
+      hqConfirmed: { label: "本部確定", color: "var(--status-hq, #15803d)" },
+    };
+    const INTEGRATION_STATUS = {
+      notStarted: { label: "未連携", color: "var(--status-draft, #6b7280)" },
+      processing: { label: "連携中", color: "var(--status-processing, #b45309)" },
+      succeeded: { label: "連携済", color: "var(--status-integration, #15803d)" },
+      failed: { label: "連携失敗", color: "var(--status-failed, #b91c1c)" },
+    };
+    const SUMMARY_STAGES = {
+      draft: { label: "未確定", color: CONFIRMATION_STATUS.draft.color },
+      storeConfirmed: { label: "店舗確定・本部未確定", color: CONFIRMATION_STATUS.storeConfirmed.color },
+      hqConfirmed: { label: "本部確定（完了）", color: CONFIRMATION_STATUS.hqConfirmed.color },
+      integrationSucceeded: { label: "連携済み", color: INTEGRATION_STATUS.succeeded.color },
+    };
+    const DATA_TYPES = {
+      stocktake: {
+        label: "棚卸",
+        fields: [
+          { key: "bookInventory", label: "帳簿在庫", unit: "円" },
+          { key: "countedInventory", label: "実地在庫", unit: "円" },
+          { key: "inventoryVariance", label: "在庫差異", unit: "円" },
+        ],
+      },
+      order: {
+        label: "発注",
+        fields: [
+          { key: "orderAmount", label: "発注金額", unit: "円" },
+          { key: "orderLines", label: "発注明細", unit: "件" },
+          { key: "deliveryCount", label: "納品予定", unit: "件" },
+        ],
+      },
+      returns: {
+        label: "返品",
+        fields: [
+          { key: "returnAmount", label: "返品金額", unit: "円" },
+          { key: "returnLines", label: "返品明細", unit: "件" },
+          { key: "returnQuantity", label: "返品数量", unit: "点" },
+        ],
+      },
+    };
+    function buildTargetDatasets(referenceDate = LOCAL_TODAY.date) {
+      const match = String(referenceDate).match(/^(\d{4})-(\d{2})-(\d{2})$/);
+      const [, year, month, day] = match || [null, LOCAL_TODAY.year, String(LOCAL_TODAY.month).padStart(2, "0"), LOCAL_TODAY.date.slice(8, 10)];
+      const compactDate = `${year}${month}${day}`;
+      const slashDate = `${year}/${month}/${day}`;
+      const period = `${year}-${month}`;
+      return [
+        { id: `dataset-${compactDate}-stocktake-household-1100`, dataNumber: `D-${compactDate}-002`, dataType: "stocktake", sourceDepartment: "家庭用品", scheduledAt: `${slashDate} 11:00`, period },
+        { id: `dataset-${compactDate}-order-seafood-1000`, dataNumber: `D-${compactDate}-001`, dataType: "order", sourceDepartment: "鮮魚", scheduledAt: `${slashDate} 10:00`, period },
+        { id: `dataset-${compactDate}-order-produce-1200`, dataNumber: `D-${compactDate}-003`, dataType: "order", sourceDepartment: "青果", scheduledAt: `${slashDate} 12:00`, period },
+        { id: `dataset-${compactDate}-order-produce-1500`, dataNumber: `D-${compactDate}-004`, dataType: "order", sourceDepartment: "青果", scheduledAt: `${slashDate} 15:00`, period },
+        { id: `dataset-${compactDate}-returns-produce-1800`, dataNumber: `D-${compactDate}-005`, dataType: "returns", sourceDepartment: "青果", scheduledAt: `${slashDate} 18:00`, period },
+        { id: `dataset-${compactDate}-order-meat-1830`, dataNumber: `D-${compactDate}-006`, dataType: "order", sourceDepartment: "精肉", scheduledAt: `${slashDate} 18:30`, period },
+      ];
+    }
+    let TARGET_DATASETS = buildTargetDatasets();
+    let DATASET_BY_ID = new Map(TARGET_DATASETS.map((item) => [item.id, item]));
+    function replaceTargetDatasetCatalog(referenceDate) { TARGET_DATASETS = buildTargetDatasets(referenceDate); DATASET_BY_ID = new Map(TARGET_DATASETS.map((item) => [item.id, item])); return TARGET_DATASETS; }
+    const DATASET_PROCESSING_SETTINGS_STORAGE_KEY = "store-data-confirmation-processing-settings-v1";
+    const SCHEDULED_TIME_PATTERN = /^([01]\d|2[0-3]):[0-5]\d$/;
+    const DEFAULT_DATASET_PROCESSING_SETTING = { processingEnabled: true, scheduledTime: null, unconfirmedReminderEnabled: false, reminderLeadMinutes: 10 };
+    function normalizeDatasetProcessingSettings(value) { return TARGET_DATASETS.reduce((settings, dataset) => { const source = value?.[dataset.id] || {}; const reminderLeadMinutes = Number(source.reminderLeadMinutes); settings[dataset.id] = { processingEnabled: source.processingEnabled !== false, scheduledTime: SCHEDULED_TIME_PATTERN.test(source.scheduledTime || "") ? source.scheduledTime : null, unconfirmedReminderEnabled: Boolean(source.unconfirmedReminderEnabled), reminderLeadMinutes: Number.isFinite(reminderLeadMinutes) ? Math.max(0, Math.min(240, Math.trunc(reminderLeadMinutes))) : DEFAULT_DATASET_PROCESSING_SETTING.reminderLeadMinutes }; return settings; }, {}); }
+    let volatileDatasetProcessingSettings = null;
+    function readDatasetProcessingSettings() { if (!volatileDatasetProcessingSettings) volatileDatasetProcessingSettings = normalizeDatasetProcessingSettings(null); return normalizeDatasetProcessingSettings(volatileDatasetProcessingSettings); }
+    function writeDatasetProcessingSettings(settings) { const normalized = normalizeDatasetProcessingSettings(settings); volatileDatasetProcessingSettings = normalized; return normalized; }
+    function clearLegacyBrowserStorage() { try { window.localStorage.removeItem(DATASET_PROCESSING_SETTINGS_STORAGE_KEY); window.localStorage.removeItem(APP_CONFIG.api.mockStorageKey); } catch (_) {} }
+    clearLegacyBrowserStorage();
+    const STORE_NAMES = ["東京駅前店", "新宿中央店", "横浜みなと店", "大宮西口店", "名古屋栄店", "大阪梅田店", "神戸三宮店", "福岡天神店"];
+    const DEPARTMENT_BY_AREA = { 東日本: "東日本営業部", 中日本: "中日本営業部", 西日本: "西日本営業部" };
+    const AREA_NAMES = Object.keys(DEPARTMENT_BY_AREA);
+    const MANAGER_NAMES = ["佐藤", "鈴木", "高橋", "田中", "伊藤", "山本", "中村", "小林"];
+    const STORE_MASTER = Array.from({ length: 150 }, (_, index) => {
+      const code = String(index + 1).padStart(3, "0");
+      const area = AREA_NAMES[index % AREA_NAMES.length];
+      return {
+        id: `S${code}`, code, name: STORE_NAMES[index] || `${area}${code}店`,
+        company: index < 120 ? "株式会社サンプルリテール" : "株式会社サンプルフーズ",
+        department: DEPARTMENT_BY_AREA[area], area, manager: MANAGER_NAMES[index % MANAGER_NAMES.length],
+      };
+    });
+    const STORE_BY_ID = new Map(STORE_MASTER.map((item) => [item.id, item]));
+    const PERMISSION = {
+      VIEW: "view", STORE_SELF_CONFIRM: "storeSelfConfirm", STORE_SELF_REOPEN: "storeSelfReopen",
+      STORE_PROXY_CONFIRM: "storeProxyConfirm", STORE_PROXY_REOPEN: "storeProxyReopen", HQ_CONFIRM: "hqConfirm", HQ_REOPEN: "hqReopen", INTEGRATION_DATA_CREATE: "integrationDataCreate",
+    };
+    const ACCESS_PROFILES = [
+      { id: "store-s004", userName: "田中 店長", orgName: "大宮西口店", orgType: "store", attentionAction: "storeConfirm", scope: { type: "stores", storeIds: ["S004"] }, permissions: [PERMISSION.VIEW, PERMISSION.STORE_SELF_CONFIRM, PERMISSION.STORE_SELF_REOPEN] },
+      { id: "hq-product", userName: "商品部 担当者", orgName: "商品部", orgType: "hq", attentionAction: "hqConfirm", scope: { type: "all" }, permissions: [PERMISSION.VIEW, PERMISSION.STORE_PROXY_CONFIRM, PERMISSION.STORE_PROXY_REOPEN, PERMISSION.HQ_CONFIRM, PERMISSION.HQ_REOPEN, PERMISSION.INTEGRATION_DATA_CREATE] },
+      { id: "hq-system", userName: "情報システム部 運用保守担当", orgName: "情報システム部", orgType: "hq", attentionAction: "storeConfirm", scope: { type: "all" }, permissions: [PERMISSION.VIEW, PERMISSION.STORE_PROXY_CONFIRM, PERMISSION.STORE_PROXY_REOPEN, PERMISSION.HQ_CONFIRM, PERMISSION.HQ_REOPEN, PERMISSION.INTEGRATION_DATA_CREATE] },
+      { id: "hq-general-affairs", userName: "総務部 担当者", orgName: "総務部", orgType: "hq", attentionAction: null, scope: { type: "all" }, permissions: [PERMISSION.VIEW] },
+    ];
+    const ACTION_DEFINITIONS = {
+      storeConfirm: { label: (profile) => profile.orgType === "store" ? "店舗確定" : "代理店舗確定", title: "店舗確定を実行しますか", body: "未確定の店舗データを店舗確定へ進めます。", permission: (profile) => profile.orgType === "store" ? PERMISSION.STORE_SELF_CONFIRM : PERMISSION.STORE_PROXY_CONFIRM, canApply: (record) => record.confirmationStatus === "draft" && record.integration.state === "notStarted", nextStatus: "storeConfirmed" },
+      storeReopen: { label: (profile) => profile.orgType === "store" ? "店舗確定解除" : "代理店舗確定解除", title: "店舗確定を解除しますか", body: "店舗確定を解除し、未確定へ1段階戻します。", permission: (profile) => profile.orgType === "store" ? PERMISSION.STORE_SELF_REOPEN : PERMISSION.STORE_PROXY_REOPEN, canApply: (record) => record.confirmationStatus === "storeConfirmed" && record.integration.state === "notStarted", nextStatus: "draft" },
+      hqConfirm: { label: () => "本部確定・連動用データ作成", title: "操作対象データを本部確定しますか", body: "店舗確定は押印チェックとして扱います。未確定を含む全店舗の現時点データを本部確定し、連動用データ作成を開始します。", permission: () => PERMISSION.HQ_CONFIRM, canApply: (record) => ["draft", "storeConfirmed"].includes(record.confirmationStatus) && record.integration.state === "notStarted", nextStatus: "hqConfirmed" },
+      hqConfirmSelected: { label: () => "選択店舗を本部確定", title: "選択店舗だけを本部確定しますか", body: "選択した店舗だけを本部確定し、連動用データ作成を開始します。未選択の店舗は変更しません。", permission: () => PERMISSION.HQ_CONFIRM, canApply: (record) => ["draft", "storeConfirmed"].includes(record.confirmationStatus) && record.integration.state === "notStarted", nextStatus: "hqConfirmed" },
+      hqReopen: { label: () => "本部確定解除", title: "本部確定を解除しますか", body: "本部確定を解除し、店舗確定へ1段階戻します。連動用データの作成開始後は解除できません。", permission: () => PERMISSION.HQ_REOPEN, canApply: (record) => record.confirmationStatus === "hqConfirmed" && ["notStarted", "failed"].includes(record.integration.state), nextStatus: "storeConfirmed" },
+      createIntegrationData: { label: () => "連動用データを追加作成", title: "連動用データを作成しますか", body: "本部確定済みの現在値から、連動用データを追加作成します。", permission: () => PERMISSION.INTEGRATION_DATA_CREATE, canApply: (record) => record.confirmationStatus === "hqConfirmed" && record.integration.state !== "processing", nextStatus: null },
+    };
+    const ACTION_ORDER = ["storeConfirm", "storeReopen", "hqConfirm", "hqConfirmSelected", "hqReopen", "createIntegrationData"];
+
+    function createSeededRandom(seed) {
+      let state = Number(seed) >>> 0;
+      return () => { state = (state * 1664525 + 1013904223) >>> 0; return state / 4294967296; };
+    }
+    function nowLabel() {
+      const date = new Date();
+      const pad = (value) => String(value).padStart(2, "0");
+      return `${date.getFullYear()}/${pad(date.getMonth() + 1)}/${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}`;
+    }
+    function generateMockSubmissions(stores, seed = Date.now()) {
+      const random = createSeededRandom(seed);
+      const hqConfirmedDatasetIds = new Set(TARGET_DATASETS.filter((_, index) => index % 2 === 0).map((dataset) => dataset.id));
+      return stores.flatMap((store) => TARGET_DATASETS.map((dataset) => {
+        const confirmationStatus = hqConfirmedDatasetIds.has(dataset.id) ? "hqConfirmed" : random() < 0.5 ? "draft" : "storeConfirmed";
+        const hqConfirmedFromStatus = confirmationStatus === "hqConfirmed" ? random() < 0.35 ? "draft" : "storeConfirmed" : null;
+        const datasetDate = dataset.scheduledAt.slice(0, 10);
+        const hqConfirmedAt = confirmationStatus === "hqConfirmed" ? `${datasetDate} 08:30` : null;
+        const hour = String(8 + Math.floor(random() * 12)).padStart(2, "0");
+        const minute = String(Math.floor(random() * 60)).padStart(2, "0");
+        const statusChangedAt = `${datasetDate} ${hour}:${minute}`;
+        const bookInventory = Math.round((2000000 + random() * 3000000) / 1000) * 1000;
+        const countedInventory = bookInventory + Math.round((-80000 + random() * 160000) / 1000) * 1000;
+        const submissionId = `${dataset.id}:${store.id}`;
+        let payload;
+        if (dataset.dataType === "stocktake") payload = { bookInventory, countedInventory, inventoryVariance: countedInventory - bookInventory };
+        else if (dataset.dataType === "returns") payload = { returnAmount: Math.round((80000 + random() * 420000) / 1000) * 1000, returnLines: 1 + Math.floor(random() * 20), returnQuantity: 1 + Math.floor(random() * 50) };
+        else payload = { orderAmount: Math.round((700000 + random() * 1800000) / 1000) * 1000, orderLines: 20 + Math.floor(random() * 80), deliveryCount: 1 + Math.floor(random() * 5) };
+        return {
+          submissionId, datasetId: dataset.id, storeId: store.id, dataType: dataset.dataType, period: dataset.period,
+          confirmationStatus, confirmationStatusChangedAt: hqConfirmedAt || statusChangedAt,
+          storeConfirmedAt: confirmationStatus === "storeConfirmed" || hqConfirmedFromStatus === "storeConfirmed" ? statusChangedAt : null,
+          storeConfirmedBy: confirmationStatus === "storeConfirmed" || hqConfirmedFromStatus === "storeConfirmed" ? "店舗担当者" : null,
+          hqConfirmedAt,
+          hqConfirmedBy: confirmationStatus === "hqConfirmed" ? "商品部 担当者" : null,
+          hqConfirmedFromStatus,
+          integration: confirmationStatus === "hqConfirmed" ? { state: "succeeded", attemptId: `${submissionId}:mock-hq-batch`, startedAt: hqConfirmedAt, completedAt: hqConfirmedAt, error: null, creationCount: 1 } : { state: "notStarted", attemptId: null, startedAt: null, completedAt: null, error: null, creationCount: 0 },
+          updatedAt: hqConfirmedAt || statusChangedAt, revision: 1,
+          history: [{ action: "mockGenerated", mode: "system", actor: "モックデータ生成", at: hqConfirmedAt || statusChangedAt, revision: 1, datasetId: dataset.id, dataNumber: dataset.dataNumber, initialConfirmationStatus: confirmationStatus, ...(hqConfirmedFromStatus ? { hqConfirmedFromStatus } : {}) }],
+          payload,
+        };
+      }));
+    }
+    function hasPermission(profile, permission) { return Boolean(profile?.permissions?.includes(permission)); }
+    function isStoreInScope(profile, store) {
+      if (!profile || !store || !profile.scope) return false;
+      if (profile.scope.type === "all") return true;
+      if (profile.scope.type === "areas") return profile.scope.areas?.includes(store.area) ?? false;
+      if (profile.scope.type === "stores") return profile.scope.storeIds?.includes(store.id) ?? false;
+      return false;
+    }
+    function canViewStore(profile, store) { return hasPermission(profile, PERMISSION.VIEW) && isStoreInScope(profile, store); }
+    function joinSubmission(submission) { return { ...STORE_BY_ID.get(submission.storeId), ...submission, dataset: DATASET_BY_ID.get(submission.datasetId) }; }
+    function canExecute(actionType, profile, record) {
+      const definition = ACTION_DEFINITIONS[actionType];
+      return Boolean(definition && canViewStore(profile, record) && hasPermission(profile, definition.permission(profile)) && definition.canApply(record));
+    }
+    function transitionSubmission(submission, actionType, profile, timestamp) {
+      const record = joinSubmission(submission);
+      if (!canExecute(actionType, profile, record)) return submission;
+      const definition = ACTION_DEFINITIONS[actionType];
+      const revision = submission.revision + 1;
+      const historyEntry = { action: actionType, mode: profile.orgType === "store" ? "self" : "proxy", actor: profile.userName, at: timestamp, revision, datasetId: submission.datasetId, dataNumber: DATASET_BY_ID.get(submission.datasetId)?.dataNumber, ...( ["hqConfirm", "hqConfirmSelected"].includes(actionType) ? { fromConfirmationStatus: submission.confirmationStatus } : {}) };
+      const next = { ...submission, confirmationStatus: definition.nextStatus || submission.confirmationStatus, confirmationStatusChangedAt: definition.nextStatus ? timestamp : submission.confirmationStatusChangedAt, updatedAt: timestamp, revision, history: [...submission.history, historyEntry] };
+      if (actionType === "storeConfirm") { next.storeConfirmedAt = timestamp; next.storeConfirmedBy = profile.userName; }
+      if (actionType === "storeReopen") { next.storeConfirmedAt = null; next.storeConfirmedBy = null; next.hqConfirmedAt = null; next.hqConfirmedBy = null; }
+      if (["hqConfirm", "hqConfirmSelected"].includes(actionType)) { const creationCount = Number(submission.integration.creationCount || 0) + 1; next.hqConfirmedAt = timestamp; next.hqConfirmedBy = profile.userName; next.hqConfirmedFromStatus = submission.confirmationStatus; next.integration = { ...submission.integration, state: "processing", attemptId: `${submission.submissionId}:hq-r${revision}`, startedAt: timestamp, completedAt: null, error: null, creationCount, mockCompleteAfter: Date.now() + APP_CONFIG.api.mockIntegrationMs }; }
+      if (actionType === "hqReopen") { next.hqConfirmedAt = null; next.hqConfirmedBy = null; next.hqConfirmedFromStatus = null; next.integration = { state: "notStarted", attemptId: null, startedAt: null, completedAt: null, error: null, creationCount: 0 }; }
+      if (actionType === "createIntegrationData") { const creationCount = Number(submission.integration.creationCount || 0) + 1; next.integration = { ...submission.integration, state: "processing", attemptId: `${submission.submissionId}:manual-r${revision}`, startedAt: timestamp, completedAt: null, error: null, creationCount, mockCompleteAfter: Date.now() + APP_CONFIG.api.mockIntegrationMs }; }
+      return next;
+    }
+    function reconcileScheduledIntegrations(db, businessNow = APP_CONFIG.demoCurrentAt, runtimeNow = Date.now()) {
+      let changed = false;
+      const businessNowMinute = dateTimeToMinuteValue(businessNow);
+      const processingSettings = readDatasetProcessingSettings();
+      const submissions = db.submissions.map((submission) => {
+        const dataset = DATASET_BY_ID.get(submission.datasetId);
+        const setting = processingSettings[submission.datasetId] || DEFAULT_DATASET_PROCESSING_SETTING;
+        const scheduledMinute = dateTimeToMinuteValue(getEffectiveScheduledAt(dataset, setting));
+        let next = submission;
+        if (setting.processingEnabled && ["draft", "storeConfirmed"].includes(next.confirmationStatus) && next.integration.state === "notStarted" && businessNowMinute !== null && scheduledMinute !== null && scheduledMinute <= businessNowMinute) {
+          const revision = next.revision + 1;
+          changed = true;
+          next = { ...next, confirmationStatus: "hqConfirmed", confirmationStatusChangedAt: businessNow, hqConfirmedAt: businessNow, hqConfirmedBy: "自動本部確定スケジューラ", hqConfirmedFromStatus: next.confirmationStatus, updatedAt: businessNow, revision, history: [...next.history, { action: "scheduledHqConfirmed", mode: "system", actor: "自動本部確定スケジューラ", at: businessNow, revision, datasetId: next.datasetId, dataNumber: dataset?.dataNumber, fromConfirmationStatus: next.confirmationStatus }] };
+        }
+        if (setting.processingEnabled && next.confirmationStatus === "hqConfirmed" && next.integration.state === "notStarted" && businessNowMinute !== null && scheduledMinute !== null && scheduledMinute <= businessNowMinute) {
+          const revision = next.revision + 1;
+          changed = true;
+          return { ...next, integration: { state: "processing", attemptId: `${next.submissionId}:auto-r${revision}`, startedAt: businessNow, completedAt: null, error: null, creationCount: Number(next.integration.creationCount || 0) + 1, mockCompleteAfter: runtimeNow + APP_CONFIG.api.mockIntegrationMs }, updatedAt: businessNow, revision, history: [...next.history, { action: "scheduledIntegrationStarted", mode: "system", actor: "自動連携スケジューラ", at: businessNow, revision, datasetId: next.datasetId, dataNumber: dataset?.dataNumber }] };
+        }
+        const completeAfter = Number(next.integration.mockCompleteAfter || 0);
+        if (next.confirmationStatus === "hqConfirmed" && next.integration.state === "processing" && (!completeAfter || completeAfter <= runtimeNow)) {
+          const revision = next.revision + 1;
+          const { mockCompleteAfter, ...integration } = next.integration;
+          changed = true;
+          return { ...next, integration: { ...integration, state: "succeeded", completedAt: businessNow }, updatedAt: businessNow, revision, history: [...next.history, { action: "integrationSucceeded", mode: "system", actor: "自動連携スケジューラ", at: businessNow, revision, datasetId: next.datasetId, dataNumber: dataset?.dataNumber }] };
+        }
+        return next;
+      });
+      return changed ? { ...db, updatedAt: businessNow, submissions } : db;
+    }
+    const sleep = (milliseconds) => new Promise((resolve) => window.setTimeout(resolve, milliseconds));
+    const cloneValue = (value) => typeof structuredClone === "function" ? structuredClone(value) : JSON.parse(JSON.stringify(value));
+    class ApiError extends Error { constructor(message, status = 0, details = null) { super(message); this.name = "ApiError"; this.status = status; this.details = details; } }
+    let volatileMockDb = null;
+    function createMockDb(seed = 20260701) { return { schemaVersion: 1, updatedAt: nowLabel(), submissions: generateMockSubmissions(STORE_MASTER, seed) }; }
+    function writeMockDb(db) { volatileMockDb = cloneValue(db); }
+    function readMockDb() { if (!volatileMockDb) volatileMockDb = createMockDb(); return cloneValue(volatileMockDb); }
+    function mergeSubmissions(current, changed) {
+      const changedById = new Map(changed.map((item) => [item.submissionId, item]));
+      return current.map((item) => changedById.get(item.submissionId) || item);
+    }
+    const mockApi = {
+      async listSubmissions({ ids = [] } = {}) {
+        await sleep(APP_CONFIG.api.mockLatencyMs);
+        const db = readMockDb();
+        const reconciled = reconcileScheduledIntegrations(db);
+        if (reconciled !== db) writeMockDb(reconciled);
+        const idSet = new Set(ids);
+        return { submissions: cloneValue(ids.length ? reconciled.submissions.filter((item) => idSet.has(item.submissionId)) : reconciled.submissions) };
+      },
+      async executeCommand({ actionType, submissionIds, profileId }) {
+        await sleep(APP_CONFIG.api.mockLatencyMs);
+        const profile = ACCESS_PROFILES.find((item) => item.id === profileId);
+        if (!profile) throw new ApiError("利用者が見つかりません。", 401);
+        const db = readMockDb();
+        const current = reconcileScheduledIntegrations(db);
+        if (current !== db) writeMockDb(current);
+        const idSet = new Set(submissionIds);
+        const requested = current.submissions.filter((item) => idSet.has(item.submissionId));
+        if (requested.length !== submissionIds.length) throw new ApiError("対象データの一部が見つかりません。再読み込みしてください。", 404);
+        let targetIds = idSet;
+        if (actionType === "hqConfirm") {
+          const datasetIds = [...new Set(requested.map((item) => item.datasetId))];
+          if (datasetIds.length !== 1) throw new ApiError("本部確定は操作対象データ単位で実行してください。", 400);
+          const datasetSubmissions = current.submissions.filter((item) => item.datasetId === datasetIds[0]);
+          if (datasetSubmissions.some((item) => !canViewStore(profile, joinSubmission(item)))) throw new ApiError("本部確定は操作対象データの全店舗を閲覧・操作できる利用者だけが実行できます。", 403);
+          const eligible = datasetSubmissions.map(joinSubmission).filter((record) => canExecute(actionType, profile, record));
+          if (!eligible.length) throw new ApiError("本部確定と連動用データ作成を開始できる店舗データがありません。", 409);
+          targetIds = new Set(eligible.map((record) => record.submissionId));
+        } else {
+          if (actionType === "hqConfirmSelected" && new Set(requested.map((item) => item.datasetId)).size !== 1) throw new ApiError("選択店舗の本部確定は同一の操作対象データだけに実行できます。", 400);
+          const invalid = requested.map(joinSubmission).filter((record) => !canExecute(actionType, profile, record));
+          if (invalid.length) throw new ApiError("現在の状態または権限では実行できないデータが含まれています。", 409, { submissionIds: invalid.map((item) => item.submissionId) });
+        }
+        const transitioned = current.submissions.map((item) => targetIds.has(item.submissionId) ? transitionSubmission(item, actionType, profile, APP_CONFIG.demoCurrentAt) : item);
+        const updated = reconcileScheduledIntegrations({ ...current, updatedAt: APP_CONFIG.demoCurrentAt, submissions: transitioned });
+        writeMockDb(updated);
+        return { submissions: cloneValue(updated.submissions.filter((item) => targetIds.has(item.submissionId))) };
+      },
+      async resetMockData({ referenceDate = LOCAL_TODAY.date } = {}) { await sleep(APP_CONFIG.api.mockLatencyMs); replaceTargetDatasetCatalog(referenceDate); const db = reconcileScheduledIntegrations(createMockDb(Date.now())); writeMockDb(db); return { submissions: cloneValue(db.submissions), referenceDate, datasets: cloneValue(TARGET_DATASETS) }; },
+    };
+    async function httpRequest(path, { method = "GET", body } = {}) {
+      const controller = new AbortController();
+      const timeoutId = window.setTimeout(() => controller.abort(), APP_CONFIG.api.timeoutMs);
+      try {
+        const response = await fetch(`${APP_CONFIG.api.baseUrl}${path}`, { method, credentials: "include", headers: { Accept: "application/json", ...(body ? { "Content-Type": "application/json" } : {}) }, body: body ? JSON.stringify(body) : undefined, signal: controller.signal });
+        const contentType = response.headers.get("content-type") || "";
+        const payload = contentType.includes("application/json") ? await response.json() : null;
+        if (!response.ok) throw new ApiError(payload?.message || `API request failed (${response.status})`, response.status, payload);
+        return payload ?? {};
+      } catch (error) {
+        if (error?.name === "AbortError") throw new ApiError("API通信がタイムアウトしました。", 408);
+        if (error instanceof ApiError) throw error;
+        throw new ApiError(`APIへ接続できません: ${error?.message || String(error)}`);
+      } finally { window.clearTimeout(timeoutId); }
+    }
+    const realApi = {
+      listSubmissions: ({ ids = [] } = {}) => httpRequest(`/submissions${ids.length ? `?ids=${encodeURIComponent(ids.join(","))}` : ""}`),
+      executeCommand: ({ actionType, submissionIds, profileId, requestedAt }) => httpRequest("/commands", { method: "POST", body: { actionType, submissionIds, profileId, requestedAt } }),
+      resetMockData: async () => { throw new ApiError("実APIモードではモック再生成は利用できません。", 400); },
+    };
+    const dataApi = APP_CONFIG.api.mode === "real" ? realApi : mockApi;
+
+    const DEFAULT_FILTERS = { company: "all", year: LOCAL_TODAY.year, month: LOCAL_TODAY.month, startDate: LOCAL_TODAY.date, endDate: LOCAL_TODAY.date, department: "all", storeId: null, status: "all" };
+    const formatNumber = (value) => new Intl.NumberFormat("ja-JP").format(value);
+    const storeLabel = (store) => `${store.code}-${store.name}`;
+    const compactCardStoreLabel = (store) => { const baseName = store.name.replace(/店$/, ""); return `${store.code}-${Array.from(baseName).slice(0, 3).join("")}`; };
+    const dataNumberShort = (dataset) => dataset.dataNumber?.match(/(\d{3})$/)?.[1] || dataset.dataNumber;
+    const periodKey = (year, month) => `${year}-${String(month).padStart(2, "0")}`;
+    const dateKey = (dateTime) => dateTime ? dateTime.slice(0, 10).replace(/\//g, "-") : "";
+    const timeLabel = (dateTime) => String(dateTime || "").match(/(?:T| )(\d{2}:\d{2})/)?.[1] || "—";
+    function dateTimeToMinuteValue(value) { const match = value?.match(/^(\d{4})\/(\d{2})\/(\d{2}) (\d{2}):(\d{2})$/); if (!match) return null; const [, year, month, day, hour, minute] = match.map(Number); return Date.UTC(year, month - 1, day, hour, minute) / 60000; }
+    function getEffectiveScheduledAt(dataset, setting = DEFAULT_DATASET_PROCESSING_SETTING) { return dataset ? `${dataset.scheduledAt.slice(0, 11)}${setting?.scheduledTime || dataset.scheduledAt.slice(11)}` : null; }
+    function getDatasetMetrics(records, datasetId) { const datasetRecords = records.filter((record) => record.datasetId === datasetId); const confirmationCounts = Object.keys(CONFIRMATION_STATUS).reduce((counts, status) => ({ ...counts, [status]: datasetRecords.filter((record) => record.confirmationStatus === status).length }), {}); const creationCounts = Object.keys(INTEGRATION_STATUS).reduce((counts, state) => ({ ...counts, [state]: datasetRecords.filter((record) => record.integration.state === state).length }), {}); const hqConfirmedFromDraft = datasetRecords.filter((record) => record.confirmationStatus === "hqConfirmed" && record.hqConfirmedFromStatus === "draft").length; return { total: datasetRecords.length, confirmationCounts, stageCounts: countBySummaryStage(datasetRecords), creationCounts, hqConfirmedFromDraft }; }
+    function formatDurationMinutes(totalMinutes) { const days = Math.floor(totalMinutes / 1440); const hours = Math.floor((totalMinutes % 1440) / 60); const minutes = totalMinutes % 60; return [days ? `${days}日` : "", hours ? `${hours}時間` : "", minutes || (!days && !hours) ? `${minutes}分` : ""].join(""); }
+    function getRemainingTimeMeta(scheduledAt) {
+      const actualNow = nowLabel();
+      const referenceAt = dateKey(actualNow) === dateKey(scheduledAt) ? actualNow : APP_CONFIG.demoCurrentAt;
+      const scheduledMinute = dateTimeToMinuteValue(scheduledAt); const referenceMinute = dateTimeToMinuteValue(referenceAt);
+      if (scheduledMinute === null || referenceMinute === null) return { label: "残り時間 --", color: "text.secondary", deadline: "--" };
+      const difference = scheduledMinute - referenceMinute;
+      return { label: difference >= 0 ? `残り ${formatDurationMinutes(difference)}` : `期限超過 ${formatDurationMinutes(Math.abs(difference))}`, color: difference < 0 ? "error.main" : difference <= 60 ? "warning.dark" : "text.primary", deadline: scheduledAt.slice(11) };
+    }
+    function getSummaryStage(record) { return record.confirmationStatus === "hqConfirmed" && record.integration.state === "succeeded" ? "integrationSucceeded" : record.confirmationStatus; }
+    function countBySummaryStage(records) { return Object.keys(SUMMARY_STAGES).reduce((counts, status) => ({ ...counts, [status]: records.filter((record) => getSummaryStage(record) === status).length }), {}); }
+    function datasetProgressLabel(records, datasetId) { const counts = countBySummaryStage(records.filter((record) => record.datasetId === datasetId)); return Object.entries(SUMMARY_STAGES).filter(([key]) => counts[key] > 0).map(([key, meta]) => `${meta.label} ${counts[key]}`).join(" / ") || "データ取得中"; }
+    function isResponseRequired(profile, record) { return Boolean(profile?.attentionAction && canExecute(profile.attentionAction, profile, record)); }
+
+    function ReloadIcon(props) { return <SvgIcon {...props}><path d="M17.65 6.35A7.95 7.95 0 0 0 12 4a8 8 0 1 0 7.75 10h-2.1A6 6 0 1 1 12 6c1.66 0 3.14.69 4.22 1.78L13 11h7V4l-2.35 2.35Z" /></SvgIcon>; }
+    function StatusLabel({ status, prefix = "" }) { const meta = CONFIRMATION_STATUS[status]; return <Typography variant="body2" sx={{ color: meta.color, fontWeight: 700 }} noWrap>{prefix ? `${prefix}：` : ""}{meta.label}</Typography>; }
+    function HqConfirmationOriginLabel({ record }) { return record.confirmationStatus === "hqConfirmed" && record.hqConfirmedFromStatus === "draft" ? <Typography variant="caption" sx={{ color: "warning.dark", fontWeight: 700 }} noWrap>店舗未確定</Typography> : null; }
+    function IntegrationLabel({ record }) { const before = record.confirmationStatus !== "hqConfirmed" && record.integration.state === "notStarted"; const meta = before ? { label: "対象前", color: "var(--status-before, #9ca3af)" } : INTEGRATION_STATUS[record.integration.state]; return <Typography variant="body2" sx={{ color: meta.color, fontWeight: 700 }} noWrap>{meta.label}</Typography>; }
+    function getCardConfirmationMeta(record) { const meta = CONFIRMATION_STATUS[record.confirmationStatus]; return record.confirmationStatus === "hqConfirmed" && record.hqConfirmedFromStatus === "draft" ? { ...meta, label: "本部確定（店未確定）" } : meta; }
+    function getCardLatestStatusMeta(record) { const confirmation = getCardConfirmationMeta(record); if (record.integration.state === "notStarted") return { label: confirmation.label, color: confirmation.color, at: record.confirmationStatusChangedAt }; const integration = INTEGRATION_STATUS[record.integration.state]; return { label: integration.label, color: integration.color, at: record.integration.completedAt || record.integration.startedAt || record.updatedAt }; }
+    const DATASET_META_FIELDS = [
+      { key: "number", label: "データ番号", value: (dataset) => dataset.dataNumber },
+      { key: "type", label: "種類", value: (dataset) => DATA_TYPES[dataset.dataType].label },
+      { key: "department", label: "部門", value: (dataset) => dataset.sourceDepartment },
+      { key: "time", label: "確定時刻", value: (dataset, scheduledAt) => (scheduledAt || dataset.scheduledAt).slice(11) },
+    ];
+    function ResponsiveChip({ label, maxWidth, onClick }) { return <Box component="span" sx={{ display: "inline-block", verticalAlign: "middle", maxWidth, mr: 0.75, mb: 0.75 }}><Chip label={label} variant="outlined" size="small" onClick={onClick} sx={{ display: "inline-flex", maxWidth: "100%", verticalAlign: "middle", "& .MuiChip-label": { display: "block", minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", wordBreak: "keep-all", overflowWrap: "normal" } }} /></Box>; }
+    function DatasetMetadata({ dataset, scheduledAt, onClick }) { return <Box component="span">{DATASET_META_FIELDS.map((field) => <ResponsiveChip key={field.key} label={`${field.label}：${field.value(dataset, scheduledAt)}`} maxWidth={{ xs: "100%", sm: 260 }} onClick={onClick} />)}</Box>; }
+    function PanelGrid({ children, sx = {} }) { return <Box sx={{ display: "grid", gridTemplateColumns: { xs: "repeat(2, minmax(0, 1fr))", sm: "repeat(3, minmax(0, 1fr))", md: "repeat(4, minmax(0, 1fr))" }, gap: 0.75, alignItems: "center", minWidth: 0, ...sx }}>{children}</Box>; }
+    function PanelHeader({ children }) { return <Box component="header" sx={{ display: "flex", alignItems: "center", flexWrap: "wrap", gap: 0.75, minHeight: 40, px: 1, py: 0.5, borderBottom: 1, borderColor: "divider", minWidth: 0 }}>{children}</Box>; }
+    function PanelContent({ children, sx = {} }) { return <Box sx={{ display: "grid", gap: 0.75, px: 1, py: 0.75, minWidth: 0, ...sx }}>{children}</Box>; }
+
+    function FilterDialog({ open, filters, companies, departments, storeOptions, onChange, onSearch, onClear, onClose }) {
+      const selectedStore = storeOptions.find((store) => store.id === filters.storeId) || null;
+      return <Dialog open={open} onClose={onClose} maxWidth="md" fullWidth><DialogTitle>表示条件</DialogTitle><DialogContent dividers><Box component="form" id="filter-form" onSubmit={(event) => { event.preventDefault(); onSearch(); }} sx={{ display: "flex", flexWrap: "wrap", gap: 1.25, pt: 1 }}>
+        <FormControl sx={{ width: { xs: "100%", sm: 80 } }}><InputLabel>年</InputLabel><Select label="年" value={filters.year} onChange={(event) => onChange("year", event.target.value)}>{[2024, 2025, 2026, 2027].map((year) => <MenuItem key={year} value={String(year)}>{year}</MenuItem>)}</Select></FormControl>
+        <FormControl sx={{ width: { xs: "100%", sm: 72 } }}><InputLabel>月</InputLabel><Select label="月" value={filters.month} onChange={(event) => onChange("month", event.target.value)}>{Array.from({ length: 12 }, (_, index) => index + 1).map((month) => <MenuItem key={month} value={String(month)}>{month}</MenuItem>)}</Select></FormControl>
+        <TextField label="開始日" type="date" value={filters.startDate} onChange={(event) => onChange("startDate", event.target.value)} sx={{ width: { xs: "100%", sm: 132 } }} slotProps={{ inputLabel: { shrink: true } }} />
+        <TextField label="終了日" type="date" value={filters.endDate} onChange={(event) => onChange("endDate", event.target.value)} sx={{ width: { xs: "100%", sm: 132 } }} slotProps={{ inputLabel: { shrink: true } }} />
+        <FormControl sx={{ width: { xs: "100%", sm: 190 } }}><InputLabel>会社</InputLabel><Select label="会社" value={filters.company} onChange={(event) => onChange("company", event.target.value)}><MenuItem value="all">すべて</MenuItem>{companies.map((company) => <MenuItem key={company} value={company}>{company}</MenuItem>)}</Select></FormControl>
+        <FormControl sx={{ width: { xs: "100%", sm: 160 } }}><InputLabel>部門</InputLabel><Select label="部門" value={filters.department} onChange={(event) => onChange("department", event.target.value)}><MenuItem value="all">すべて</MenuItem>{departments.map((department) => <MenuItem key={department} value={department}>{department}</MenuItem>)}</Select></FormControl>
+        <Autocomplete options={storeOptions} value={selectedStore} onChange={(_, store) => onChange("storeId", store?.id || null)} getOptionLabel={storeLabel} isOptionEqualToValue={(option, value) => option.id === value.id} noOptionsText="該当する店舗はありません" sx={{ width: { xs: "100%", sm: 190 } }} renderInput={(params) => <TextField {...params} label="店舗" placeholder="店番・店名" />} />
+        <FormControl sx={{ width: { xs: "100%", sm: 180 } }}><InputLabel>状態</InputLabel><Select label="状態" value={filters.status} onChange={(event) => onChange("status", event.target.value)}><MenuItem value="all">すべて</MenuItem>{Object.entries(SUMMARY_STAGES).map(([key, meta]) => <MenuItem key={key} value={key}>{meta.label}</MenuItem>)}</Select></FormControl>
+      </Box></DialogContent><DialogActions sx={{ flexWrap: "wrap", gap: 0.5, px: 3, py: 1.25 }}><Button onClick={onClear} sx={{ mr: { xs: 0, sm: "auto" } }}>初期</Button><Button onClick={onClose}>キャンセル</Button><Button type="submit" form="filter-form" variant="contained">適用</Button></DialogActions></Dialog>;
+    }
+    function HelpSection({ title, children }) {
+      return <Box component="section"><Typography component="h3" variant="subtitle2" sx={{ mb: 0.6, fontWeight: 800 }}>{title}</Typography>{children}</Box>;
+    }
+    function HelpDialog({ open, onClose }) {
+      const itemSx = { pl: 0.25, lineHeight: 1.7 };
+      return <Dialog id="help-dialog" open={open} onClose={onClose} maxWidth="md" fullWidth aria-labelledby="help-dialog-title">
+        <DialogTitle id="help-dialog-title">店舗データ確定・連携管理の使い方</DialogTitle>
+        <DialogContent dividers>
+          <Stack spacing={2}>
+            <Typography color="text.secondary">1日の対象データごとに、150店舗の確定状況と連携状況を確認・操作する画面です。利用者の権限に応じて実行できる操作だけが表示されます。</Typography>
+            <HelpSection title="基本の操作手順">
+              <Box component="ol" sx={{ m: 0, pl: 2.5, display: "grid", gap: 0.65 }}>
+                <Typography component="li" variant="body2" sx={itemSx}><strong>表示条件を確認</strong>：各Chipまたは「条件変更」を選び、日付・会社・部門・店舗を絞り込みます。</Typography>
+                <Typography component="li" variant="body2" sx={itemSx}><strong>対象データを選択</strong>：対象データのChipまたは「変更」を選び、確定時刻・種類・部門を確認して操作対象にします。</Typography>
+                <Typography component="li" variant="body2" sx={itemSx}><strong>状態別に確認</strong>：サマリーから未確定・店舗確定・本部確定・連携済みを選ぶと、該当店舗だけを表示します。</Typography>
+                <Typography component="li" variant="body2" sx={itemSx}><strong>店舗を選択して実行</strong>：チェックボックスで店舗を選び、店舗一覧ヘッダーの操作ボタンから確定・解除・連携処理を実行します。</Typography>
+              </Box>
+            </HelpSection>
+            <HelpSection title="状態と連携状況">
+              <Box component="ul" sx={{ m: 0, pl: 2.5, display: "grid", gap: 0.45 }}>
+                <Typography component="li" variant="body2"><strong>未確定</strong>：店舗での確認が必要な状態です。</Typography>
+                <Typography component="li" variant="body2"><strong>店舗確定</strong>：店舗確認済みで、本部確認待ちの状態です。</Typography>
+                <Typography component="li" variant="body2"><strong>本部確定</strong>：本部で確定した状態です。連携状況は別欄で確認します。</Typography>
+                <Typography component="li" variant="body2"><strong>未連携／連携中／連携済／連携失敗</strong>：本部確定後の外部連携の進み具合です。連携中・連携済みのデータは通常の確定解除ができません。</Typography>
+              </Box>
+            </HelpSection>
+            <HelpSection title="一覧の見方">
+              <Stack spacing={0.65}>
+                <Typography variant="body2">薄い黄色のカード・行は、現在の利用者による対応が必要です。カード下部には、その確定状態へ変更された時刻を表示します。</Typography>
+                <Typography variant="body2">店舗一覧はカード／テーブルを切り替えられます。テーブルは画面幅に合わせて列幅が変わり、スマートフォンでは一覧枠内だけを横スクロールできます。</Typography>
+              </Stack>
+            </HelpSection>
+            <HelpSection title="対象データ一覧とモック生成">
+              <Stack spacing={0.65}>
+                <Typography variant="body2">データ一覧では、確定時刻、種類、部門、店舗状態の件数、通知・処理設定を確認できます。「適用」で選択したデータへ切り替えます。</Typography>
+                <Typography variant="body2">「モック生成」は、現在の表示条件の開始日を基準に6対象データ×150店舗を作り直します。会社・部門・店舗・状態は表示の絞り込みとして維持されます。</Typography>
+              </Stack>
+            </HelpSection>
+            <Alert severity="info">アプリバーの「テーマ」で標準／パステル／パネル区分／Berry風／Paperbase風／Material 2を切り替えられます。ページ再読み込みはタイトル右の再読み込みボタンから実行できます。モックの操作内容と処理設定は、このページを開いている間だけ保持されます。</Alert>
+          </Stack>
+        </DialogContent>
+        <DialogActions><Button variant="contained" onClick={onClose} autoFocus>閉じる</Button></DialogActions>
+      </Dialog>;
+    }
+    function TargetDataDialog({ open, value, records, processingSettings, onChange, onProcessingSettingsChange, onClose, onApply }) {
+      const progressEntries = Object.entries(SUMMARY_STAGES);
+      const columnTemplate = "minmax(145px, 1.2fr) 72px minmax(92px, 0.8fr) minmax(128px, 1fr) minmax(300px, 2.2fr) 84px";
+      return <Dialog open={open} onClose={onClose} maxWidth="md" fullWidth><DialogTitle>操作対象データを選択</DialogTitle><DialogContent dividers sx={{ px: { xs: 1.25, sm: 2.5 }, py: 1.5 }}><Stack direction="row" alignItems="center" justifyContent="space-between" flexWrap="wrap" useFlexGap spacing={1} sx={{ mb: 1.25 }}><Typography variant="body2" color="text.secondary">操作する対象データを選択します。各カードで処理設定を変更できます。対象データの切替は「適用」で反映し、処理設定は変更時に保存されます。</Typography><Chip label={`${TARGET_DATASETS.length}件`} size="small" variant="outlined" sx={{ flex: "0 0 auto", fontWeight: 700 }} /></Stack><Box aria-hidden="true" sx={{ display: { xs: "none", md: "grid" }, gridTemplateColumns: columnTemplate, gap: 1.25, alignItems: "center", px: 1.25, pb: 0.75, color: "text.secondary" }}>{["データ番号", "時刻", "種類", "部門", "進捗（店舗数）", "操作対象"].map((label) => <Typography key={label} variant="caption" sx={{ fontWeight: 700 }}>{label}</Typography>)}</Box><List disablePadding role="listbox" aria-label="対象データ">{TARGET_DATASETS.map((dataset) => { const selected = value === dataset.id; const setting = processingSettings[dataset.id] || DEFAULT_DATASET_PROCESSING_SETTING; const datasetRecords = records.filter((record) => record.datasetId === dataset.id); const counts = countBySummaryStage(datasetRecords); const total = datasetRecords.length; const progressLabel = total ? datasetProgressLabel(records, dataset.id) : "対象なし"; return <Paper key={dataset.id} component="li" role="option" aria-selected={selected} tabIndex={0} onClick={() => onChange(dataset.id)} onKeyDown={(event) => { if (event.key === "Enter" || event.key === " ") { event.preventDefault(); onChange(dataset.id); } }} variant="outlined" sx={{ display: "grid", gridTemplateColumns: { xs: "minmax(0, 1fr) auto", md: columnTemplate }, gridTemplateAreas: { xs: `'identity selection' 'meta meta' 'progress progress'`, md: `'number time type department progress selection'` }, gap: { xs: 0.75, md: 1.25 }, alignItems: "center", minWidth: 0, borderRadius: 1.5, mb: 0.75, p: 1.25, border: 2, borderColor: selected ? "primary.main" : "divider", bgcolor: selected ? "action.selected" : "background.paper", cursor: "pointer", "&:hover": { borderColor: "primary.main", bgcolor: selected ? "action.selected" : "action.hover" }, "&:focus-visible": { outline: "2px solid", outlineColor: "primary.main", outlineOffset: 2 } }}><Box sx={{ gridArea: { xs: "identity", md: "number" }, display: "flex", alignItems: "baseline", gap: 1, minWidth: 0 }}><Typography variant="body2" sx={{ fontWeight: 800, whiteSpace: "nowrap" }}>{dataset.dataNumber}</Typography><Typography variant="caption" color="text.secondary" sx={{ display: { xs: "block", md: "none" }, whiteSpace: "nowrap" }}>{dataset.scheduledAt.slice(11)}</Typography></Box><Typography variant="body2" sx={{ gridArea: "time", display: { xs: "none", md: "block" }, fontWeight: 700, whiteSpace: "nowrap" }}>{dataset.scheduledAt.slice(11)}</Typography><Box sx={{ gridArea: { xs: "meta", md: "auto" }, display: { xs: "flex", md: "contents" }, alignItems: "center", gap: 1, minWidth: 0 }}><Typography variant="body2" sx={{ gridArea: "type", fontWeight: 700, whiteSpace: "nowrap" }}>{DATA_TYPES[dataset.dataType].label}</Typography><Typography variant="body2" color="text.secondary" title={dataset.sourceDepartment} sx={{ gridArea: "department", minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{dataset.sourceDepartment}</Typography></Box><Box sx={{ gridArea: "progress", minWidth: 0 }}><Stack direction="row" alignItems="center" justifyContent="space-between" spacing={1} sx={{ mb: 0.45 }}><Typography variant="caption" color="text.secondary" sx={{ display: { xs: "block", md: "none" }, fontWeight: 700 }}>進捗</Typography><Typography variant="caption" color={total ? "text.secondary" : "text.disabled"} sx={{ ml: "auto", whiteSpace: "nowrap", fontWeight: 700 }}>{total ? `全${total}店舗` : "対象なし"}</Typography></Stack><Box role="img" aria-label={`進捗：${progressLabel}`} sx={{ display: "flex", width: "100%", height: 7, overflow: "hidden", borderRadius: 999, bgcolor: "action.hover" }}>{progressEntries.map(([key, meta]) => <Box key={key} title={`${meta.label} ${counts[key]}件`} sx={{ display: counts[key] > 0 ? "block" : "none", flexGrow: counts[key], flexBasis: 0, minWidth: counts[key] > 0 ? 3 : 0, bgcolor: meta.color }} />)}</Box><Box sx={{ display: "grid", gridTemplateColumns: { xs: "repeat(2, minmax(0, 1fr))", sm: "repeat(4, minmax(0, 1fr))" }, gap: 0.5, mt: 0.55 }}>{progressEntries.map(([key, meta]) => <Stack key={key} direction="row" alignItems="center" spacing={0.45} sx={{ minWidth: 0 }}><Box sx={{ width: 7, height: 7, borderRadius: "50%", bgcolor: meta.color, flex: "0 0 auto" }} /><Typography variant="caption" title={meta.label} sx={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{meta.label}</Typography><Typography variant="caption" sx={{ ml: "auto !important", fontWeight: 800 }}>{counts[key]}</Typography></Stack>)}</Box></Box><Chip label={selected ? "操作対象" : "対象にする"} color={selected ? "primary" : "default"} variant={selected ? "filled" : "outlined"} size="small" sx={{ gridArea: "selection", width: 88, justifySelf: "end", fontWeight: 700 }} /><Paper variant="outlined" aria-label={`${dataset.dataNumber}の処理設定`} onClick={(event) => event.stopPropagation()} onKeyDown={(event) => event.stopPropagation()} sx={{ gridColumn: "1 / -1", p: 1, mt: 0.25, bgcolor: selected ? "background.paper" : "background.default", cursor: "default" }}><Stack spacing={0.75}><Stack direction="row" alignItems="baseline" justifyContent="space-between" spacing={1}><Typography variant="subtitle2" sx={{ fontWeight: 800 }}>処理設定</Typography><Typography variant="caption" color="text.secondary" sx={{ whiteSpace: "nowrap" }}>本部確定予定 {dataset.scheduledAt}</Typography></Stack><Box component="label" sx={{ display: "flex", alignItems: "flex-start", gap: 0.5, cursor: "pointer" }}><Checkbox checked={setting.autoHqConfirmEnabled} onChange={(event) => onProcessingSettingsChange(dataset.id, { autoHqConfirmEnabled: event.target.checked })} slotProps={{ input: { "aria-label": `${dataset.dataNumber}を予定時刻に自動本部確定して連携対象にする` } }} sx={{ p: 0.25, mt: 0.05 }} /><Box><Typography variant="body2" sx={{ fontWeight: 700 }}>予定時刻に自動本部確定し、連携対象にする</Typography><Typography variant="caption" color="text.secondary">店舗確定済みのデータだけを自動本部確定し、既存の自動連携へ渡します。</Typography></Box></Box><Stack direction={{ xs: "column", sm: "row" }} spacing={1} alignItems={{ sm: "center" }}><Box component="label" sx={{ display: "flex", alignItems: "flex-start", gap: 0.5, flex: 1, cursor: "pointer" }}><Checkbox checked={setting.unconfirmedReminderEnabled} onChange={(event) => onProcessingSettingsChange(dataset.id, { unconfirmedReminderEnabled: event.target.checked })} slotProps={{ input: { "aria-label": `${dataset.dataNumber}の未確定店舗への事前通知を有効にする` } }} sx={{ p: 0.25, mt: 0.05 }} /><Box><Typography variant="body2" sx={{ fontWeight: 700 }}>未確定店舗へ事前通知を有効にする</Typography><Typography variant="caption" color="text.secondary">未確定の店舗だけを通知対象にします。</Typography></Box></Box><TextField label="通知時刻（分前）" type="number" value={setting.reminderLeadMinutes} disabled={!setting.unconfirmedReminderEnabled} onChange={(event) => onProcessingSettingsChange(dataset.id, { reminderLeadMinutes: Number(event.target.value || 0) })} slotProps={{ htmlInput: { min: 0, max: 240, step: 1 } }} sx={{ width: { xs: "100%", sm: 170 } }} helperText="既定 10分前" /></Stack></Stack></Paper></Paper>; })}</List></DialogContent><DialogActions><Button onClick={onClose}>キャンセル</Button><Button variant="contained" onClick={onApply}>適用</Button></DialogActions></Dialog>;
+    }
+    function TargetDataTableDialog({ open, value, records, processingSettings, onChange, onProcessingSettingsChange, onClose, onApply }) {
+      const progressEntries = Object.entries(SUMMARY_STAGES);
+      return <Dialog open={open} onClose={onClose} maxWidth="xl" fullWidth><DialogTitle>操作対象データを選択</DialogTitle><DialogContent dividers sx={{ px: { xs: 1, sm: 2 }, py: 1.25 }}><Stack direction={{ xs: "column", sm: "row" }} alignItems={{ sm: "center" }} justifyContent="space-between" spacing={0.75} sx={{ mb: 1 }}><Typography variant="body2" color="text.secondary">操作する対象データを選択し、データ別の処理設定を変更します。対象データの切替は「適用」で反映し、設定はこのページを開いている間だけ反映されます。</Typography><Chip label={`${TARGET_DATASETS.length}件`} size="small" variant="outlined" sx={{ flex: "0 0 auto", fontWeight: 700 }} /></Stack><TableContainer component={Paper} variant="outlined" sx={{ overflowX: "auto", maxHeight: "min(60vh, 520px)" }}><Table size="small" stickyHeader aria-label="操作対象データと処理設定" sx={{ minWidth: 1080 }}><TableHead><TableRow><TableCell sx={{ minWidth: 150, fontWeight: 800 }}>データ番号</TableCell><TableCell sx={{ minWidth: 88, fontWeight: 800 }}>予定時刻</TableCell><TableCell sx={{ minWidth: 72, fontWeight: 800 }}>種類</TableCell><TableCell sx={{ minWidth: 100, fontWeight: 800 }}>部門</TableCell><TableCell sx={{ minWidth: 130, fontWeight: 800 }}>進捗</TableCell><TableCell align="center" sx={{ minWidth: 112, fontWeight: 800 }}>自動確定・連携</TableCell><TableCell align="center" sx={{ minWidth: 96, fontWeight: 800 }}>未確定通知</TableCell><TableCell align="center" sx={{ minWidth: 108, fontWeight: 800 }}>通知（分前）</TableCell><TableCell align="center" sx={{ minWidth: 96, fontWeight: 800 }}>操作対象</TableCell></TableRow></TableHead><TableBody>{TARGET_DATASETS.map((dataset) => { const selected = value === dataset.id; const setting = processingSettings[dataset.id] || DEFAULT_DATASET_PROCESSING_SETTING; const datasetRecords = records.filter((record) => record.datasetId === dataset.id); const counts = countBySummaryStage(datasetRecords); const total = datasetRecords.length; const progressLabel = total ? datasetProgressLabel(records, dataset.id) : "対象なし"; return <TableRow key={dataset.id} hover aria-selected={selected} onClick={() => onChange(dataset.id)} sx={{ cursor: "pointer", bgcolor: selected ? "action.selected" : "background.paper", "&:hover": { bgcolor: selected ? "action.selected" : "action.hover" } }}><TableCell sx={{ py: 0.75, fontWeight: 800, whiteSpace: "nowrap" }}>{dataset.dataNumber}</TableCell><TableCell sx={{ py: 0.75, whiteSpace: "nowrap" }}>{dataset.scheduledAt}</TableCell><TableCell sx={{ py: 0.75, whiteSpace: "nowrap" }}>{DATA_TYPES[dataset.dataType].label}</TableCell><TableCell sx={{ py: 0.75, whiteSpace: "nowrap" }}>{dataset.sourceDepartment}</TableCell><TableCell sx={{ py: 0.75 }}><Stack spacing={0.4}><Box role="img" aria-label={`進捗：${progressLabel}`} sx={{ display: "flex", width: "100%", height: 6, overflow: "hidden", borderRadius: 999, bgcolor: "action.hover" }}>{progressEntries.map(([key, meta]) => <Box key={key} sx={{ display: counts[key] > 0 ? "block" : "none", flexGrow: counts[key], flexBasis: 0, minWidth: counts[key] > 0 ? 3 : 0, bgcolor: meta.color }} />)}</Box><Typography variant="caption" color="text.secondary">{total ? `${progressLabel} / ${total}店舗` : "対象なし"}</Typography></Stack></TableCell><TableCell align="center" sx={{ py: 0.5 }}><Checkbox checked={setting.autoHqConfirmEnabled} onClick={(event) => event.stopPropagation()} onChange={(event) => onProcessingSettingsChange(dataset.id, { autoHqConfirmEnabled: event.target.checked })} slotProps={{ input: { "aria-label": `${dataset.dataNumber}を予定時刻に自動本部確定して連携対象にする` } }} /></TableCell><TableCell align="center" sx={{ py: 0.5 }}><Checkbox checked={setting.unconfirmedReminderEnabled} onClick={(event) => event.stopPropagation()} onChange={(event) => onProcessingSettingsChange(dataset.id, { unconfirmedReminderEnabled: event.target.checked })} slotProps={{ input: { "aria-label": `${dataset.dataNumber}の未確定店舗への事前通知を有効にする` } }} /></TableCell><TableCell align="center" sx={{ py: 0.5 }}><TextField aria-label={`${dataset.dataNumber}の通知時刻（分前）`} type="number" value={setting.reminderLeadMinutes} disabled={!setting.unconfirmedReminderEnabled} onClick={(event) => event.stopPropagation()} onChange={(event) => onProcessingSettingsChange(dataset.id, { reminderLeadMinutes: Number(event.target.value || 0) })} slotProps={{ htmlInput: { min: 0, max: 240, step: 1 } }} sx={{ width: 88 }} /></TableCell><TableCell align="center" sx={{ py: 0.5 }}><Button variant={selected ? "contained" : "outlined"} onClick={(event) => { event.stopPropagation(); onChange(dataset.id); }} aria-pressed={selected} sx={{ minWidth: 80 }}>{selected ? "操作対象" : "選択"}</Button></TableCell></TableRow>; })}</TableBody></Table></TableContainer><Typography variant="caption" color="text.secondary" sx={{ display: "block", mt: 0.75 }}>自動確定は店舗確定済みデータだけを対象にします。未確定通知は閲覧可能な未確定店舗を対象とし、通知時刻の既定値は10分前です。</Typography></DialogContent><DialogActions><Button onClick={onClose}>キャンセル</Button><Button variant="contained" onClick={onApply}>適用</Button></DialogActions></Dialog>;
+    }
+    function TargetDataSettingsDialog({ open, value, records, processingSettings, onChange, onProcessingSettingsChange, onClose, onApply }) {
+      const metrics = TARGET_DATASETS.reduce((total, dataset) => { const datasetRecords = records.filter((record) => record.datasetId === dataset.id); const hqConfirmed = datasetRecords.length > 0 && datasetRecords.every((record) => record.confirmationStatus === "hqConfirmed"); return { datasets: total.datasets + 1, hqConfirmedDatasets: total.hqConfirmedDatasets + (hqConfirmed ? 1 : 0) }; }, { datasets: 0, hqConfirmedDatasets: 0 });
+      const [sortConfig, setSortConfig] = useState({ key: "dataNumber", direction: "asc" });
+      const [columnWidths, setColumnWidths] = useState({ target: 88, dataNumber: 110, scheduledAt: 196, dataType: 90, department: 120, draft: 72, storeConfirmed: 90, hqConfirmed: 90, hqConfirmedFromDraft: 160, integration: 80, reminderEnabled: 100, reminderLeadMinutes: 100, processingEnabled: 88 });
+      const resizeState = useRef(null);
+      const tableColumns = [
+        { key: "target", label: "操作対象", align: "center", minWidth: 88 },
+        { key: "dataNumber", label: "データ番号", minWidth: 110 },
+        { key: "scheduledAt", label: "確定時刻", minWidth: 196 },
+        { key: "dataType", label: "データ種類", minWidth: 90 },
+        { key: "department", label: "部門", minWidth: 120 },
+        { key: "draft", label: "未確定", align: "center", minWidth: 72 },
+        { key: "storeConfirmed", label: "店舗確定", align: "center", minWidth: 90 },
+        { key: "hqConfirmed", label: "本部確定", align: "center", minWidth: 90 },
+        { key: "hqConfirmedFromDraft", label: "店舗未確定→本部確定", align: "center", minWidth: 160 },
+        { key: "integration", label: "連動済", align: "center", minWidth: 80 },
+        { key: "reminderEnabled", label: "未確定通知", align: "center", minWidth: 100 },
+        { key: "reminderLeadMinutes", label: "通知（分前）", align: "center", minWidth: 100 },
+        { key: "processingEnabled", label: "自動処理", align: "center", minWidth: 88 },
+      ];
+      const tableRows = useMemo(() => TARGET_DATASETS.map((dataset) => { const setting = processingSettings[dataset.id] || DEFAULT_DATASET_PROCESSING_SETTING; const item = getDatasetMetrics(records, dataset.id); const integrationSucceededCount = item.creationCounts.succeeded || 0; const effectiveScheduledAt = getEffectiveScheduledAt(dataset, setting); const isProcessingEnabled = setting.processingEnabled; return { dataset, setting, item, integrationSucceededCount, effectiveScheduledAt, isProcessingEnabled, sortValues: { target: dataset.id === value, dataNumber: dataNumberShort(dataset), scheduledAt: effectiveScheduledAt, dataType: DATA_TYPES[dataset.dataType].label, department: dataset.sourceDepartment, draft: item.confirmationCounts.draft, storeConfirmed: item.confirmationCounts.storeConfirmed, hqConfirmed: item.confirmationCounts.hqConfirmed, hqConfirmedFromDraft: item.hqConfirmedFromDraft, integration: integrationSucceededCount, reminderEnabled: setting.unconfirmedReminderEnabled, reminderLeadMinutes: setting.reminderLeadMinutes, processingEnabled: isProcessingEnabled } }; }).sort((left, right) => { const a = left.sortValues[sortConfig.key]; const b = right.sortValues[sortConfig.key]; const comparison = typeof a === "number" && typeof b === "number" ? a - b : typeof a === "boolean" && typeof b === "boolean" ? Number(a) - Number(b) : String(a).localeCompare(String(b), "ja"); return sortConfig.direction === "asc" ? comparison : -comparison; }), [processingSettings, records, sortConfig, value]);
+      const requestSort = (key) => setSortConfig((current) => current.key === key ? { key, direction: current.direction === "asc" ? "desc" : "asc" } : { key, direction: "asc" });
+      const startResize = (event, column) => { event.preventDefault(); event.stopPropagation(); resizeState.current = { key: column.key, startX: event.clientX, startWidth: columnWidths[column.key] || column.minWidth, minWidth: column.minWidth }; };
+      useEffect(() => { const handlePointerMove = (event) => { if (!resizeState.current) return; const { key, minWidth, startWidth, startX } = resizeState.current; setColumnWidths((current) => ({ ...current, [key]: Math.max(minWidth, startWidth + event.clientX - startX) })); }; const handlePointerUp = () => { resizeState.current = null; }; window.addEventListener("pointermove", handlePointerMove); window.addEventListener("pointerup", handlePointerUp); return () => { window.removeEventListener("pointermove", handlePointerMove); window.removeEventListener("pointerup", handlePointerUp); }; }, []);
+      const tableMinWidth = tableColumns.reduce((total, column) => total + (columnWidths[column.key] || column.minWidth), 0);
+      return <Dialog open={open} onClose={onClose} maxWidth="xl" fullWidth><DialogTitle>データ一覧</DialogTitle><DialogContent dividers sx={{ px: { xs: 1, sm: 2 }, py: 1.25 }}><Typography variant="body2" color="text.secondary" sx={{ mb: 1 }}>操作する対象データを選択し、各データの処理設定を変更します。対象データの切替は「適用」で反映し、設定はこのページを開いている間だけ反映されます。</Typography><Paper variant="outlined" sx={{ display: "flex", flexWrap: "wrap", gap: 0.75, p: 1, mb: 1 }}><Chip label={`データ件数 ${metrics.datasets}件`} size="small" /><Chip label={`本部確定済 ${metrics.hqConfirmedDatasets}/${metrics.datasets}件`} size="small" color="primary" variant="outlined" /></Paper><Typography variant="caption" color="text.secondary" sx={{ display: "block", mb: 0.75 }}>列見出しを選択して並び替え、見出し右端をドラッグして列幅を変更できます。</Typography><TableContainer component={Paper} variant="outlined" tabIndex={0} sx={{ width: "100%", maxWidth: "100%", minWidth: 0, overflowX: "auto", WebkitOverflowScrolling: "touch", maxHeight: "min(60vh, 520px)" }}><Table size="small" stickyHeader aria-label="操作対象データと処理設定" sx={{ tableLayout: "fixed", width: "max-content", minWidth: tableMinWidth }}><colgroup>{tableColumns.map((column) => <col key={column.key} style={{ width: columnWidths[column.key] || column.minWidth }} />)}</colgroup><TableHead><TableRow>{tableColumns.map((column) => <TableCell key={column.key} align="center" sortDirection={sortConfig.key === column.key ? sortConfig.direction : false} sx={{ position: "relative", fontWeight: 800, whiteSpace: "nowrap", pr: 1.5 }}><TableSortLabel sx={{ width: "100%", justifyContent: "center" }} active={sortConfig.key === column.key} direction={sortConfig.key === column.key ? sortConfig.direction : "asc"} onClick={() => requestSort(column.key)}>{column.label}</TableSortLabel><Box role="separator" aria-label={`${column.label}の列幅をドラッグして調整`} aria-orientation="vertical" onPointerDown={(event) => startResize(event, column)} sx={{ position: "absolute", top: 0, right: -4, zIndex: 2, width: 9, height: "100%", cursor: "col-resize", touchAction: "none", "&:hover::after": { content: '\"\"', position: "absolute", top: 5, bottom: 5, left: 4, borderLeft: 2, borderColor: "primary.main" } }} /></TableCell>)}</TableRow></TableHead><TableBody>{tableRows.map(({ dataset, setting, item, integrationSucceededCount, effectiveScheduledAt, isProcessingEnabled }) => { const selected = value === dataset.id; const stop = (event) => event.stopPropagation(); return <TableRow key={dataset.id} hover aria-selected={selected} onClick={() => onChange(dataset.id)} sx={{ cursor: "pointer", bgcolor: selected ? "action.selected" : "background.paper", "&:hover": { bgcolor: selected ? "action.selected" : "action.hover" } }}><TableCell align="center" onClick={stop}><Button variant={selected ? "contained" : "outlined"} onClick={() => onChange(dataset.id)} aria-pressed={selected} sx={{ minWidth: 80 }}>{selected ? "操作対象" : "選択"}</Button></TableCell><TableCell sx={{ fontWeight: 800, whiteSpace: "nowrap" }}>No.{dataNumberShort(dataset)}</TableCell><TableCell sx={{ whiteSpace: "nowrap" }} onClick={stop}><Stack direction="row" alignItems="center" spacing={0.5}><TextField aria-label={`No.${dataNumberShort(dataset)}の確定時刻`} type="time" value={effectiveScheduledAt.slice(11)} disabled={!isProcessingEnabled} onChange={(event) => onProcessingSettingsChange(dataset.id, { scheduledTime: SCHEDULED_TIME_PATTERN.test(event.target.value) ? event.target.value : null })} slotProps={{ htmlInput: { step: 60 } }} sx={{ width: 112 }} /><Button disabled={!isProcessingEnabled || !setting.scheduledTime} onClick={() => onProcessingSettingsChange(dataset.id, { scheduledTime: null })}>初期</Button></Stack></TableCell><TableCell sx={{ whiteSpace: "nowrap" }}><Typography variant="body2" noWrap>{DATA_TYPES[dataset.dataType].label}</Typography></TableCell><TableCell sx={{ whiteSpace: "nowrap" }}><Typography variant="body2" noWrap>{dataset.sourceDepartment}</Typography></TableCell><TableCell align="center" sx={{ whiteSpace: "nowrap", fontWeight: 700 }}>{item.confirmationCounts.draft}</TableCell><TableCell align="center" sx={{ whiteSpace: "nowrap", fontWeight: 700 }}>{item.confirmationCounts.storeConfirmed}</TableCell><TableCell align="center" sx={{ whiteSpace: "nowrap", fontWeight: 700 }}>{item.confirmationCounts.hqConfirmed}</TableCell><TableCell align="center" sx={{ whiteSpace: "nowrap", fontWeight: 700 }}>{item.hqConfirmedFromDraft}</TableCell><TableCell align="center" sx={{ whiteSpace: "nowrap", fontWeight: 700 }}>{integrationSucceededCount || ""}</TableCell><TableCell align="center" onClick={stop}><Checkbox checked={setting.unconfirmedReminderEnabled} disabled={!isProcessingEnabled} onChange={(event) => onProcessingSettingsChange(dataset.id, { unconfirmedReminderEnabled: event.target.checked })} slotProps={{ input: { "aria-label": `No.${dataNumberShort(dataset)}の未確定通知を有効にする` } }} /></TableCell><TableCell align="center" onClick={stop}><TextField aria-label={`No.${dataNumberShort(dataset)}の通知分前`} type="number" value={setting.reminderLeadMinutes} disabled={!isProcessingEnabled || !setting.unconfirmedReminderEnabled} onChange={(event) => onProcessingSettingsChange(dataset.id, { reminderLeadMinutes: Number(event.target.value || 0) })} slotProps={{ htmlInput: { min: 0, max: 240, step: 1 } }} sx={{ width: 80 }} /></TableCell><TableCell align="center" onClick={stop}><Switch checked={isProcessingEnabled} onChange={(event) => onProcessingSettingsChange(dataset.id, { processingEnabled: event.target.checked })} slotProps={{ input: { "aria-label": `No.${dataNumberShort(dataset)}の処理を有効にする` } }} /></TableCell></TableRow>; })}</TableBody></Table></TableContainer><Typography variant="caption" color="text.secondary" sx={{ display: "block", mt: 0.75 }}>処理を無効にすると、確定時刻での自動確定・連携と未確定通知を停止します。すでに連携中または連携済みのデータは巻き戻しません。</Typography></DialogContent><DialogActions><Button onClick={onClose}>キャンセル</Button><Button variant="contained" onClick={onApply}>適用</Button></DialogActions></Dialog>;
+    }
+    function SummaryPanel({ counts, total, activeStatus, onChange }) {
+      const items = [{ key: "all", label: "全て", value: total, color: "primary.main" }, ...Object.entries(SUMMARY_STAGES).map(([key, meta]) => ({ key, label: meta.label, value: counts[key], color: meta.color }))];
+      return <Paper component="section" aria-label="進捗状況" variant="outlined"><PanelContent><PanelGrid sx={{ width: "100%", justifyItems: "stretch", gridTemplateColumns: { xs: "minmax(0, 1fr)", sm: "repeat(2, minmax(0, 1fr))", md: "repeat(5, minmax(0, 1fr))" } }}>{items.map((item) => { const active = activeStatus === item.key; return <Button key={item.key} variant="outlined" aria-pressed={active} aria-label={`${item.label} ${item.value} / ${total}店舗で絞り込む`} onClick={() => onChange(item.key)} sx={{ width: "100%", minWidth: 0, minHeight: 44, display: "grid", gridTemplateColumns: "5px minmax(0, 1fr) auto", alignItems: "center", gap: 1, px: 1, py: 0.5, borderWidth: active ? 2 : 1, borderColor: active ? "primary.main" : "divider", bgcolor: active ? "action.selected" : "background.paper", color: "text.primary", "&:hover": { borderColor: "primary.main", bgcolor: active ? "action.selected" : "action.hover" } }}><Box sx={{ width: 5, height: "100%", minHeight: 28, borderRadius: 999, bgcolor: item.color }} /><Typography variant="body2" noWrap sx={{ minWidth: 0, textAlign: "left", fontWeight: 700 }}>{item.label}</Typography><Box sx={{ display: "flex", alignItems: "baseline", gap: 0.35, whiteSpace: "nowrap" }}><Typography component="span" sx={{ fontSize: "1.05rem", lineHeight: 1.1, fontWeight: 800 }}>{item.value} / {total}</Typography><Typography component="span" variant="caption" color="text.secondary">店舗</Typography></Box></Button>; })}</PanelGrid></PanelContent></Paper>;
+    }
+    function StoreCard({ record, checked, onToggle, profile }) { const required = isResponseRequired(profile, record); const confirmation = getCardConfirmationMeta(record); const latest = getCardLatestStatusMeta(record); return <Paper component="article" variant="outlined" sx={{ display: "flex", flexDirection: "column", height: "100%", minWidth: 0, overflow: "hidden", borderColor: checked ? "primary.main" : required ? "var(--attention-border)" : "divider", bgcolor: required ? "var(--attention-bg)" : checked ? "action.selected" : "background.paper" }}><Box sx={{ px: { xs: 1, sm: 0.9 }, py: { xs: 0.85, sm: 0.7 }, flex: 1 }}><Stack spacing={0.5}><Stack direction="row" spacing={0.5} alignItems="flex-start"><Checkbox checked={checked} onChange={onToggle} slotProps={{ input: { "aria-label": `${storeLabel(record)}を選択` } }} sx={{ p: 0.5, mt: -0.1, ml: -0.35 }} /><Tooltip title={storeLabel(record)} arrow><Typography component="h3" variant="subtitle2" sx={{ minWidth: 0, flex: 1, fontWeight: 800, lineHeight: 1.45 }} noWrap>{compactCardStoreLabel(record)}</Typography></Tooltip></Stack><Box sx={{ minWidth: 0, pt: 0.5, borderTop: 1, borderColor: "divider" }}><Typography variant="body2" sx={{ color: confirmation.color, fontWeight: 700 }} noWrap>{confirmation.label}</Typography></Box>{required && <Alert severity="warning" icon={false} sx={{ py: 0.2, px: 0.65, "& .MuiAlert-message": { py: 0 } }}>要対応：{ACTION_DEFINITIONS[profile.attentionAction].label(profile)}</Alert>}</Stack></Box><Box component="footer" title={`${latest.label} ${latest.at}`} aria-label={`最新状態 ${latest.label} ${latest.at}`} sx={{ mt: "auto", px: 1, py: 0.25, display: "flex", alignItems: "center", justifyContent: "space-between", gap: 0.75, borderTop: 1, borderColor: "divider", bgcolor: "#fff" }}><Typography variant="caption" sx={{ minWidth: 0, color: latest.color, fontWeight: 700 }} noWrap>{latest.label}</Typography><Typography variant="caption" color="text.secondary" sx={{ flexShrink: 0, fontWeight: 700, textAlign: "right" }} noWrap>{timeLabel(latest.at)}</Typography></Box></Paper>; }
+    function StoreTable({ records, selectedIds, onToggle, profile }) {
+      const selectedCount = records.filter((record) => selectedIds.includes(record.submissionId)).length;
+      const allSelected = records.length > 0 && selectedCount === records.length;
+      const someSelected = selectedCount > 0 && !allSelected;
+      const columns = [
+        { key: "target", label: "操作対象", width: 56, align: "center" },
+        { key: "store", label: "店番-店名", width: 220 },
+        { key: "confirmation", label: "確定状態", width: 120 },
+        { key: "origin", label: "本部確定元", width: 120 },
+        { key: "integration", label: "連携状況", width: 110 },
+        { key: "changedAt", label: "状態日時", width: 160 },
+        { key: "required", label: "対応", width: 220 },
+      ];
+      return <Box sx={{ width: "100%", maxWidth: "100%", minWidth: 0 }}>
+        <Typography variant="caption" color="text.secondary" sx={{ display: "block", mb: 0.75 }}>列内は1行で表示します。狭い画面では一覧エリア内を横スクロールできます。</Typography>
+        <TableContainer component={Paper} variant="outlined" tabIndex={0} sx={{ width: "100%", maxWidth: "100%", minWidth: 0, overflowX: "auto", overscrollBehaviorX: "contain", WebkitOverflowScrolling: "touch", maxHeight: "min(68vh, 720px)" }}>
+          <Table size="small" stickyHeader aria-label="店舗データ一覧" sx={{ tableLayout: "fixed", width: "100%", minWidth: 1006 }}>
+            <colgroup>{columns.map((column) => <col key={column.key} style={{ width: column.width }} />)}</colgroup>
+            <TableHead><TableRow>{columns.map((column) => <TableCell key={column.key} align={column.align || "left"} title={column.label} sx={{ fontWeight: 800, whiteSpace: "nowrap" }}>{column.key === "target" ? <Checkbox checked={allSelected} indeterminate={someSelected} disabled={!records.length} onChange={() => onToggle(records.map((record) => record.submissionId))} slotProps={{ input: { "aria-label": "表示中の店舗をすべて選択" } }} sx={{ p: 0.5 }} /> : column.label}</TableCell>)}</TableRow></TableHead>
+            <TableBody>{records.map((record) => {
+              const checked = selectedIds.includes(record.submissionId);
+              const required = isResponseRequired(profile, record);
+              const confirmationOrigin = record.confirmationStatus === "hqConfirmed" ? record.hqConfirmedFromStatus === "draft" ? "未確定" : record.hqConfirmedFromStatus === "storeConfirmed" ? "店舗確定" : "—" : "—";
+              const requiredLabel = required ? `要対応：${ACTION_DEFINITIONS[profile.attentionAction].label(profile)}` : "—";
+              return <TableRow key={record.submissionId} hover aria-selected={checked} sx={{ bgcolor: required ? "var(--attention-bg)" : checked ? "action.selected" : "background.paper", "&:hover": { bgcolor: required ? "var(--attention-hover)" : checked ? "action.selected" : "action.hover" } }}>
+                <TableCell align="center"><Checkbox checked={checked} onChange={() => onToggle(record.submissionId)} slotProps={{ input: { "aria-label": `${storeLabel(record)}を選択` } }} sx={{ p: 0.5 }} /></TableCell>
+                <TableCell title={storeLabel(record)} sx={{ fontWeight: 800 }}>{storeLabel(record)}</TableCell>
+                <TableCell><StatusLabel status={record.confirmationStatus} /></TableCell>
+                <TableCell title={confirmationOrigin} sx={{ color: "text.secondary" }}>{confirmationOrigin}</TableCell>
+                <TableCell><IntegrationLabel record={record} /></TableCell>
+                <TableCell title={record.confirmationStatusChangedAt} sx={{ color: "text.secondary" }}>{record.confirmationStatusChangedAt}</TableCell>
+                <TableCell title={requiredLabel} sx={{ color: required ? "warning.dark" : "text.disabled", fontWeight: required ? 700 : 400 }}>{requiredLabel}</TableCell>
+              </TableRow>;
+            })}</TableBody>
+          </Table>
+        </TableContainer>
+      </Box>;
+    }
+    function ConfirmDialog({ action, records, profile, dataset, onClose, onConfirm }) { if (!action || !dataset) return null; const definition = ACTION_DEFINITIONS[action.type]; const visibleRecords = records.slice(0, 8); return <Dialog open onClose={onClose} maxWidth="sm" fullWidth><DialogTitle>{definition.title}</DialogTitle><DialogContent><Stack spacing={1.5}><Typography color="text.secondary">{definition.body}</Typography><Paper variant="outlined" sx={{ p: 1.25 }}><Typography variant="body2" sx={{ mb: 1, fontWeight: 700 }}>対象データ</Typography><DatasetMetadata dataset={dataset} /></Paper><Paper variant="outlined" sx={{ p: 1.25 }}><Typography variant="body2" sx={{ fontWeight: 700, mb: 0.75 }}>{action.type === "hqConfirm" ? `操作対象データ全${action.totalStoreCount}店舗のうち、本部確定・連携を開始する ${records.length}店舗` : action.type === "hqConfirmSelected" ? `選択した ${records.length}店舗だけを本部確定・連携する` : `対象 ${records.length}店舗`}</Typography>{action.type === "hqConfirm" ? <Typography variant="caption" color="text.secondary" sx={{ display: "block", mb: 0.75 }}>未確定・店舗確定を問わず、各店舗の現時点データを本部確定します。すでに本部確定済みの店舗は変更しません。</Typography> : action.type === "hqConfirmSelected" ? <Typography variant="caption" color="text.secondary" sx={{ display: "block", mb: 0.75 }}>選択した店舗だけを本部確定します。未選択の店舗と、すでに本部確定済みの店舗は変更しません。</Typography> : null}<Stack spacing={0.6}>{visibleRecords.map((record) => <Stack key={record.submissionId} direction="row" justifyContent="space-between" spacing={1}><Typography variant="body2" noWrap>{storeLabel(record)}</Typography><StatusLabel status={record.confirmationStatus} /></Stack>)}{records.length > visibleRecords.length && <Typography variant="caption" color="text.secondary">ほか {records.length - visibleRecords.length}店舗</Typography>}</Stack></Paper>{records.length === 1 && <Box sx={{ display: "grid", gridTemplateColumns: "repeat(2, minmax(0, 1fr))", gap: 1 }}>{DATA_TYPES[dataset.dataType].fields.map((item) => <Box key={item.key}><Typography variant="caption" color="text.secondary">{item.label}</Typography><Typography variant="body2" sx={{ fontWeight: 700 }}>{formatNumber(records[0].payload[item.key])} {item.unit}</Typography></Box>)}</Box>}<Typography variant="caption" color="text.secondary">操作者：{profile.userName} / 所属：{profile.orgName}</Typography></Stack></DialogContent><DialogActions><Button onClick={onClose}>キャンセル</Button><Button variant="contained" onClick={onConfirm}>{definition.label(profile)}</Button></DialogActions></Dialog>; }
+
+    function ActionBar({ dataset, scheduledAt, profile, visibleRecords, selectedRecords, selectedIds, actions, hqConfirmationCount = 0, hqConfirmationTotal = 0, onToggleVisible, onRequestAction, onRequestHqConfirmation, disabled }) {
+      const visibleIds = visibleRecords.map((record) => record.submissionId); const selectedVisible = visibleIds.filter((id) => selectedIds.includes(id)).length; const allSelected = visibleIds.length > 0 && selectedVisible === visibleIds.length; const someSelected = selectedVisible > 0 && !allSelected; const remaining = getRemainingTimeMeta(scheduledAt || dataset?.scheduledAt);
+      return <Box sx={{ display: "flex", alignItems: "center", flexWrap: "wrap", columnGap: 0.25, rowGap: 0.75, minWidth: 0 }}><Box component="span" sx={{ display: "inline-flex", alignItems: "center", verticalAlign: "middle", mr: 1, mb: 0.75, minHeight: 36, lineHeight: 1.43 }}><Checkbox checked={allSelected} indeterminate={someSelected} disabled={disabled || !visibleRecords.length} onChange={onToggleVisible} slotProps={{ input: { "aria-label": "表示中の店舗を全選択" } }} sx={{ p: 0.75 }} /><Typography variant="body2" color="text.secondary" sx={{ whiteSpace: "nowrap" }}>選択 {selectedRecords.length}件</Typography></Box><Box component="span" sx={{ display: "inline-flex", alignItems: "center", verticalAlign: "middle", gap: 0.5, mr: 1, mb: 0.75, minHeight: 36, px: 0.75, lineHeight: 1.43 }}><Typography variant="body2" sx={{ color: remaining.color, fontWeight: 700, whiteSpace: "nowrap" }}>{remaining.label}</Typography><Typography variant="caption" color="text.secondary" sx={{ whiteSpace: "nowrap" }}>{remaining.deadline}まで</Typography></Box>{onRequestHqConfirmation && <Box component="span" sx={{ display: "inline-block", mr: 0.75, mb: 0.75 }}><Button variant="contained" disabled={disabled || !hqConfirmationCount} onClick={onRequestHqConfirmation} sx={{ minWidth: 112, whiteSpace: "nowrap" }}>本部一括確定（{hqConfirmationCount}/{hqConfirmationTotal}店舗）</Button></Box>}{actions.map((actionType, index) => { const definition = ACTION_DEFINITIONS[actionType]; const eligibleCount = selectedRecords.filter((record) => canExecute(actionType, profile, record)).length; return <Box key={actionType} component="span" sx={{ display: "inline-block", flex: "0 0 auto", verticalAlign: "middle", width: "auto", maxWidth: "100%", mr: 0.75, mb: 0.75 }}><Button variant={index === 0 ? "contained" : "outlined"} disabled={!(!disabled && selectedRecords.length > 0 && eligibleCount === selectedRecords.length)} onClick={() => onRequestAction(actionType)} sx={{ display: "inline-flex", flex: "0 0 auto", flexShrink: 0, width: "auto", minWidth: 112, maxWidth: "100%", whiteSpace: "nowrap", wordBreak: "keep-all", overflowWrap: "normal", writingMode: "horizontal-tb", overflow: "hidden", textOverflow: "ellipsis", lineHeight: 1.35, py: 0.75 }}><Box component="span" sx={{ display: "block", minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", wordBreak: "keep-all", overflowWrap: "normal", writingMode: "horizontal-tb" }}>{definition.label(profile)}{selectedRecords.length ? `(${eligibleCount})` : ""}</Box></Button></Box>; })}</Box>;
+    }
+
+    const THEME_PRESETS = {
+      pastel: {
+        label: "パステル", primary: "#5b72c9", page: "#f7f8fc", paper: "#ffffff", text: "#243447", secondaryText: "#5f6b7a", divider: "#ced6df", tableHeader: "#eaf2f8", tableGrid: "#cbd4de", hover: "#f1f6fa", selected: "#eaf0ff", listArea: "#f3f6fa", attention: "#fff4cc", attentionHover: "#ffedb0", attentionBorder: "#dfc565",
+        status: { draft: "#59636e", store: "#9a4500", hq: "#2457c5", integration: "#187a43", processing: "#9a5b13", failed: "#b42318", before: "#8993a1" },
+      },
+      panelZones: {
+        label: "パネル区分", primary: "#5b72c9", page: "#f2f4f7", paper: "#ffffff", text: "#243447", secondaryText: "#5f6b7a", divider: "#c8d1dc", tableHeader: "#eaf2f8", tableGrid: "#c5cfda", hover: "#eef4f8", selected: "#e8efff", listArea: "#f5f7fa", attention: "#fff4cc", attentionHover: "#ffedb0", attentionBorder: "#dfc565",
+        status: { draft: "#59636e", store: "#9a4500", hq: "#2457c5", integration: "#187a43", processing: "#9a5b13", failed: "#b42318", before: "#8993a1" },
+        panels: { accentWidth: "3px", filterBg: "#f4f7fa", filterAccent: "#7890a6", targetBg: "#f1f5fc", targetAccent: "#6f8fd5", summaryBg: "#f1f8f4", summaryAccent: "#6fa68a", storeHeader: "#eaf2f8", storeAccent: "#607d98" },
+      },
+      berry: {
+        label: "Berry風", primary: "#673ab7", page: "#eef2f6", paper: "#ffffff", text: "#121926", secondaryText: "#697586", divider: "#e3e8ef", tableHeader: "#f3f0fa", tableGrid: "#dce2ea", hover: "#f7f5fb", selected: "#ede7f6", listArea: "#f5f7fa", attention: "#fff8e1", attentionHover: "#ffefc1", attentionBorder: "#e1bd57",
+        status: { draft: "#697586", store: "#a34700", hq: "#3366cc", integration: "#2e7d5b", processing: "#a85d00", failed: "#c62828", before: "#9aa4b2" },
+        radius: 12, buttonRadius: 8,
+        panels: { accentWidth: "0px", filterBg: "#ffffff", filterAccent: "transparent", targetBg: "#ffffff", targetAccent: "transparent", summaryBg: "#ffffff", summaryAccent: "transparent", storeHeader: "#f3f0fa", storeAccent: "transparent", shadow: "0 2px 12px rgba(103, 58, 183, 0.08)" },
+      },
+      paperbase: {
+        label: "Paperbase風", primary: "#009be5", page: "#f3f6f9", paper: "#ffffff", text: "#263238", secondaryText: "#607d8b", divider: "#d8e1e8", tableHeader: "#e8f3f9", tableGrid: "#cbd8e1", hover: "#eef7fc", selected: "#d9effa", listArea: "#edf2f6", attention: "#fff8df", attentionHover: "#ffefbd", attentionBorder: "#d9b94b",
+        appBar: "#18202c", appBarText: "#ffffff", radius: 8, buttonRadius: 4,
+        status: { draft: "#607d8b", store: "#bf360c", hq: "#0277bd", integration: "#2e7d32", processing: "#a65d00", failed: "#c62828", before: "#90a4ae" },
+        panels: { accentWidth: "0px", filterBg: "#ffffff", filterAccent: "transparent", targetBg: "#ffffff", targetAccent: "transparent", summaryBg: "#ffffff", summaryAccent: "transparent", storeHeader: "#e8f3f9", storeAccent: "transparent", shadow: "0 1px 4px rgba(24, 32, 44, 0.12)" },
+      },
+      material2: {
+        label: "Material 2", primary: "#3f51b5", secondary: "#ff4081", page: "#fafafa", paper: "#ffffff", text: "#212121", secondaryText: "#616161", divider: "#d6d6d6", tableHeader: "#e8eaf6", tableGrid: "#c5cae9", hover: "#f5f5f5", selected: "#e8eaf6", listArea: "#f5f5f5", attention: "#fff8e1", attentionHover: "#ffecb3", attentionBorder: "#f9a825",
+        appBar: "#303f9f", appBarText: "#ffffff", radius: 4, buttonRadius: 4,
+        status: { draft: "#616161", store: "#bf360c", hq: "#1565c0", integration: "#2e7d32", processing: "#e65100", failed: "#c62828", before: "#607d8b" },
+        panels: { accentWidth: "0px", filterBg: "#ffffff", filterAccent: "transparent", targetBg: "#ffffff", targetAccent: "transparent", summaryBg: "#ffffff", summaryAccent: "transparent", storeHeader: "#e8eaf6", storeAccent: "transparent", shadow: "0 2px 4px rgba(0, 0, 0, 0.12)" },
+      },
+      standard: {
+        label: "標準", primary: "#2457c5", page: "#f5f6f8", paper: "#ffffff", text: "#1f2937", secondaryText: "#667085", divider: "#d9dee6", tableHeader: "#f2f4f7", tableGrid: "#d6dbe1", hover: "#f3f4f6", selected: "#e8eefc", listArea: "#f6f7f9", attention: "#fff9e6", attentionHover: "#fff4cc", attentionBorder: "#e1c76b",
+        status: { draft: "#6b7280", store: "#9a4500", hq: "#2563eb", integration: "#15803d", processing: "#b45309", failed: "#b91c1c", before: "#9ca3af" },
+      },
+    };
+    function createAppTheme(themeMode) {
+      const preset = THEME_PRESETS[themeMode] || THEME_PRESETS.pastel;
+      const panels = preset.panels || { accentWidth: "0px", filterBg: preset.paper, filterAccent: "transparent", targetBg: preset.paper, targetAccent: "transparent", summaryBg: preset.paper, summaryAccent: "transparent", storeHeader: preset.paper, storeAccent: "transparent", shadow: "none" };
+      return createTheme({
+        palette: { mode: "light", primary: { main: preset.primary }, secondary: { main: preset.secondary || preset.primary }, background: { default: preset.page, paper: preset.paper }, text: { primary: preset.text, secondary: preset.secondaryText }, divider: preset.divider, action: { hover: preset.hover, selected: preset.selected } },
+        typography: { fontFamily: '"Roboto", "Noto Sans JP", "Yu Gothic UI", sans-serif', fontSize: 13, subtitle1: { fontSize: "0.96rem" }, subtitle2: { fontSize: "0.84rem" }, body2: { fontSize: "0.82rem" }, caption: { fontSize: "0.74rem" }, button: { fontSize: "0.78rem" } },
+        shape: { borderRadius: preset.radius || (themeMode === "standard" ? 6 : 8) },
+        components: {
+          MuiCssBaseline: { styleOverrides: { ":root": { "--page-bg": preset.page, "--table-grid": preset.tableGrid, "--list-area": preset.listArea, "--attention-bg": preset.attention, "--attention-hover": preset.attentionHover, "--attention-border": preset.attentionBorder, "--status-draft": preset.status.draft, "--status-store": preset.status.store, "--status-hq": preset.status.hq, "--status-integration": preset.status.integration, "--status-processing": preset.status.processing, "--status-failed": preset.status.failed, "--status-before": preset.status.before, "--panel-accent-width": panels.accentWidth, "--panel-filter-bg": panels.filterBg, "--panel-filter-accent": panels.filterAccent, "--panel-target-bg": panels.targetBg, "--panel-target-accent": panels.targetAccent, "--panel-summary-bg": panels.summaryBg, "--panel-summary-accent": panels.summaryAccent, "--panel-store-header": panels.storeHeader, "--panel-store-accent": panels.storeAccent }, body: { backgroundColor: preset.page } } },
+          MuiAppBar: { styleOverrides: { root: { backgroundColor: preset.appBar || preset.paper, color: preset.appBarText || preset.text, ...(preset.appBarText ? { "& .MuiInputLabel-root, & .MuiSelect-select, & .MuiSvgIcon-root": { color: preset.appBarText }, "& .MuiOutlinedInput-notchedOutline": { borderColor: "rgba(255, 255, 255, 0.55)" }, "& .MuiOutlinedInput-root:hover .MuiOutlinedInput-notchedOutline": { borderColor: "rgba(255, 255, 255, 0.85)" }, "& .MuiChip-root": { color: preset.appBarText, borderColor: "rgba(255, 255, 255, 0.55)" } } : {}) } } },
+          MuiPaper: { defaultProps: { elevation: 0 }, styleOverrides: { root: { backgroundImage: "none", boxShadow: panels.shadow || "none" } } },
+          MuiTableCell: { styleOverrides: { head: { backgroundColor: preset.tableHeader, color: preset.text, fontWeight: 800 } } },
+          MuiButton: { defaultProps: { disableElevation: true, size: "small" }, styleOverrides: { root: { minHeight: 36, borderRadius: preset.buttonRadius || 4, textTransform: "none", fontWeight: 700 } } },
+          MuiChip: { styleOverrides: { root: { fontSize: 13 }, sizeSmall: { height: 30 } } },
+          MuiFormControl: { defaultProps: { size: "small" } },
+          MuiTextField: { defaultProps: { size: "small" } },
+        },
+      });
+    }
+
+    function App() {
+      const [themeMode, setThemeMode] = useState("material2");
+      const theme = useMemo(() => createAppTheme(themeMode), [themeMode]);
+      const [profileId, setProfileId] = useState("hq-product"); const [submissions, setSubmissions] = useState([]); const [dataLoading, setDataLoading] = useState(true); const [commandRunning, setCommandRunning] = useState(false); const [filterForm, setFilterForm] = useState(DEFAULT_FILTERS); const [appliedFilters, setAppliedFilters] = useState(DEFAULT_FILTERS); const [filterDialogOpen, setFilterDialogOpen] = useState(false); const [activeDatasetId, setActiveDatasetId] = useState(TARGET_DATASETS[0].id); const [pendingDatasetId, setPendingDatasetId] = useState(TARGET_DATASETS[0].id); const [targetDataDialogOpen, setTargetDataDialogOpen] = useState(false); const [storeView, setStoreView] = useState("card"); const [selectedIds, setSelectedIds] = useState([]); const [confirmAction, setConfirmAction] = useState(null); const [helpDialogOpen, setHelpDialogOpen] = useState(false); const [snackbar, setSnackbar] = useState(""); const [datasetProcessingSettings, setDatasetProcessingSettings] = useState(() => readDatasetProcessingSettings()); const reminderNotificationKeys = useRef(new Set());
+      const profile = ACCESS_PROFILES.find((item) => item.id === profileId); const activeDataset = DATASET_BY_ID.get(activeDatasetId); const activeDatasetProcessingSetting = datasetProcessingSettings[activeDatasetId] || DEFAULT_DATASET_PROCESSING_SETTING; const activeDatasetScheduledAt = getEffectiveScheduledAt(activeDataset, activeDatasetProcessingSetting); const appliedStore = STORE_MASTER.find((store) => store.id === appliedFilters.storeId);
+      async function reloadSubmissions({ quiet = false } = {}) { if (!quiet) setDataLoading(true); try { const result = await dataApi.listSubmissions(); if (!Array.isArray(result.submissions)) throw new ApiError("APIレスポンスに submissions がありません。", 500, result); setSubmissions(result.submissions); return result.submissions; } catch (error) { setSnackbar(error?.message || "データ取得に失敗しました。"); throw error; } finally { if (!quiet) setDataLoading(false); } }
+      useEffect(() => { let active = true; dataApi.listSubmissions().then((result) => { if (!active) return; if (!Array.isArray(result.submissions)) throw new ApiError("APIレスポンスに submissions がありません。", 500, result); setSubmissions(result.submissions); }).catch((error) => { if (active) setSnackbar(error?.message || "初期データ取得に失敗しました。"); }).finally(() => { if (active) setDataLoading(false); }); return () => { active = false; }; }, []);
+      const records = useMemo(() => submissions.map(joinSubmission), [submissions]);
+      useEffect(() => { const businessNowMinute = dateTimeToMinuteValue(APP_CONFIG.demoCurrentAt); if (businessNowMinute === null) return; TARGET_DATASETS.forEach((dataset) => { const setting = datasetProcessingSettings[dataset.id] || DEFAULT_DATASET_PROCESSING_SETTING; const effectiveScheduledAt = getEffectiveScheduledAt(dataset, setting); const scheduledMinute = dateTimeToMinuteValue(effectiveScheduledAt); if (!setting.processingEnabled || !setting.unconfirmedReminderEnabled || scheduledMinute === null || businessNowMinute < scheduledMinute - setting.reminderLeadMinutes || businessNowMinute >= scheduledMinute) return; const unconfirmedCount = records.filter((record) => record.datasetId === dataset.id && record.confirmationStatus === "draft" && canViewStore(profile, record)).length; const reminderKey = `${dataset.id}:${effectiveScheduledAt}:${setting.reminderLeadMinutes}`; if (unconfirmedCount && !reminderNotificationKeys.current.has(reminderKey)) { reminderNotificationKeys.current.add(reminderKey); setSnackbar(`${dataset.dataNumber}：未確定 ${unconfirmedCount}店舗へ、確定時刻 ${effectiveScheduledAt.slice(11)}の${setting.reminderLeadMinutes}分前通知を送信しました。`); } }); }, [records, profileId, datasetProcessingSettings]);
+      const processingIds = useMemo(() => submissions.filter((item) => item.integration.state === "processing").map((item) => item.submissionId), [submissions]);
+      const processingIdsKey = processingIds.join("|");
+      useEffect(() => {
+        if (!processingIds.length) return undefined;
+        let active = true;
+        let timerId;
+        const poll = () => {
+          timerId = window.setTimeout(async () => {
+            try {
+              const result = await dataApi.listSubmissions({ ids: processingIds });
+              if (!active) return;
+              if (!Array.isArray(result.submissions)) throw new ApiError("APIレスポンスに submissions がありません。", 500, result);
+              setSubmissions((current) => mergeSubmissions(current, result.submissions));
+              poll();
+            } catch (error) {
+              if (active) setSnackbar(error?.message || "自動連携の完了確認に失敗しました。");
+            }
+          }, 250);
+        };
+        poll();
+        return () => { active = false; window.clearTimeout(timerId); };
+      }, [processingIdsKey]);
+      const accessibleStores = useMemo(() => STORE_MASTER.filter((store) => canViewStore(profile, store)), [profileId]);
+      const companies = useMemo(() => [...new Set(accessibleStores.map((store) => store.company))].sort(), [accessibleStores]);
+      const departments = useMemo(() => [...new Set(accessibleStores.filter((store) => filterForm.company === "all" || store.company === filterForm.company).map((store) => store.department))].sort(), [accessibleStores, filterForm.company]);
+      const storeOptions = useMemo(() => accessibleStores.filter((store) => (filterForm.company === "all" || store.company === filterForm.company) && (filterForm.department === "all" || store.department === filterForm.department)), [accessibleStores, filterForm.company, filterForm.department]);
+      const conditionRecords = useMemo(() => { const selectedPeriod = periodKey(appliedFilters.year, appliedFilters.month); return records.filter((record) => { const changedOn = dateKey(record.confirmationStatusChangedAt); return canViewStore(profile, record) && record.datasetId === activeDatasetId && record.period === selectedPeriod && (!appliedFilters.startDate || changedOn >= appliedFilters.startDate) && (!appliedFilters.endDate || changedOn <= appliedFilters.endDate) && (appliedFilters.company === "all" || record.company === appliedFilters.company) && (appliedFilters.department === "all" || record.department === appliedFilters.department) && (!appliedFilters.storeId || record.storeId === appliedFilters.storeId); }); }, [records, profileId, appliedFilters, activeDatasetId]);
+      const counts = useMemo(() => countBySummaryStage(conditionRecords), [conditionRecords]); const visibleRecords = useMemo(() => appliedFilters.status === "all" ? conditionRecords : conditionRecords.filter((record) => getSummaryStage(record) === appliedFilters.status), [conditionRecords, appliedFilters.status]); const selectedIdSet = useMemo(() => new Set(selectedIds), [selectedIds]); const selectedRecords = visibleRecords.filter((record) => selectedIdSet.has(record.submissionId)); const availableActions = ACTION_ORDER.filter((actionType) => actionType !== "hqConfirm" && hasPermission(profile, ACTION_DEFINITIONS[actionType].permission(profile))); const activeDatasetRecords = useMemo(() => records.filter((record) => record.datasetId === activeDatasetId), [records, activeDatasetId]); const hqConfirmationRecords = useMemo(() => activeDatasetRecords.filter((record) => canExecute("hqConfirm", profile, record)), [activeDatasetRecords, profileId]);
+      function resetListState() { setSelectedIds([]); setConfirmAction(null); }
+      function handleProfileChange(event) { setProfileId(event.target.value); setFilterForm(DEFAULT_FILTERS); setAppliedFilters(DEFAULT_FILTERS); setFilterDialogOpen(false); setTargetDataDialogOpen(false); resetListState(); }
+      function openTargetDataDialog() { setPendingDatasetId(activeDatasetId); setTargetDataDialogOpen(true); }
+      async function handleGenerateMockData() {
+        if (APP_CONFIG.api.mode !== "mock" || commandRunning) return;
+        const referenceDate = appliedFilters.startDate || `${appliedFilters.year}-${String(appliedFilters.month).padStart(2, "0")}-01`;
+        const currentDatasetIndex = Math.max(0, TARGET_DATASETS.findIndex((dataset) => dataset.id === activeDatasetId));
+        setCommandRunning(true);
+        try {
+          const result = await dataApi.resetMockData({ referenceDate });
+          const nextDatasetId = result.datasets[currentDatasetIndex]?.id || result.datasets[0].id;
+          const nextProcessingSettings = writeDatasetProcessingSettings(null);
+          setSubmissions(result.submissions);
+          setDatasetProcessingSettings(nextProcessingSettings);
+          setActiveDatasetId(nextDatasetId);
+          setPendingDatasetId(nextDatasetId);
+          setTargetDataDialogOpen(false);
+          resetListState();
+          setSnackbar(`${referenceDate}の条件で、${STORE_MASTER.length}店舗 × ${result.datasets.length}対象データを再生成しました。`);
+        } catch (error) { setSnackbar(error?.message || "モックデータ生成に失敗しました。"); }
+        finally { setCommandRunning(false); }
+      }
+      function handleFilterChange(key, value) { setFilterForm((current) => { if (key === "company") return { ...current, company: value, department: "all", storeId: null }; if (key === "department") return { ...current, department: value, storeId: null }; return { ...current, [key]: value }; }); }
+      function handleSearch() { setAppliedFilters({ ...filterForm }); setFilterDialogOpen(false); resetListState(); }
+      function openFilterDialog() { setFilterForm({ ...appliedFilters }); setFilterDialogOpen(true); }
+      function handleDatasetChange(datasetId) { if (datasetId !== activeDatasetId) { setActiveDatasetId(datasetId); resetListState(); } }
+      function handleDatasetProcessingSettingsChange(datasetId, patch) { const next = writeDatasetProcessingSettings({ ...datasetProcessingSettings, [datasetId]: { ...(datasetProcessingSettings[datasetId] || DEFAULT_DATASET_PROCESSING_SETTING), ...patch } }); setDatasetProcessingSettings(next); void reloadSubmissions({ quiet: true }).catch((error) => setSnackbar(error?.message || "処理設定の反映に失敗しました。")); }
+      function handleStatusChange(status) { setFilterForm((current) => ({ ...current, status })); setAppliedFilters((current) => ({ ...current, status })); resetListState(); }
+      function toggleStore(idOrIds) { const ids = Array.isArray(idOrIds) ? idOrIds : [idOrIds]; setSelectedIds((current) => { const allSelected = ids.length > 0 && ids.every((id) => current.includes(id)); return allSelected ? current.filter((id) => !ids.includes(id)) : [...new Set([...current, ...ids])]; }); }
+      function toggleVisibleSelection() { const ids = visibleRecords.map((record) => record.submissionId); const allSelected = ids.length > 0 && ids.every((id) => selectedIds.includes(id)); setSelectedIds((current) => allSelected ? current.filter((id) => !ids.includes(id)) : [...new Set([...current, ...ids])]); }
+      function requestAction(actionType) { const eligible = selectedRecords.filter((record) => canExecute(actionType, profile, record)); if (!eligible.length || eligible.length !== selectedRecords.length) return; setConfirmAction({ type: actionType, datasetId: activeDatasetId, ids: eligible.map((record) => record.submissionId) }); }
+      function requestHqConfirmation() { if (!hqConfirmationRecords.length) return; setConfirmAction({ type: "hqConfirm", datasetId: activeDatasetId, ids: hqConfirmationRecords.map((record) => record.submissionId), totalStoreCount: activeDatasetRecords.length }); }
+      async function executeAction() { if (!confirmAction || commandRunning) return; const { type, ids, datasetId } = confirmAction; const dataset = DATASET_BY_ID.get(datasetId); setConfirmAction(null); setSelectedIds([]); setCommandRunning(true); try { const result = await dataApi.executeCommand({ actionType: type, submissionIds: ids, profileId: profile.id, requestedAt: nowLabel() }); if (!Array.isArray(result.submissions)) throw new ApiError("APIレスポンスに submissions がありません。", 500, result); setSubmissions((current) => mergeSubmissions(current, result.submissions)); const executedCount = result.submissions.length; setSnackbar(type === "hqConfirm" ? `${dataset?.dataNumber || "対象データ"}：全店舗を本部確定し、連携を${executedCount}店舗で開始しました。` : type === "hqConfirmSelected" ? `${dataset?.dataNumber || "対象データ"}：選択した${executedCount}店舗を本部確定し、連携を開始しました。` : `${dataset?.dataNumber || "対象データ"}：${ACTION_DEFINITIONS[type].label(profile)}を${executedCount}店舗に実行しました。`); } catch (error) { setSnackbar(error?.message || "操作の実行に失敗しました。"); try { await reloadSubmissions({ quiet: true }); } catch (_) {} } finally { setCommandRunning(false); } }
+      const dialogRecords = confirmAction ? records.filter((record) => confirmAction.ids.includes(record.submissionId)) : [];
+      return <ThemeProvider theme={theme}><CssBaseline /><AppBar position="sticky" color="inherit" elevation={0} sx={{ borderBottom: 1, borderColor: "divider" }}><Toolbar sx={{ display: "flex", flexWrap: { xs: "wrap", sm: "nowrap" }, overflowX: "visible", gap: 1, py: 0.75, minHeight: { xs: "auto", sm: 58 } }}><Stack direction="row" alignItems="center" spacing={1} sx={{ minWidth: 0, flex: { xs: "1 1 100%", sm: "1 1 280px" }, whiteSpace: "nowrap" }}><Stack direction="row" alignItems="center" spacing={0.25}><Tooltip title="使い方を表示"><Button variant="text" color="inherit" onClick={() => setHelpDialogOpen(true)} aria-haspopup="dialog" aria-controls={helpDialogOpen ? "help-dialog" : undefined} sx={{ minWidth: 0, px: 0.5, fontSize: "0.96rem", fontWeight: 700, whiteSpace: "nowrap" }}>{APP_CONFIG.name}</Button></Tooltip><Tooltip title="ページを再読み込み"><IconButton size="small" aria-label="ページを再読み込み" onClick={() => window.location.reload()}><ReloadIcon fontSize="small" /></IconButton></Tooltip></Stack></Stack><Stack direction="row" spacing={0.75} alignItems="center" flexWrap="wrap" useFlexGap sx={{ width: { xs: "100%", sm: "auto" }, flex: { xs: "1 1 100%", sm: "0 1 auto" } }}><FormControl sx={{ width: 130, flex: "0 0 130px" }}><InputLabel>テーマ</InputLabel><Select label="テーマ" value={themeMode} onChange={(event) => setThemeMode(event.target.value)}>{Object.entries(THEME_PRESETS).map(([key, item]) => <MenuItem key={key} value={key}>{item.label}</MenuItem>)}</Select></FormControl><Chip label={`API: ${APP_CONFIG.api.mode.toUpperCase()}`} color={APP_CONFIG.api.mode === "real" ? "primary" : "default"} variant="outlined" sx={{ fontWeight: 700 }} />{APP_CONFIG.api.mode === "mock" && <Button variant="outlined" color="inherit" onClick={handleGenerateMockData} disabled={commandRunning}>モック生成</Button>}<FormControl sx={{ width: { xs: "auto", sm: 250 }, flex: "1 1 220px" }}><InputLabel>利用者</InputLabel><Select label="利用者" value={profileId} onChange={handleProfileChange} disabled={commandRunning}>{ACCESS_PROFILES.map((item) => <MenuItem key={item.id} value={item.id}>{item.orgName} / {item.userName}</MenuItem>)}</Select></FormControl></Stack></Toolbar></AppBar><Container component="main" maxWidth={false} sx={{ width: "100%", maxWidth: 1600, px: { xs: 1, sm: 1.5, md: 2 }, py: 1.5 }}><Stack spacing={1.25}><Paper component="section" aria-label="表示条件" variant="outlined"><PanelContent><Box sx={{ display: "block", minWidth: 0, lineHeight: 0 }}><Typography component="h2" variant="body2" sx={{ display: "inline-flex", alignItems: "center", minHeight: 30, fontWeight: 800, whiteSpace: "nowrap", verticalAlign: "middle", mr: 0.75, mb: 0.75, lineHeight: 1.43 }}>表示条件</Typography>{[{ label: `年 ${appliedFilters.year}年` }, { label: `月 ${appliedFilters.month}月` }, { label: `開始日 ${appliedFilters.startDate || "未指定"}` }, { label: `終了日 ${appliedFilters.endDate || "未指定"}` }, { label: `会社 ${appliedFilters.company === "all" ? "すべて" : appliedFilters.company}` }, { label: `部門 ${appliedFilters.department === "all" ? "すべて" : appliedFilters.department}` }, { label: `店舗 ${appliedStore ? storeLabel(appliedStore) : "すべて"}` }, { label: `状態 ${appliedFilters.status === "all" ? "すべて" : SUMMARY_STAGES[appliedFilters.status].label}` }].map((item) => <ResponsiveChip key={item.label} label={item.label} maxWidth={{ xs: "100%", sm: 280 }} onClick={openFilterDialog} />)}<Button variant="text" onClick={openFilterDialog} sx={{ verticalAlign: "middle", mb: 0.75 }}>条件変更</Button></Box></PanelContent></Paper><Paper component="section" aria-label="対象データ" variant="outlined"><PanelContent><Box sx={{ display: "block", minWidth: 0, lineHeight: 0 }}><Typography component="h2" variant="body2" sx={{ display: "inline-flex", alignItems: "center", minHeight: 30, fontWeight: 800, whiteSpace: "nowrap", verticalAlign: "middle", mr: 0.75, mb: 0.75, lineHeight: 1.43 }}>対象データ</Typography><DatasetMetadata dataset={activeDataset} scheduledAt={activeDatasetScheduledAt} onClick={openTargetDataDialog} /><Button size="small" variant="outlined" sx={{ verticalAlign: "middle", mb: 0.75 }} onClick={openTargetDataDialog}>変更</Button></Box></PanelContent></Paper><SummaryPanel counts={counts} total={conditionRecords.length} activeStatus={appliedFilters.status} onChange={handleStatusChange} /><Paper component="section" aria-label="店舗一覧" variant="outlined"><PanelHeader><Box sx={{ width: "100%", display: "grid", gridTemplateColumns: { xs: "minmax(0, 1fr)", sm: "minmax(0, 1fr) auto" }, alignItems: "center", columnGap: 1, rowGap: 0.75 }}><Stack direction="row" flexWrap="nowrap" alignItems="baseline" gap={0.75} sx={{ minWidth: 0 }}><Typography component="h2" variant="subtitle1" title={`店舗一覧（${activeDataset.dataNumber} / ${DATA_TYPES[activeDataset.dataType].label}）`} sx={{ display: "inline-flex", alignItems: "center", minHeight: 30, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", fontWeight: 700, whiteSpace: "nowrap", lineHeight: 1.43 }}>店舗一覧（{activeDataset.dataNumber} / {DATA_TYPES[activeDataset.dataType].label}）</Typography><Typography variant="caption" color="text.secondary" sx={{ display: "inline-flex", alignItems: "center", minHeight: 30, lineHeight: 1.43, whiteSpace: "nowrap" }}>{visibleRecords.length}件</Typography></Stack><Box sx={{ display: "flex", alignItems: "center", justifyContent: { xs: "flex-start", sm: "flex-end" }, gap: 0.75, justifySelf: { xs: "start", sm: "end" } }}><Button variant={storeView === "card" ? "contained" : "outlined"} onClick={() => setStoreView("card")} aria-pressed={storeView === "card"}>カード</Button><Button variant={storeView === "table" ? "contained" : "outlined"} onClick={() => setStoreView("table")} aria-pressed={storeView === "table"}>テーブル</Button></Box></Box></PanelHeader><PanelContent sx={{ pt: 0.75 }}><ActionBar dataset={activeDataset} scheduledAt={activeDatasetScheduledAt} profile={profile} visibleRecords={visibleRecords} selectedRecords={selectedRecords} selectedIds={selectedIds} actions={availableActions} hqConfirmationCount={hqConfirmationRecords.length} hqConfirmationTotal={activeDatasetRecords.length} onToggleVisible={toggleVisibleSelection} onRequestAction={requestAction} onRequestHqConfirmation={hasPermission(profile, PERMISSION.HQ_CONFIRM) ? requestHqConfirmation : undefined} disabled={commandRunning || dataLoading} /><Box sx={{ mt: 0.75, p: { xs: 0.75, sm: 1 }, width: "100%", maxWidth: "100%", minWidth: 0, overflow: "hidden", borderRadius: 1, bgcolor: "var(--list-area)" }}>{dataLoading ? <Alert severity="info">APIから店舗データを取得しています。</Alert> : visibleRecords.length ? storeView === "card" ? <Box sx={{ display: "grid", gridTemplateColumns: { xs: "minmax(0, 1fr)", sm: "repeat(3, minmax(0, 1fr))", md: "repeat(5, minmax(0, 1fr))", lg: "repeat(8, minmax(0, 1fr))", xl: "repeat(10, minmax(0, 1fr))" }, gap: 1 }}>{visibleRecords.map((record) => <StoreCard key={record.submissionId} record={record} checked={selectedIds.includes(record.submissionId)} onToggle={() => toggleStore(record.submissionId)} profile={profile} />)}</Box> : <StoreTable records={visibleRecords} selectedIds={selectedIds} onToggle={toggleStore} profile={profile} /> : <Alert severity="info">条件に一致する店舗データはありません。</Alert>}</Box></PanelContent></Paper><Typography variant="caption" color="text.secondary" align="center">Version {APP_CONFIG.version} / API {APP_CONFIG.api.mode.toUpperCase()} / 利用者切替はプロトタイプ確認用</Typography></Stack></Container><HelpDialog open={helpDialogOpen} onClose={() => setHelpDialogOpen(false)} /><FilterDialog open={filterDialogOpen} filters={filterForm} companies={companies} departments={departments} storeOptions={storeOptions} onChange={handleFilterChange} onSearch={handleSearch} onClear={() => setFilterForm(DEFAULT_FILTERS)} onClose={() => { setFilterForm({ ...appliedFilters }); setFilterDialogOpen(false); }} /><TargetDataSettingsDialog open={targetDataDialogOpen} value={pendingDatasetId} records={records.filter((record) => canViewStore(profile, record))} processingSettings={datasetProcessingSettings} onChange={setPendingDatasetId} onProcessingSettingsChange={handleDatasetProcessingSettingsChange} onClose={() => { setPendingDatasetId(activeDatasetId); setTargetDataDialogOpen(false); }} onApply={() => { handleDatasetChange(pendingDatasetId); setTargetDataDialogOpen(false); }} /><ConfirmDialog action={confirmAction} records={dialogRecords} profile={profile} dataset={DATASET_BY_ID.get(confirmAction?.datasetId || activeDatasetId)} onClose={() => setConfirmAction(null)} onConfirm={executeAction} /><Snackbar open={Boolean(snackbar)} autoHideDuration={3500} onClose={() => setSnackbar("")} message={snackbar} /></ThemeProvider>;
+    }
+
+    const rootElement = document.getElementById("root");
+    if (!rootElement) throw new Error("#root was not found.");
+    createRoot(rootElement).render(DEV_MODE ? <React.StrictMode><App /></React.StrictMode> : <App />);
+  </script>
+  <script type="module">
+    import React from "https://esm.sh/react@19.2.8";
+    import { createRoot } from "https://esm.sh/react-dom@19.2.8/client";
+    import * as MaterialUI from "https://esm.sh/@mui/material@9.3.1?deps=react@19.2.8,react-dom@19.2.8";
+    const DEV_MODE = true;
+    const rootElement = document.getElementById("root");
+    function showBootError(error) {
+      console.error("Application boot failed", error);
+      if (!rootElement) return;
+      rootElement.replaceChildren();
+      const wrapper = document.createElement("div"); wrapper.style.padding = "24px"; wrapper.style.fontFamily = '"Roboto", "Noto Sans JP", "Yu Gothic UI", sans-serif';
+      const title = document.createElement("h2"); title.textContent = "Application failed to start";
+      const message = document.createElement("p"); message.textContent = "アプリケーションを起動できませんでした。再読み込みしてください。";
+      wrapper.append(title, message);
+      if (DEV_MODE) { const detail = document.createElement("pre"); detail.style.whiteSpace = "pre-wrap"; detail.style.overflow = "auto"; detail.textContent = error?.stack || String(error); wrapper.append(detail); }
+      rootElement.append(wrapper);
+    }
+    try {
+      if (!rootElement) throw new Error("#root was not found.");
+      if (!window.Babel) throw new Error("Babel Standalone failed to load.");
+      const sourceElement = document.getElementById("app-source");
+      if (!sourceElement) throw new Error("#app-source was not found.");
+      const { code } = window.Babel.transform(sourceElement.textContent, { presets: [["react", { runtime: "classic" }]], sourceType: "script" });
+      new Function("React", "createRoot", "MaterialUI", "DEV_MODE", code)(React, createRoot, MaterialUI, DEV_MODE);
+    } catch (error) { showBootError(error); }
+  </script>
+</body>
+</html>
